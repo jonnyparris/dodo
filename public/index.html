@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Dodo</title>
+  <style>
+    :root{--bg:#f5f5f0;--panel:#fff;--text:#1a1a1a;--muted:#666;--accent:#0a7c66;--accent-bg:rgba(10,124,102,.08);--border:#e0e0e0;--red:#c0392b;--tool-bg:#f0f4f8;--tool-border:#c8d6e5;--mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;--radius:8px}
+    *{box-sizing:border-box;margin:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);font-size:14px}
+    /* Desktop layout */
+    .app{display:grid;grid-template-columns:260px 1fr 280px;height:100vh}
+    .sidebar,.right{background:var(--panel);overflow-y:auto;padding:16px}
+    .sidebar{border-right:1px solid var(--border)}
+    .right{border-left:1px solid var(--border)}
+    .center{display:flex;flex-direction:column;overflow:hidden}
+    h2{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:12px}
+    button{cursor:pointer;border:1px solid var(--border);background:var(--panel);color:var(--text);padding:6px 12px;border-radius:var(--radius);font-size:13px}
+    button:hover{background:var(--accent-bg)}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+    button.danger{background:var(--red);color:#fff;border-color:var(--red)}
+    button.sm{padding:2px 6px;font-size:11px}
+    input,textarea,select{border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;font-size:13px;font-family:inherit;width:100%}
+    textarea{resize:vertical;font-family:var(--mono)}
+    .session-item{padding:10px 12px;border-radius:var(--radius);cursor:pointer;margin-bottom:4px;border:1px solid transparent}
+    .session-item:hover{background:var(--accent-bg)}
+    .session-item.active{background:var(--accent-bg);border-color:var(--accent)}
+    .session-title{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .session-meta{font-size:11px;color:var(--muted);margin-top:2px}
+    .chat{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+    .msg{max-width:80%;padding:10px 14px;border-radius:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-size:13px}
+    .msg.user{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}
+    .msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--border);border-bottom-left-radius:4px}
+    .msg.tool_call{align-self:flex-start;background:var(--tool-bg);border:1px solid var(--tool-border);border-radius:8px;font-family:var(--mono);font-size:12px;max-width:90%}
+    .msg.tool_call summary{cursor:pointer;color:var(--accent);font-weight:600}
+    .msg.thinking{align-self:flex-start;background:var(--accent-bg);border:1px dashed var(--accent);color:var(--accent);font-style:italic}
+    .thinking-dots::after{content:'';animation:dots 1.5s steps(4,end) infinite}
+    @keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+    .input-bar{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);background:var(--panel);align-items:center}
+    .input-bar input{flex:1}
+    .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+    .status-dot.idle{background:var(--accent)}
+    .status-dot.running{background:#e67e22;animation:pulse 1s infinite}
+    @keyframes pulse{50%{opacity:.4}}
+    .file-tree{font-family:var(--mono);font-size:12px}
+    .file-entry{padding:4px 8px;cursor:pointer;border-radius:4px;display:flex;align-items:center;gap:4px}
+    .file-entry:hover{background:var(--accent-bg)}
+    .file-children{padding-left:16px}
+    .section{margin-bottom:20px}
+    .kv{display:flex;justify-content:space-between;padding:4px 0;font-size:12px;align-items:center}
+    .tag{display:inline-block;background:var(--accent-bg);color:var(--accent);padding:2px 8px;border-radius:12px;font-size:11px;margin-right:4px}
+    .empty{color:var(--muted);font-style:italic;font-size:12px;padding:8px 0}
+    .example-prompt{padding:8px 12px;border-radius:var(--radius);border:1px solid var(--border);cursor:pointer;font-size:12px;margin-bottom:6px;line-height:1.4;transition:border-color .15s}
+    .example-prompt:hover{border-color:var(--accent);background:var(--accent-bg)}
+    .onboarding{padding:32px;text-align:center;color:var(--muted)}
+    .onboarding h3{color:var(--text);margin-bottom:8px;font-size:18px}
+    .onboarding p{margin-bottom:16px;line-height:1.5;max-width:480px;margin-left:auto;margin-right:auto}
+    .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;margin-right:6px;vertical-align:middle}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .banner{padding:8px 16px;font-size:12px;text-align:center}
+    .banner.warn{background:#fef3cd;color:#856404;border-bottom:1px solid #ffc107}
+    .footer{padding:6px 16px;font-size:10px;color:var(--muted);text-align:center;border-top:1px solid var(--border);background:var(--panel)}
+    .token-summary{font-size:11px;color:var(--muted)}
+    .help-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;justify-content:center}
+    .help-content{background:var(--panel);border-radius:16px;padding:24px;max-width:560px;max-height:80vh;overflow-y:auto;width:90%}
+    .help-content h3{margin-bottom:12px}
+    .help-content dt{font-weight:600;margin-top:12px}
+    .help-content dd{color:var(--muted);margin-left:0;margin-bottom:4px}
+    /* Kanban */
+    .kanban{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;font-size:11px}
+    .kanban-col{background:var(--bg);border-radius:var(--radius);padding:6px}
+    .kanban-col h3{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:6px}
+    .kanban-card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:4px;cursor:pointer;font-size:11px}
+    .kanban-card:hover{border-color:var(--accent)}
+    .kanban-card .priority{font-size:9px;text-transform:uppercase;opacity:.6}
+    /* Mobile layout */
+    .mobile-nav{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--panel);border-top:1px solid var(--border);z-index:100;padding:6px 0 env(safe-area-inset-bottom,6px)}
+    .mobile-nav-inner{display:flex;justify-content:space-around}
+    .mobile-nav button{border:none;background:none;font-size:11px;color:var(--muted);padding:6px 12px;display:flex;flex-direction:column;align-items:center;gap:2px}
+    .mobile-nav button.active{color:var(--accent)}
+    .fab{display:none;position:fixed;bottom:72px;right:16px;width:48px;height:48px;border-radius:50%;background:var(--accent);color:#fff;border:none;font-size:24px;box-shadow:0 4px 12px rgba(0,0,0,.2);z-index:100}
+    @media(max-width:900px){
+      .app{grid-template-columns:1fr;height:calc(100vh - 56px)}
+      .sidebar,.right{display:none}
+      .sidebar.mobile-visible,.right.mobile-visible{display:block;position:fixed;inset:0;z-index:90;bottom:56px;overflow-y:auto}
+      .mobile-nav{display:block}
+      .fab{display:flex;align-items:center;justify-content:center}
+      .kanban{grid-template-columns:1fr 1fr}
+    }
+  </style>
+</head>
+<body>
+  <div id="banner-container"></div>
+  <div class="app">
+    <div class="sidebar" id="sidebar-panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h2 style="margin:0">Sessions</h2>
+        <button class="primary" onclick="createSession()">+ New</button>
+      </div>
+      <div id="session-list"></div>
+      <div class="section" style="margin-top:24px">
+        <h2>Config</h2>
+        <div id="config-display"></div>
+        <details style="margin-top:8px">
+          <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Edit config</summary>
+          <div style="margin-top:8px">
+            <label style="font-size:11px;color:var(--muted)">Model</label>
+            <input id="cfg-model" list="model-list" style="margin-bottom:6px"/>
+            <datalist id="model-list"></datalist>
+            <label style="font-size:11px;color:var(--muted)">Gateway</label>
+            <select id="cfg-gateway" style="margin-bottom:6px">
+              <option value="opencode">OpenCode</option>
+              <option value="ai-gateway">AI Gateway</option>
+            </select>
+            <button onclick="saveConfig()" style="margin-top:4px">Save</button>
+          </div>
+        </details>
+      </div>
+      <div class="section">
+        <h2>Allowlist</h2>
+        <div id="allowlist-display"></div>
+        <div style="display:flex;gap:4px;margin-top:6px">
+          <input id="allowlist-input" placeholder="hostname" style="flex:1"/>
+          <button onclick="addHost()">+</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="center">
+      <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--panel)">
+        <div>
+          <span id="session-status-dot" class="status-dot idle"></span>
+          <strong id="session-title-display">No session</strong>
+          <span id="session-id-display" style="font-size:11px;color:var(--muted);margin-left:8px"></span>
+          <span id="token-summary" class="token-summary" style="margin-left:8px"></span>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button onclick="showHelp()" title="Help — explains each feature and button">?</button>
+          <button onclick="forkSession()" title="Fork — creates a copy of this session with all files and messages for branching experiments">Fork</button>
+          <button id="abort-btn" onclick="abortPrompt()" disabled title="Abort — cancels the currently running async prompt">Abort</button>
+          <button class="danger" onclick="deleteSession()" title="Delete — permanently removes this session and all its data">Delete</button>
+        </div>
+      </div>
+      <div class="chat" id="chat">
+        <div class="onboarding" id="onboarding">
+          <h3>Welcome to Dodo</h3>
+          <p>Autonomous coding agent running on Cloudflare Workers. Create a session and start building.</p>
+          <p style="font-size:12px;color:var(--muted)">The agent can read/write workspace files, execute sandboxed code, and manage git repos autonomously.</p>
+          <div style="margin-top:16px;text-align:left;max-width:400px;margin-left:auto;margin-right:auto">
+            <h2>Try these prompts</h2>
+            <div class="example-prompt" onclick="useExample(this)">Create a Cloudflare Worker that returns the current time as JSON. Write it to /src/index.ts</div>
+            <div class="example-prompt" onclick="useExample(this)">Write a fibonacci function in /src/fib.ts, then write tests for it in /test/fib.test.ts</div>
+            <div class="example-prompt" onclick="useExample(this)">Read all files in the workspace and give me a summary of what's there</div>
+            <div class="example-prompt" onclick="useExample(this)">Initialize a git repo, create a README.md with a project description, and make an initial commit</div>
+            <div class="example-prompt" onclick="useExample(this)">Create a simple TODO app with an HTML file and a Worker API backend. Put files in /src/</div>
+          </div>
+        </div>
+      </div>
+      <div class="input-bar">
+        <input id="msg-input" placeholder="Ask Dodo to build something..." onkeydown="if(event.key==='Enter'&&!event.shiftKey)sendMessage()"/>
+        <button class="primary" id="send-btn" onclick="sendMessage()">Send</button>
+        <button id="async-btn" onclick="sendAsync()">Async</button>
+      </div>
+      <div class="footer" id="footer">Dodo</div>
+    </div>
+
+    <div class="right" id="right-panel">
+      <div class="section">
+        <h2>Workspace Files</h2>
+        <div id="file-tree" class="file-tree"></div>
+        <details style="margin-top:8px">
+          <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Write file</summary>
+          <input id="file-path" placeholder="/path/to/file" style="margin-top:6px;margin-bottom:4px"/>
+          <textarea id="file-content" rows="4" placeholder="content"></textarea>
+          <button onclick="writeFile()" style="margin-top:4px">Write</button>
+        </details>
+      </div>
+      <div class="section">
+        <h2>Git</h2>
+        <div id="git-status-display"></div>
+        <div style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap">
+          <button onclick="gitInit()">Init</button>
+          <button onclick="gitAddAll()">Add all</button>
+          <button onclick="gitCommitPrompt()">Commit</button>
+          <button onclick="refreshGit()">Status</button>
+        </div>
+      </div>
+      <div class="section">
+        <h2>Prompts</h2>
+        <div id="prompt-list"></div>
+      </div>
+      <div class="section">
+        <h2>Tasks</h2>
+        <div id="task-board"></div>
+        <details style="margin-top:6px">
+          <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Add task</summary>
+          <input id="task-title" placeholder="Title" style="margin-top:6px;margin-bottom:4px"/>
+          <textarea id="task-desc" rows="2" placeholder="Description"></textarea>
+          <button onclick="createTask()" style="margin-top:4px">Add</button>
+        </details>
+      </div>
+      <div class="section">
+        <h2>Cron Jobs</h2>
+        <div id="cron-list"></div>
+        <details style="margin-top:6px">
+          <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Schedule task</summary>
+          <input id="cron-desc" placeholder="Description" style="margin-top:6px;margin-bottom:4px"/>
+          <input id="cron-prompt" placeholder="Prompt text" style="margin-bottom:4px"/>
+          <input id="cron-delay" placeholder="Delay (seconds)" type="number" style="margin-bottom:4px"/>
+          <button onclick="createCron()">Schedule</button>
+        </details>
+      </div>
+      <div class="section">
+        <h2>Memory</h2>
+        <div style="display:flex;gap:4px;margin-bottom:8px">
+          <input id="mem-search" placeholder="Search..." style="flex:1" oninput="loadMemory(this.value)"/>
+        </div>
+        <div id="memory-list"></div>
+        <details style="margin-top:6px">
+          <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Add / Edit entry</summary>
+          <input id="mem-id" type="hidden"/>
+          <input id="mem-title" placeholder="Title" style="margin-top:6px;margin-bottom:4px"/>
+          <textarea id="mem-content" rows="3" placeholder="Content"></textarea>
+          <input id="mem-tags" placeholder="Tags (comma-separated)" style="margin-top:4px;margin-bottom:4px"/>
+          <div style="display:flex;gap:4px">
+            <button onclick="saveMemory()" style="flex:1">Save</button>
+            <button onclick="clearMemoryForm()">Clear</button>
+          </div>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mobile navigation -->
+  <div class="mobile-nav" id="mobile-nav">
+    <div class="mobile-nav-inner">
+      <button class="active" onclick="switchTab('chat')"><span>&#128172;</span>Chat</button>
+      <button onclick="switchTab('files')"><span>&#128196;</span>Files</button>
+      <button onclick="switchTab('tools')"><span>&#128295;</span>Tools</button>
+      <button onclick="switchTab('settings')"><span>&#9881;</span>Settings</button>
+    </div>
+  </div>
+  <button class="fab" onclick="createSession()" title="New session">+</button>
+
+  <!-- Help overlay -->
+  <div class="help-overlay" id="help-overlay" style="display:none" onclick="if(event.target===this)hideHelp()">
+    <div class="help-content">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3>How Dodo Works</h3>
+        <button onclick="hideHelp()" class="sm">Close</button>
+      </div>
+      <p style="color:var(--muted);margin-bottom:16px">Dodo is an autonomous coding agent. Each session is an isolated workspace with its own files, git repo, and conversation history.</p>
+      <dl>
+        <dt>Send / Async</dt><dd>Send waits for the full response (streaming). Async dispatches work in the background — you'll get a push notification when it completes.</dd>
+        <dt>Fork</dt><dd>Creates a copy of the current session (files + messages) so you can branch experiments without losing the original.</dd>
+        <dt>Abort</dt><dd>Cancels the currently running async prompt.</dd>
+        <dt>Workspace Files</dt><dd>The agent's virtual filesystem. It can read, write, search, and edit files autonomously during conversations. Click directories to expand.</dd>
+        <dt>Git</dt><dd>Full git support — init, add, commit, branch, push/pull to GitHub/GitLab with configured tokens.</dd>
+        <dt>Tasks</dt><dd>A Kanban backlog. Add tasks, advance their status. Click "Work on this" to dispatch a task to a new session.</dd>
+        <dt>Prompts</dt><dd>History of async prompts with their status (queued, running, completed, failed, aborted).</dd>
+        <dt>Cron Jobs</dt><dd>Schedule delayed or recurring prompts that run automatically.</dd>
+        <dt>Memory</dt><dd>Persistent key-value store with search. Survives across sessions.</dd>
+        <dt>Config</dt><dd>Switch LLM models and gateways. The model dropdown is populated from the available models on the OpenCode gateway.</dd>
+        <dt>Allowlist</dt><dd>Hosts that sandboxed code execution is allowed to reach. Unlisted hosts are blocked.</dd>
+      </dl>
+      <p style="margin-top:16px"><a href="/docs" style="color:var(--accent)">Full architecture documentation</a></p>
+    </div>
+  </div>
+
+  <script>
+    let currentSession=null,eventSource=null,isProcessing=false,streamingEl=null,expandedDirs=new Set(),activeTab='chat';
+
+    const $=(id)=>document.getElementById(id);
+    const esc=(s)=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    const api=async(path,opts)=>{const r=await fetch(path,opts);return r.headers.get("content-type")?.includes("json")?r.json():r.text()};
+    const json=(path,body,method="POST")=>api(path,{method,headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+
+    // --- Mobile tab switching ---
+    function switchTab(tab){
+      activeTab=tab;
+      document.querySelectorAll('.mobile-nav button').forEach(b=>b.classList.remove('active'));
+      document.querySelector(`.mobile-nav button[onclick="switchTab('${tab}')"]`)?.classList.add('active');
+      $('sidebar-panel').classList.remove('mobile-visible');
+      $('right-panel').classList.remove('mobile-visible');
+      document.querySelector('.center').style.display=tab==='chat'?'flex':'none';
+      if(tab==='settings')$('sidebar-panel').classList.add('mobile-visible');
+      if(tab==='files'||tab==='tools')$('right-panel').classList.add('mobile-visible');
+    }
+
+    function showHelp(){$('help-overlay').style.display='flex'}
+    function hideHelp(){$('help-overlay').style.display='none'}
+
+    function setProcessing(active){
+      isProcessing=active;
+      $("send-btn").disabled=active;$("async-btn").disabled=active;$("abort-btn").disabled=!active;$("msg-input").disabled=active;
+      $("send-btn").innerHTML=active?'<span class="spinner"></span>Thinking':'Send';
+    }
+    function showThinking(){const el=document.createElement("div");el.className="msg thinking";el.id="thinking-indicator";el.innerHTML='Dodo is thinking<span class="thinking-dots"></span>';$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
+    function hideThinking(){$("thinking-indicator")?.remove()}
+    function useExample(el){if(!currentSession){createSession().then(()=>{$("msg-input").value=el.textContent});return}$("msg-input").value=el.textContent;$("msg-input").focus()}
+
+    async function boot(){await Promise.all([loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks()])}
+
+    // --- Status & models ---
+    async function loadStatus(){
+      try{
+        const s=await api("/api/status");
+        $("footer").textContent=`Dodo v${esc(s.version)}`;
+        if(s.tokenExpiry){
+          const exp=new Date(s.tokenExpiry);const days=Math.floor((exp.getTime()-Date.now())/(86400000));
+          if(days<7){$("banner-container").innerHTML=`<div class="banner warn">Gateway token expires in ${days} day${days!==1?'s':''} — rotate with: wrangler versions secret put OPENCODE_GATEWAY_TOKEN</div>`}
+        }
+      }catch{}
+    }
+    async function loadModels(){
+      try{
+        const{models}=await api("/api/models");
+        const dl=$("model-list");dl.innerHTML="";
+        models.forEach(m=>{const o=document.createElement("option");o.value=m.id;o.textContent=`${m.name}${m.costInput?` ($${m.costInput}/M in)`:''}`; dl.appendChild(o)});
+      }catch{}
+    }
+
+    // --- Sessions ---
+    async function loadSessions(){
+      const{sessions}=await api("/session");const el=$("session-list");
+      if(!sessions.length){el.innerHTML='<div class="empty">No sessions yet</div>';return}
+      el.innerHTML=sessions.map(s=>`<div class="session-item ${currentSession===s.id?'active':''}" onclick="selectSession('${esc(s.id)}')"><div class="session-title">${esc(s.title||s.id.slice(0,8))}</div><div class="session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`).join("")
+    }
+    async function createSession(){const{id}=await json("/session",{});currentSession=id;await loadSessions();await selectSession(id)}
+    async function selectSession(id){
+      currentSession=id;setProcessing(false);await loadSessions();$("chat").innerHTML="";$("onboarding")?.remove();
+      $("session-id-display").textContent=id.slice(0,8);
+      const state=await api(`/session/${id}`);
+      $("session-title-display").textContent=state.title||id.slice(0,8);setStatusDot(state.status);
+      updateTokenSummary(state);
+      if(state.status==="running")setProcessing(true);
+      const{messages}=await api(`/session/${id}/messages`);messages.forEach(renderMessage);
+      await Promise.all([loadFiles("/"),loadPrompts(),loadCron(),refreshGit()]);connectSSE(id);
+      if(window.innerWidth<=900)switchTab('chat');
+    }
+    function updateTokenSummary(state){
+      const ti=state.totalTokenInput??0,to=state.totalTokenOutput??0;
+      $("token-summary").textContent=ti||to?`${(ti/1000).toFixed(1)}k in / ${(to/1000).toFixed(1)}k out`:'';
+    }
+
+    // --- SSE ---
+    function connectSSE(id){
+      if(eventSource)eventSource.close();eventSource=new EventSource(`/session/${id}/events`);
+      eventSource.addEventListener("text_delta",(e)=>{hideThinking();const{delta}=JSON.parse(e.data);if(!streamingEl){streamingEl=document.createElement("div");streamingEl.className="msg assistant";streamingEl.textContent="";$("chat").appendChild(streamingEl)}streamingEl.textContent+=delta;$("chat").scrollTop=$("chat").scrollHeight});
+      eventSource.addEventListener("message",(e)=>{hideThinking();const msg=JSON.parse(e.data);if(streamingEl){streamingEl.textContent=msg.content;if(msg.tokenInput||msg.tokenOutput){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;streamingEl.appendChild(m)}streamingEl=null}else{renderMessage(msg)}loadFiles("/");api(`/session/${id}`).then(updateTokenSummary)});
+      eventSource.addEventListener("state",(e)=>{const s=JSON.parse(e.data);setStatusDot(s.status);updateTokenSummary(s);if(s.status!=="running"){setProcessing(false);hideThinking();streamingEl=null;loadPrompts()}});
+      eventSource.addEventListener("tool_call",(e)=>{hideThinking();if(streamingEl)streamingEl=null;renderToolCall(JSON.parse(e.data));loadFiles("/")});
+      eventSource.addEventListener("file",()=>loadFiles("/"));
+      eventSource.addEventListener("prompt",()=>loadPrompts());
+      eventSource.addEventListener("execution",(e)=>{const r=JSON.parse(e.data);const el=document.createElement("div");el.className="msg tool_call";el.textContent=r.error?`Error: ${r.error}`:`Result: ${JSON.stringify(r.result,null,2)}`;$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight});
+    }
+
+    function renderMessage(msg){const el=document.createElement("div");el.className=`msg ${msg.role}`;el.textContent=msg.content;if(msg.role==="assistant"&&(msg.tokenInput||msg.tokenOutput)){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;el.appendChild(m)}$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
+    function renderToolCall(tc){const el=document.createElement("div");el.className="msg tool_call";el.innerHTML=`<details><summary>Tool call</summary><pre style="margin:6px 0 0;font-size:11px;white-space:pre-wrap;max-height:200px;overflow:auto">${esc(tc.code||"")}</pre><div style="margin-top:4px;font-size:11px;color:var(--muted)">Result: ${esc(JSON.stringify(tc.result,null,2)?.slice(0,500)||"null")}</div></details>`;$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
+    function setStatusDot(status){$("session-status-dot").className=`status-dot ${status==="running"?"running":"idle"}`}
+
+    // --- Chat ---
+    async function sendMessage(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";setProcessing(true);showThinking();try{await json(`/session/${currentSession}/message`,{content})}finally{setProcessing(false);hideThinking();loadFiles("/")}}
+    async function sendAsync(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";setProcessing(true);showThinking();await json(`/session/${currentSession}/prompt`,{content})}
+    async function abortPrompt(){if(!currentSession)return;await json(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
+    async function forkSession(){if(!currentSession)return;const{id}=await json(`/session/${currentSession}/fork`,{});currentSession=id;await loadSessions();await selectSession(id)}
+    async function deleteSession(){if(!currentSession||!confirm("Delete this session?"))return;await api(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";await loadSessions()}
+
+    // --- Files (recursive expansion) ---
+    async function loadFiles(path){
+      if(!currentSession)return;
+      try{
+        const{entries}=await api(`/session/${currentSession}/files?path=${encodeURIComponent(path)}`);
+        if(path==="/"){$("file-tree").innerHTML=entries.length?renderFileEntries(entries,path):'<div class="empty">Empty workspace</div>'}
+        else{const container=$(`dir-${CSS.escape(path)}`);if(container)container.innerHTML=renderFileEntries(entries,path)}
+      }catch{if(path==="/")$("file-tree").innerHTML='<div class="empty">Empty workspace</div>'}
+    }
+    function renderFileEntries(entries,parentPath){
+      return entries.map(e=>{
+        if(e.type==="directory"){
+          const expanded=expandedDirs.has(e.path);
+          return `<div class="file-entry" onclick="toggleDir('${esc(e.path)}')"><span>${expanded?'&#9660;':'&#9654;'}</span><span>&#128193; ${esc(e.name)}</span></div>${expanded?`<div class="file-children" id="dir-${esc(e.path)}"></div>`:''}`
+        }
+        return `<div class="file-entry" onclick="readFile('${esc(e.path)}')"><span>&#128196;</span><span>${esc(e.name)}</span></div>`
+      }).join("")
+    }
+    async function toggleDir(path){
+      if(expandedDirs.has(path)){expandedDirs.delete(path);loadFiles("/")}
+      else{expandedDirs.add(path);await loadFiles("/");await loadFiles(path)}
+    }
+    async function readFile(path){if(!currentSession)return;const{content}=await api(`/session/${currentSession}/file?path=${encodeURIComponent(path)}`);$("file-path").value=path;$("file-content").value=content??""}
+    async function writeFile(){if(!currentSession)return;const path=$("file-path").value.trim();const content=$("file-content").value;if(!path)return;await json(`/session/${currentSession}/file?path=${encodeURIComponent(path)}`,{content},"PUT");await loadFiles("/")}
+
+    // --- Config ---
+    async function loadConfig(){const cfg=await api("/api/config");$("cfg-model").value=cfg.model;$("cfg-gateway").value=cfg.activeGateway;$("config-display").innerHTML=`<div class="kv"><span>Model</span><code>${esc(cfg.model)}</code></div><div class="kv"><span>Gateway</span><code>${esc(cfg.activeGateway)}</code></div><div class="kv"><span>Git</span><code>${esc(cfg.gitAuthorName)}</code></div>`}
+    async function saveConfig(){await json("/api/config",{model:$("cfg-model").value,activeGateway:$("cfg-gateway").value},"PUT");await loadConfig()}
+
+    // --- Allowlist ---
+    async function loadAllowlist(){const{hosts}=await api("/api/allowlist");$("allowlist-display").innerHTML=hosts.length?hosts.map(h=>`<div class="kv"><code>${esc(h.hostname)}</code><button onclick="removeHost('${esc(h.hostname)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No hosts</div>'}
+    async function addHost(){const hostname=$("allowlist-input").value.trim();if(!hostname)return;await json("/api/allowlist",{hostname});$("allowlist-input").value="";await loadAllowlist()}
+    async function removeHost(hostname){await api(`/api/allowlist/${encodeURIComponent(hostname)}`,{method:"DELETE"});await loadAllowlist()}
+
+    // --- Prompts ---
+    async function loadPrompts(){
+      if(!currentSession)return;
+      try{const{prompts}=await api(`/session/${currentSession}/prompts`);$("prompt-list").innerHTML=prompts.length?prompts.slice(0,10).map(p=>`<div class="kv"><span class="tag">${esc(p.status)}</span><span style="font-size:11px">${esc(p.content.slice(0,40))}</span></div>`).join(""):'<div class="empty">No prompts</div>'}catch{$("prompt-list").innerHTML='<div class="empty">No prompts</div>'}
+    }
+
+    // --- Tasks (Kanban) ---
+    async function loadTasks(){
+      try{
+        const{tasks}=await api("/api/tasks");const board=$("task-board");
+        const cols={backlog:[],todo:[],in_progress:[],done:[]};
+        tasks.forEach(t=>{if(cols[t.status])cols[t.status].push(t);else if(t.status!=="cancelled")(cols.backlog).push(t)});
+        board.innerHTML=`<div class="kanban">${Object.entries(cols).map(([status,items])=>`<div class="kanban-col"><h3>${esc(status.replace('_',' '))}</h3>${items.map(t=>`<div class="kanban-card" onclick="advanceTask('${esc(t.id)}','${esc(status)}')"><div>${esc(t.title)}</div><div class="priority">${esc(t.priority)}</div></div>`).join("")||'<div class="empty">-</div>'}</div>`).join("")}</div>`;
+      }catch{$("task-board").innerHTML='<div class="empty">No tasks</div>'}
+    }
+    async function createTask(){const title=$("task-title").value.trim();const desc=$("task-desc").value.trim();if(!title)return;await json("/api/tasks",{title,description:desc});$("task-title").value="";$("task-desc").value="";await loadTasks()}
+    async function advanceTask(id,currentStatus){
+      const next={backlog:"todo",todo:"in_progress",in_progress:"done",done:"done"};
+      const nextStatus=next[currentStatus]||currentStatus;
+      if(nextStatus==="done"&&currentStatus==="done")return;
+      await json(`/api/tasks/${encodeURIComponent(id)}`,{status:nextStatus},"PUT");
+      if(nextStatus==="in_progress"){
+        const sessionId=await createSessionForTask(id);
+        if(sessionId)await json(`/api/tasks/${encodeURIComponent(id)}`,{session_id:sessionId},"PUT");
+      }
+      await loadTasks();
+    }
+    async function createSessionForTask(taskId){
+      try{
+        const tasks=await api("/api/tasks");const task=(tasks.tasks||[]).find(t=>t.id===taskId);if(!task)return null;
+        const{id}=await json("/session",{});
+        await json(`/session/${id}/prompt`,{content:`You are working on the following task:\n\nTitle: ${task.title}\n\nDescription: ${task.description}\n\nComplete this task.`});
+        return id;
+      }catch{return null}
+    }
+
+    // --- Cron ---
+    async function loadCron(){if(!currentSession)return;try{const{jobs}=await api(`/session/${currentSession}/cron`);$("cron-list").innerHTML=jobs.length?jobs.map(j=>`<div class="kv"><span>${esc(j.description)}</span><button onclick="deleteCron('${esc(j.id)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No cron jobs</div>'}catch{$("cron-list").innerHTML='<div class="empty">No cron jobs</div>'}}
+    async function createCron(){if(!currentSession)return;const desc=$("cron-desc").value.trim();const prompt=$("cron-prompt").value.trim();const delay=parseInt($("cron-delay").value,10);if(!desc||!prompt||!delay)return;await json(`/session/${currentSession}/cron`,{description:desc,prompt,type:"delayed",delayInSeconds:delay});$("cron-desc").value="";$("cron-prompt").value="";$("cron-delay").value="";await loadCron()}
+    async function deleteCron(id){if(!currentSession)return;await api(`/session/${currentSession}/cron/${encodeURIComponent(id)}`,{method:"DELETE"});await loadCron()}
+
+    // --- Memory ---
+    async function loadMemory(query){const q=query??$("mem-search")?.value??"";const{entries}=await api(`/api/memory${q?`?q=${encodeURIComponent(q)}`:""}`);$("memory-list").innerHTML=entries.length?entries.slice(0,15).map(e=>`<div class="kv" style="flex-wrap:wrap"><span style="cursor:pointer" onclick="editMemory('${esc(e.id)}')">${esc(e.title)}</span><span style="display:flex;gap:4px;align-items:center">${(e.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}<button onclick="deleteMemory('${esc(e.id)}')" class="sm">x</button></span></div>`).join(""):'<div class="empty">No entries</div>'}
+    async function editMemory(id){const entry=await api(`/api/memory/${encodeURIComponent(id)}`);$("mem-id").value=entry.id;$("mem-title").value=entry.title;$("mem-content").value=entry.content;$("mem-tags").value=(entry.tags||[]).join(", ");const details=$("mem-title").closest("details");if(details)details.open=true}
+    function clearMemoryForm(){$("mem-id").value="";$("mem-title").value="";$("mem-content").value="";$("mem-tags").value=""}
+    async function saveMemory(){const id=$("mem-id").value;const title=$("mem-title").value.trim();const content=$("mem-content").value.trim();const tags=$("mem-tags").value.split(",").map(t=>t.trim()).filter(Boolean);if(!title||!content)return;if(id){await json(`/api/memory/${encodeURIComponent(id)}`,{title,content,tags},"PUT")}else{await json("/api/memory",{title,content,tags})}clearMemoryForm();await loadMemory()}
+    async function deleteMemory(id){await api(`/api/memory/${encodeURIComponent(id)}`,{method:"DELETE"});await loadMemory()}
+
+    // --- Git ---
+    async function refreshGit(){if(!currentSession){$("git-status-display").innerHTML="";return}try{const{entries}=await api(`/session/${currentSession}/git/status`);$("git-status-display").innerHTML=entries.length?entries.map(e=>`<div style="font-size:11px;font-family:var(--mono)">${esc(e.status)} ${esc(e.filepath)}</div>`).join(""):'<div class="empty">Clean or no repo</div>'}catch{$("git-status-display").innerHTML='<div class="empty">No repo</div>'}}
+    async function gitInit(){if(!currentSession)return;await json(`/session/${currentSession}/git/init`,{});await refreshGit()}
+    async function gitAddAll(){if(!currentSession)return;await json(`/session/${currentSession}/git/add`,{filepath:"."});await refreshGit()}
+    async function gitCommitPrompt(){if(!currentSession)return;const message=prompt("Commit message:");if(!message)return;await json(`/session/${currentSession}/git/commit`,{message});await refreshGit()}
+
+    boot();
+  </script>
+</body>
+</html>
