@@ -1,0 +1,1024 @@
+import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
+import { Agent } from "agents";
+import { z } from "zod";
+import { runAgenticChat, streamAgenticChat } from "./agentic";
+import { sendNotification } from "./notify";
+import { runSandboxedCode } from "./executor";
+import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
+import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
+import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
+
+const sendMessageSchema = z.object({ content: z.string().trim().min(1) }).strict();
+const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
+const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
+const gitCloneSchema = z.object({ branch: z.string().optional(), depth: z.number().int().positive().optional(), dir: z.string().optional(), singleBranch: z.boolean().optional(), url: z.string().url() }).strict();
+const gitDirSchema = z.object({ dir: z.string().optional(), filepath: z.string().optional() }).strict();
+const gitBranchSchema = z.object({ delete: z.string().optional(), dir: z.string().optional(), list: z.boolean().optional(), name: z.string().optional() }).strict();
+const gitCheckoutSchema = z.object({ branch: z.string().optional(), dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional() }).strict();
+const gitRemoteSchema = z.object({ add: z.object({ name: z.string().min(1), url: z.string().url() }).optional(), dir: z.string().optional(), list: z.boolean().optional(), remove: z.string().optional() }).strict();
+const cronCreateSchema = z.discriminatedUnion("type", [
+  z.object({ description: z.string().min(1), prompt: z.string().min(1), type: z.literal("delayed"), delayInSeconds: z.number().int().positive() }).strict(),
+  z.object({ description: z.string().min(1), prompt: z.string().min(1), type: z.literal("scheduled"), date: z.string().datetime() }).strict(),
+  z.object({ description: z.string().min(1), prompt: z.string().min(1), type: z.literal("cron"), cron: z.string().min(1) }).strict(),
+  z.object({ description: z.string().min(1), prompt: z.string().min(1), type: z.literal("interval"), intervalSeconds: z.number().int().positive() }).strict(),
+]);
+const replaceFileSchema = z.object({ replacement: z.string(), search: z.string().min(1) }).strict();
+const searchFilesSchema = z.object({ pattern: z.string().min(1), query: z.string().min(1) }).strict();
+const writeFileSchema = z.object({ content: z.string(), mimeType: z.string().optional() }).strict();
+
+const SYSTEM_PROMPT = [
+  "You are Dodo, a Cloudflare Workers coding agent.",
+  "Be concise, direct, and implementation-focused.",
+  "Prefer concrete next actions over long explanations.",
+].join(" ");
+
+function normalizePath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    throw new Error("Path is required");
+  }
+
+  const raw = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  const segments = raw.split("/").filter(Boolean);
+  const resolved: string[] = [];
+
+  for (const segment of segments) {
+    if (segment === "..") {
+      throw new Error("Parent path traversal is not allowed");
+    }
+    if (segment !== ".") {
+      resolved.push(segment);
+    }
+  }
+
+  return `/${resolved.join("/")}`;
+}
+
+export class CodingAgent extends Agent<Env, SessionState> {
+  initialState: SessionState = {
+    activePromptId: null,
+    activeStreamCount: 0,
+    createdAt: "",
+    messageCount: 0,
+    sessionId: "",
+    status: "idle",
+    totalTokenInput: 0,
+    totalTokenOutput: 0,
+    updatedAt: "",
+  };
+
+  private readonly activePromptControllers = new Map<string, AbortController>();
+  private readonly clients = new Set<WritableStreamDefaultWriter<Uint8Array>>();
+  private readonly db: SqlHelper;
+  private readonly stateBackend;
+  private readonly workspace: Workspace;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.db = new SqlHelper(ctx.storage.sql);
+    this.initializeSchema();
+    this.workspace = new Workspace({
+      name: () => this.sessionId() || "session-pending",
+      r2: env.WORKSPACE_BUCKET,
+      sql: ctx.storage.sql,
+    });
+    this.stateBackend = createWorkspaceStateBackend(this.workspace);
+  }
+
+  async onStart(): Promise<void> {
+    const details = this.readSessionDetails();
+    this.setState({
+      ...this.state,
+      ...details,
+      activeStreamCount: this.clients.size,
+      messageCount: this.messageCount(),
+    });
+  }
+
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    try {
+      if (request.method === "GET" && url.pathname === "/") {
+        return Response.json(this.readSessionDetails());
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/") {
+        const sid = this.sessionId();
+        await this.syncSessionIndex({ status: "deleted" });
+        await this.destroyStorage();
+        return Response.json({ deleted: true, sessionId: sid });
+      }
+
+      if (request.method === "GET" && url.pathname === "/messages") {
+        return Response.json({ messages: this.listMessages() });
+      }
+
+      if (request.method === "GET" && url.pathname === "/prompts") {
+        return Response.json({ prompts: this.listPrompts() });
+      }
+
+      if (request.method === "GET" && url.pathname === "/cron") {
+        return Response.json({ jobs: this.listCronJobs() });
+      }
+
+      if (request.method === "POST" && url.pathname === "/cron") {
+        return await this.handleCreateCron(request);
+      }
+
+      if (request.method === "DELETE" && url.pathname.startsWith("/cron/")) {
+        return await this.handleDeleteCron(url.pathname.split("/").at(-1) ?? "");
+      }
+
+      if (request.method === "GET" && url.pathname === "/snapshot") {
+        return Response.json(await this.exportSnapshot());
+      }
+
+      if (request.method === "POST" && (url.pathname === "/snapshot" || url.pathname === "/snapshot/import")) {
+        return await this.handleImportSnapshot(request);
+      }
+
+      if (request.method === "GET" && url.pathname === "/events") {
+        return await this.openEventStream(request);
+      }
+
+      if (request.method === "GET" && url.pathname === "/files") {
+        return await this.handleListFiles(url);
+      }
+
+      if (request.method === "GET" && url.pathname === "/file") {
+        return await this.handleReadFile(url);
+      }
+
+      if (request.method === "PUT" && url.pathname === "/file") {
+        return await this.handleWriteFile(request, url);
+      }
+
+      if (request.method === "PATCH" && url.pathname === "/file") {
+        return await this.handleReplaceInFile(request, url);
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/file") {
+        return await this.handleDeleteFile(url);
+      }
+
+      if (request.method === "POST" && url.pathname === "/search") {
+        return await this.handleSearchFiles(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/execute") {
+        return await this.handleExecute(request);
+      }
+
+      if (request.method === "GET" && url.pathname === "/git/status") {
+        return await this.handleGitStatus(url);
+      }
+
+      if (request.method === "GET" && url.pathname === "/git/log") {
+        return await this.handleGitLog(url);
+      }
+
+      if (request.method === "GET" && url.pathname === "/git/diff") {
+        return await this.handleGitDiff(url);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/init") {
+        return await this.handleGitInit(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/clone") {
+        return await this.handleGitClone(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/add") {
+        return await this.handleGitAdd(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/commit") {
+        return await this.handleGitCommit(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/branch") {
+        return await this.handleGitBranch(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/checkout") {
+        return await this.handleGitCheckout(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/pull") {
+        return await this.handleGitPull(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/push") {
+        return await this.handleGitPush(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/remote") {
+        return await this.handleGitRemote(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/message") {
+        return await this.handleMessage(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/prompt") {
+        return await this.handlePrompt(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/abort") {
+        return await this.handleAbort();
+      }
+
+      return new Response("Not Found", { status: 404 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unexpected request failure";
+      return Response.json({ error: message }, { status: 400 });
+    }
+  }
+
+  private initializeSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT,
+        model TEXT,
+        provider TEXT,
+        created_at INTEGER NOT NULL,
+        token_input INTEGER NOT NULL DEFAULT 0,
+        token_output INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+
+
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS prompts (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error TEXT,
+        result_message_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS cron_jobs (
+        schedule_id TEXT PRIMARY KEY,
+        description TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)");
+
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
+  }
+
+  private async handleListFiles(url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "/");
+    const entries = await this.workspace.readDir(path);
+    return Response.json({ entries: entries.map((entry) => this.mapWorkspaceEntry(entry)) });
+  }
+
+  private async handleReadFile(url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "");
+    const content = await this.workspace.readFile(path);
+    if (content === null) {
+      return Response.json({ error: `File not found: ${path}` }, { status: 404 });
+    }
+
+    return Response.json({ content, path });
+  }
+
+  private async handleWriteFile(request: Request, url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "");
+    const body = writeFileSchema.parse(await request.json());
+    await this.workspace.writeFile(path, body.content, body.mimeType);
+    const content = await this.workspace.readFile(path);
+    this.emitEvent({ data: { path, type: "write" }, type: "file" });
+    return Response.json({ content, path, written: true });
+  }
+
+  private async handleReplaceInFile(request: Request, url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "");
+    const body = replaceFileSchema.parse(await request.json());
+    const result = await this.stateBackend.replaceInFile(path, body.search, body.replacement);
+    this.emitEvent({ data: { path, type: "edit" }, type: "file" });
+    return Response.json({ path, result });
+  }
+
+  private async handleDeleteFile(url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "");
+    if (path === "/") {
+      return Response.json({ error: "Cannot delete workspace root" }, { status: 400 });
+    }
+    await this.workspace.rm(path, { force: true, recursive: true });
+    this.emitEvent({ data: { path, type: "delete" }, type: "file" });
+    return Response.json({ deleted: true, path });
+  }
+
+  private async handleSearchFiles(request: Request): Promise<Response> {
+    const body = searchFilesSchema.parse(await request.json());
+    const result = await this.stateBackend.searchFiles(body.pattern, body.query);
+    return Response.json({ matches: result });
+  }
+
+  private async handleExecute(request: Request): Promise<Response> {
+    const body = executeCodeSchema.parse(await request.json());
+    this.ensureMetadata(this.requireSessionId(request));
+
+    const execution = await runSandboxedCode({
+      code: body.code,
+      env: this.env,
+      workspace: this.workspace,
+    });
+
+    this.emitEvent({ data: execution, type: "execution" });
+    return Response.json(execution, { status: execution.error ? 400 : 200 });
+  }
+
+  private async handleGitInit(request: Request): Promise<Response> {
+    const body = gitDirSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const result = await git.init({ defaultBranch: "main", dir: body.dir ? normalizePath(body.dir) : undefined });
+    return Response.json(result);
+  }
+
+  private async handleGitClone(request: Request): Promise<Response> {
+    const body = gitCloneSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const token = await resolveRemoteToken({ dir, env: this.env, git, url: body.url });
+    const result = await git.clone({
+      branch: body.branch,
+      depth: body.depth,
+      dir,
+      singleBranch: body.singleBranch,
+      token,
+      url: body.url,
+    });
+    return Response.json(result);
+  }
+
+  private async handleGitAdd(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), filepath: z.string().min(1) }).strict().parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    return Response.json(await git.add({ dir: body.dir ? normalizePath(body.dir) : undefined, filepath: body.filepath }));
+  }
+
+  private async handleGitCommit(request: Request): Promise<Response> {
+    const body = gitCommitSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const config = await this.readAppConfig();
+    return Response.json(
+      await git.commit({ author: defaultAuthor(config), dir: body.dir ? normalizePath(body.dir) : undefined, message: body.message }),
+    );
+  }
+
+  private async handleGitStatus(url: URL): Promise<Response> {
+    const git = createWorkspaceGit(this.workspace);
+    const dir = url.searchParams.get("dir");
+    return Response.json({ entries: await git.status({ dir: dir ? normalizePath(dir) : undefined }) });
+  }
+
+  private async handleGitLog(url: URL): Promise<Response> {
+    const git = createWorkspaceGit(this.workspace);
+    const dir = url.searchParams.get("dir");
+    const depth = url.searchParams.get("depth");
+    return Response.json({ entries: await git.log({ depth: depth ? Number(depth) : undefined, dir: dir ? normalizePath(dir) : undefined }) });
+  }
+
+  private async handleGitDiff(url: URL): Promise<Response> {
+    const git = createWorkspaceGit(this.workspace);
+    const dir = url.searchParams.get("dir");
+    return Response.json({ entries: await git.diff({ dir: dir ? normalizePath(dir) : undefined }) });
+  }
+
+  private async handleGitBranch(request: Request): Promise<Response> {
+    const body = gitBranchSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    return Response.json(await git.branch({ delete: body.delete, dir: body.dir ? normalizePath(body.dir) : undefined, list: body.list, name: body.name }));
+  }
+
+  private async handleGitCheckout(request: Request): Promise<Response> {
+    const body = gitCheckoutSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    return Response.json(
+      await git.checkout({ branch: body.branch, dir: body.dir ? normalizePath(body.dir) : undefined, force: body.force, ref: body.ref }),
+    );
+  }
+
+  private async handleGitPull(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), ref: z.string().optional(), remote: z.string().optional() }).strict().parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote });
+    const config = await this.readAppConfig();
+    return Response.json(await git.pull({ author: defaultAuthor(config), dir, ref: body.ref, remote: body.remote, token }));
+  }
+
+  private async handleGitPush(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional(), remote: z.string().optional() }).strict().parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote });
+    return Response.json(await git.push({ dir, force: body.force, ref: body.ref, remote: body.remote, token }));
+  }
+
+  private async handleGitRemote(request: Request): Promise<Response> {
+    const body = gitRemoteSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    return Response.json(
+      await git.remote({ add: body.add, dir, list: body.list, remove: body.remove }),
+    );
+  }
+
+  private async handleCreateCron(request: Request): Promise<Response> {
+    const body = cronCreateSchema.parse(await request.json());
+    let scheduled;
+    if (body.type === "delayed") {
+      scheduled = await this.schedule(body.delayInSeconds, "runCronPrompt", { description: body.description, prompt: body.prompt });
+    } else if (body.type === "scheduled") {
+      scheduled = await this.schedule(new Date(body.date), "runCronPrompt", { description: body.description, prompt: body.prompt });
+    } else if (body.type === "cron") {
+      scheduled = await this.schedule(body.cron, "runCronPrompt", { description: body.description, prompt: body.prompt });
+    } else {
+      scheduled = await this.scheduleEvery(body.intervalSeconds, "runCronPrompt", { description: body.description, prompt: body.prompt });
+    }
+
+    this.db.exec(
+      "INSERT INTO cron_jobs (schedule_id, description, prompt, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(schedule_id) DO UPDATE SET description = excluded.description, prompt = excluded.prompt",
+      scheduled.id,
+      body.description,
+      body.prompt,
+      nowEpoch(),
+    );
+
+    return Response.json(this.toCronJobRecord(scheduled, body.description, body.prompt), { status: 201 });
+  }
+
+  private async handleDeleteCron(scheduleId: string): Promise<Response> {
+    const id = decodeURIComponent(scheduleId);
+    await this.cancelSchedule(id);
+    this.db.exec("DELETE FROM cron_jobs WHERE schedule_id = ?", id);
+    return Response.json({ deleted: true, id });
+  }
+
+  async runCronPrompt(payload: { description: string; prompt: string }): Promise<void> {
+    if (this.readMetadata("active_prompt_id")) {
+      return;
+    }
+
+    const title = this.readMetadata("title") ?? payload.description;
+    const promptId = crypto.randomUUID();
+    this.writeMetadata("active_prompt_id", promptId);
+    this.writeMetadata("status", "running");
+    this.insertPrompt(promptId, payload.prompt, "queued");
+    await this.runAsyncPrompt(promptId, payload.prompt, await this.readAppConfig(), title);
+  }
+
+  private listCronJobs(): CronJobRecord[] {
+    return this.db.all("SELECT schedule_id, description, prompt, created_at FROM cron_jobs ORDER BY created_at DESC").map((row) => {
+      const schedule = this.getSchedule<{ description: string; prompt: string }>(String(row.schedule_id));
+      return this.toCronJobRecord(schedule, String(row.description), String(row.prompt), Number(row.created_at));
+    });
+  }
+
+  private toCronJobRecord(
+    schedule: ReturnType<CodingAgent["getSchedule"]>,
+    description: string,
+    prompt: string,
+    createdAt = nowEpoch(),
+  ): CronJobRecord {
+    return {
+      callback: schedule?.callback ?? "runCronPrompt",
+      createdAt: epochToIso(createdAt),
+      description,
+      id: schedule?.id ?? "missing",
+      nextRunAt: schedule ? epochToIso(schedule.time) : null,
+      payload: prompt,
+      scheduleType: schedule?.type ?? "scheduled",
+    };
+  }
+
+  private async exportSnapshot(): Promise<SessionSnapshot> {
+    const paths = await this.workspace._getAllPaths();
+    const files: Array<{ content: string; path: string }> = [];
+
+    for (const path of paths) {
+      const stat = await this.workspace.stat(path);
+      if (!stat || stat.type !== "file") {
+        continue;
+      }
+      const content = await this.workspace.readFile(path);
+      if (content !== null) {
+        files.push({ content, path });
+      }
+    }
+
+    return {
+      files,
+      messages: this.listMessages(),
+      title: this.readMetadata("title"),
+    };
+  }
+
+  private async handleImportSnapshot(request: Request): Promise<Response> {
+    this.ensureMetadata(this.requireSessionId(request));
+    const url = new URL(request.url);
+    let snapshotInput: unknown;
+    const snapshotId = url.searchParams.get("snapshotId");
+    if (snapshotId) {
+      const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
+      const response = await stub.fetch(`https://app-control/fork-snapshots/${encodeURIComponent(snapshotId)}`);
+      snapshotInput = await response.json();
+    } else {
+      snapshotInput = await request.json();
+    }
+
+    const snapshot = z.object({ files: z.array(z.object({ content: z.string(), path: z.string().min(1) })), messages: z.array(z.object({ content: z.string(), createdAt: z.string(), id: z.string(), model: z.string().nullable(), provider: z.string().nullable(), role: z.enum(["assistant", "system", "tool", "user"]) })), title: z.string().nullable() }).parse(snapshotInput) as SessionSnapshot;
+
+    if (snapshot.title) {
+      this.writeMetadata("title", snapshot.title);
+    }
+
+    for (const file of snapshot.files) {
+      await this.workspace.writeFile(normalizePath(file.path), file.content);
+    }
+
+    for (const message of snapshot.messages) {
+      this.insertMessage({ content: message.content, model: message.model, provider: message.provider, role: message.role });
+    }
+
+    return Response.json({ imported: true, messages: snapshot.messages.length, files: snapshot.files.length });
+  }
+
+  private async handleMessage(request: Request): Promise<Response> {
+    const input = sendMessageSchema.parse(await request.json());
+    const sessionId = this.requireSessionId(request);
+    this.ensureMetadata(sessionId);
+
+    const title = this.readMetadata("title") ?? input.content.slice(0, 72);
+    this.writeMetadata("title", title);
+    this.writeMetadata("status", "running");
+    await this.syncSessionIndex({ status: "running", title });
+
+    const userMessage = this.insertMessage({
+      content: input.content,
+      model: null,
+      provider: null,
+      role: "user",
+    });
+    this.emitEvent({ data: userMessage, type: "message" });
+
+    try {
+      const llmConfig = this.readGatewayConfig(request);
+      const history = this.recentMessages().map((m) => ({ content: m.content, role: m.role }));
+      const result = await streamAgenticChat({
+        config: llmConfig,
+        env: this.env,
+        messages: history,
+        onTextDelta: (delta) => {
+          this.emitEvent({ data: { delta }, type: "text_delta" });
+        },
+        onToolCall: (tc) => {
+          this.emitEvent({ data: { code: tc.code, result: tc.result }, type: "tool_call" });
+        },
+        systemPrompt: SYSTEM_PROMPT,
+        workspace: this.workspace,
+      });
+
+      const assistantMessage = this.insertMessage({
+        content: result.text,
+        model: result.model,
+        provider: result.gateway,
+        role: "assistant",
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
+      });
+
+      this.writeMetadata("status", "idle");
+      await this.syncSessionIndex({ status: "idle", title });
+      this.emitEvent({ data: assistantMessage, type: "message" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot" });
+
+      return Response.json({ gateway: result.gateway, message: assistantMessage, sessionId, steps: result.steps, toolCalls: result.toolCalls });
+    } catch (error) {
+      this.writeMetadata("status", "idle");
+      await this.syncSessionIndex({ status: "idle", title });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      const message = error instanceof Error ? error.message : "Unknown LLM failure";
+      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high" });
+      return Response.json({ error: message, sessionId }, { status: 502 });
+    }
+  }
+
+  private async handlePrompt(request: Request): Promise<Response> {
+    const input = sendMessageSchema.parse(await request.json());
+    const sessionId = this.requireSessionId(request);
+    this.ensureMetadata(sessionId);
+
+    if (this.readMetadata("active_prompt_id")) {
+      return Response.json({ error: "A prompt is already running" }, { status: 409 });
+    }
+
+    const promptId = crypto.randomUUID();
+    const llmConfig = this.readGatewayConfig(request);
+    const title = this.readMetadata("title") ?? input.content.slice(0, 72);
+
+    this.writeMetadata("title", title);
+    this.writeMetadata("active_prompt_id", promptId);
+    this.writeMetadata("status", "running");
+    this.insertPrompt(promptId, input.content, "queued");
+    await this.syncSessionIndex({ status: "running", title });
+
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    void this.runAsyncPrompt(promptId, input.content, llmConfig, title);
+
+    return Response.json({ promptId, status: "queued" }, { status: 202 });
+  }
+
+  private async handleAbort(): Promise<Response> {
+    const promptId = this.readMetadata("active_prompt_id");
+    if (!promptId) {
+      return Response.json({ error: "No active prompt" }, { status: 409 });
+    }
+
+    const controller = this.activePromptControllers.get(promptId);
+    if (controller) {
+      controller.abort();
+    } else {
+      await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
+    }
+
+    return Response.json({ aborted: true, promptId });
+  }
+
+  private async runAsyncPrompt(promptId: string, content: string, llmConfig: AppConfig, title: string): Promise<void> {
+    const controller = new AbortController();
+    this.activePromptControllers.set(promptId, controller);
+    this.updatePrompt(promptId, { status: "running" });
+    this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+
+    const userMessage = this.insertMessage({
+      content,
+      model: null,
+      provider: null,
+      role: "user",
+    });
+    this.emitEvent({ data: userMessage, type: "message" });
+
+    try {
+      const history = this.recentMessages().map((m) => ({ content: m.content, role: m.role }));
+      const result = await runAgenticChat({
+        config: llmConfig,
+        env: this.env,
+        messages: history,
+        signal: controller.signal,
+        systemPrompt: SYSTEM_PROMPT,
+        workspace: this.workspace,
+      });
+
+      for (const call of result.toolCalls) {
+        this.emitEvent({ data: { code: call.code, result: call.result }, type: "tool_call" });
+      }
+
+      const assistantMessage = this.insertMessage({
+        content: result.text,
+        model: result.model,
+        provider: result.gateway,
+        role: "assistant",
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
+      });
+
+      await this.finishPrompt(promptId, { resultMessageId: assistantMessage.id, status: "completed" });
+      this.emitEvent({ data: assistantMessage, type: "message" });
+      sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot" });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
+        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (aborted)`, body: "Prompt was cancelled", tags: "stop_sign,robot" });
+      } else {
+        const message = error instanceof Error ? error.message : "Prompt failed";
+        await this.finishPrompt(promptId, { error: message, status: "failed" });
+        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high" });
+      }
+    } finally {
+      this.activePromptControllers.delete(promptId);
+      await this.syncSessionIndex({ status: "idle", title });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    }
+  }
+
+  private async finishPrompt(
+    promptId: string,
+    patch: { error?: string; resultMessageId?: string; status: PromptRecord["status"] },
+  ): Promise<void> {
+    this.updatePrompt(promptId, patch);
+    this.deleteMetadata("active_prompt_id");
+    this.writeMetadata("status", "idle");
+  }
+
+  private readGatewayConfig(request: Request): AppConfig {
+    const activeGateway = request.headers.get("x-dodo-gateway") === "ai-gateway" ? "ai-gateway" : "opencode";
+    return {
+      activeGateway,
+      aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? this.env.AI_GATEWAY_BASE_URL,
+      gitAuthorEmail: this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
+      gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
+      model: request.headers.get("x-dodo-model") ?? this.env.DEFAULT_MODEL,
+      opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? this.env.OPENCODE_BASE_URL,
+    };
+  }
+
+  private ensureMetadata(sessionId: string): void {
+    const now = nowEpoch();
+    if (!this.readMetadata("session_id")) {
+      this.writeMetadata("session_id", sessionId);
+      this.writeMetadata("created_at", new Date(now * 1000).toISOString());
+    }
+    if (!this.readMetadata("status")) {
+      this.writeMetadata("status", "idle");
+    }
+    this.writeMetadata("updated_at", new Date(now * 1000).toISOString());
+  }
+
+  private readSessionDetails(): SessionState {
+    const createdAt = this.readMetadata("created_at") ?? new Date().toISOString();
+    const updatedAt = this.readMetadata("updated_at") ?? createdAt;
+    const sessionId = this.readMetadata("session_id") ?? "";
+    const status = (this.readMetadata("status") as SessionState["status"] | null) ?? "idle";
+    const totals = this.db.one("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM messages");
+    return {
+      activePromptId: this.readMetadata("active_prompt_id"),
+      activeStreamCount: this.clients.size,
+      createdAt,
+      messageCount: this.messageCount(),
+      sessionId,
+      status,
+      totalTokenInput: Number(totals?.total_in ?? 0),
+      totalTokenOutput: Number(totals?.total_out ?? 0),
+      updatedAt,
+    };
+  }
+
+  private insertMessage(input: {
+    content: string;
+    model: string | null;
+    provider: string | null;
+    role: ChatMessageRecord["role"];
+    tokenInput?: number;
+    tokenOutput?: number;
+  }): ChatMessageRecord {
+    const sessionId = this.sessionId();
+    const messageId = crypto.randomUUID();
+    const createdAtEpoch = nowEpoch();
+    const createdAt = new Date(createdAtEpoch * 1000).toISOString();
+
+    this.db.exec(
+      "INSERT INTO messages (id, session_id, role, content, model, provider, created_at, token_input, token_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      messageId,
+      sessionId,
+      input.role,
+      input.content,
+      input.model,
+      input.provider,
+      createdAtEpoch,
+      input.tokenInput ?? 0,
+      input.tokenOutput ?? 0,
+    );
+
+    this.writeMetadata("updated_at", createdAt);
+    this.setState({ ...this.readSessionDetails() });
+
+    return {
+      content: input.content,
+      createdAt,
+      id: messageId,
+      model: input.model,
+      provider: input.provider,
+      role: input.role,
+      tokenInput: input.tokenInput ?? 0,
+      tokenOutput: input.tokenOutput ?? 0,
+    };
+  }
+
+  private listMessages(): ChatMessageRecord[] {
+    return this.db.all(
+      "SELECT id, role, content, model, provider, created_at, token_input, token_output FROM messages ORDER BY created_at ASC, rowid ASC",
+    ).map((row) => this.mapMessageRow(row));
+  }
+
+  private recentMessages(limit = 50): ChatMessageRecord[] {
+    const rows = this.db.all(
+      "SELECT id, role, content, model, provider, created_at, token_input, token_output FROM messages ORDER BY created_at DESC, rowid DESC LIMIT ?",
+      limit,
+    );
+    return rows.reverse().map((row) => this.mapMessageRow(row));
+  }
+
+  private messageCount(): number {
+    return Number(this.db.one("SELECT COUNT(*) AS count FROM messages")?.count ?? 0);
+  }
+
+  private mapMessageRow(row: SqlRow): ChatMessageRecord {
+    return {
+      content: String(row.content ?? ""),
+      createdAt: epochToIso(row.created_at),
+      id: String(row.id),
+      model: row.model === null ? null : String(row.model),
+      provider: row.provider === null ? null : String(row.provider),
+      role: row.role as ChatMessageRecord["role"],
+      tokenInput: Number(row.token_input ?? 0),
+      tokenOutput: Number(row.token_output ?? 0),
+    };
+  }
+
+  private insertPrompt(promptId: string, content: string, status: PromptRecord["status"]): void {
+    const sessionId = this.sessionId();
+    const createdAt = nowEpoch();
+    this.db.exec(
+      "INSERT INTO prompts (id, session_id, content, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      promptId,
+      sessionId,
+      content,
+      status,
+      createdAt,
+      createdAt,
+    );
+  }
+
+  private updatePrompt(
+    promptId: string,
+    patch: { error?: string; resultMessageId?: string; status: PromptRecord["status"] },
+  ): void {
+    const existing = this.db.one("SELECT error, result_message_id FROM prompts WHERE id = ?", promptId);
+    this.db.exec(
+      "UPDATE prompts SET status = ?, error = ?, result_message_id = ?, updated_at = ? WHERE id = ?",
+      patch.status,
+      patch.error ?? (existing?.error === null || existing?.error === undefined ? null : String(existing.error)),
+      patch.resultMessageId ??
+        (existing?.result_message_id === null || existing?.result_message_id === undefined
+          ? null
+          : String(existing.result_message_id)),
+      nowEpoch(),
+      promptId,
+    );
+  }
+
+  private listPrompts(): PromptRecord[] {
+    return this.db.all(
+      "SELECT id, content, status, error, result_message_id, created_at, updated_at FROM prompts ORDER BY created_at DESC, rowid DESC",
+    ).map((row) => ({
+      content: String(row.content),
+      createdAt: epochToIso(row.created_at),
+      error: row.error === null ? null : String(row.error),
+      id: String(row.id),
+      resultMessageId: row.result_message_id === null ? null : String(row.result_message_id),
+      status: row.status as PromptRecord["status"],
+      updatedAt: epochToIso(row.updated_at),
+    }));
+  }
+
+  private mapWorkspaceEntry(entry: {
+    createdAt: number;
+    mimeType: string;
+    name: string;
+    path: string;
+    size: number;
+    type: "file" | "directory" | "symlink";
+    updatedAt: number;
+  }): WorkspaceEntry {
+    return {
+      createdAt: epochToIso(entry.createdAt),
+      mimeType: entry.mimeType,
+      name: entry.name,
+      path: entry.path,
+      size: entry.size,
+      type: entry.type,
+      updatedAt: epochToIso(entry.updatedAt),
+    };
+  }
+
+  private openEventStream(request: Request): Response {
+    const stream = new TransformStream<Uint8Array>();
+    const writer = stream.writable.getWriter();
+    this.clients.add(writer);
+    this.setState({ ...this.readSessionDetails() });
+
+    void this.writeEvent(writer, { data: this.readSessionDetails(), type: "ready" });
+
+    request.signal.addEventListener(
+      "abort",
+      () => {
+        this.clients.delete(writer);
+        void writer.close();
+        this.setState({ ...this.readSessionDetails() });
+      },
+      { once: true },
+    );
+
+    return new Response(stream.readable, {
+      headers: {
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        "content-type": "text/event-stream",
+      },
+    });
+  }
+
+  private async writeEvent(writer: WritableStreamDefaultWriter<Uint8Array>, event: SessionEvent): Promise<void> {
+    const payload = `event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`;
+    await writer.write(new TextEncoder().encode(payload));
+  }
+
+  private emitEvent(event: SessionEvent): void {
+    for (const writer of [...this.clients]) {
+      void this.writeEvent(writer, event).catch(() => {
+        this.clients.delete(writer);
+      });
+    }
+  }
+
+  private requireSessionId(request: Request): string {
+    const sessionId = request.headers.get("x-dodo-session-id");
+    if (!sessionId) {
+      throw new Error("Missing session id header");
+    }
+    return sessionId;
+  }
+
+  private sessionId(): string {
+    return this.readMetadata("session_id") ?? "";
+  }
+
+  private readMetadata(key: string): string | null {
+    const row = this.db.one("SELECT value FROM metadata WHERE key = ?", key);
+    return row ? String(row.value) : null;
+  }
+
+  private writeMetadata(key: string, value: string): void {
+    this.db.exec(
+      "INSERT INTO metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      key,
+      value,
+      nowEpoch(),
+    );
+  }
+
+  private deleteMetadata(key: string): void {
+    this.db.exec("DELETE FROM metadata WHERE key = ?", key);
+  }
+
+  private async readAppConfig(): Promise<AppConfig> {
+    const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
+    const response = await stub.fetch("https://app-control/config");
+    return (await response.json()) as AppConfig;
+  }
+
+  private async syncSessionIndex(patch: { status?: string; title?: string | null }): Promise<void> {
+    const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
+    await stub.fetch("https://app-control/sessions/" + this.sessionId(), {
+      body: JSON.stringify(patch),
+      headers: { "content-type": "application/json" },
+      method: "PATCH",
+    });
+  }
+
+  private async destroyStorage(): Promise<void> {
+    this.db.exec("DELETE FROM messages");
+    this.db.exec("DELETE FROM prompts");
+    this.db.exec("DELETE FROM cron_jobs");
+    this.db.exec("DELETE FROM metadata");
+
+    try {
+      await this.workspace.rm("/", { force: true, recursive: true });
+    } catch {
+      // workspace may already be empty
+    }
+
+    for (const writer of [...this.clients]) {
+      try { void writer.close(); } catch { /* ignore */ }
+      this.clients.delete(writer);
+    }
+  }
+}
