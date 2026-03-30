@@ -2,6 +2,7 @@ import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { Agent } from "agents";
 import { z } from "zod";
 import { runAgenticChat, streamAgenticChat } from "./agentic";
+import { getUserControlStub } from "./auth";
 import { sendNotification } from "./notify";
 import { runSandboxedCode } from "./executor";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
@@ -254,6 +255,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
         content TEXT,
         model TEXT,
         provider TEXT,
+        author_email TEXT,
         created_at INTEGER NOT NULL,
         token_input INTEGER NOT NULL DEFAULT 0,
         token_output INTEGER NOT NULL DEFAULT 0
@@ -270,6 +272,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
         status TEXT NOT NULL,
         error TEXT,
         result_message_id TEXT,
+        author_email TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )
@@ -340,7 +343,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
 
   private async handleExecute(request: Request): Promise<Response> {
     const body = executeCodeSchema.parse(await request.json());
-    this.ensureMetadata(this.requireSessionId(request));
+    this.ensureMetadata(this.requireSessionId(request), request.headers.get("x-owner-email"));
 
     const execution = await runSandboxedCode({
       code: body.code,
@@ -363,7 +366,8 @@ export class CodingAgent extends Agent<Env, SessionState> {
     const body = gitCloneSchema.parse(await request.json());
     const git = createWorkspaceGit(this.workspace);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
-    const token = await resolveRemoteToken({ dir, env: this.env, git, url: body.url });
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    const token = await resolveRemoteToken({ dir, env: this.env, git, url: body.url, ownerEmail });
     const result = await git.clone({
       branch: body.branch,
       depth: body.depth,
@@ -427,7 +431,8 @@ export class CodingAgent extends Agent<Env, SessionState> {
     const body = z.object({ dir: z.string().optional(), ref: z.string().optional(), remote: z.string().optional() }).strict().parse(await request.json());
     const git = createWorkspaceGit(this.workspace);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
-    const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote });
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote, ownerEmail });
     const config = await this.readAppConfig();
     return Response.json(await git.pull({ author: defaultAuthor(config), dir, ref: body.ref, remote: body.remote, token }));
   }
@@ -436,7 +441,8 @@ export class CodingAgent extends Agent<Env, SessionState> {
     const body = z.object({ dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional(), remote: z.string().optional() }).strict().parse(await request.json());
     const git = createWorkspaceGit(this.workspace);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
-    const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote });
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote, ownerEmail });
     return Response.json(await git.push({ dir, force: body.force, ref: body.ref, remote: body.remote, token }));
   }
 
@@ -489,7 +495,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
     const promptId = crypto.randomUUID();
     this.writeMetadata("active_prompt_id", promptId);
     this.writeMetadata("status", "running");
-    this.insertPrompt(promptId, payload.prompt, "queued");
+    this.insertPrompt(promptId, payload.prompt, "queued", "cron");
     await this.runAsyncPrompt(promptId, payload.prompt, await this.readAppConfig(), title);
   }
 
@@ -540,13 +546,21 @@ export class CodingAgent extends Agent<Env, SessionState> {
   }
 
   private async handleImportSnapshot(request: Request): Promise<Response> {
-    this.ensureMetadata(this.requireSessionId(request));
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.ensureMetadata(this.requireSessionId(request), ownerEmail);
     const url = new URL(request.url);
     let snapshotInput: unknown;
     const snapshotId = url.searchParams.get("snapshotId");
     if (snapshotId) {
-      const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
-      const response = await stub.fetch(`https://app-control/fork-snapshots/${encodeURIComponent(snapshotId)}`);
+      // Try UserControl first, fall back to AppControl
+      let response: Response;
+      if (ownerEmail) {
+        const stub = getUserControlStub(this.env, ownerEmail);
+        response = await stub.fetch(`https://user-control/fork-snapshots/${encodeURIComponent(snapshotId)}`);
+      } else {
+        const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
+        response = await stub.fetch(`https://app-control/fork-snapshots/${encodeURIComponent(snapshotId)}`);
+      }
       snapshotInput = await response.json();
     } else {
       snapshotInput = await request.json();
@@ -572,7 +586,9 @@ export class CodingAgent extends Agent<Env, SessionState> {
   private async handleMessage(request: Request): Promise<Response> {
     const input = sendMessageSchema.parse(await request.json());
     const sessionId = this.requireSessionId(request);
-    this.ensureMetadata(sessionId);
+    const authorEmail = request.headers.get("x-author-email");
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.ensureMetadata(sessionId, ownerEmail);
 
     const title = this.readMetadata("title") ?? input.content.slice(0, 72);
     this.writeMetadata("title", title);
@@ -580,6 +596,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
     await this.syncSessionIndex({ status: "running", title });
 
     const userMessage = this.insertMessage({
+      authorEmail,
       content: input.content,
       model: null,
       provider: null,
@@ -617,7 +634,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
       await this.syncSessionIndex({ status: "idle", title });
       this.emitEvent({ data: assistantMessage, type: "message" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-      sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot" });
+      sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
 
       return Response.json({ gateway: result.gateway, message: assistantMessage, sessionId, steps: result.steps, toolCalls: result.toolCalls });
     } catch (error) {
@@ -625,7 +642,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
       await this.syncSessionIndex({ status: "idle", title });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
       const message = error instanceof Error ? error.message : "Unknown LLM failure";
-      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high" });
+      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
       return Response.json({ error: message, sessionId }, { status: 502 });
     }
   }
@@ -633,7 +650,9 @@ export class CodingAgent extends Agent<Env, SessionState> {
   private async handlePrompt(request: Request): Promise<Response> {
     const input = sendMessageSchema.parse(await request.json());
     const sessionId = this.requireSessionId(request);
-    this.ensureMetadata(sessionId);
+    const authorEmail = request.headers.get("x-author-email");
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.ensureMetadata(sessionId, ownerEmail);
 
     if (this.readMetadata("active_prompt_id")) {
       return Response.json({ error: "A prompt is already running" }, { status: 409 });
@@ -646,7 +665,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
     this.writeMetadata("title", title);
     this.writeMetadata("active_prompt_id", promptId);
     this.writeMetadata("status", "running");
-    this.insertPrompt(promptId, input.content, "queued");
+    this.insertPrompt(promptId, input.content, "queued", authorEmail);
     await this.syncSessionIndex({ status: "running", title });
 
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
@@ -711,15 +730,15 @@ export class CodingAgent extends Agent<Env, SessionState> {
 
       await this.finishPrompt(promptId, { resultMessageId: assistantMessage.id, status: "completed" });
       this.emitEvent({ data: assistantMessage, type: "message" });
-      sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot" });
+      sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
     } catch (error) {
       if (controller.signal.aborted) {
         await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
-        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (aborted)`, body: "Prompt was cancelled", tags: "stop_sign,robot" });
+        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (aborted)`, body: "Prompt was cancelled", tags: "stop_sign,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
       } else {
         const message = error instanceof Error ? error.message : "Prompt failed";
         await this.finishPrompt(promptId, { error: message, status: "failed" });
-        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high" });
+        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
       }
     } finally {
       this.activePromptControllers.delete(promptId);
@@ -750,11 +769,14 @@ export class CodingAgent extends Agent<Env, SessionState> {
     };
   }
 
-  private ensureMetadata(sessionId: string): void {
+  private ensureMetadata(sessionId: string, ownerEmail?: string | null): void {
     const now = nowEpoch();
     if (!this.readMetadata("session_id")) {
       this.writeMetadata("session_id", sessionId);
       this.writeMetadata("created_at", new Date(now * 1000).toISOString());
+    }
+    if (ownerEmail && !this.readMetadata("owner_email")) {
+      this.writeMetadata("owner_email", ownerEmail);
     }
     if (!this.readMetadata("status")) {
       this.writeMetadata("status", "idle");
@@ -766,6 +788,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
     const createdAt = this.readMetadata("created_at") ?? new Date().toISOString();
     const updatedAt = this.readMetadata("updated_at") ?? createdAt;
     const sessionId = this.readMetadata("session_id") ?? "";
+    const ownerEmail = this.readMetadata("owner_email") ?? undefined;
     const status = (this.readMetadata("status") as SessionState["status"] | null) ?? "idle";
     const totals = this.db.one("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM messages");
     return {
@@ -773,6 +796,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
       activeStreamCount: this.clients.size,
       createdAt,
       messageCount: this.messageCount(),
+      ownerEmail,
       sessionId,
       status,
       totalTokenInput: Number(totals?.total_in ?? 0),
@@ -782,6 +806,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
   }
 
   private insertMessage(input: {
+    authorEmail?: string | null;
     content: string;
     model: string | null;
     provider: string | null;
@@ -795,13 +820,14 @@ export class CodingAgent extends Agent<Env, SessionState> {
     const createdAt = new Date(createdAtEpoch * 1000).toISOString();
 
     this.db.exec(
-      "INSERT INTO messages (id, session_id, role, content, model, provider, created_at, token_input, token_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO messages (id, session_id, role, content, model, provider, author_email, created_at, token_input, token_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       messageId,
       sessionId,
       input.role,
       input.content,
       input.model,
       input.provider,
+      input.authorEmail ?? null,
       createdAtEpoch,
       input.tokenInput ?? 0,
       input.tokenOutput ?? 0,
@@ -811,6 +837,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
     this.setState({ ...this.readSessionDetails() });
 
     return {
+      authorEmail: input.authorEmail ?? null,
       content: input.content,
       createdAt,
       id: messageId,
@@ -824,13 +851,13 @@ export class CodingAgent extends Agent<Env, SessionState> {
 
   private listMessages(): ChatMessageRecord[] {
     return this.db.all(
-      "SELECT id, role, content, model, provider, created_at, token_input, token_output FROM messages ORDER BY created_at ASC, rowid ASC",
+      "SELECT id, role, content, model, provider, author_email, created_at, token_input, token_output FROM messages ORDER BY created_at ASC, rowid ASC",
     ).map((row) => this.mapMessageRow(row));
   }
 
   private recentMessages(limit = 50): ChatMessageRecord[] {
     const rows = this.db.all(
-      "SELECT id, role, content, model, provider, created_at, token_input, token_output FROM messages ORDER BY created_at DESC, rowid DESC LIMIT ?",
+      "SELECT id, role, content, model, provider, author_email, created_at, token_input, token_output FROM messages ORDER BY created_at DESC, rowid DESC LIMIT ?",
       limit,
     );
     return rows.reverse().map((row) => this.mapMessageRow(row));
@@ -842,6 +869,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
 
   private mapMessageRow(row: SqlRow): ChatMessageRecord {
     return {
+      authorEmail: row.author_email === null || row.author_email === undefined ? null : String(row.author_email),
       content: String(row.content ?? ""),
       createdAt: epochToIso(row.created_at),
       id: String(row.id),
@@ -853,15 +881,16 @@ export class CodingAgent extends Agent<Env, SessionState> {
     };
   }
 
-  private insertPrompt(promptId: string, content: string, status: PromptRecord["status"]): void {
+  private insertPrompt(promptId: string, content: string, status: PromptRecord["status"], authorEmail?: string | null): void {
     const sessionId = this.sessionId();
     const createdAt = nowEpoch();
     this.db.exec(
-      "INSERT INTO prompts (id, session_id, content, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO prompts (id, session_id, content, status, author_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       promptId,
       sessionId,
       content,
       status,
+      authorEmail ?? null,
       createdAt,
       createdAt,
     );
@@ -887,8 +916,9 @@ export class CodingAgent extends Agent<Env, SessionState> {
 
   private listPrompts(): PromptRecord[] {
     return this.db.all(
-      "SELECT id, content, status, error, result_message_id, created_at, updated_at FROM prompts ORDER BY created_at DESC, rowid DESC",
+      "SELECT id, content, status, error, result_message_id, author_email, created_at, updated_at FROM prompts ORDER BY created_at DESC, rowid DESC",
     ).map((row) => ({
+      authorEmail: row.author_email === null || row.author_email === undefined ? null : String(row.author_email),
       content: String(row.content),
       createdAt: epochToIso(row.created_at),
       error: row.error === null ? null : String(row.error),
@@ -990,12 +1020,30 @@ export class CodingAgent extends Agent<Env, SessionState> {
   }
 
   private async readAppConfig(): Promise<AppConfig> {
+    const ownerEmail = this.readMetadata("owner_email");
+    if (ownerEmail) {
+      const stub = getUserControlStub(this.env, ownerEmail);
+      const response = await stub.fetch("https://user-control/config");
+      return (await response.json()) as AppConfig;
+    }
+    // Fallback to AppControl for pre-migration sessions
     const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
     const response = await stub.fetch("https://app-control/config");
     return (await response.json()) as AppConfig;
   }
 
   private async syncSessionIndex(patch: { status?: string; title?: string | null }): Promise<void> {
+    const ownerEmail = this.readMetadata("owner_email");
+    if (ownerEmail) {
+      const stub = getUserControlStub(this.env, ownerEmail);
+      await stub.fetch("https://user-control/sessions/" + this.sessionId(), {
+        body: JSON.stringify(patch),
+        headers: { "content-type": "application/json" },
+        method: "PATCH",
+      });
+      return;
+    }
+    // Fallback to AppControl for pre-migration sessions
     const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
     await stub.fetch("https://app-control/sessions/" + this.sessionId(), {
       body: JSON.stringify(patch),

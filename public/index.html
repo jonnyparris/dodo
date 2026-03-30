@@ -94,6 +94,7 @@
   <div id="banner-container"></div>
   <div class="app">
     <div class="sidebar" id="sidebar-panel">
+      <div id="identity-display" style="font-size:11px;color:var(--muted);margin-bottom:12px;padding:6px 8px;background:var(--accent-bg);border-radius:var(--radius)"></div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
         <h2 style="margin:0">Sessions</h2>
         <button class="primary" onclick="createSession()">+ New</button>
@@ -229,6 +230,35 @@
           </div>
         </details>
       </div>
+      <div class="section">
+        <h2>Secrets</h2>
+        <div id="passkey-status"></div>
+        <div id="secrets-list"></div>
+        <details style="margin-top:6px" id="secrets-form-details">
+          <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Manage secrets</summary>
+          <div id="passkey-init-form" style="display:none;margin-top:6px">
+            <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Set a passkey to protect your secrets. This enables encrypted token storage.</p>
+            <input id="passkey-input" type="password" placeholder="Passkey (min 4 chars)" style="margin-bottom:4px"/>
+            <button onclick="initPasskey()">Set Passkey</button>
+          </div>
+          <div id="secret-add-form" style="margin-top:6px">
+            <select id="secret-key" style="margin-bottom:4px">
+              <option value="github_token">GitHub Token</option>
+              <option value="gitlab_token">GitLab Token</option>
+              <option value="gateway_token">Gateway Token</option>
+              <option value="ntfy_topic">Ntfy Topic</option>
+            </select>
+            <input id="secret-value" type="password" placeholder="Secret value" style="margin-bottom:4px"/>
+            <button onclick="setSecret()">Save Secret</button>
+          </div>
+          <details style="margin-top:6px">
+            <summary style="cursor:pointer;font-size:11px;color:var(--muted)">Change passkey</summary>
+            <input id="passkey-current" type="password" placeholder="Current passkey" style="margin-top:4px;margin-bottom:4px"/>
+            <input id="passkey-new" type="password" placeholder="New passkey" style="margin-bottom:4px"/>
+            <button onclick="changePasskey()">Change</button>
+          </details>
+        </details>
+      </div>
     </div>
   </div>
 
@@ -300,17 +330,51 @@
     function hideThinking(){$("thinking-indicator")?.remove()}
     function useExample(el){if(!currentSession){createSession().then(()=>{$("msg-input").value=el.textContent});return}$("msg-input").value=el.textContent;$("msg-input").focus()}
 
-    async function boot(){await Promise.all([loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks()])}
+    async function boot(){await Promise.all([loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets()])}
+
+    // --- Identity ---
+    async function loadIdentity(){
+      try{
+        const{email,isAdmin}=await api("/api/identity");
+        $("identity-display").innerHTML=`${esc(email)}${isAdmin?' <span class="tag">admin</span>':''}`;
+      }catch{$("identity-display").textContent=""}
+    }
+
+    // --- Passkey & Secrets ---
+    async function loadPasskeyStatus(){
+      try{
+        const{initialized}=await api("/api/passkey/status");
+        $("passkey-status").innerHTML=initialized?'<div style="font-size:11px;color:var(--accent)">Passkey configured</div>':'<div style="font-size:11px;color:var(--red)">No passkey set</div>';
+        if(!initialized){$("passkey-init-form").style.display="block";$("secret-add-form").style.display="none"}
+        else{$("passkey-init-form").style.display="none";$("secret-add-form").style.display="block"}
+      }catch{$("passkey-status").innerHTML=""}
+    }
+    async function initPasskey(){
+      const passkey=$("passkey-input").value;if(!passkey||passkey.length<4)return alert("Passkey must be at least 4 characters");
+      await json("/api/passkey/init",{passkey});$("passkey-input").value="";await loadPasskeyStatus();await loadSecrets()
+    }
+    async function changePasskey(){
+      const current=$("passkey-current").value,newPk=$("passkey-new").value;
+      if(!current||!newPk||newPk.length<4)return alert("Both fields required, new passkey min 4 chars");
+      try{await json("/api/passkey/change",{currentPasskey:current,newPasskey:newPk});$("passkey-current").value="";$("passkey-new").value="";alert("Passkey changed")}catch(e){alert("Failed: "+(e.message||e))}
+    }
+    async function loadSecrets(){
+      try{
+        const{keys}=await api("/api/secrets");
+        $("secrets-list").innerHTML=keys.length?keys.map(k=>`<div class="kv"><code>${esc(k)}</code><button onclick="deleteSecret('${esc(k)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No secrets</div>';
+      }catch{$("secrets-list").innerHTML='<div class="empty">No secrets</div>'}
+    }
+    async function setSecret(){
+      const key=$("secret-key").value,value=$("secret-value").value;if(!key||!value)return;
+      await json(`/api/secrets/${encodeURIComponent(key)}`,{value},"PUT");$("secret-value").value="";await loadSecrets()
+    }
+    async function deleteSecret(key){await api(`/api/secrets/${encodeURIComponent(key)}`,{method:"DELETE"});await loadSecrets()}
 
     // --- Status & models ---
     async function loadStatus(){
       try{
         const s=await api("/api/status");
-        $("footer").textContent=`Dodo v${esc(s.version)}`;
-        if(s.tokenExpiry){
-          const exp=new Date(s.tokenExpiry);const days=Math.floor((exp.getTime()-Date.now())/(86400000));
-          if(days<7){$("banner-container").innerHTML=`<div class="banner warn">Gateway token expires in ${days} day${days!==1?'s':''} — rotate with: wrangler versions secret put OPENCODE_GATEWAY_TOKEN</div>`}
-        }
+        $("footer").textContent=`Dodo v${esc(s.version)} · ${s.sessionCount} session${s.sessionCount!==1?'s':''}${s.hasPasskey?' · secrets enabled':''}`;
       }catch{}
     }
     async function loadModels(){

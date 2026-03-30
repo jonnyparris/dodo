@@ -1,6 +1,15 @@
 import { z } from "zod";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
-import type { AllowlistEntry, AppConfig, Env, MemoryEntry, SessionIndexRecord, UpdateConfigRequest } from "./types";
+import type { AllowlistEntry, AppConfig, Env, MemoryEntry, UpdateConfigRequest } from "./types";
+
+/** Legacy session record (without owner_email, created_by). */
+interface LegacySessionIndexRecord {
+  createdAt: string;
+  id: string;
+  status: string;
+  title: string | null;
+  updatedAt: string;
+}
 
 const updateConfigSchema = z
   .object({
@@ -292,7 +301,7 @@ export class AppControl implements DurableObject {
     return this.readConfig();
   }
 
-  private registerSession(id: string, title: string | null): SessionIndexRecord {
+  private registerSession(id: string, title: string | null): LegacySessionIndexRecord {
     const now = nowEpoch();
     this.db.exec(
       "INSERT INTO sessions (id, title, status, created_at, updated_at) VALUES (?, ?, 'idle', ?, ?) ON CONFLICT(id) DO NOTHING",
@@ -304,7 +313,7 @@ export class AppControl implements DurableObject {
     return this.getSession(id);
   }
 
-  private touchSession(id: string, patch: { status?: string; title?: string | null }): SessionIndexRecord {
+  private touchSession(id: string, patch: { status?: string; title?: string | null }): LegacySessionIndexRecord {
     const current = this.getSession(id);
     const nextTitle = patch.title === undefined ? current.title : patch.title;
     const nextStatus = patch.status ?? current.status;
@@ -314,7 +323,7 @@ export class AppControl implements DurableObject {
     return this.getSession(id);
   }
 
-  private listSessions(): SessionIndexRecord[] {
+  private listSessions(): LegacySessionIndexRecord[] {
     return this.db.all("SELECT id, title, status, created_at, updated_at FROM sessions ORDER BY updated_at DESC").map((row) => ({
       createdAt: epochToIso(row.created_at),
       id: String(row.id),
@@ -324,7 +333,7 @@ export class AppControl implements DurableObject {
     }));
   }
 
-  private getSession(id: string): SessionIndexRecord {
+  private getSession(id: string): LegacySessionIndexRecord {
     const row = this.db.one("SELECT id, title, status, created_at, updated_at FROM sessions WHERE id = ?", id);
     if (!row) {
       throw new Error(`Session ${id} not found`);

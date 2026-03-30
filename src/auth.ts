@@ -34,8 +34,12 @@ export class AuthError extends Error {
   }
 }
 
+export function isDevMode(env: Env): boolean {
+  return env.ALLOW_UNAUTHENTICATED_DEV === "true";
+}
+
 export async function verifyAccess(request: Request, env: Env): Promise<AccessIdentity> {
-  if (env.ALLOW_UNAUTHENTICATED_DEV === "true") {
+  if (isDevMode(env)) {
     return { email: DEV_EMAIL, source: "dev" };
   }
 
@@ -62,4 +66,29 @@ export async function verifyAccess(request: Request, env: Env): Promise<AccessId
       request.headers.get("Cf-Access-Authenticated-User-Email"),
     source: "access",
   };
+}
+
+/** Check if user is on the Dodo allowlist (SharedIndex DO). */
+export async function checkAllowlist(email: string, env: Env): Promise<{ allowed: boolean; role?: string }> {
+  const stub = getSharedIndexStub(env);
+  const response = await stub.fetch(`https://shared-index/users/check?email=${encodeURIComponent(email)}`);
+  if (!response.ok) return { allowed: false };
+  return (await response.json()) as { allowed: boolean; role?: string };
+}
+
+/** Check if an email is the admin. */
+export function isAdmin(email: string | null, env: Env): boolean {
+  if (!email) return false;
+  const adminEmail = env.ADMIN_EMAIL ?? "ruskin.constant@gmail.com";
+  return email === adminEmail;
+}
+
+// ─── DO Stub Helpers ───
+
+export function getSharedIndexStub(env: Env): DurableObjectStub {
+  return env.SHARED_INDEX.get(env.SHARED_INDEX.idFromName("global"));
+}
+
+export function getUserControlStub(env: Env, email: string): DurableObjectStub {
+  return env.USER_CONTROL.get(env.USER_CONTROL.idFromName(email));
 }

@@ -1,26 +1,43 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
+import { getSharedIndexStub, getUserControlStub } from "./auth";
 import type { Env } from "./types";
 
-async function controlFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
-  const stub = env.APP_CONTROL.get(env.APP_CONTROL.idFromName("global"));
-  return stub.fetch(`https://app-control${path}`, init);
+// MCP uses the admin email for all operations since MCP is token-authenticated
+// (no CF Access identity available). In Phase 2, MCP can pass user context.
+function mcpUserEmail(env: Env): string {
+  return env.ADMIN_EMAIL ?? "ruskin.constant@gmail.com";
+}
+
+async function userControlFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
+  const email = mcpUserEmail(env);
+  const stub = getUserControlStub(env, email);
+  const headers = new Headers(init?.headers);
+  headers.set("x-owner-email", email);
+  return stub.fetch(`https://user-control${path}`, { ...init, headers });
+}
+
+async function sharedIndexFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
+  const stub = getSharedIndexStub(env);
+  return stub.fetch(`https://shared-index${path}`, init);
 }
 
 async function agentFetch(env: Env, sessionId: string, path: string, init?: RequestInit): Promise<Response> {
   const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
   const headers = new Headers(init?.headers);
   headers.set("x-dodo-session-id", sessionId);
+  headers.set("x-owner-email", mcpUserEmail(env));
 
   // Inject gateway config for message/prompt routes
   if (path === "/message" || path === "/prompt") {
-    const configRes = await controlFetch(env, "/config");
+    const configRes = await userControlFetch(env, "/config");
     const config = (await configRes.json()) as Record<string, string>;
     headers.set("x-dodo-gateway", config.activeGateway ?? "opencode");
     headers.set("x-dodo-model", config.model ?? "");
     headers.set("x-dodo-opencode-base-url", config.opencodeBaseURL ?? "");
     headers.set("x-dodo-ai-base-url", config.aiGatewayBaseURL ?? "");
+    headers.set("x-author-email", mcpUserEmail(env));
   }
 
   return agent.fetch(new Request(`https://coding-agent${path}`, { ...init, headers }));
@@ -30,27 +47,33 @@ function textResult(data: unknown): { content: Array<{ type: "text"; text: strin
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
 
-async function jsonFetch(env: Env, fetcher: "control" | "agent", path: string, opts?: { sessionId?: string; init?: RequestInit }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
-  const res = fetcher === "control"
-    ? await controlFetch(env, path, opts?.init)
-    : await agentFetch(env, opts?.sessionId ?? "", path, opts?.init);
+async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: string, opts?: { sessionId?: string; init?: RequestInit }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+  let res: Response;
+  if (fetcher === "user") {
+    res = await userControlFetch(env, path, opts?.init);
+  } else if (fetcher === "shared") {
+    res = await sharedIndexFetch(env, path, opts?.init);
+  } else {
+    res = await agentFetch(env, opts?.sessionId ?? "", path, opts?.init);
+  }
   const data = await res.json();
   return textResult(data);
 }
 
 export function createDodoMcpServer(env: Env): McpServer {
-  const server = new McpServer({ name: "dodo", version: "0.2.0" });
+  const server = new McpServer({ name: "dodo", version: "0.3.0" });
 
   // --- Session tools ---
 
   server.tool("list_sessions", "List all Dodo coding sessions", {}, async () =>
-    jsonFetch(env, "control", "/sessions"),
+    jsonFetch(env, "user", "/sessions"),
   );
 
   server.tool("create_session", "Create a new Dodo coding session", {}, async () => {
     const sessionId = crypto.randomUUID();
-    await controlFetch(env, "/sessions", {
-      body: JSON.stringify({ id: sessionId }),
+    const email = mcpUserEmail(env);
+    await userControlFetch(env, "/sessions", {
+      body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }),
       headers: { "content-type": "application/json" },
       method: "POST",
     });
@@ -63,19 +86,20 @@ export function createDodoMcpServer(env: Env): McpServer {
 
   server.tool("delete_session", "Delete a Dodo session and its storage", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
     const result = await agentFetch(env, sessionId, "/", { method: "DELETE" });
-    await controlFetch(env, `/sessions/${sessionId}`, { method: "DELETE" });
+    await userControlFetch(env, `/sessions/${sessionId}`, { method: "DELETE" });
     return textResult(await result.json());
   });
 
   server.tool("fork_session", "Fork a session (copy files + messages into a new session)", { sessionId: z.string().describe("Source session ID") }, async ({ sessionId }) => {
     const snapshotRes = await agentFetch(env, sessionId, "/snapshot");
     const snapshot = await snapshotRes.text();
-    const storeRes = await controlFetch(env, "/fork-snapshots", { body: snapshot, headers: { "content-type": "application/json" }, method: "POST" });
+    const storeRes = await userControlFetch(env, "/fork-snapshots", { body: snapshot, headers: { "content-type": "application/json" }, method: "POST" });
     const { id: snapshotId } = (await storeRes.json()) as { id: string };
     const newId = crypto.randomUUID();
-    await controlFetch(env, "/sessions", { body: JSON.stringify({ id: newId }), headers: { "content-type": "application/json" }, method: "POST" });
+    const email = mcpUserEmail(env);
+    await userControlFetch(env, "/sessions", { body: JSON.stringify({ id: newId, ownerEmail: email, createdBy: email }), headers: { "content-type": "application/json" }, method: "POST" });
     await agentFetch(env, newId, `/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`, { method: "POST" });
-    await controlFetch(env, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
+    await userControlFetch(env, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
     return textResult({ id: newId, sourceId: sessionId });
   });
 
@@ -254,12 +278,12 @@ export function createDodoMcpServer(env: Env): McpServer {
     }),
   );
 
-  // --- Memory tools ---
+  // --- Memory tools (per-user) ---
 
   server.tool("memory_search", "Search Dodo's persistent memory store", {
     query: z.string().default("").describe("Search query (empty for all)"),
   }, async ({ query }) =>
-    jsonFetch(env, "control", `/memory${query ? `?q=${encodeURIComponent(query)}` : ""}`),
+    jsonFetch(env, "user", `/memory${query ? `?q=${encodeURIComponent(query)}` : ""}`),
   );
 
   server.tool("memory_write", "Write an entry to Dodo's memory store", {
@@ -267,32 +291,32 @@ export function createDodoMcpServer(env: Env): McpServer {
     content: z.string().describe("Entry content"),
     tags: z.array(z.string()).default([]).describe("Tags"),
   }, async ({ title, content, tags }) =>
-    jsonFetch(env, "control", "/memory", {
+    jsonFetch(env, "user", "/memory", {
       init: { body: JSON.stringify({ title, content, tags }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
 
-  // --- Config tools ---
+  // --- Config tools (per-user) ---
 
   server.tool("get_config", "Get Dodo's current LLM and git configuration", {}, async () =>
-    jsonFetch(env, "control", "/config"),
+    jsonFetch(env, "user", "/config"),
   );
 
   server.tool("update_config", "Update Dodo's LLM gateway, model, or git author config", {
     model: z.string().optional().describe("Model ID"),
     activeGateway: z.enum(["opencode", "ai-gateway"]).optional().describe("LLM gateway"),
   }, async (params) =>
-    jsonFetch(env, "control", "/config", {
+    jsonFetch(env, "user", "/config", {
       init: { body: JSON.stringify(params), headers: { "content-type": "application/json" }, method: "PUT" },
     }),
   );
 
-  // --- Task tools ---
+  // --- Task tools (per-user) ---
 
   server.tool("list_tasks", "List all tasks in the Dodo backlog", {
     status: z.string().optional().describe("Filter by status: backlog, todo, in_progress, done, cancelled"),
   }, async ({ status }) =>
-    jsonFetch(env, "control", `/tasks${status ? `?status=${encodeURIComponent(status)}` : ""}`),
+    jsonFetch(env, "user", `/tasks${status ? `?status=${encodeURIComponent(status)}` : ""}`),
   );
 
   server.tool("create_task", "Create a new task in the Dodo backlog", {
@@ -300,7 +324,7 @@ export function createDodoMcpServer(env: Env): McpServer {
     description: z.string().default("").describe("Task description"),
     priority: z.enum(["low", "medium", "high"]).default("medium").describe("Task priority"),
   }, async ({ title, description, priority }) =>
-    jsonFetch(env, "control", "/tasks", {
+    jsonFetch(env, "user", "/tasks", {
       init: { body: JSON.stringify({ title, description, priority }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
@@ -312,7 +336,7 @@ export function createDodoMcpServer(env: Env): McpServer {
     status: z.enum(["backlog", "todo", "in_progress", "done", "cancelled"]).optional().describe("New status"),
     priority: z.enum(["low", "medium", "high"]).optional().describe("New priority"),
   }, async ({ id, ...patch }) =>
-    jsonFetch(env, "control", `/tasks/${encodeURIComponent(id)}`, {
+    jsonFetch(env, "user", `/tasks/${encodeURIComponent(id)}`, {
       init: { body: JSON.stringify(patch), headers: { "content-type": "application/json" }, method: "PUT" },
     }),
   );
@@ -320,7 +344,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   server.tool("delete_task", "Delete a task from the backlog", {
     id: z.string().describe("Task ID"),
   }, async ({ id }) =>
-    jsonFetch(env, "control", `/tasks/${encodeURIComponent(id)}`, { init: { method: "DELETE" } }),
+    jsonFetch(env, "user", `/tasks/${encodeURIComponent(id)}`, { init: { method: "DELETE" } }),
   );
 
   return server;
