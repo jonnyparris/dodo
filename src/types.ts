@@ -176,6 +176,7 @@ export interface UserRecord {
   displayName: string | null;
   role: "admin" | "user";
   blockedAt: number | null;
+  browserEnabled: boolean;
   createdAt: string;
   lastSeenAt: string;
 }

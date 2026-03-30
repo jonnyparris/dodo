@@ -234,6 +234,14 @@ app.delete("/api/admin/users/:email/block", adminGuard as never, async (c) =>
   proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/block`, { method: "DELETE" }),
 );
 
+// ─── Admin: browser access ───
+app.post("/api/admin/users/:email/browser", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/browser`, { method: "POST" }),
+);
+app.delete("/api/admin/users/:email/browser", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/browser`, { method: "DELETE" }),
+);
+
 app.get("/api/admin/stats", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/stats"));
 
 app.get("/api/admin/users/detailed", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users/detailed"));
