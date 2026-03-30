@@ -124,14 +124,17 @@
     .typing-indicator{align-self:flex-start;color:var(--muted);font-size:11px;font-style:italic;padding:4px 14px}
 
     @media(max-width:900px){
-      .app{grid-template-columns:1fr;height:calc(100vh - 56px)}
+      .app{grid-template-columns:1fr;height:calc(100dvh - 56px);height:calc(100vh - 56px)} /* dvh first, vh fallback */
+      @supports(height:100dvh){.app{height:calc(100dvh - 56px)}}
       .sidebar,.right{display:none}
       .sidebar.mobile-visible,.right.mobile-visible{display:block;position:fixed;inset:0;z-index:90;bottom:56px;overflow-y:auto}
-      .mobile-nav{display:block}
+      .mobile-nav{display:block;transition:transform .2s}
+      .mobile-nav.keyboard-open{transform:translateY(100%)}
       .fab{display:flex;align-items:center;justify-content:center}
       .kanban{grid-template-columns:1fr 1fr}
       .wizard-card{padding:24px 16px}
       .settings-content{padding:16px}
+      .input-bar{padding-bottom:max(12px,env(safe-area-inset-bottom))}
     }
   </style>
 </head>
@@ -207,7 +210,7 @@
       </div>
       <div id="typing-indicator" class="typing-indicator" style="display:none"></div>
       <div class="input-bar">
-        <input id="msg-input" placeholder="Ask Dodo to build something..." onkeydown="if(event.key==='Enter'&&!event.shiftKey)sendMessage()"/>
+        <input id="msg-input" placeholder="Ask Dodo to build something..." onkeydown="if(event.key==='Enter'&&!event.shiftKey)sendMessage()" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)"/>
         <button class="primary" id="send-btn" onclick="sendMessage()">Send</button>
         <button id="async-btn" onclick="sendAsync()">Async</button>
       </div>
@@ -1042,6 +1045,23 @@
         await api(`/session/${currentSession}/mcp-configs/${encodeURIComponent(mcpId)}`,{method:"DELETE"});
         await loadSessionMcpConfigs();
       }catch(e){alert("Failed: "+(e.message||e))}
+    }
+
+    // --- Mobile keyboard handling ---
+    if(window.visualViewport){
+      const nav=$("mobile-nav");
+      const msgInput=$("msg-input");
+      let initialHeight=window.visualViewport.height;
+      window.visualViewport.addEventListener("resize",()=>{
+        const keyboardOpen=window.visualViewport.height<initialHeight*0.75;
+        if(nav)nav.classList.toggle("keyboard-open",keyboardOpen);
+        // On keyboard open, ensure input stays visible
+        if(keyboardOpen&&document.activeElement===msgInput){
+          requestAnimationFrame(()=>msgInput.scrollIntoView({block:"nearest",behavior:"smooth"}));
+        }
+      });
+      // Update baseline on orientation change
+      window.visualViewport.addEventListener("scroll",()=>{initialHeight=Math.max(initialHeight,window.visualViewport.height)});
     }
 
     boot();
