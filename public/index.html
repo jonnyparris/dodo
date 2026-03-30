@@ -567,7 +567,7 @@
 
     // --- Chat ---
     async function sendMessage(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";setProcessing(true);showThinking();try{await json(`/session/${currentSession}/message`,{content})}finally{setProcessing(false);hideThinking();loadFiles("/")}}
-    async function sendAsync(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";setProcessing(true);showThinking();await jsonSafe(`/session/${currentSession}/prompt`,{content})}
+    async function sendAsync(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";setProcessing(true);showThinking();const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});if(!result){setProcessing(false);hideThinking()}}
     async function abortPrompt(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
     async function forkSession(){if(!currentSession)return;const d=await jsonSafe(`/session/${currentSession}/fork`,{});if(!d)return;const{id}=d;currentSession=id;await loadSessions();await selectSession(id)}
     async function deleteSession(){if(!currentSession||!confirm("Delete this session?"))return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("presence-bar").innerHTML="";await loadSessions()}
