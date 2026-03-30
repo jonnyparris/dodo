@@ -40,7 +40,11 @@ function buildProvider(config: AppConfig, env: Env) {
   });
 }
 
-function buildTools(env: Env, workspace: Workspace): Record<string, ReturnType<typeof createCodeTool>> {
+function buildTools(
+  env: Env,
+  workspace: Workspace,
+  options?: { authorEmail?: string; ownerEmail?: string },
+): Record<string, ReturnType<typeof createCodeTool>> {
   const tools: Record<string, ReturnType<typeof createCodeTool>> = {};
 
   if (env.LOADER) {
@@ -55,6 +59,13 @@ function buildTools(env: Env, workspace: Workspace): Record<string, ReturnType<t
       tools: [stateTools(workspace)],
     });
   }
+
+  // Memory tools: only include for session owner.
+  // When memory tools are added to the agentic loop's tool set:
+  // if (isCallerOwner(options?.authorEmail, options?.ownerEmail)) {
+  //   tools.memory = memoryTools;
+  // }
+  // Non-owner guests should not have access to the owner's memory tools.
 
   return tools;
 }
@@ -75,6 +86,13 @@ export function buildBrowserTools(_env: Env, browserEnabled: boolean): Record<st
 // to the external MCP server or the built-in UserControl memory endpoints.
 // If external is selected but the connection fails, fall back to builtin.
 // See: src/memory-resolver.ts
+
+// TODO: Approval queue integration
+// When MCP tools are included in the agentic tool set:
+// 1. Before executing a side-effecting MCP tool call, submit to approval queue
+// 2. Await approval from the user (via WebSocket callback or polling)
+// 3. Only execute if approved
+// See: CodingAgent.submitApproval() for the queue infrastructure
 
 function buildMessages(messages: Array<{ content: string; role: string }>): ModelMessage[] {
   return messages
@@ -121,9 +139,10 @@ export async function runAgenticChat(input: {
 }): Promise<AgenticResult> {
   const provider = buildProvider(input.config, input.env);
   const model = provider.chatModel(input.config.model);
-  const tools = buildTools(input.env, input.workspace);
-  // TODO: When memory tools are added to the agentic loop, filter them out
-  // for non-owner callers using: isCallerOwner(input.authorEmail, input.ownerEmail)
+  const tools = buildTools(input.env, input.workspace, {
+    authorEmail: input.authorEmail,
+    ownerEmail: input.ownerEmail,
+  });
 
   const result = await generateText({
     abortSignal: input.signal,
@@ -165,9 +184,10 @@ export async function streamAgenticChat(input: {
 }): Promise<AgenticResult> {
   const provider = buildProvider(input.config, input.env);
   const model = provider.chatModel(input.config.model);
-  const tools = buildTools(input.env, input.workspace);
-  // TODO: When memory tools are added to the agentic loop, filter them out
-  // for non-owner callers using: isCallerOwner(input.authorEmail, input.ownerEmail)
+  const tools = buildTools(input.env, input.workspace, {
+    authorEmail: input.authorEmail,
+    ownerEmail: input.ownerEmail,
+  });
 
   const result = streamText({
     abortSignal: input.signal,

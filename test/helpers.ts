@@ -25,6 +25,32 @@ export async function createSession(): Promise<string> {
   return ((await response.json()) as { id: string }).id;
 }
 
+/**
+ * Add a hostname to the allowlist via direct SharedIndex DO access (bypasses adminGuard).
+ * Use this in tests instead of `POST /api/allowlist` which now requires admin.
+ */
+export async function addAllowlistHostDirect(hostname: string): Promise<void> {
+  const testEnv = env as Env;
+  const stub = testEnv.SHARED_INDEX.get(testEnv.SHARED_INDEX.idFromName("global"));
+  const res = await stub.fetch("https://shared-index/allowlist", {
+    body: JSON.stringify({ hostname }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  if (!res.ok && res.status !== 201) {
+    throw new Error(`Failed to add allowlist host ${hostname}: ${res.status}`);
+  }
+}
+
+/**
+ * Remove a hostname from the allowlist via direct SharedIndex DO access.
+ */
+export async function removeAllowlistHostDirect(hostname: string): Promise<void> {
+  const testEnv = env as Env;
+  const stub = testEnv.SHARED_INDEX.get(testEnv.SHARED_INDEX.idFromName("global"));
+  await stub.fetch(`https://shared-index/allowlist/${encodeURIComponent(hostname)}`, { method: "DELETE" });
+}
+
 export async function eventually(assertion: () => Promise<void>, attempts = 20): Promise<void> {
   let lastError: unknown;
   for (let index = 0; index < attempts; index += 1) {
