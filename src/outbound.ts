@@ -1,6 +1,30 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "./types";
 
+const GITHUB_HOSTS = new Set([
+  "api.github.com",
+  "github.com",
+  "raw.githubusercontent.com",
+  "objects.githubusercontent.com",
+]);
+
+const GITLAB_HOSTS = new Set([
+  "gitlab.com",
+  "gitlab.cfdata.org",
+]);
+
+/**
+ * Returns true if the hostname is a known GitLab instance —
+ * either an exact match or a subdomain of a known host.
+ */
+function isGitLabHost(hostname: string): boolean {
+  if (GITLAB_HOSTS.has(hostname)) return true;
+  for (const known of GITLAB_HOSTS) {
+    if (hostname.endsWith(`.${known}`)) return true;
+  }
+  return false;
+}
+
 /**
  * WorkerEntrypoint that intercepts all outbound fetch() calls from sandboxed
  * dynamic workers. Checks the hostname against the AppControl allowlist and
@@ -36,31 +60,19 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     const headers = new Headers(request.headers);
     this.injectAuth(hostname, headers);
 
-    const outboundRequest = new Request(request.url, {
-      body: request.body,
-      headers,
-      method: request.method,
-      redirect: request.redirect,
-    });
+    // Clone via the original request to preserve all properties (cf, signal, etc.)
+    const outboundRequest = new Request(request, { headers });
 
     return fetch(outboundRequest);
   }
 
   /**
    * Injects auth headers for known providers if a token is available and
-   * the request doesn't already carry its own Authorization header.
+   * the request doesn't already carry its own auth headers.
    */
   private injectAuth(hostname: string, headers: Headers): void {
-    if (headers.has("Authorization")) {
-      return;
-    }
-
-    if (
-      hostname === "api.github.com" ||
-      hostname === "github.com" ||
-      hostname === "raw.githubusercontent.com" ||
-      hostname === "objects.githubusercontent.com"
-    ) {
+    if (GITHUB_HOSTS.has(hostname)) {
+      if (headers.has("Authorization")) return;
       const token = this.env.GITHUB_TOKEN;
       if (token) {
         headers.set("Authorization", `token ${token}`);
@@ -68,7 +80,8 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
           headers.set("User-Agent", "dodo-agent");
         }
       }
-    } else if (hostname.includes("gitlab")) {
+    } else if (isGitLabHost(hostname)) {
+      if (headers.has("Authorization") || headers.has("PRIVATE-TOKEN")) return;
       const token = this.env.GITLAB_TOKEN;
       if (token) {
         headers.set("PRIVATE-TOKEN", token);
