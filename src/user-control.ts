@@ -11,6 +11,7 @@ import {
   unwrapDEK,
   wrapDEK,
 } from "./crypto";
+import { HttpMcpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
 import type { AppConfig, Env, MemoryEntry, SessionIndexRecord, UpdateConfigRequest } from "./types";
 
@@ -30,6 +31,26 @@ const memoryWriteSchema = z
     content: z.string().min(1),
     tags: z.array(z.string().min(1)).default([]),
     title: z.string().min(1),
+  })
+  .strict();
+
+const mcpConfigCreateSchema = z
+  .object({
+    name: z.string().min(1),
+    type: z.enum(["http", "service-binding"]).default("http"),
+    url: z.string().url().optional(),
+    headers: z.record(z.string(), z.string()).optional(),
+    enabled: z.boolean().default(true),
+  })
+  .strict();
+
+const mcpConfigUpdateSchema = z
+  .object({
+    name: z.string().min(1).optional(),
+    type: z.enum(["http", "service-binding"]).optional(),
+    url: z.string().url().optional(),
+    headers: z.record(z.string(), z.string()).optional(),
+    enabled: z.boolean().optional(),
   })
   .strict();
 
@@ -192,6 +213,39 @@ export class UserControl implements DurableObject {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
         this.db.exec("DELETE FROM fork_snapshots WHERE id = ?", id);
         return Response.json({ deleted: true, id });
+      }
+
+      // ─── MCP Configs ───
+
+      if (request.method === "GET" && url.pathname === "/mcp-configs") {
+        return Response.json({ configs: this.listMcpConfigs() });
+      }
+
+      if (request.method === "POST" && url.pathname === "/mcp-configs") {
+        const body = mcpConfigCreateSchema.parse(await request.json());
+        return Response.json(this.createMcpConfig(body), { status: 201 });
+      }
+
+      if (request.method === "PUT" && url.pathname.match(/^\/mcp-configs\/[^/]+$/) && !url.pathname.includes("/test")) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        const body = mcpConfigUpdateSchema.parse(await request.json());
+        return Response.json(this.updateMcpConfig(id, body));
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/mcp-configs\/[^/]+$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        this.db.exec("DELETE FROM mcp_configs WHERE id = ?", id);
+        return Response.json({ deleted: true, id });
+      }
+
+      if (request.method === "POST" && url.pathname.match(/^\/mcp-configs\/[^/]+\/test$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const row = this.db.one("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
+        if (!row) return Response.json({ error: `MCP config ${id} not found` }, { status: 404 });
+        const config = this.mapMcpConfigRow(row);
+        const gatekeeper = new HttpMcpGatekeeper(config);
+        const result = await gatekeeper.testConnection();
+        return Response.json(result);
       }
 
       // ─── Status ───
@@ -573,6 +627,56 @@ export class UserControl implements DurableObject {
       createdAt: epochToIso(row.created_at),
       updatedAt: epochToIso(row.updated_at),
     }));
+  }
+
+  // ─── MCP Configs ───
+
+  private createMcpConfig(input: { name: string; type: string; url?: string; headers?: Record<string, string>; enabled: boolean }): McpGatekeeperConfig {
+    const id = crypto.randomUUID();
+    const now = nowEpoch();
+    this.db.exec(
+      "INSERT INTO mcp_configs (id, name, type, url, headers_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      id, input.name, input.type, input.url ?? null, input.headers ? JSON.stringify(input.headers) : null, input.enabled ? 1 : 0, now, now,
+    );
+    return this.getMcpConfig(id);
+  }
+
+  private updateMcpConfig(id: string, patch: { name?: string; type?: string; url?: string; headers?: Record<string, string>; enabled?: boolean }): McpGatekeeperConfig {
+    const current = this.getMcpConfig(id);
+    const now = nowEpoch();
+    this.db.exec(
+      "UPDATE mcp_configs SET name = ?, type = ?, url = ?, headers_json = ?, enabled = ?, updated_at = ? WHERE id = ?",
+      patch.name ?? current.name,
+      patch.type ?? current.type,
+      patch.url ?? current.url ?? null,
+      patch.headers ? JSON.stringify(patch.headers) : (current.headers ? JSON.stringify(current.headers) : null),
+      (patch.enabled !== undefined ? patch.enabled : current.enabled) ? 1 : 0,
+      now,
+      id,
+    );
+    return this.getMcpConfig(id);
+  }
+
+  private getMcpConfig(id: string): McpGatekeeperConfig {
+    const row = this.db.one("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
+    if (!row) throw new Error(`MCP config ${id} not found`);
+    return this.mapMcpConfigRow(row);
+  }
+
+  private listMcpConfigs(): McpGatekeeperConfig[] {
+    return this.db.all("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")
+      .map((row) => this.mapMcpConfigRow(row));
+  }
+
+  private mapMcpConfigRow(row: SqlRow): McpGatekeeperConfig {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      type: String(row.type) as "http" | "service-binding",
+      url: row.url === null ? undefined : String(row.url),
+      headers: row.headers_json ? (JSON.parse(String(row.headers_json)) as Record<string, string>) : undefined,
+      enabled: Number(row.enabled) === 1,
+    };
   }
 
   // ─── Status ───

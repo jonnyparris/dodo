@@ -7,6 +7,7 @@ import { AuthError, checkAllowlist, getSharedIndexStub, getUserControlStub, isAd
 import { CodingAgent } from "./coding-agent";
 import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
+import { MCP_CATALOG } from "./mcp-catalog";
 import { AllowlistOutbound } from "./outbound";
 import { RateLimiter } from "./rate-limit";
 import { signCookie } from "./share";
@@ -377,6 +378,45 @@ app.get("/api/secrets/:key/test", async (c) => {
   const email = c.get("userEmail");
   return proxyToUserControl(c.env, email, `/secrets/${encodeURIComponent(c.req.param("key"))}/test`);
 });
+
+// ─── MCP Configs (per-user via UserControl) ───
+
+app.get("/api/mcp-configs", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/mcp-configs");
+});
+
+app.post("/api/mcp-configs", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/mcp-configs", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.put("/api/mcp-configs/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/mcp-configs/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" });
+});
+
+app.post("/api/mcp-configs/:id/test", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}/test`, { method: "POST" });
+});
+
+// ─── MCP Catalog (static) ───
+
+app.get("/api/mcp-catalog", (c) => c.json(MCP_CATALOG));
 
 // ─── Passkey / Onboarding ───
 
