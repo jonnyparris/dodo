@@ -219,22 +219,27 @@ export class UserControl implements DurableObject {
       // ─── MCP Configs ───
 
       if (request.method === "GET" && url.pathname === "/mcp-configs") {
-        return Response.json({ configs: this.listMcpConfigs() });
+        return Response.json({ configs: this.listMcpConfigsSafe() });
       }
 
       if (request.method === "POST" && url.pathname === "/mcp-configs") {
         const body = mcpConfigCreateSchema.parse(await request.json());
-        return Response.json(this.createMcpConfig(body), { status: 201 });
+        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+        const config = await this.createMcpConfigEncrypted(body, ownerEmail);
+        return Response.json(config, { status: 201 });
       }
 
       if (request.method === "PUT" && url.pathname.match(/^\/mcp-configs\/[^/]+$/) && !url.pathname.includes("/test")) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
         const body = mcpConfigUpdateSchema.parse(await request.json());
-        return Response.json(this.updateMcpConfig(id, body));
+        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+        const config = await this.updateMcpConfigEncrypted(id, body, ownerEmail);
+        return Response.json(config);
       }
 
       if (request.method === "DELETE" && url.pathname.match(/^\/mcp-configs\/[^/]+$/)) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        this.deleteMcpConfigSecrets(id);
         this.db.exec("DELETE FROM mcp_configs WHERE id = ?", id);
         return Response.json({ deleted: true, id });
       }
@@ -243,7 +248,8 @@ export class UserControl implements DurableObject {
         const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
         const row = this.db.one("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
         if (!row) return Response.json({ error: `MCP config ${id} not found` }, { status: 404 });
-        const config = this.mapMcpConfigRow(row);
+        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+        const config = await this.resolveMcpConfigHeaders(this.mapMcpConfigRow(row), ownerEmail);
         const gatekeeper = new HttpMcpGatekeeper(config);
         const result = await gatekeeper.testConnection();
         return Response.json(result);
@@ -269,6 +275,13 @@ export class UserControl implements DurableObject {
         const ownerEmail = request.headers.get("x-owner-email") ?? "";
         await this.changePasskey(body.currentPasskey, body.newPasskey, ownerEmail);
         return Response.json({ changed: true });
+      }
+
+      if (request.method === "POST" && url.pathname === "/passkey/rotate-server-key") {
+        const body = z.object({ passkey: z.string().min(1) }).parse(await request.json());
+        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+        await this.rotateServerKey(body.passkey, ownerEmail);
+        return Response.json({ rotated: true });
       }
 
       if (request.method === "GET" && url.pathname === "/passkey/status") {
@@ -662,50 +675,164 @@ export class UserControl implements DurableObject {
 
   // ─── MCP Configs ───
 
-  private createMcpConfig(input: { name: string; type: string; url?: string; headers?: Record<string, string>; enabled: boolean }): McpGatekeeperConfig {
+  /**
+   * Create an MCP config, storing headers as encrypted secrets.
+   * The mcp_configs table stores only header key names (not values).
+   */
+  private async createMcpConfigEncrypted(input: { name: string; type: string; url?: string; headers?: Record<string, string>; enabled: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
     const id = crypto.randomUUID();
     const now = nowEpoch();
+    const headerKeys = input.headers ? Object.keys(input.headers) : [];
+
     this.db.exec(
       "INSERT INTO mcp_configs (id, name, type, url, headers_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      id, input.name, input.type, input.url ?? null, input.headers ? JSON.stringify(input.headers) : null, input.enabled ? 1 : 0, now, now,
+      id, input.name, input.type, input.url ?? null, headerKeys.length > 0 ? JSON.stringify(headerKeys) : null, input.enabled ? 1 : 0, now, now,
     );
-    return this.getMcpConfig(id);
+
+    // Store each header value as an encrypted secret
+    if (input.headers && ownerEmail && this.hasKeyEnvelope()) {
+      for (const [headerName, headerValue] of Object.entries(input.headers)) {
+        await this.setSecret(`mcp:${id}:${headerName}`, headerValue, ownerEmail);
+      }
+    }
+
+    const config = this.getMcpConfigSafe(id);
+    return { ...config, headerKeys };
   }
 
-  private updateMcpConfig(id: string, patch: { name?: string; type?: string; url?: string; headers?: Record<string, string>; enabled?: boolean }): McpGatekeeperConfig {
-    const current = this.getMcpConfig(id);
+  /**
+   * Update an MCP config, replacing encrypted header secrets if new headers provided.
+   */
+  private async updateMcpConfigEncrypted(id: string, patch: { name?: string; type?: string; url?: string; headers?: Record<string, string>; enabled?: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
+    const current = this.getMcpConfigSafe(id);
     const now = nowEpoch();
+
+    let headerKeys: string[];
+    if (patch.headers) {
+      // Delete old header secrets
+      this.deleteMcpConfigSecrets(id);
+      headerKeys = Object.keys(patch.headers);
+      // Store new header secrets
+      if (ownerEmail && this.hasKeyEnvelope()) {
+        for (const [headerName, headerValue] of Object.entries(patch.headers)) {
+          await this.setSecret(`mcp:${id}:${headerName}`, headerValue, ownerEmail);
+        }
+      }
+    } else {
+      headerKeys = current.headerKeys ?? [];
+    }
+
     this.db.exec(
       "UPDATE mcp_configs SET name = ?, type = ?, url = ?, headers_json = ?, enabled = ?, updated_at = ? WHERE id = ?",
       patch.name ?? current.name,
       patch.type ?? current.type,
       patch.url ?? current.url ?? null,
-      patch.headers ? JSON.stringify(patch.headers) : (current.headers ? JSON.stringify(current.headers) : null),
+      headerKeys.length > 0 ? JSON.stringify(headerKeys) : null,
       (patch.enabled !== undefined ? patch.enabled : current.enabled) ? 1 : 0,
       now,
       id,
     );
-    return this.getMcpConfig(id);
+
+    const updated = this.getMcpConfigSafe(id);
+    return { ...updated, headerKeys };
   }
 
-  private getMcpConfig(id: string): McpGatekeeperConfig {
+  /** Delete all encrypted secrets associated with an MCP config. */
+  private deleteMcpConfigSecrets(configId: string): void {
+    const rows = this.db.all("SELECT key FROM encrypted_secrets WHERE key LIKE ?", `mcp:${configId}:%`);
+    for (const row of rows) {
+      this.db.exec("DELETE FROM encrypted_secrets WHERE key = ?", String(row.key));
+    }
+  }
+
+  /** Resolve encrypted headers for actual MCP connection. */
+  private async resolveMcpConfigHeaders(config: McpGatekeeperConfig, ownerEmail: string): Promise<McpGatekeeperConfig> {
+    if (!config.headerKeys || config.headerKeys.length === 0) return config;
+    if (!ownerEmail || !this.hasKeyEnvelope()) return config;
+
+    const headers: Record<string, string> = {};
+    for (const headerName of config.headerKeys) {
+      const value = await this.getSecret(`mcp:${config.id}:${headerName}`, ownerEmail);
+      if (value !== null) {
+        headers[headerName] = value;
+      }
+    }
+
+    return { ...config, headers: Object.keys(headers).length > 0 ? headers : undefined };
+  }
+
+  private getMcpConfigSafe(id: string): McpGatekeeperConfig & { headerKeys?: string[] } {
     const row = this.db.one("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
     if (!row) throw new Error(`MCP config ${id} not found`);
-    return this.mapMcpConfigRow(row);
+    return this.mapMcpConfigRowSafe(row);
   }
 
-  private listMcpConfigs(): McpGatekeeperConfig[] {
+  /**
+   * List MCP configs for display. Returns header key names but not values.
+   */
+  private listMcpConfigsSafe(): Array<McpGatekeeperConfig & { headerKeys?: string[] }> {
     return this.db.all("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")
-      .map((row) => this.mapMcpConfigRow(row));
+      .map((row) => this.mapMcpConfigRowSafe(row));
   }
 
-  private mapMcpConfigRow(row: SqlRow): McpGatekeeperConfig {
+  private hasKeyEnvelope(): boolean {
+    return !!this.db.one("SELECT id FROM key_envelope WHERE id = 'default'");
+  }
+
+  /**
+   * Map a row to safe config (headers_json now stores key names array, not values).
+   */
+  private mapMcpConfigRowSafe(row: SqlRow): McpGatekeeperConfig & { headerKeys?: string[] } {
+    const headersJsonStr = row.headers_json ? String(row.headers_json) : null;
+    let headerKeys: string[] | undefined;
+
+    if (headersJsonStr) {
+      try {
+        const parsed = JSON.parse(headersJsonStr);
+        if (Array.isArray(parsed)) {
+          // New format: array of key names
+          headerKeys = parsed as string[];
+        } else if (typeof parsed === "object" && parsed !== null) {
+          // Legacy format: object with key-value pairs (pre-encryption migration)
+          headerKeys = Object.keys(parsed);
+        }
+      } catch { /* invalid JSON */ }
+    }
+
     return {
       id: String(row.id),
       name: String(row.name),
       type: String(row.type) as "http" | "service-binding",
       url: row.url === null ? undefined : String(row.url),
-      headers: row.headers_json ? (JSON.parse(String(row.headers_json)) as Record<string, string>) : undefined,
+      headers: undefined, // Never expose header values in listing
+      headerKeys,
+      enabled: Number(row.enabled) === 1,
+    };
+  }
+
+  /** Legacy mapper used only for internal test endpoint resolution. */
+  private mapMcpConfigRow(row: SqlRow): McpGatekeeperConfig & { headerKeys?: string[] } {
+    const headersJsonStr = row.headers_json ? String(row.headers_json) : null;
+    let headerKeys: string[] | undefined;
+
+    if (headersJsonStr) {
+      try {
+        const parsed = JSON.parse(headersJsonStr);
+        if (Array.isArray(parsed)) {
+          headerKeys = parsed as string[];
+        } else if (typeof parsed === "object" && parsed !== null) {
+          headerKeys = Object.keys(parsed);
+        }
+      } catch { /* invalid JSON */ }
+    }
+
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      type: String(row.type) as "http" | "service-binding",
+      url: row.url === null ? undefined : String(row.url),
+      headers: undefined,
+      headerKeys,
       enabled: Number(row.enabled) === 1,
     };
   }
@@ -826,6 +953,33 @@ export class UserControl implements DurableObject {
         "UPDATE key_envelope SET pbkdf2_salt = ?, wrapped_dek_passkey = ?, rotated_at = ? WHERE id = 'default'",
         bytesToBase64(newSalt),
         newWrappedPasskey,
+        nowEpoch(),
+      );
+    } finally {
+      dek.fill(0);
+    }
+  }
+
+  /**
+   * Rotate the server-side wrapping key after SECRETS_MASTER_KEY changes.
+   *
+   * The old server key no longer works, so the user must provide their passkey
+   * to bootstrap: passkey → DEK → re-wrap with new server key.
+   */
+  private async rotateServerKey(passkey: string, ownerEmail: string): Promise<void> {
+    const masterKeyHex = this.env.SECRETS_MASTER_KEY;
+    if (!masterKeyHex) throw new Error("Server encryption not configured");
+    if (!ownerEmail) throw new Error("Owner email required for server key rotation");
+
+    // Unwrap DEK using the user's passkey (old server key is unusable)
+    const dek = await this.unwrapDEKWithPasskey(passkey);
+    try {
+      // Derive new SDK from the current (new) SECRETS_MASTER_KEY
+      const newSdk = await deriveSDK(masterKeyHex, ownerEmail);
+      const newWrappedServer = await wrapDEK(dek, newSdk);
+      this.db.exec(
+        "UPDATE key_envelope SET wrapped_dek_server = ?, rotated_at = ? WHERE id = 'default'",
+        newWrappedServer,
         nowEpoch(),
       );
     } finally {

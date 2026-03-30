@@ -26,7 +26,7 @@ async function fetchJson(path: string, init?: RequestInit): Promise<Response> {
 }
 
 describe("MCP Config CRUD", () => {
-  // Warm up: absorb any DO invalidation
+  // Warm up: absorb any DO invalidation and add test hosts to allowlist
   beforeAll(async () => {
     for (let i = 0; i < 3; i++) {
       const res = await fetchJson("/health");
@@ -34,6 +34,15 @@ describe("MCP Config CRUD", () => {
     }
     try { await fetchJson("/api/mcp-configs"); } catch { /* absorb invalidation */ }
     try { await fetchJson("/api/mcp-configs"); } catch { /* retry */ }
+    // Add test hostnames to the allowlist so MCP config creation succeeds
+    const hosts = ["mcp.example.com", "mcp-v2.example.com", "minimal.example.com", "toggle.example.com"];
+    for (const hostname of hosts) {
+      await fetchJson("/api/allowlist", {
+        body: JSON.stringify({ hostname }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+    }
   });
 
   it("list MCP configs → empty initially", async () => {
@@ -63,14 +72,16 @@ describe("MCP Config CRUD", () => {
       name: string;
       type: string;
       url: string;
-      headers: Record<string, string>;
+      headers?: Record<string, string>;
+      headerKeys?: string[];
       enabled: boolean;
     };
     expect(created.id).toBeTruthy();
     expect(created.name).toBe("Test MCP Server");
     expect(created.type).toBe("http");
-    expect(created.url).toBe("https://mcp.example.com/v1");
-    expect(created.headers).toEqual({ Authorization: "Bearer test-token" });
+    // Headers are now stored as encrypted secrets; only key names returned
+    expect(created.headerKeys).toEqual(["Authorization"]);
+    expect(created.headers).toBeUndefined();
     expect(created.enabled).toBe(true);
 
     // Listed

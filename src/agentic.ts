@@ -91,12 +91,23 @@ function extractToolCalls(steps: Array<{ toolCalls: unknown[]; toolResults: unkn
 }
 
 /**
+ * Check if the caller is the session owner (i.e. should have access to memory tools).
+ * Non-owner guests should not have access to the owner's memory tools.
+ */
+export function isCallerOwner(authorEmail?: string, ownerEmail?: string): boolean {
+  if (!authorEmail || !ownerEmail) return true; // default to owner if unknown
+  return authorEmail === ownerEmail;
+}
+
+/**
  * Non-streaming agentic chat. Used for async prompts and cron callbacks.
  */
 export async function runAgenticChat(input: {
+  authorEmail?: string;
   config: AppConfig;
   env: Env;
   messages: Array<{ content: string; role: "assistant" | "system" | "tool" | "user" }>;
+  ownerEmail?: string;
   signal?: AbortSignal;
   systemPrompt: string;
   workspace: Workspace;
@@ -104,6 +115,8 @@ export async function runAgenticChat(input: {
   const provider = buildProvider(input.config, input.env);
   const model = provider.chatModel(input.config.model);
   const tools = buildTools(input.env, input.workspace);
+  // TODO: When memory tools are added to the agentic loop, filter them out
+  // for non-owner callers using: isCallerOwner(input.authorEmail, input.ownerEmail)
 
   const result = await generateText({
     abortSignal: input.signal,
@@ -132,11 +145,13 @@ export async function runAgenticChat(input: {
  * Returns the full AgenticResult once the stream is consumed.
  */
 export async function streamAgenticChat(input: {
+  authorEmail?: string;
   config: AppConfig;
   env: Env;
   messages: Array<{ content: string; role: "assistant" | "system" | "tool" | "user" }>;
   onTextDelta: (delta: string) => void;
   onToolCall: (tc: { code: string; result: unknown }) => void;
+  ownerEmail?: string;
   signal?: AbortSignal;
   systemPrompt: string;
   workspace: Workspace;
@@ -144,6 +159,8 @@ export async function streamAgenticChat(input: {
   const provider = buildProvider(input.config, input.env);
   const model = provider.chatModel(input.config.model);
   const tools = buildTools(input.env, input.workspace);
+  // TODO: When memory tools are added to the agentic loop, filter them out
+  // for non-owner callers using: isCallerOwner(input.authorEmail, input.ownerEmail)
 
   const result = streamText({
     abortSignal: input.signal,
