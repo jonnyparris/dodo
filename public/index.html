@@ -4,6 +4,7 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Dodo</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
     :root{--bg:#f5f5f0;--panel:#fff;--text:#1a1a1a;--muted:#666;--accent:#0a7c66;--accent-bg:rgba(10,124,102,.08);--border:#e0e0e0;--red:#c0392b;--tool-bg:#f0f4f8;--tool-border:#c8d6e5;--mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;--radius:8px}
     *{box-sizing:border-box;margin:0}
@@ -36,6 +37,25 @@
     .msg.tool_call summary{cursor:pointer;color:var(--accent);font-weight:600}
     .msg.thinking{align-self:flex-start;background:var(--accent-bg);border:1px dashed var(--accent);color:var(--accent);font-style:italic}
     .thinking-dots::after{content:'';animation:dots 1.5s steps(4,end) infinite}
+    /* Markdown rendering in assistant messages */
+    .msg.assistant{white-space:normal}
+    .msg.assistant p{margin:0 0 8px}
+    .msg.assistant p:last-child{margin-bottom:0}
+    .msg.assistant h1,.msg.assistant h2,.msg.assistant h3,.msg.assistant h4{margin:12px 0 6px;line-height:1.3}
+    .msg.assistant h1{font-size:16px} .msg.assistant h2{font-size:15px} .msg.assistant h3{font-size:14px}
+    .msg.assistant ul,.msg.assistant ol{margin:4px 0 8px 20px;padding:0}
+    .msg.assistant li{margin-bottom:2px}
+    .msg.assistant code{font-family:var(--mono);font-size:12px;background:rgba(0,0,0,.06);padding:1px 4px;border-radius:3px}
+    .msg.assistant pre{background:#1e1e1e;color:#d4d4d4;padding:10px 12px;border-radius:6px;overflow-x:auto;margin:8px 0;font-size:12px;line-height:1.4}
+    .msg.assistant pre code{background:none;padding:0;color:inherit;font-size:inherit}
+    .msg.assistant blockquote{border-left:3px solid var(--accent);padding:4px 12px;margin:8px 0;color:var(--muted);background:var(--accent-bg);border-radius:0 4px 4px 0}
+    .msg.assistant table{border-collapse:collapse;margin:8px 0;font-size:12px;width:100%}
+    .msg.assistant th,.msg.assistant td{border:1px solid var(--border);padding:4px 8px;text-align:left}
+    .msg.assistant th{background:var(--bg);font-weight:600}
+    .msg.assistant img{max-width:100%;height:auto;border-radius:6px;margin:8px 0}
+    .msg.assistant a{color:var(--accent);text-decoration:none}
+    .msg.assistant a:hover{text-decoration:underline}
+    .msg.assistant hr{border:none;border-top:1px solid var(--border);margin:12px 0}
     @keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
     .input-bar{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);background:var(--panel);align-items:center}
     .input-bar input{flex:1}
@@ -485,6 +505,13 @@
 
     const $=(id)=>document.getElementById(id);
     const esc=(s)=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+
+    // Markdown rendering for assistant messages
+    if(typeof marked!=="undefined"){marked.setOptions({breaks:true,gfm:true})}
+    function renderMarkdown(text){
+      if(typeof marked==="undefined")return esc(text);
+      try{return marked.parse(text)}catch{return esc(text)}
+    }
     const api=async(path,opts)=>{const r=await fetch(path,opts);const data=r.headers.get("content-type")?.includes("json")?await r.json():await r.text();if(!r.ok){const msg=typeof data==="object"?data.error||"Request failed":data;const e=new Error(msg);e.status=r.status;e.data=data;throw e}return data};
     const json=(path,body,method="POST")=>api(path,{method,headers:{"content-type":"application/json"},body:JSON.stringify(body)});
     // Safe variants that return null on error (for UI loaders that shouldn't crash)
@@ -600,7 +627,7 @@
     function connectSSE(id){
       if(eventSource)eventSource.close();eventSource=new EventSource(`/session/${id}/events`);
       eventSource.addEventListener("text_delta",(e)=>{hideThinking();const{delta}=JSON.parse(e.data);if(!streamingEl){streamingEl=document.createElement("div");streamingEl.className="msg assistant";streamingEl.textContent="";$("chat").appendChild(streamingEl)}streamingEl.textContent+=delta;$("chat").scrollTop=$("chat").scrollHeight});
-      eventSource.addEventListener("message",(e)=>{hideThinking();const msg=JSON.parse(e.data);if(streamingEl){streamingEl.textContent=msg.content;if(msg.tokenInput||msg.tokenOutput){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;streamingEl.appendChild(m)}streamingEl=null}else{renderMessage(msg)}loadFiles("/");apiSafe(`/session/${id}`).then(s=>{if(s)updateTokenSummary(s)})});
+      eventSource.addEventListener("message",(e)=>{hideThinking();const msg=JSON.parse(e.data);if(streamingEl){streamingEl.innerHTML=renderMarkdown(msg.content);if(msg.tokenInput||msg.tokenOutput){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;streamingEl.appendChild(m)}streamingEl=null}else{renderMessage(msg)}loadFiles("/");apiSafe(`/session/${id}`).then(s=>{if(s)updateTokenSummary(s)})});
       eventSource.addEventListener("state",(e)=>{const s=JSON.parse(e.data);setStatusDot(s.status);updateTokenSummary(s);if(s.status!=="running"){setProcessing(false);hideThinking();streamingEl=null;loadPrompts()}});
       eventSource.addEventListener("tool_call",(e)=>{hideThinking();if(streamingEl)streamingEl=null;renderToolCall(JSON.parse(e.data));loadFiles("/")});
       eventSource.addEventListener("file",()=>loadFiles("/"));
@@ -609,7 +636,7 @@
       eventSource.addEventListener("presence",(e)=>{const data=JSON.parse(e.data);presenceUsers=data.users||[];renderPresence()});
     }
 
-    function renderMessage(msg){const el=document.createElement("div");el.className=`msg ${msg.role}`;el.textContent=msg.content;if(msg.role==="assistant"&&(msg.tokenInput||msg.tokenOutput)){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;el.appendChild(m)}$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
+    function renderMessage(msg){const el=document.createElement("div");el.className=`msg ${msg.role}`;if(msg.role==="assistant"){el.innerHTML=renderMarkdown(msg.content)}else{el.textContent=msg.content}if(msg.role==="assistant"&&(msg.tokenInput||msg.tokenOutput)){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;el.appendChild(m)}$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
     function renderToolCall(tc){const el=document.createElement("div");el.className="msg tool_call";el.innerHTML=`<details><summary>Tool call</summary><pre style="margin:6px 0 0;font-size:11px;white-space:pre-wrap;max-height:200px;overflow:auto">${esc(tc.code||"")}</pre><div style="margin-top:4px;font-size:11px;color:var(--muted)">Result: ${esc(JSON.stringify(tc.result,null,2)?.slice(0,500)||"null")}</div></details>`;$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
     function setStatusDot(status){$("session-status-dot").className=`status-dot ${status==="running"?"running":"idle"}`}
 
