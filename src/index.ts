@@ -10,7 +10,7 @@ import { createDodoMcpServer } from "./mcp";
 import { MCP_CATALOG } from "./mcp-catalog";
 import { AllowlistOutbound } from "./outbound";
 import { RateLimiter } from "./rate-limit";
-import { signCookie } from "./share";
+import { signCookie, verifyCookie } from "./share";
 import { SharedIndex } from "./shared-index";
 import { UserControl } from "./user-control";
 import type { AccessIdentity, AppConfig, Env } from "./types";
@@ -28,7 +28,9 @@ setInterval(() => {
   messageLimiter.cleanup();
 }, 5 * 60 * 1000);
 
-type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail: string } };
+type PermissionLevel = "readonly" | "readwrite" | "write" | "admin";
+
+type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail: string; sessionPermission: PermissionLevel } };
 
 const app = new Hono<HonoEnv>();
 
@@ -100,6 +102,79 @@ async function verifySessionAccess(env: Env, email: string, sessionId: string): 
   if (response.ok) return true;
   if (isAdmin(email, env)) return true;
   return false;
+}
+
+/**
+ * Determine the effective permission level for a user on a session.
+ * - Session owner → "admin"
+ * - Admin user → "admin"
+ * - Granted permission via SharedIndex → "readonly" | "readwrite"
+ * - Share cookie guest → permission from signed cookie
+ * - Otherwise → null (no access)
+ */
+async function resolveSessionPermission(
+  env: Env,
+  email: string,
+  sessionId: string,
+  request: Request,
+): Promise<PermissionLevel | null> {
+  // Session owner gets admin
+  const ownerStub = getUserControlStub(env, email);
+  const ownerCheck = await ownerStub.fetch(`https://user-control/sessions/${encodeURIComponent(sessionId)}/check`);
+  if (ownerCheck.ok) return "admin";
+
+  // Platform admin gets admin
+  if (isAdmin(email, env)) return "admin";
+
+  // Check SharedIndex for granted permission
+  const permRes = await proxyToSharedIndex(env, `/permissions/${encodeURIComponent(sessionId)}/${encodeURIComponent(email)}`);
+  if (permRes.ok) {
+    const perm = (await permRes.json()) as { permission: string };
+    if (perm.permission === "readwrite") return "write";
+    if (perm.permission === "readonly") return "readonly";
+  }
+
+  // Check share cookie
+  const cookieSecret = env.COOKIE_SECRET;
+  if (cookieSecret) {
+    const cookieHeader = request.headers.get("Cookie") ?? "";
+    for (const cookie of cookieHeader.split(";")) {
+      const trimmed = cookie.trim();
+      if (trimmed.startsWith("dodo_share=")) {
+        const signedValue = trimmed.slice("dodo_share=".length);
+        const payload = await verifyCookie(signedValue, cookieSecret);
+        if (payload) {
+          try {
+            const parsed = JSON.parse(payload) as { sessionId?: string; permission?: string; expiresAt?: string };
+            if (parsed.sessionId === sessionId) {
+              if (parsed.expiresAt && new Date(parsed.expiresAt) <= new Date()) continue;
+              if (parsed.permission === "readwrite") return "write";
+              return "readonly";
+            }
+          } catch { /* invalid cookie payload */ }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+const PERMISSION_LEVELS: Record<string, number> = { readonly: 0, readwrite: 1, write: 1, admin: 2 };
+
+/**
+ * Check if the current session permission meets the required level.
+ * Returns a 403 Response if insufficient, or null if OK.
+ */
+export function requirePermission(
+  c: { get: (key: string) => unknown; json: (data: unknown, status?: number) => Response },
+  required: "readonly" | "write" | "admin",
+): Response | null {
+  const perm = c.get("sessionPermission") as string;
+  if ((PERMISSION_LEVELS[perm] ?? -1) < (PERMISSION_LEVELS[required] ?? 999)) {
+    return c.json({ error: "Insufficient permission" }, 403);
+  }
+  return null;
 }
 
 // ─── MCP (token auth, no CF Access) ───
@@ -247,8 +322,30 @@ app.get("/api/admin/stats", adminGuard as never, async (c) => proxyToSharedIndex
 app.get("/api/admin/users/detailed", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users/detailed"));
 
 app.get("/api/admin/sessions", adminGuard as never, async (c) => {
-  const email = c.get("userEmail");
-  return proxyToUserControl(c.env, email, "/sessions");
+  // Fetch all registered users from SharedIndex
+  const usersRes = await proxyToSharedIndex(c.env, "/users");
+  const { users } = (await usersRes.json()) as { users: Array<{ email: string }> };
+
+  // Query each user's UserControl for their sessions
+  const allSessions: Array<Record<string, unknown>> = [];
+  await Promise.all(
+    users.map(async (user) => {
+      try {
+        const sessionsRes = await proxyToUserControl(c.env, user.email, "/sessions");
+        if (!sessionsRes.ok) return;
+        const { sessions } = (await sessionsRes.json()) as { sessions: Array<Record<string, unknown>> };
+        for (const session of sessions) {
+          allSessions.push({ ...session, ownerEmail: user.email });
+        }
+      } catch {
+        // Skip users whose UserControl is unavailable
+      }
+    }),
+  );
+
+  // Sort by updatedAt descending
+  allSessions.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+  return c.json({ sessions: allSessions });
 });
 
 // ─── User config (per-user via UserControl) ───
@@ -396,8 +493,26 @@ app.get("/api/mcp-configs", async (c) => {
 
 app.post("/api/mcp-configs", async (c) => {
   const email = c.get("userEmail");
+  const body = await c.req.raw.text();
+  // Validate URL hostname against host allowlist
+  try {
+    const parsed = JSON.parse(body) as { url?: string };
+    if (parsed.url) {
+      const hostname = new URL(parsed.url).hostname.toLowerCase();
+      const checkRes = await proxyToSharedIndex(c.env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
+      const checkBody = (await checkRes.json()) as { allowed: boolean };
+      if (!checkBody.allowed) {
+        return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
+      }
+    }
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      return c.json({ error: "Invalid JSON" }, 400);
+    }
+    if (!(e instanceof TypeError)) throw e;
+  }
   return proxyToUserControl(c.env, email, "/mcp-configs", {
-    body: await c.req.raw.text(),
+    body,
     headers: { "content-type": "application/json" },
     method: "POST",
   });
@@ -419,6 +534,22 @@ app.delete("/api/mcp-configs/:id", async (c) => {
 
 app.post("/api/mcp-configs/:id/test", async (c) => {
   const email = c.get("userEmail");
+  // Fetch config to check URL against allowlist before testing connection
+  const configRes = await proxyToUserControl(c.env, email, "/mcp-configs");
+  if (configRes.ok) {
+    const configBody = (await configRes.json()) as { configs: Array<{ id: string; url?: string }> };
+    const config = configBody.configs.find((cfg) => cfg.id === c.req.param("id"));
+    if (config?.url) {
+      try {
+        const hostname = new URL(config.url).hostname.toLowerCase();
+        const checkRes = await proxyToSharedIndex(c.env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
+        const checkBody = (await checkRes.json()) as { allowed: boolean };
+        if (!checkBody.allowed) {
+          return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
+        }
+      } catch { /* URL parse error — let UserControl handle */ }
+    }
+  }
   return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}/test`, { method: "POST" });
 });
 
@@ -445,6 +576,15 @@ app.post("/api/passkey/init", async (c) => {
 app.post("/api/passkey/change", async (c) => {
   const email = c.get("userEmail");
   return proxyToUserControl(c.env, email, "/passkey/change", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.post("/api/passkey/rotate-server-key", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/passkey/rotate-server-key", {
     body: await c.req.raw.text(),
     headers: { "content-type": "application/json" },
     method: "POST",
@@ -509,15 +649,16 @@ app.get("/session", async (c) => {
   return proxyToUserControl(c.env, email, "/sessions");
 });
 
-// ─── Session ownership middleware ───
+// ─── Session ownership + permission middleware ───
 
 app.use("/session/:id/*", async (c, next) => {
   const email = c.get("userEmail");
   const sessionId = c.req.param("id");
-  const hasAccess = await verifySessionAccess(c.env, email, sessionId);
-  if (!hasAccess) {
+  const permission = await resolveSessionPermission(c.env, email, sessionId, c.req.raw);
+  if (!permission) {
     return c.json({ error: "Session not found or access denied" }, 403);
   }
+  c.set("sessionPermission", permission);
   return next();
 });
 
@@ -526,59 +667,160 @@ app.use("/session/:id", async (c, next) => {
   if (c.req.method === "POST") return next();
   const email = c.get("userEmail");
   const sessionId = c.req.param("id");
-  const hasAccess = await verifySessionAccess(c.env, email, sessionId);
-  if (!hasAccess) {
+  const permission = await resolveSessionPermission(c.env, email, sessionId, c.req.raw);
+  if (!permission) {
     return c.json({ error: "Session not found or access denied" }, 403);
   }
+  c.set("sessionPermission", permission);
   return next();
 });
 
-app.get("/session/:id", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/", { "x-owner-email": c.get("userEmail") }));
+app.get("/session/:id", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/", { "x-owner-email": c.get("userEmail") });
+});
 
 app.delete("/session/:id", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
   const sessionId = c.req.param("id");
   const email = c.get("userEmail");
-  const result = await proxyToAgent(c.req.raw, c.env, sessionId, "/");
+  const result = await proxyToAgent(c.req.raw, c.env, sessionId, "/", { "x-owner-email": email });
   await proxyToUserControl(c.env, email, `/sessions/${sessionId}`, { method: "DELETE" });
   return result;
 });
 
-app.get("/session/:id/messages", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/messages"));
+app.get("/session/:id/messages", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/messages");
+});
 
-app.get("/session/:id/prompts", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompts"));
+app.get("/session/:id/prompts", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompts");
+});
 
-app.get("/session/:id/cron", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/cron"));
+app.get("/session/:id/cron", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/cron");
+});
 
-app.get("/session/:id/events", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/events"));
+app.get("/session/:id/events", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/events");
+});
 
-app.get("/session/:id/files", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/files${new URL(c.req.raw.url).search}`));
+app.get("/session/:id/files", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/files${new URL(c.req.raw.url).search}`);
+});
 
-app.get("/session/:id/file", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`));
+app.get("/session/:id/file", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`);
+});
 
-app.put("/session/:id/file", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`));
+app.put("/session/:id/file", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`);
+});
 
-app.patch("/session/:id/file", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`));
+app.patch("/session/:id/file", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`);
+});
 
-app.delete("/session/:id/file", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`));
+app.delete("/session/:id/file", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`);
+});
 
-app.post("/session/:id/search", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/search"));
+app.post("/session/:id/search", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/search");
+});
 
-app.post("/session/:id/execute", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/execute"));
+app.post("/session/:id/execute", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/execute");
+});
 
-app.post("/session/:id/git/init", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/init"));
-app.post("/session/:id/git/clone", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/clone", { "x-owner-email": c.get("userEmail") }));
-app.post("/session/:id/git/add", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/add"));
-app.post("/session/:id/git/commit", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/commit"));
-app.post("/session/:id/git/branch", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/branch"));
-app.post("/session/:id/git/checkout", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/checkout"));
-app.post("/session/:id/git/pull", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/pull", { "x-owner-email": c.get("userEmail") }));
-app.post("/session/:id/git/push", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/push", { "x-owner-email": c.get("userEmail") }));
-app.post("/session/:id/git/remote", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/remote"));
-app.get("/session/:id/git/status", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/status${new URL(c.req.raw.url).search}`));
-app.get("/session/:id/git/log", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/log${new URL(c.req.raw.url).search}`));
-app.get("/session/:id/git/diff", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/diff${new URL(c.req.raw.url).search}`));
+app.post("/session/:id/git/init", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/init");
+});
+app.post("/session/:id/git/clone", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/clone", { "x-owner-email": c.get("userEmail") });
+});
+app.post("/session/:id/git/add", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/add");
+});
+app.post("/session/:id/git/commit", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/commit", { "x-owner-email": c.get("userEmail") });
+});
+app.post("/session/:id/git/branch", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/branch");
+});
+app.post("/session/:id/git/checkout", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/checkout");
+});
+app.post("/session/:id/git/pull", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/pull", { "x-owner-email": c.get("userEmail") });
+});
+app.post("/session/:id/git/push", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/push", { "x-owner-email": c.get("userEmail") });
+});
+app.post("/session/:id/git/remote", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/remote");
+});
+app.get("/session/:id/git/status", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/status${new URL(c.req.raw.url).search}`);
+});
+app.get("/session/:id/git/log", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/log${new URL(c.req.raw.url).search}`);
+});
+app.get("/session/:id/git/diff", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/diff${new URL(c.req.raw.url).search}`);
+});
 
 app.post("/session/:id/message", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
   const email = c.get("userEmail");
   const rl = messageLimiter.check(`msg:${email}`, 120, 60 * 60 * 1000);
   if (!rl.allowed) return rateLimitedResponse(rl, "message", email);
@@ -594,6 +836,8 @@ app.post("/session/:id/message", async (c) => {
 });
 
 app.post("/session/:id/prompt", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
   const email = c.get("userEmail");
   const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
   if (!rl.allowed) return rateLimitedResponse(rl, "prompt", email);
@@ -636,15 +880,27 @@ app.get("/session/:id/ws", async (c) => {
   }));
 });
 
-app.post("/session/:id/abort", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/abort"));
+app.post("/session/:id/abort", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/abort");
+});
 
-app.post("/session/:id/cron", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/cron"));
+app.post("/session/:id/cron", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/cron");
+});
 
-app.delete("/session/:id/cron/:cronId", async (c) =>
-  proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/cron/${encodeURIComponent(c.req.param("cronId"))}`),
-);
+app.delete("/session/:id/cron/:cronId", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/cron/${encodeURIComponent(c.req.param("cronId"))}`);
+});
 
 app.post("/session/:id/fork", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
   const email = c.get("userEmail");
   const sourceId = c.req.param("id");
   const sourceAgent = await getAgentByName(c.env.CODING_AGENT as never, sourceId);
@@ -682,6 +938,8 @@ app.post("/session/:id/fork", async (c) => {
 // ─── Share link management (session owner only) ───
 
 app.post("/session/:id/share", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
   const sessionId = c.req.param("id");
   const email = c.get("userEmail");
   const rl = shareLimiter.check(`share:${sessionId}`, 20, 60 * 60 * 1000);
@@ -704,11 +962,15 @@ app.post("/session/:id/share", async (c) => {
 });
 
 app.get("/session/:id/shares", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
   const sessionId = c.req.param("id");
   return proxyToSharedIndex(c.env, `/shares?sessionId=${encodeURIComponent(sessionId)}`);
 });
 
 app.delete("/session/:id/share/:shareId", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
   const shareId = c.req.param("shareId");
   const email = c.get("userEmail");
   log("info", "Share revoked", { email, sessionId: c.req.param("id"), shareId });
@@ -718,11 +980,15 @@ app.delete("/session/:id/share/:shareId", async (c) => {
 // ─── Permission management (session owner only) ───
 
 app.get("/session/:id/permissions", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
   const sessionId = c.req.param("id");
   return proxyToSharedIndex(c.env, `/permissions?sessionId=${encodeURIComponent(sessionId)}`);
 });
 
 app.post("/session/:id/permissions", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
   const sessionId = c.req.param("id");
   const email = c.get("userEmail");
   const body = await c.req.raw.json() as Record<string, unknown>;
@@ -740,6 +1006,8 @@ app.post("/session/:id/permissions", async (c) => {
 });
 
 app.delete("/session/:id/permissions/:email", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
   const sessionId = c.req.param("id");
   const granteeEmail = c.req.param("email");
   return proxyToSharedIndex(c.env, `/permissions/${encodeURIComponent(sessionId)}/${encodeURIComponent(granteeEmail)}`, { method: "DELETE" });

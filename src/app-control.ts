@@ -1,3 +1,5 @@
+/** @deprecated Use UserControl + SharedIndex instead. Kept only for one-time data migration. */
+
 import { z } from "zod";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
 import type { AllowlistEntry, AppConfig, Env, MemoryEntry, UpdateConfigRequest } from "./types";

@@ -112,6 +112,10 @@ export class CodingAgent extends Agent<Env, SessionState> {
       }
 
       if (request.method === "DELETE" && url.pathname === "/") {
+        const ownerEmail = request.headers.get("x-owner-email");
+        if (ownerEmail && !this.readMetadata("owner_email")) {
+          this.writeMetadata("owner_email", ownerEmail);
+        }
         const sid = this.sessionId();
         await this.syncSessionIndex({ status: "deleted" });
         await this.destroyStorage();
@@ -336,7 +340,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
         this.emitEvent({ data: this.readSessionDetails(), type: "state" });
 
         connection.send(JSON.stringify({ type: "prompt_queued", promptId }));
-        void this.runAsyncPrompt(promptId, content, llmConfig, title);
+        void this.runAsyncPrompt(promptId, content, llmConfig, title, entry?.email);
         break;
       }
 
@@ -553,6 +557,10 @@ export class CodingAgent extends Agent<Env, SessionState> {
 
   private async handleGitCommit(request: Request): Promise<Response> {
     const body = gitCommitSchema.parse(await request.json());
+    const ownerEmail = request.headers.get("x-owner-email");
+    if (ownerEmail && !this.readMetadata("owner_email")) {
+      this.writeMetadata("owner_email", ownerEmail);
+    }
     const git = createWorkspaceGit(this.workspace);
     const config = await this.readAppConfig();
     return Response.json(
@@ -662,7 +670,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
     this.writeMetadata("active_prompt_id", promptId);
     this.writeMetadata("status", "running");
     this.insertPrompt(promptId, payload.prompt, "queued", "cron");
-    await this.runAsyncPrompt(promptId, payload.prompt, await this.readAppConfig(), title);
+    await this.runAsyncPrompt(promptId, payload.prompt, await this.readAppConfig(), title, this.readMetadata("owner_email") ?? undefined);
   }
 
   private listCronJobs(): CronJobRecord[] {
@@ -718,15 +726,11 @@ export class CodingAgent extends Agent<Env, SessionState> {
     let snapshotInput: unknown;
     const snapshotId = url.searchParams.get("snapshotId");
     if (snapshotId) {
-      // Try UserControl first, fall back to AppControl
-      let response: Response;
-      if (ownerEmail) {
-        const stub = getUserControlStub(this.env, ownerEmail);
-        response = await stub.fetch(`https://user-control/fork-snapshots/${encodeURIComponent(snapshotId)}`);
-      } else {
-        const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
-        response = await stub.fetch(`https://app-control/fork-snapshots/${encodeURIComponent(snapshotId)}`);
+      if (!ownerEmail) {
+        throw new Error("Session has no owner_email. Run migration (POST /api/admin/migrate) to fix legacy sessions.");
       }
+      const stub = getUserControlStub(this.env, ownerEmail);
+      const response = await stub.fetch(`https://user-control/fork-snapshots/${encodeURIComponent(snapshotId)}`);
       snapshotInput = await response.json();
     } else {
       snapshotInput = await request.json();
@@ -774,6 +778,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
       const llmConfig = this.readGatewayConfig(request);
       const history = this.recentMessages().map((m) => ({ content: m.content, role: m.role }));
       const result = await streamAgenticChat({
+        authorEmail: authorEmail ?? undefined,
         config: llmConfig,
         env: this.env,
         messages: history,
@@ -783,6 +788,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
         onToolCall: (tc) => {
           this.emitEvent({ data: { code: tc.code, result: tc.result }, type: "tool_call" });
         },
+        ownerEmail: this.readMetadata("owner_email") ?? undefined,
         systemPrompt: SYSTEM_PROMPT,
         workspace: this.workspace,
       });
@@ -835,7 +841,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
     await this.syncSessionIndex({ status: "running", title });
 
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-    void this.runAsyncPrompt(promptId, input.content, llmConfig, title);
+    void this.runAsyncPrompt(promptId, input.content, llmConfig, title, authorEmail ?? undefined);
 
     return Response.json({ promptId, status: "queued" }, { status: 202 });
   }
@@ -856,7 +862,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
     return Response.json({ aborted: true, promptId });
   }
 
-  private async runAsyncPrompt(promptId: string, content: string, llmConfig: AppConfig, title: string): Promise<void> {
+  private async runAsyncPrompt(promptId: string, content: string, llmConfig: AppConfig, title: string, authorEmail?: string): Promise<void> {
     const controller = new AbortController();
     this.activePromptControllers.set(promptId, controller);
     this.updatePrompt(promptId, { status: "running" });
@@ -873,9 +879,11 @@ export class CodingAgent extends Agent<Env, SessionState> {
     try {
       const history = this.recentMessages().map((m) => ({ content: m.content, role: m.role }));
       const result = await runAgenticChat({
+        authorEmail,
         config: llmConfig,
         env: this.env,
         messages: history,
+        ownerEmail: this.readMetadata("owner_email") ?? undefined,
         signal: controller.signal,
         systemPrompt: SYSTEM_PROMPT,
         workspace: this.workspace,
@@ -1192,31 +1200,21 @@ export class CodingAgent extends Agent<Env, SessionState> {
 
   private async readAppConfig(): Promise<AppConfig> {
     const ownerEmail = this.readMetadata("owner_email");
-    if (ownerEmail) {
-      const stub = getUserControlStub(this.env, ownerEmail);
-      const response = await stub.fetch("https://user-control/config");
-      return (await response.json()) as AppConfig;
+    if (!ownerEmail) {
+      throw new Error("Session has no owner_email. Run migration (POST /api/admin/migrate) to fix legacy sessions.");
     }
-    // Fallback to AppControl for pre-migration sessions
-    const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
-    const response = await stub.fetch("https://app-control/config");
+    const stub = getUserControlStub(this.env, ownerEmail);
+    const response = await stub.fetch("https://user-control/config");
     return (await response.json()) as AppConfig;
   }
 
   private async syncSessionIndex(patch: { status?: string; title?: string | null }): Promise<void> {
     const ownerEmail = this.readMetadata("owner_email");
-    if (ownerEmail) {
-      const stub = getUserControlStub(this.env, ownerEmail);
-      await stub.fetch("https://user-control/sessions/" + this.sessionId(), {
-        body: JSON.stringify(patch),
-        headers: { "content-type": "application/json" },
-        method: "PATCH",
-      });
-      return;
+    if (!ownerEmail) {
+      throw new Error("Session has no owner_email. Run migration (POST /api/admin/migrate) to fix legacy sessions.");
     }
-    // Fallback to AppControl for pre-migration sessions
-    const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
-    await stub.fetch("https://app-control/sessions/" + this.sessionId(), {
+    const stub = getUserControlStub(this.env, ownerEmail);
+    await stub.fetch("https://user-control/sessions/" + this.sessionId(), {
       body: JSON.stringify(patch),
       headers: { "content-type": "application/json" },
       method: "PATCH",

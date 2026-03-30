@@ -9,6 +9,8 @@ export interface McpGatekeeperConfig {
   type: "http" | "service-binding";
   url?: string;
   headers?: Record<string, string>;
+  /** Header key names (without values) for display purposes. */
+  headerKeys?: string[];
   enabled: boolean;
 }
 

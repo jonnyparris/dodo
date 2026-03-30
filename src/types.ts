@@ -22,7 +22,7 @@ export interface Env {
   USER_CONTROL: DurableObjectNamespace;
   SHARED_INDEX: DurableObjectNamespace;
 
-  // Keep APP_CONTROL for migration / fallback (removed in v3)
+  /** @deprecated Kept for migration only */
   APP_CONTROL: DurableObjectNamespace;
 
   // Secrets (wrangler secret)
