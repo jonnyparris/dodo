@@ -480,6 +480,34 @@ app.post("/session/:id/prompt", async (c) => {
   });
 });
 
+app.get("/session/:id/ws", async (c) => {
+  const upgradeHeader = c.req.header("Upgrade");
+  if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+    return c.json({ error: "Expected WebSocket upgrade" }, 426);
+  }
+
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const agent = await getAgentByName(c.env.CODING_AGENT as never, sessionId);
+
+  // Forward WebSocket upgrade to the CodingAgent DO
+  const url = new URL(c.req.url);
+  const wsUrl = new URL("https://coding-agent/ws");
+  wsUrl.searchParams.set("email", email);
+  wsUrl.searchParams.set("displayName", email);
+  wsUrl.searchParams.set("permission", "readwrite");
+  // Preserve any extra query params from the original request
+  for (const [key, value] of url.searchParams) {
+    if (!wsUrl.searchParams.has(key)) {
+      wsUrl.searchParams.set(key, value);
+    }
+  }
+
+  return agent.fetch(new Request(wsUrl.toString(), {
+    headers: c.req.raw.headers,
+  }));
+});
+
 app.post("/session/:id/abort", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/abort"));
 
 app.post("/session/:id/cron", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/cron"));

@@ -1,11 +1,12 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
-import { Agent } from "agents";
+import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import { z } from "zod";
 import { runAgenticChat, streamAgenticChat } from "./agentic";
 import { getUserControlStub } from "./auth";
 import { sendNotification } from "./notify";
 import { runSandboxedCode } from "./executor";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
+import { PresenceTracker } from "./presence";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
 
@@ -71,6 +72,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
   private readonly activePromptControllers = new Map<string, AbortController>();
   private readonly clients = new Set<WritableStreamDefaultWriter<Uint8Array>>();
   private readonly db: SqlHelper;
+  private readonly presence = new PresenceTracker();
   private readonly stateBackend;
   private readonly workspace: Workspace;
 
@@ -100,6 +102,11 @@ export class CodingAgent extends Agent<Env, SessionState> {
     const url = new URL(request.url);
 
     try {
+      if (request.method === "GET" && url.pathname === "/ws") {
+        // Non-WebSocket request to the WS endpoint
+        return new Response("Expected WebSocket upgrade", { status: 426 });
+      }
+
       if (request.method === "GET" && url.pathname === "/") {
         return Response.json(this.readSessionDetails());
       }
@@ -236,6 +243,165 @@ export class CodingAgent extends Agent<Env, SessionState> {
       const message = error instanceof Error ? error.message : "Unexpected request failure";
       return Response.json({ error: message }, { status: 400 });
     }
+  }
+
+  // ─── WebSocket lifecycle (Agent SDK / partyserver) ───
+
+  async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    const url = new URL(ctx.request.url);
+    const email = url.searchParams.get("email") ?? "anonymous";
+    const displayName = url.searchParams.get("displayName") ?? email;
+    const permission = url.searchParams.get("permission") ?? "readwrite";
+
+    this.presence.join(connection.id, {
+      connectedAt: Date.now(),
+      displayName,
+      email,
+      permission,
+    });
+
+    // Send ready message with current state and presence
+    const readyPayload = JSON.stringify({
+      type: "ready",
+      state: this.readSessionDetails(),
+      presence: this.presence.getAll(),
+      messages: this.listMessages().slice(-20),
+    });
+    connection.send(readyPayload);
+
+    // Broadcast updated presence to all WebSocket clients
+    this.broadcastPresence();
+  }
+
+  async onMessage(connection: Connection, message: WSMessage): Promise<void> {
+    if (typeof message !== "string") return;
+
+    this.presence.updateActivity(connection.id);
+
+    let parsed: { type: string; [key: string]: unknown };
+    try {
+      parsed = JSON.parse(message);
+    } catch {
+      connection.send(JSON.stringify({ type: "error", error: "Invalid JSON" }));
+      return;
+    }
+
+    switch (parsed.type) {
+      case "ping":
+        connection.send(JSON.stringify({ type: "pong" }));
+        break;
+
+      case "typing": {
+        const isTyping = Boolean(parsed.isTyping);
+        this.presence.setTyping(connection.id, isTyping);
+        const entry = this.presence.get(connection.id);
+        if (entry) {
+          this.broadcastToWebSockets(JSON.stringify({
+            type: "typing",
+            email: entry.email,
+            isTyping,
+          }), connection.id);
+        }
+        break;
+      }
+
+      case "prompt": {
+        const content = typeof parsed.content === "string" ? parsed.content.trim() : "";
+        if (!content) {
+          connection.send(JSON.stringify({ type: "error", error: "Empty prompt content" }));
+          return;
+        }
+        // Delegate to the existing prompt mechanism via internal request
+        const entry = this.presence.get(connection.id);
+        const promptId = crypto.randomUUID();
+        const sessionId = this.sessionId();
+        if (!sessionId) {
+          connection.send(JSON.stringify({ type: "error", error: "Session not initialized" }));
+          return;
+        }
+
+        if (this.readMetadata("active_prompt_id")) {
+          connection.send(JSON.stringify({ type: "error", error: "A prompt is already running" }));
+          return;
+        }
+
+        const llmConfig = await this.readAppConfig();
+        const title = this.readMetadata("title") ?? content.slice(0, 72);
+
+        this.writeMetadata("title", title);
+        this.writeMetadata("active_prompt_id", promptId);
+        this.writeMetadata("status", "running");
+        this.insertPrompt(promptId, content, "queued", entry?.email);
+        await this.syncSessionIndex({ status: "running", title });
+        this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+
+        connection.send(JSON.stringify({ type: "prompt_queued", promptId }));
+        void this.runAsyncPrompt(promptId, content, llmConfig, title);
+        break;
+      }
+
+      case "abort": {
+        const promptId = this.readMetadata("active_prompt_id");
+        if (!promptId) {
+          connection.send(JSON.stringify({ type: "error", error: "No active prompt" }));
+          return;
+        }
+        const controller = this.activePromptControllers.get(promptId);
+        if (controller) {
+          controller.abort();
+        } else {
+          await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
+        }
+        connection.send(JSON.stringify({ type: "aborted", promptId }));
+        break;
+      }
+
+      default:
+        connection.send(JSON.stringify({ type: "error", error: `Unknown message type: ${parsed.type}` }));
+    }
+  }
+
+  async onClose(connection: Connection): Promise<void> {
+    const hadEntry = this.presence.has(connection.id);
+    this.presence.leave(connection.id);
+    if (hadEntry) {
+      this.broadcastPresence();
+    }
+  }
+
+  async onError(connectionOrError: Connection | unknown, error?: unknown): Promise<void> {
+    // Handle the Connection overload
+    if (connectionOrError && typeof connectionOrError === "object" && "id" in connectionOrError) {
+      const connection = connectionOrError as Connection;
+      this.presence.leave(connection.id);
+      this.broadcastPresence();
+    }
+  }
+
+  /** Broadcast a JSON message to all connected WebSocket clients (excluding one). */
+  private broadcastToWebSockets(message: string, excludeId?: string): void {
+    for (const conn of this.getConnections()) {
+      if (excludeId && conn.id === excludeId) continue;
+      try {
+        conn.send(message);
+      } catch {
+        // connection may have closed
+      }
+    }
+  }
+
+  /** Broadcast current presence list to all WebSocket clients. */
+  private broadcastPresence(): void {
+    const payload = JSON.stringify({
+      type: "presence",
+      users: this.presence.getAll(),
+    });
+    this.broadcastToWebSockets(payload);
+  }
+
+  /** Get current presence entries (used by RPC API). */
+  getPresenceEntries() {
+    return this.presence.getAll();
   }
 
   private initializeSchema(): void {
@@ -982,11 +1148,16 @@ export class CodingAgent extends Agent<Env, SessionState> {
   }
 
   private emitEvent(event: SessionEvent): void {
+    // Broadcast to SSE clients
     for (const writer of [...this.clients]) {
       void this.writeEvent(writer, event).catch(() => {
         this.clients.delete(writer);
       });
     }
+
+    // Broadcast to WebSocket clients
+    const wsPayload = JSON.stringify({ type: event.type, ...event.data as object });
+    this.broadcastToWebSockets(wsPayload);
   }
 
   private requireSessionId(request: Request): string {
