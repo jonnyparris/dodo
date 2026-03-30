@@ -195,6 +195,31 @@ app.all("/mcp", async (c) => {
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
+// ─── Bootstrap (one-time, only works when no users exist) ───
+
+app.post("/api/bootstrap", async (c) => {
+  const stub = getSharedIndexStub(c.env);
+  const usersResp = await stub.fetch("https://shared-index/users");
+  const { users } = (await usersResp.json()) as { users: unknown[] };
+  if (users.length > 0) {
+    return c.json({ error: "Already bootstrapped — users exist" }, 409);
+  }
+  const adminEmail = c.env.ADMIN_EMAIL;
+  if (!adminEmail) {
+    return c.json({ error: "ADMIN_EMAIL not configured" }, 500);
+  }
+  const addResp = await stub.fetch("https://shared-index/users", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: adminEmail, role: "admin" }),
+  });
+  if (!addResp.ok) {
+    return c.json({ error: "Failed to seed admin user" }, 500);
+  }
+  log("info", "Bootstrap: admin user seeded", { email: adminEmail });
+  return c.json({ bootstrapped: true, adminEmail }, 201);
+});
+
 // ─── Cap'n Web RPC (public API; auth via authenticate() method) ───
 
 app.all("/rpc", async (c) => {
@@ -240,7 +265,7 @@ app.get("/shared/:token", async (c) => {
 
 app.use("*", async (c, next) => {
   const path = new URL(c.req.raw.url).pathname;
-  if (path === "/health" || path === "/mcp" || path === "/rpc" || path.startsWith("/shared/")) return next();
+  if (path === "/health" || path === "/api/bootstrap" || path === "/mcp" || path === "/rpc" || path.startsWith("/shared/")) return next();
 
   let identity: AccessIdentity;
   try {
