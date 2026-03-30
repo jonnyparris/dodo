@@ -2,8 +2,10 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import { createCodeTool } from "@cloudflare/codemode/ai";
 import { stateTools } from "@cloudflare/shell/workers";
-import { generateText, streamText, stepCountIs, type ModelMessage } from "ai";
+import { generateText, streamText, stepCountIs, tool, zodSchema, type ModelMessage } from "ai";
+import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
+import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
 import type { AppConfig, Env } from "./types";
 
 const MAX_TOOL_STEPS = 10;
@@ -40,12 +42,143 @@ function buildProvider(config: AppConfig, env: Env) {
   });
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyTool = any;
+
+function buildGitTools(
+  env: Env,
+  workspace: Workspace,
+  config: AppConfig,
+  ownerEmail?: string,
+): Record<string, AnyTool> {
+  const git = createWorkspaceGit(workspace);
+
+  const dirSchema = zodSchema(z.object({ dir: z.string().optional().describe("Repo directory") }));
+
+  return {
+    git_clone: tool({
+      description: "Clone a git repo into the workspace. Auth is automatic for GitHub/GitLab.",
+      inputSchema: zodSchema(z.object({
+        url: z.string().describe("Git repo URL (e.g. https://github.com/owner/repo)"),
+        dir: z.string().optional().describe("Target directory (default: repo name)"),
+        branch: z.string().optional().describe("Branch to clone"),
+        depth: z.number().optional().describe("Shallow clone depth"),
+      })),
+      execute: async ({ url, dir, branch, depth }) => {
+        const token = await resolveRemoteToken({ dir, env, git, url, ownerEmail });
+        return git.clone({ branch, depth, dir, singleBranch: true, token, url });
+      },
+    }),
+
+    git_status: tool({
+      description: "Show working tree status (modified, added, deleted files).",
+      inputSchema: dirSchema,
+      execute: async ({ dir }) => {
+        const entries = await git.status({ dir });
+        return { entries };
+      },
+    }),
+
+    git_add: tool({
+      description: "Stage files for commit.",
+      inputSchema: zodSchema(z.object({
+        filepath: z.string().describe("File or directory to stage (use '.' for all)"),
+        dir: z.string().optional().describe("Repo directory"),
+      })),
+      execute: async ({ filepath, dir }) => git.add({ dir, filepath }),
+    }),
+
+    git_commit: tool({
+      description: "Commit staged changes.",
+      inputSchema: zodSchema(z.object({
+        message: z.string().describe("Commit message"),
+        dir: z.string().optional().describe("Repo directory"),
+      })),
+      execute: async ({ message, dir }) =>
+        git.commit({ author: defaultAuthor(config), dir, message }),
+    }),
+
+    git_push: tool({
+      description: "Push commits to the remote.",
+      inputSchema: zodSchema(z.object({
+        dir: z.string().optional().describe("Repo directory"),
+        remote: z.string().optional().describe("Remote name (default: origin)"),
+        ref: z.string().optional().describe("Branch ref to push"),
+        force: z.boolean().optional().describe("Force push"),
+      })),
+      execute: async ({ dir, remote, ref, force }) => {
+        const token = await resolveRemoteToken({ dir, env, git, remote, ownerEmail });
+        return git.push({ dir, force, ref, remote, token });
+      },
+    }),
+
+    git_branch: tool({
+      description: "List, create, or delete branches.",
+      inputSchema: zodSchema(z.object({
+        dir: z.string().optional().describe("Repo directory"),
+        name: z.string().optional().describe("Branch name to create"),
+        list: z.boolean().optional().describe("List all branches"),
+        delete: z.string().optional().describe("Branch name to delete"),
+      })),
+      execute: async ({ dir, name, list, delete: del }) =>
+        git.branch({ delete: del, dir, list, name }),
+    }),
+
+    git_checkout: tool({
+      description: "Switch branches or restore files.",
+      inputSchema: zodSchema(z.object({
+        dir: z.string().optional().describe("Repo directory"),
+        branch: z.string().optional().describe("Branch to checkout"),
+        ref: z.string().optional().describe("Ref (commit/tag) to checkout"),
+        force: z.boolean().optional().describe("Force checkout"),
+      })),
+      execute: async ({ dir, branch, ref, force }) =>
+        git.checkout({ branch, dir, force, ref }),
+    }),
+
+    git_diff: tool({
+      description: "Show unstaged changes in the working tree.",
+      inputSchema: dirSchema,
+      execute: async ({ dir }) => {
+        const entries = await git.diff({ dir });
+        return { entries };
+      },
+    }),
+
+    git_log: tool({
+      description: "Show commit history.",
+      inputSchema: zodSchema(z.object({
+        dir: z.string().optional().describe("Repo directory"),
+        depth: z.number().optional().describe("Number of commits to show"),
+      })),
+      execute: async ({ dir, depth }) => {
+        const entries = await git.log({ depth, dir });
+        return { entries };
+      },
+    }),
+
+    git_pull: tool({
+      description: "Pull changes from the remote.",
+      inputSchema: zodSchema(z.object({
+        dir: z.string().optional().describe("Repo directory"),
+        remote: z.string().optional().describe("Remote name (default: origin)"),
+        ref: z.string().optional().describe("Branch ref to pull"),
+      })),
+      execute: async ({ dir, remote, ref }) => {
+        const token = await resolveRemoteToken({ dir, env, git, remote, ownerEmail });
+        return git.pull({ author: defaultAuthor(config), dir, ref, remote, token });
+      },
+    }),
+  };
+}
+
 function buildTools(
   env: Env,
   workspace: Workspace,
+  config: AppConfig,
   options?: { authorEmail?: string; ownerEmail?: string },
-): Record<string, ReturnType<typeof createCodeTool>> {
-  const tools: Record<string, ReturnType<typeof createCodeTool>> = {};
+): Record<string, AnyTool> {
+  const tools: Record<string, AnyTool> = {};
 
   if (env.LOADER) {
     const executor = new DynamicWorkerExecutor({
@@ -59,6 +192,9 @@ function buildTools(
       tools: [stateTools(workspace)],
     });
   }
+
+  // Git tools — always available
+  Object.assign(tools, buildGitTools(env, workspace, config, options?.ownerEmail));
 
   // Memory tools: only include for session owner.
   // When memory tools are added to the agentic loop's tool set:
@@ -139,7 +275,7 @@ export async function runAgenticChat(input: {
 }): Promise<AgenticResult> {
   const provider = buildProvider(input.config, input.env);
   const model = provider.chatModel(input.config.model);
-  const tools = buildTools(input.env, input.workspace, {
+  const tools = buildTools(input.env, input.workspace, input.config, {
     authorEmail: input.authorEmail,
     ownerEmail: input.ownerEmail,
   });
@@ -184,7 +320,7 @@ export async function streamAgenticChat(input: {
 }): Promise<AgenticResult> {
   const provider = buildProvider(input.config, input.env);
   const model = provider.chatModel(input.config.model);
-  const tools = buildTools(input.env, input.workspace, {
+  const tools = buildTools(input.env, input.workspace, input.config, {
     authorEmail: input.authorEmail,
     ownerEmail: input.ownerEmail,
   });
