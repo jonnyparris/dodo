@@ -25,6 +25,23 @@ async function fetchJson(path: string, init?: RequestInit): Promise<Response> {
   return response;
 }
 
+function getSharedIndexStub(): DurableObjectStub {
+  const testEnv = env as Env;
+  return testEnv.SHARED_INDEX.get(testEnv.SHARED_INDEX.idFromName("global"));
+}
+
+async function addAllowlistDirect(hostname: string): Promise<Response> {
+  return getSharedIndexStub().fetch("https://shared-index/allowlist", {
+    body: JSON.stringify({ hostname }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+}
+
+async function removeAllowlistDirect(hostname: string): Promise<Response> {
+  return getSharedIndexStub().fetch(`https://shared-index/allowlist/${encodeURIComponent(hostname)}`, { method: "DELETE" });
+}
+
 describe("SharedIndex DO", () => {
   // Warm up: absorb any DO invalidation from module changes between test files
   beforeAll(async () => {
@@ -40,27 +57,19 @@ describe("SharedIndex DO", () => {
   const TEST_HOST_A = "si-test-alpha.example.org";
   const TEST_HOST_B = "si-test-bravo.example.org";
 
-  it("host allowlist: add → listed → check true → remove → check false", async () => {
-    // Add host A
-    const addA = await fetchJson("/api/allowlist", {
-      body: JSON.stringify({ hostname: TEST_HOST_A }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    });
+  it("host allowlist: add → listed → check true → remove → check false (via direct DO)", async () => {
+    // Add host A via direct DO access
+    const addA = await addAllowlistDirect(TEST_HOST_A);
     expect(addA.status).toBe(201);
     const addedA = (await addA.json()) as { hostname: string; createdAt: string };
     expect(addedA.hostname).toBe(TEST_HOST_A);
     expect(addedA.createdAt).toBeTruthy();
 
     // Add host B
-    const addB = await fetchJson("/api/allowlist", {
-      body: JSON.stringify({ hostname: TEST_HOST_B }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    });
+    const addB = await addAllowlistDirect(TEST_HOST_B);
     expect(addB.status).toBe(201);
 
-    // List — both should appear
+    // List via API — both should appear (GET is not admin-gated)
     const listRes = await fetchJson("/api/allowlist");
     expect(listRes.status).toBe(200);
     const list = (await listRes.json()) as { hosts: Array<{ hostname: string }> };
@@ -78,8 +87,8 @@ describe("SharedIndex DO", () => {
     expect(checkABody.allowed).toBe(true);
     expect(checkABody.hostname).toBe(TEST_HOST_A);
 
-    // Remove host A
-    const removeA = await fetchJson(`/api/allowlist/${encodeURIComponent(TEST_HOST_A)}`, { method: "DELETE" });
+    // Remove host A via direct DO access
+    const removeA = await removeAllowlistDirect(TEST_HOST_A);
     expect(removeA.status).toBe(200);
     const removeABody = (await removeA.json()) as { deleted: boolean; hostname: string };
     expect(removeABody.deleted).toBe(true);
@@ -96,18 +105,26 @@ describe("SharedIndex DO", () => {
     expect(checkBBody.allowed).toBe(true);
 
     // Cleanup: remove host B
-    await fetchJson(`/api/allowlist/${encodeURIComponent(TEST_HOST_B)}`, { method: "DELETE" });
+    await removeAllowlistDirect(TEST_HOST_B);
+  });
+
+  it("allowlist write routes return 403 for non-admin", async () => {
+    const postRes = await fetchJson("/api/allowlist", {
+      body: JSON.stringify({ hostname: "admin-only.example.org" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(postRes.status).toBe(403);
+
+    const deleteRes = await fetchJson("/api/allowlist/admin-only.example.org", { method: "DELETE" });
+    expect(deleteRes.status).toBe(403);
   });
 
   it("host allowlist normalizes hostnames to lowercase", async () => {
     const host = "SI-TEST-UPPERCASE.Example.Org";
     const normalized = "si-test-uppercase.example.org";
 
-    const addRes = await fetchJson("/api/allowlist", {
-      body: JSON.stringify({ hostname: host }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    });
+    const addRes = await addAllowlistDirect(host);
     expect(addRes.status).toBe(201);
     const added = (await addRes.json()) as { hostname: string };
     expect(added.hostname).toBe(normalized);
@@ -118,7 +135,7 @@ describe("SharedIndex DO", () => {
     expect(checkBody.allowed).toBe(true);
 
     // Cleanup
-    await fetchJson(`/api/allowlist/${encodeURIComponent(normalized)}`, { method: "DELETE" });
+    await removeAllowlistDirect(normalized);
   });
 
   it("models endpoint returns an array", async () => {

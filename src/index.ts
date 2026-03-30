@@ -377,7 +377,7 @@ app.put("/api/config", async (c) => {
 
 app.get("/api/allowlist", async (c) => proxyToSharedIndex(c.env, "/allowlist"));
 
-app.post("/api/allowlist", async (c) =>
+app.post("/api/allowlist", adminGuard as never, async (c) =>
   proxyToSharedIndex(c.env, "/allowlist", {
     body: await c.req.raw.text(),
     headers: { "content-type": "application/json" },
@@ -385,7 +385,7 @@ app.post("/api/allowlist", async (c) =>
   }),
 );
 
-app.delete("/api/allowlist/:hostname", async (c) =>
+app.delete("/api/allowlist/:hostname", adminGuard as never, async (c) =>
   proxyToSharedIndex(c.env, `/allowlist/${encodeURIComponent(c.req.param("hostname"))}`, { method: "DELETE" }),
 );
 
@@ -913,6 +913,7 @@ app.get("/session/:id/ws", async (c) => {
 
   const email = c.get("userEmail");
   const sessionId = c.req.param("id");
+  const permission = c.get("sessionPermission") ?? "readonly";
   const agent = await getAgentByName(c.env.CODING_AGENT as never, sessionId);
 
   // Forward WebSocket upgrade to the CodingAgent DO
@@ -920,7 +921,7 @@ app.get("/session/:id/ws", async (c) => {
   const wsUrl = new URL("https://coding-agent/ws");
   wsUrl.searchParams.set("email", email);
   wsUrl.searchParams.set("displayName", email);
-  wsUrl.searchParams.set("permission", "readwrite");
+  wsUrl.searchParams.set("permission", permission);
   // Preserve any extra query params from the original request
   for (const [key, value] of url.searchParams) {
     if (!wsUrl.searchParams.has(key)) {

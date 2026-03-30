@@ -30,6 +30,16 @@ async function fetchJson(path: string, init?: RequestInit): Promise<Response> {
   return response;
 }
 
+async function addAllowlistDirect(hostname: string): Promise<void> {
+  const testEnv = env as Env;
+  const stub = testEnv.SHARED_INDEX.get(testEnv.SHARED_INDEX.idFromName("global"));
+  await stub.fetch("https://shared-index/allowlist", {
+    body: JSON.stringify({ hostname }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+}
+
 async function createSession(): Promise<string> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const response = await fetchJson("/session", { method: "POST" });
@@ -263,6 +273,9 @@ describe("MCP credential encryption", () => {
       headers: { "content-type": "application/json" },
       method: "POST",
     });
+    // Add test hosts to allowlist via direct DO access (write routes are admin-only)
+    await addAllowlistDirect("mcp.example.com");
+    await addAllowlistDirect("mcp-secrets.example.com");
   });
 
   it("create MCP config stores headerKeys not header values", async () => {
@@ -277,58 +290,26 @@ describe("MCP credential encryption", () => {
       headers: { "content-type": "application/json" },
       method: "POST",
     });
-    // May be 403 if host not on allowlist — add host first
-    if (createRes.status === 403) {
-      // Add host to allowlist and retry
-      await fetchJson("/api/allowlist", {
-        body: JSON.stringify({ hostname: "mcp.example.com" }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      });
-      const retryRes = await fetchJson("/api/mcp-configs", {
-        body: JSON.stringify({
-          name: "Encrypted Test",
-          type: "http",
-          url: "https://mcp.example.com/v1",
-          headers: { Authorization: "Bearer secret-token", "X-Custom": "custom-value" },
-          enabled: true,
-        }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      });
-      expect(retryRes.status).toBe(201);
-      const body = (await retryRes.json()) as { id: string; headerKeys?: string[]; headers?: Record<string, string> };
-      expect(body.headerKeys).toEqual(expect.arrayContaining(["Authorization", "X-Custom"]));
-      // Header values should NOT be exposed
-      expect(body.headers).toBeUndefined();
+    expect(createRes.status).toBe(201);
+    const body = (await createRes.json()) as { id: string; headerKeys?: string[]; headers?: Record<string, string> };
+    expect(body.headerKeys).toEqual(expect.arrayContaining(["Authorization", "X-Custom"]));
+    // Header values should NOT be exposed
+    expect(body.headers).toBeUndefined();
 
-      // Verify in listing too
-      const listRes = await fetchJson("/api/mcp-configs");
-      const listBody = (await listRes.json()) as { configs: Array<{ id: string; headerKeys?: string[]; headers?: Record<string, string> }> };
-      const config = listBody.configs.find((c) => c.id === body.id);
-      expect(config).toBeTruthy();
-      expect(config!.headers).toBeUndefined();
-      expect(config!.headerKeys).toEqual(expect.arrayContaining(["Authorization", "X-Custom"]));
+    // Verify in listing too
+    const listRes = await fetchJson("/api/mcp-configs");
+    const listBody = (await listRes.json()) as { configs: Array<{ id: string; headerKeys?: string[]; headers?: Record<string, string> }> };
+    const config = listBody.configs.find((c) => c.id === body.id);
+    expect(config).toBeTruthy();
+    expect(config!.headers).toBeUndefined();
+    expect(config!.headerKeys).toEqual(expect.arrayContaining(["Authorization", "X-Custom"]));
 
-      // Cleanup
-      await fetchJson(`/api/mcp-configs/${body.id}`, { method: "DELETE" });
-    } else {
-      expect(createRes.status).toBe(201);
-      const body = (await createRes.json()) as { id: string; headerKeys?: string[]; headers?: Record<string, string> };
-      expect(body.headerKeys).toEqual(expect.arrayContaining(["Authorization", "X-Custom"]));
-      expect(body.headers).toBeUndefined();
-      await fetchJson(`/api/mcp-configs/${body.id}`, { method: "DELETE" });
-    }
+    // Cleanup
+    await fetchJson(`/api/mcp-configs/${body.id}`, { method: "DELETE" });
   });
 
   it("secrets are created for MCP header values", async () => {
-    // Ensure host is on allowlist
-    await fetchJson("/api/allowlist", {
-      body: JSON.stringify({ hostname: "mcp-secrets.example.com" }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    });
-
+    // Host already added to allowlist in beforeAll via direct DO access
     const createRes = await fetchJson("/api/mcp-configs", {
       body: JSON.stringify({
         name: "Secrets Test",
@@ -385,12 +366,8 @@ describe("MCP URL allowlist check", () => {
   });
 
   it("allows MCP config creation for host on allowlist", async () => {
-    // Add host to allowlist first
-    await fetchJson("/api/allowlist", {
-      body: JSON.stringify({ hostname: "allowed-mcp.example.com" }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    });
+    // Add host to allowlist via direct DO access (write routes are admin-only)
+    await addAllowlistDirect("allowed-mcp.example.com");
 
     const res = await fetchJson("/api/mcp-configs", {
       body: JSON.stringify({

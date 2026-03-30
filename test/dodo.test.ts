@@ -165,18 +165,36 @@ describe("Dodo foundation", () => {
     expect(messages.messages[1].role).toBe("assistant");
   });
 
-  it("manages global allowlist and memory entries", async () => {
+  it("allowlist write routes require admin", async () => {
+    // POST /api/allowlist requires admin — non-admin gets 403
     const allowlistCreate = await fetchJson("/api/allowlist", {
       body: JSON.stringify({ hostname: "example.com" }),
       headers: { "content-type": "application/json" },
       method: "POST",
     });
-    expect(allowlistCreate.status).toBe(201);
+    expect(allowlistCreate.status).toBe(403);
 
+    // DELETE /api/allowlist/:hostname requires admin — non-admin gets 403
+    const allowlistDelete = await fetchJson("/api/allowlist/example.com", { method: "DELETE" });
+    expect(allowlistDelete.status).toBe(403);
+
+    // Add via direct DO access for subsequent read test
+    const testEnv = env as Env;
+    const stub = testEnv.SHARED_INDEX.get(testEnv.SHARED_INDEX.idFromName("global"));
+    await stub.fetch("https://shared-index/allowlist", {
+      body: JSON.stringify({ hostname: "example.com" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+
+    // GET /api/allowlist is still accessible to authenticated users
     const allowlistRead = await fetchJson("/api/allowlist");
+    expect(allowlistRead.status).toBe(200);
     const allowlist = (await allowlistRead.json()) as { hosts: Array<{ hostname: string }> };
     expect(allowlist.hosts).toEqual(expect.arrayContaining([expect.objectContaining({ hostname: "example.com" })]));
+  });
 
+  it("manages memory entries", async () => {
     const memoryCreate = await fetchJson("/api/memory", {
       body: JSON.stringify({ content: "Remember to deploy Dodo", tags: ["ops"], title: "Deploy note" }),
       headers: { "content-type": "application/json" },

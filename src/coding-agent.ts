@@ -7,6 +7,7 @@ import { sendNotification } from "./notify";
 import { runSandboxedCode } from "./executor";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
 import { PresenceTracker } from "./presence";
+import { AgentConnectionTransport } from "./rpc-transport";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
 
@@ -74,6 +75,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
   private readonly db: SqlHelper;
   private readonly presence = new PresenceTracker();
   private readonly stateBackend;
+  private readonly transports = new Map<string, AgentConnectionTransport>();
   private readonly workspace: Workspace;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -290,6 +292,15 @@ export class CodingAgent extends Agent<Env, SessionState> {
     const permission = url.searchParams.get("permission") ?? "readwrite";
     const lastMessageCountParam = url.searchParams.get("lastMessageCount");
 
+    // Cap'n Web RPC protocol — store transport for message routing
+    if (url.searchParams.get("protocol") === "capnweb") {
+      const transport = new AgentConnectionTransport(connection);
+      this.transports.set(connection.id, transport);
+      // Future: create RpcSession with transport and wire to DodoPublicApi
+      // For now, the transport is stored so onMessage can route to it.
+      return;
+    }
+
     this.presence.join(connection.id, {
       connectedAt: Date.now(),
       displayName,
@@ -324,6 +335,13 @@ export class CodingAgent extends Agent<Env, SessionState> {
 
   async onMessage(connection: Connection, message: WSMessage): Promise<void> {
     if (typeof message !== "string") return;
+
+    // Route Cap'n Web RPC messages to the stored transport
+    const transport = this.transports.get(connection.id);
+    if (transport) {
+      transport.deliver(message);
+      return;
+    }
 
     this.presence.updateActivity(connection.id);
 
@@ -411,6 +429,13 @@ export class CodingAgent extends Agent<Env, SessionState> {
   }
 
   async onClose(connection: Connection): Promise<void> {
+    // Clean up Cap'n Web transport if present
+    const transport = this.transports.get(connection.id);
+    if (transport) {
+      transport.close();
+      this.transports.delete(connection.id);
+    }
+
     const hadEntry = this.presence.has(connection.id);
     this.presence.leave(connection.id);
     if (hadEntry) {
@@ -422,6 +447,12 @@ export class CodingAgent extends Agent<Env, SessionState> {
     // Handle the Connection overload
     if (connectionOrError && typeof connectionOrError === "object" && "id" in connectionOrError) {
       const connection = connectionOrError as Connection;
+      // Clean up Cap'n Web transport if present
+      const transport = this.transports.get(connection.id);
+      if (transport) {
+        transport.abort(error);
+        this.transports.delete(connection.id);
+      }
       this.presence.leave(connection.id);
       this.broadcastPresence();
     }

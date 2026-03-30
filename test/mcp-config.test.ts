@@ -25,6 +25,16 @@ async function fetchJson(path: string, init?: RequestInit): Promise<Response> {
   return response;
 }
 
+async function addAllowlistDirect(hostname: string): Promise<void> {
+  const testEnv = env as Env;
+  const stub = testEnv.SHARED_INDEX.get(testEnv.SHARED_INDEX.idFromName("global"));
+  await stub.fetch("https://shared-index/allowlist", {
+    body: JSON.stringify({ hostname }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+}
+
 describe("MCP Config CRUD", () => {
   // Warm up: absorb any DO invalidation and add test hosts to allowlist
   beforeAll(async () => {
@@ -34,14 +44,10 @@ describe("MCP Config CRUD", () => {
     }
     try { await fetchJson("/api/mcp-configs"); } catch { /* absorb invalidation */ }
     try { await fetchJson("/api/mcp-configs"); } catch { /* retry */ }
-    // Add test hostnames to the allowlist so MCP config creation succeeds
+    // Add test hostnames to the allowlist via direct DO access (write routes are admin-only)
     const hosts = ["mcp.example.com", "mcp-v2.example.com", "minimal.example.com", "toggle.example.com"];
     for (const hostname of hosts) {
-      await fetchJson("/api/allowlist", {
-        body: JSON.stringify({ hostname }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      });
+      await addAllowlistDirect(hostname);
     }
   });
 
