@@ -12,6 +12,7 @@ import {
   wrapDEK,
 } from "./crypto";
 import { HttpMcpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
+import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
 import type { AppConfig, Env, MemoryEntry, SessionIndexRecord, UpdateConfigRequest } from "./types";
 
@@ -310,6 +311,36 @@ export class UserControl implements DurableObject {
         const value = await this.getSecret(key, ownerEmail);
         if (value === null) return Response.json({ error: "Secret not found" }, { status: 404 });
         return Response.json({ value });
+      }
+
+      // ─── Onboarding ───
+
+      if (request.method === "GET" && url.pathname === "/onboarding") {
+        return Response.json(this.getOnboardingState());
+      }
+
+      if (request.method === "POST" && url.pathname === "/onboarding/advance") {
+        const body = z.object({
+          step: z.string().min(1),
+          skip: z.boolean().optional(),
+          data: z.record(z.string(), z.unknown()).optional(),
+        }).parse(await request.json());
+        const hasKeyEnvelope = !!this.db.one("SELECT id FROM key_envelope WHERE id = 'default'");
+        const current = this.getOnboardingState();
+        const next = advanceStep(current, body.step as OnboardingState["currentStep"], body.skip ?? false, hasKeyEnvelope);
+        this.saveOnboardingState(next);
+        return Response.json(next);
+      }
+
+      if (request.method === "POST" && url.pathname === "/onboarding/reset") {
+        const initial = getInitialState();
+        this.saveOnboardingState(initial);
+        return Response.json(initial);
+      }
+
+      if (request.method === "GET" && url.pathname === "/onboarding/status") {
+        const state = this.getOnboardingState();
+        return Response.json({ completed: state.currentStep === "complete", step: state.currentStep });
       }
 
       return new Response("Not Found", { status: 404 });
@@ -677,6 +708,27 @@ export class UserControl implements DurableObject {
       headers: row.headers_json ? (JSON.parse(String(row.headers_json)) as Record<string, string>) : undefined,
       enabled: Number(row.enabled) === 1,
     };
+  }
+
+  // ─── Onboarding ───
+
+  private getOnboardingState(): OnboardingState {
+    const row = this.db.one("SELECT value FROM user_config WHERE key = 'onboarding_state'");
+    if (!row) {
+      const initial = getInitialState();
+      this.saveOnboardingState(initial);
+      return initial;
+    }
+    return JSON.parse(String(row.value)) as OnboardingState;
+  }
+
+  private saveOnboardingState(state: OnboardingState): void {
+    const now = nowEpoch();
+    this.db.exec(
+      "INSERT INTO user_config (key, value, updated_at) VALUES ('onboarding_state', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      JSON.stringify(state),
+      now,
+    );
   }
 
   // ─── Status ───

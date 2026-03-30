@@ -451,6 +451,32 @@ app.post("/api/passkey/change", async (c) => {
   });
 });
 
+// ─── Onboarding ───
+
+app.get("/api/onboarding", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/onboarding");
+});
+
+app.post("/api/onboarding/advance", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/onboarding/advance", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.post("/api/onboarding/reset", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/onboarding/reset", { method: "POST" });
+});
+
+app.get("/api/onboarding/status", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/onboarding/status");
+});
+
 // ─── Identity ───
 
 app.get("/api/identity", async (c) => {
