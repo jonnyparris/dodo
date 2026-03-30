@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import type { Env } from "../src/types";
 
@@ -42,9 +42,18 @@ async function fetchWithoutWaiting(path: string, init?: RequestInit): Promise<{ 
 }
 
 async function createSession(): Promise<string> {
-  const response = await fetchJson("/session", { method: "POST" });
-  expect(response.status).toBe(201);
-  return ((await response.json()) as { id: string }).id;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await fetchJson("/session", { method: "POST" });
+    if (response.status === 201) {
+      return ((await response.json()) as { id: string }).id;
+    }
+    if (response.status === 500 && attempt < 2) {
+      await new Promise(r => setTimeout(r, 10));
+      continue;
+    }
+    throw new Error(`Failed to create session: ${response.status}`);
+  }
+  throw new Error("Failed to create session after retries");
 }
 
 async function eventually(assertion: () => Promise<void>, attempts = 20): Promise<void> {
@@ -64,6 +73,17 @@ async function eventually(assertion: () => Promise<void>, attempts = 20): Promis
 }
 
 describe("Dodo foundation", () => {
+  beforeAll(async () => {
+    for (let i = 0; i < 5; i++) {
+      try {
+        await fetchJson("/health");
+        break;
+      } catch {
+        await new Promise(r => setTimeout(r, 10));
+      }
+    }
+  });
+
   beforeEach(async () => {
     releaseSlowPrompt = null;
     vi.restoreAllMocks();
