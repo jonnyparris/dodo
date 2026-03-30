@@ -59,6 +59,16 @@ function buildTools(env: Env, workspace: Workspace): Record<string, ReturnType<t
   return tools;
 }
 
+/**
+ * Browser tools are conditionally loaded based on user's browser_enabled flag.
+ * This will be wired up when agents/browser/ai is available.
+ */
+export function buildBrowserTools(_env: Env, browserEnabled: boolean): Record<string, unknown> {
+  if (!browserEnabled) return {};
+  // TODO: import createBrowserTools from agents/browser/ai when available
+  return {};
+}
+
 function buildMessages(messages: Array<{ content: string; role: string }>): ModelMessage[] {
   return messages
     .filter((m) => m.role === "user" || m.role === "assistant")

@@ -53,7 +53,7 @@ export class SharedIndex implements DurableObject {
         return Response.json(this.addUser(body.email, body.displayName ?? null, body.role), { status: 201 });
       }
 
-      if (request.method === "DELETE" && url.pathname.startsWith("/users/")) {
+      if (request.method === "DELETE" && url.pathname.match(/^\/users\/[^/]+$/)) {
         const email = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
         this.db.exec("DELETE FROM users WHERE email = ?", email);
         return Response.json({ deleted: true, email });
@@ -69,6 +69,27 @@ export class SharedIndex implements DurableObject {
         const email = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
         this.db.exec("UPDATE users SET blocked_at = NULL WHERE email = ?", email);
         return Response.json({ unblocked: true, email });
+      }
+
+      // ─── Browser access ───
+
+      if (request.method === "POST" && url.pathname.match(/^\/users\/[^/]+\/browser$/)) {
+        const email = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        this.db.exec("UPDATE users SET browser_enabled = 1 WHERE email = ?", email);
+        return Response.json({ browserEnabled: true, email });
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/users\/[^/]+\/browser$/)) {
+        const email = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        this.db.exec("UPDATE users SET browser_enabled = 0 WHERE email = ?", email);
+        return Response.json({ browserEnabled: false, email });
+      }
+
+      if (request.method === "GET" && url.pathname.match(/^\/users\/[^/]+\/browser$/)) {
+        const email = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const row = this.db.one("SELECT browser_enabled FROM users WHERE email = ?", email);
+        if (!row) return Response.json({ error: "User not found" }, { status: 404 });
+        return Response.json({ browserEnabled: Number(row.browser_enabled) === 1, email });
       }
 
       // ─── Host allowlist ───
@@ -314,6 +335,18 @@ export class SharedIndex implements DurableObject {
     `);
     // Seed default stat keys
     this.db.exec("INSERT OR IGNORE INTO aggregate_stats (key, value) VALUES ('sessionCount', 0)");
+
+    // Phase 6: browser_enabled column (migration-safe)
+    this.migrateAddBrowserEnabled();
+  }
+
+  private migrateAddBrowserEnabled(): void {
+    // Check if column already exists by querying table_info
+    const cols = this.db.all("PRAGMA table_info(users)");
+    const hasBrowserEnabled = cols.some((col) => String(col.name) === "browser_enabled");
+    if (!hasBrowserEnabled) {
+      this.db.exec("ALTER TABLE users ADD COLUMN browser_enabled INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   private seedAdmin(): void {
@@ -330,18 +363,18 @@ export class SharedIndex implements DurableObject {
 
   // ─── User management ───
 
-  private getUser(email: string): { email: string; displayName: string | null; role: string; blockedAt: number | null; createdAt: string; lastSeenAt: string } | null {
-    const row = this.db.one("SELECT email, display_name, role, blocked_at, created_at, last_seen_at FROM users WHERE email = ?", email);
+  private getUser(email: string): { email: string; displayName: string | null; role: string; blockedAt: number | null; browserEnabled: boolean; createdAt: string; lastSeenAt: string } | null {
+    const row = this.db.one("SELECT email, display_name, role, blocked_at, browser_enabled, created_at, last_seen_at FROM users WHERE email = ?", email);
     if (!row) return null;
     return this.mapUserRow(row);
   }
 
-  private listUsers(): Array<{ email: string; displayName: string | null; role: string; blockedAt: number | null; createdAt: string; lastSeenAt: string }> {
-    return this.db.all("SELECT email, display_name, role, blocked_at, created_at, last_seen_at FROM users ORDER BY created_at ASC")
+  private listUsers(): Array<{ email: string; displayName: string | null; role: string; blockedAt: number | null; browserEnabled: boolean; createdAt: string; lastSeenAt: string }> {
+    return this.db.all("SELECT email, display_name, role, blocked_at, browser_enabled, created_at, last_seen_at FROM users ORDER BY created_at ASC")
       .map((row) => this.mapUserRow(row));
   }
 
-  private addUser(email: string, displayName: string | null, role: string): { email: string; displayName: string | null; role: string; blockedAt: number | null; createdAt: string; lastSeenAt: string } {
+  private addUser(email: string, displayName: string | null, role: string): { email: string; displayName: string | null; role: string; blockedAt: number | null; browserEnabled: boolean; createdAt: string; lastSeenAt: string } {
     const now = nowEpoch();
     this.db.exec(
       "INSERT INTO users (email, display_name, role, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET display_name = COALESCE(excluded.display_name, users.display_name), role = excluded.role",
@@ -354,12 +387,13 @@ export class SharedIndex implements DurableObject {
     return this.getUser(email)!;
   }
 
-  private mapUserRow(row: SqlRow): { email: string; displayName: string | null; role: string; blockedAt: number | null; createdAt: string; lastSeenAt: string } {
+  private mapUserRow(row: SqlRow): { email: string; displayName: string | null; role: string; blockedAt: number | null; browserEnabled: boolean; createdAt: string; lastSeenAt: string } {
     return {
       email: String(row.email),
       displayName: row.display_name === null ? null : String(row.display_name),
       role: String(row.role),
       blockedAt: row.blocked_at === null ? null : Number(row.blocked_at),
+      browserEnabled: Number(row.browser_enabled) === 1,
       createdAt: epochToIso(row.created_at),
       lastSeenAt: epochToIso(row.last_seen_at),
     };
@@ -724,11 +758,12 @@ export class SharedIndex implements DurableObject {
     displayName: string | null;
     role: string;
     blockedAt: number | null;
+    browserEnabled: boolean;
     createdAt: string;
     lastSeenAt: string;
   }> {
     return this.db
-      .all("SELECT email, display_name, role, blocked_at, created_at, last_seen_at FROM users ORDER BY last_seen_at DESC")
+      .all("SELECT email, display_name, role, blocked_at, browser_enabled, created_at, last_seen_at FROM users ORDER BY last_seen_at DESC")
       .map((row) => this.mapUserRow(row));
   }
 
