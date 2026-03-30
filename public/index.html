@@ -435,6 +435,51 @@
   </div>
 
   <script>
+    // --- Error monitoring ---
+    (function(){
+      var errQueue = [];
+      var lastSent = 0;
+      var MIN_INTERVAL = 2000; // 2s between reports
+
+      function reportError(msg, source, lineno, colno, stack) {
+        var now = Date.now();
+        if (now - lastSent < MIN_INTERVAL) {
+          errQueue.push({ msg: msg, source: source, lineno: lineno, colno: colno, stack: stack });
+          return;
+        }
+        lastSent = now;
+        navigator.sendBeacon("/api/errors", JSON.stringify({
+          message: msg,
+          source: source,
+          lineno: lineno,
+          colno: colno,
+          stack: stack,
+          userAgent: navigator.userAgent,
+          url: location.href,
+        }));
+      }
+
+      window.onerror = function(msg, source, lineno, colno, error) {
+        reportError(msg, source, lineno, colno, error && error.stack ? error.stack : undefined);
+      };
+
+      window.onunhandledrejection = function(event) {
+        var reason = event.reason;
+        var msg = reason instanceof Error ? reason.message : String(reason);
+        var stack = reason instanceof Error ? reason.stack : undefined;
+        reportError("Unhandled rejection: " + msg, "", 0, 0, stack);
+      };
+
+      // Flush queued errors periodically
+      setInterval(function(){
+        if (!errQueue.length) return;
+        var batch = errQueue.splice(0, 5);
+        batch.forEach(function(e){
+          reportError(e.msg, e.source, e.lineno, e.colno, e.stack);
+        });
+      }, 5000);
+    })();
+
     let currentSession=null,eventSource=null,isProcessing=false,streamingEl=null,expandedDirs=new Set(),activeTab='chat';
     let wsConnection=null,presenceUsers=[],typingUsers=[];
 

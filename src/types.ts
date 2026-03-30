@@ -183,3 +183,16 @@ export interface UserRecord {
   createdAt: string;
   lastSeenAt: string;
 }
+
+export interface ClientError {
+  id: string;
+  message: string;
+  source: string;
+  lineno: number;
+  colno: number;
+  stack: string;
+  userAgent: string;
+  email: string;
+  url: string;
+  createdAt: string;
+}

@@ -6,6 +6,7 @@ import { cors } from "hono/cors";
 import { AppControl } from "./app-control";
 import { AuthError, checkAllowlist, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
+import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
 import { MCP_CATALOG } from "./mcp-catalog";
@@ -270,11 +271,35 @@ app.get("/shared/:token", async (c) => {
   );
 });
 
+// ─── Error ingestion (no auth — errors can happen before/during auth) ───
+
+app.post("/api/errors", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.message) return c.json({ error: "Missing message" }, 400);
+
+  const stub = getSharedIndexStub(c.env);
+  await stub.fetch("https://shared-index/errors", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      message: String(body.message).slice(0, 1000),
+      source: String(body.source ?? "").slice(0, 500),
+      lineno: Number(body.lineno) || 0,
+      colno: Number(body.colno) || 0,
+      stack: String(body.stack ?? "").slice(0, 5000),
+      userAgent: String(body.userAgent ?? "").slice(0, 300),
+      email: String(body.email ?? "").slice(0, 200),
+      url: String(body.url ?? "").slice(0, 500),
+    }),
+  });
+  return c.json({ received: true }, 201);
+});
+
 // ─── Auth middleware ───
 
 app.use("*", async (c, next) => {
   const path = new URL(c.req.raw.url).pathname;
-  if (path === "/health" || path === "/api/bootstrap" || path === "/mcp" || path === "/rpc" || path.startsWith("/shared/")) return next();
+  if (path === "/health" || path === "/api/bootstrap" || path === "/api/errors" || path === "/mcp" || path === "/rpc" || path.startsWith("/shared/")) return next();
 
   let identity: AccessIdentity;
   try {
@@ -363,6 +388,24 @@ app.delete("/api/admin/users/:email/browser", adminGuard as never, async (c) =>
 app.get("/api/admin/stats", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/stats"));
 
 app.get("/api/admin/users/detailed", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users/detailed"));
+
+// ─── Admin: error monitoring ───
+
+app.get("/api/admin/errors", adminGuard as never, async (c) => {
+  const search = new URL(c.req.raw.url).search;
+  return proxyToSharedIndex(c.env, `/errors${search}`);
+});
+
+app.get("/api/admin/errors/summary", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/errors/summary"));
+
+app.delete("/api/admin/errors", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/errors", { method: "DELETE" }));
+
+// ─── Admin: health check (manual trigger) ───
+
+app.post("/api/admin/health-check", adminGuard as never, async (c) => {
+  const report = await runHealthCheck(c.env, c.executionCtx);
+  return c.json(report);
+});
 
 app.get("/api/admin/sessions", adminGuard as never, async (c) => {
   // Fetch all registered users from SharedIndex
@@ -1287,5 +1330,8 @@ export { AllowlistOutbound, AppControl, CodingAgent, SharedIndex, UserControl };
 export default {
   fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {
     return Promise.resolve(app.fetch(request, env, executionContext));
+  },
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    await runHealthCheck(env, ctx);
   },
 };
