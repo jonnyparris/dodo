@@ -1,5 +1,7 @@
 # Dodo
 
+![Dodo](https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/Dodo_%28PSF%29.png/320px-Dodo_%28PSF%29.png)
+
 Self-hostable autonomous coding agent on Cloudflare Workers + Durable Objects.
 
 ## What it does
