@@ -63,6 +63,14 @@ async function readConfig(env: Env, email: string): Promise<AppConfig> {
   return (await response.json()) as AppConfig;
 }
 
+async function verifySessionAccess(env: Env, email: string, sessionId: string): Promise<boolean> {
+  const stub = getUserControlStub(env, email);
+  const response = await stub.fetch(`https://user-control/sessions/${encodeURIComponent(sessionId)}/check`);
+  if (response.ok) return true;
+  if (isAdmin(email, env)) return true;
+  return false;
+}
+
 // ─── MCP (token auth, no CF Access) ───
 
 app.all("/mcp", async (c) => {
@@ -340,6 +348,30 @@ app.post("/session", async (c) => {
 app.get("/session", async (c) => {
   const email = c.get("userEmail");
   return proxyToUserControl(c.env, email, "/sessions");
+});
+
+// ─── Session ownership middleware ───
+
+app.use("/session/:id/*", async (c, next) => {
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const hasAccess = await verifySessionAccess(c.env, email, sessionId);
+  if (!hasAccess) {
+    return c.json({ error: "Session not found or access denied" }, 403);
+  }
+  return next();
+});
+
+app.use("/session/:id", async (c, next) => {
+  // Skip ownership check for POST (handled by the create route above)
+  if (c.req.method === "POST") return next();
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const hasAccess = await verifySessionAccess(c.env, email, sessionId);
+  if (!hasAccess) {
+    return c.json({ error: "Session not found or access denied" }, 403);
+  }
+  return next();
 });
 
 app.get("/session/:id", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/", { "x-owner-email": c.get("userEmail") }));

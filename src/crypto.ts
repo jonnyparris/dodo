@@ -24,11 +24,19 @@ export async function derivePDK(passkey: string, salt: Uint8Array): Promise<Cryp
     keyMaterial,
     { name: "AES-GCM", length: 256 },
     false,
-    ["wrapKey", "unwrapKey"],
+    ["encrypt", "decrypt"],
   );
 }
 
-/** Derive a Server-Derived Key (SDK) from master key + email via HKDF-SHA256. */
+/**
+ * Derive a Server-Derived Key (SDK) from master key + email via HKDF-SHA256.
+ *
+ * The `salt` parameter uses the user's email intentionally: it makes each
+ * user's SDK deterministic for the same master key, enabling server-side
+ * recovery without storing additional per-user state.  This is safe because
+ * HKDF's security does not depend on the salt being secret — it only needs
+ * to be distinct per context, which the email guarantees.
+ */
 export async function deriveSDK(masterKeyHex: string, email: string): Promise<CryptoKey> {
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
@@ -41,13 +49,14 @@ export async function deriveSDK(masterKeyHex: string, email: string): Promise<Cr
     {
       name: "HKDF",
       hash: "SHA-256",
+      // Email used as salt for deterministic server-side recovery — see docstring above
       salt: new TextEncoder().encode(email).buffer as ArrayBuffer,
       info: new TextEncoder().encode("dodo-server-key").buffer as ArrayBuffer,
     },
     keyMaterial,
     { name: "AES-GCM", length: 256 },
     false,
-    ["wrapKey", "unwrapKey"],
+    ["encrypt", "decrypt"],
   );
 }
 
@@ -116,6 +125,9 @@ export async function decryptSecret(encrypted: string, dek: Uint8Array): Promise
 // ─── Helpers ───
 
 export function hexToBytes(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
+    throw new Error("Invalid hex string");
+  }
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) {
     bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);

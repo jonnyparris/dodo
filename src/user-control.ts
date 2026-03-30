@@ -54,6 +54,26 @@ export class UserControl implements DurableObject {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
+    // ─── Owner email validation ───
+    const headerEmail = request.headers.get("x-owner-email") ?? "";
+    if (headerEmail) {
+      const stored = this.getOwnerEmail();
+      if (!stored) {
+        // First request with an owner email — store it
+        this.setOwnerEmail(headerEmail);
+      } else if (stored !== headerEmail) {
+        return Response.json({ error: "Owner email mismatch" }, { status: 403 });
+      }
+    }
+
+    // Internal secret endpoint requires owner email header to match
+    if (url.pathname.startsWith("/internal/secret/")) {
+      const stored = this.getOwnerEmail();
+      if (!headerEmail || (stored && stored !== headerEmail)) {
+        return Response.json({ error: "Owner email required and must match" }, { status: 403 });
+      }
+    }
+
     try {
       // ─── Config ───
 
@@ -86,6 +106,13 @@ export class UserControl implements DurableObject {
         const sessionId = url.pathname.split("/").at(-1) ?? "";
         const body = z.object({ status: z.string().optional(), title: z.string().nullable().optional() }).strict().parse(await request.json());
         return Response.json(this.touchSession(sessionId, body));
+      }
+
+      if (request.method === "GET" && url.pathname.match(/^\/sessions\/[^/]+\/check$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const row = this.db.one("SELECT id FROM sessions WHERE id = ?", sessionId);
+        if (!row) return Response.json({ error: "Session not found" }, { status: 404 });
+        return Response.json({ found: true });
       }
 
       if (request.method === "DELETE" && url.pathname.startsWith("/sessions/")) {
@@ -345,6 +372,21 @@ export class UserControl implements DurableObject {
     }
   }
 
+  // ─── Owner Email ───
+
+  private getOwnerEmail(): string | null {
+    const row = this.db.one("SELECT value FROM user_config WHERE key = 'owner_email'");
+    return row ? String(row.value) : null;
+  }
+
+  private setOwnerEmail(email: string): void {
+    this.db.exec(
+      "INSERT INTO user_config (key, value, updated_at) VALUES ('owner_email', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      email,
+      nowEpoch(),
+    );
+  }
+
   // ─── Config ───
 
   private readConfig(): AppConfig {
@@ -590,36 +632,48 @@ export class UserControl implements DurableObject {
 
   private async setSecret(key: string, plaintext: string, ownerEmail: string): Promise<void> {
     const dek = await this.unwrapDEKWithServer(ownerEmail);
-    const encrypted = await encryptSecret(plaintext, dek);
-    const now = nowEpoch();
-    this.db.exec(
-      "INSERT INTO encrypted_secrets (key, encrypted_value, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET encrypted_value = excluded.encrypted_value, updated_at = excluded.updated_at",
-      key,
-      encrypted,
-      now,
-      now,
-    );
+    try {
+      const encrypted = await encryptSecret(plaintext, dek);
+      const now = nowEpoch();
+      this.db.exec(
+        "INSERT INTO encrypted_secrets (key, encrypted_value, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET encrypted_value = excluded.encrypted_value, updated_at = excluded.updated_at",
+        key,
+        encrypted,
+        now,
+        now,
+      );
+    } finally {
+      dek.fill(0);
+    }
   }
 
   private async getSecret(key: string, ownerEmail: string): Promise<string | null> {
     const row = this.db.one("SELECT encrypted_value FROM encrypted_secrets WHERE key = ?", key);
     if (!row) return null;
     const dek = await this.unwrapDEKWithServer(ownerEmail);
-    return decryptSecret(String(row.encrypted_value), dek);
+    try {
+      return await decryptSecret(String(row.encrypted_value), dek);
+    } finally {
+      dek.fill(0);
+    }
   }
 
   private async changePasskey(currentPasskey: string, newPasskey: string, ownerEmail: string): Promise<void> {
     // Verify current passkey works
     const dek = await this.unwrapDEKWithPasskey(currentPasskey);
-    // Generate new salt and PDK
-    const newSalt = generateSalt();
-    const newPdk = await derivePDK(newPasskey, newSalt);
-    const newWrappedPasskey = await wrapDEK(dek, newPdk);
-    this.db.exec(
-      "UPDATE key_envelope SET pbkdf2_salt = ?, wrapped_dek_passkey = ?, rotated_at = ? WHERE id = 'default'",
-      bytesToBase64(newSalt),
-      newWrappedPasskey,
-      nowEpoch(),
-    );
+    try {
+      // Generate new salt and PDK
+      const newSalt = generateSalt();
+      const newPdk = await derivePDK(newPasskey, newSalt);
+      const newWrappedPasskey = await wrapDEK(dek, newPdk);
+      this.db.exec(
+        "UPDATE key_envelope SET pbkdf2_salt = ?, wrapped_dek_passkey = ?, rotated_at = ? WHERE id = 'default'",
+        bytesToBase64(newSalt),
+        newWrappedPasskey,
+        nowEpoch(),
+      );
+    } finally {
+      dek.fill(0);
+    }
   }
 }
