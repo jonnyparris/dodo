@@ -1046,15 +1046,23 @@ export class CodingAgent extends Agent<Env, SessionState> {
     this.writeMetadata("updated_at", new Date(now * 1000).toISOString());
   }
 
-  private readSessionDetails(): SessionState {
+   private readSessionDetails(): SessionState {
     const createdAt = this.readMetadata("created_at") ?? new Date().toISOString();
     const updatedAt = this.readMetadata("updated_at") ?? createdAt;
     const sessionId = this.readMetadata("session_id") ?? "";
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
-    const status = (this.readMetadata("status") as SessionState["status"] | null) ?? "idle";
+    const activePromptId = this.readMetadata("active_prompt_id");
+    let status = (this.readMetadata("status") as SessionState["status"] | null) ?? "idle";
+    // Reconcile stale "running" status when no prompt is active
+    if (status === "running" && !activePromptId && !this.activePromptControllers.size) {
+      this.writeMetadata("status", "idle");
+      status = "idle";
+      // Fire-and-forget sync to UserControl
+      void this.syncSessionIndex({ status: "idle" }).catch(() => {});
+    }
     const totals = this.db.one("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM messages");
     return {
-      activePromptId: this.readMetadata("active_prompt_id"),
+      activePromptId,
       activeStreamCount: this.clients.size,
       createdAt,
       messageCount: this.messageCount(),
@@ -1362,12 +1370,17 @@ export class CodingAgent extends Agent<Env, SessionState> {
     if (!ownerEmail) {
       throw new Error("Session has no owner_email. Run migration (POST /api/admin/migrate) to fix legacy sessions.");
     }
-    const stub = getUserControlStub(this.env, ownerEmail);
-    await stub.fetch("https://user-control/sessions/" + this.sessionId(), {
-      body: JSON.stringify(patch),
-      headers: { "content-type": "application/json" },
-      method: "PATCH",
-    });
+    try {
+      const stub = getUserControlStub(this.env, ownerEmail);
+      await stub.fetch("https://user-control/sessions/" + this.sessionId(), {
+        body: JSON.stringify(patch),
+        headers: { "content-type": "application/json" },
+        method: "PATCH",
+      });
+    } catch (error) {
+      // Log but don't throw — sync failure shouldn't break prompt completion
+      console.error("syncSessionIndex failed:", error instanceof Error ? error.message : error);
+    }
   }
 
   private async destroyStorage(): Promise<void> {
