@@ -137,7 +137,7 @@ export class UserControl implements DurableObject {
         return Response.json({ found: true });
       }
 
-      if (request.method === "DELETE" && url.pathname.startsWith("/sessions/")) {
+      if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/[^/]+$/) && !url.pathname.includes("/mcp-overrides")) {
         const sessionId = url.pathname.split("/").at(-1) ?? "";
         this.db.exec("DELETE FROM sessions WHERE id = ?", sessionId);
         return Response.json({ deleted: true, id: sessionId });
@@ -253,6 +253,36 @@ export class UserControl implements DurableObject {
         const gatekeeper = new HttpMcpGatekeeper(config);
         const result = await gatekeeper.testConnection();
         return Response.json(result);
+      }
+
+      // ─── Session MCP Overrides ───
+
+      if (request.method === "GET" && url.pathname.match(/^\/sessions\/[^/]+\/mcp-overrides$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        return Response.json({ overrides: this.listMcpOverrides(sessionId) });
+      }
+
+      if (request.method === "POST" && url.pathname.match(/^\/sessions\/[^/]+\/mcp-overrides$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const body = z.object({
+          mcpConfigId: z.string().min(1),
+          enabled: z.boolean(),
+        }).parse(await request.json());
+        this.setMcpOverride(sessionId, body.mcpConfigId, body.enabled);
+        return Response.json({ sessionId, mcpConfigId: body.mcpConfigId, enabled: body.enabled }, { status: 201 });
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/[^/]+\/mcp-overrides\/[^/]+$/)) {
+        const parts = url.pathname.split("/");
+        const mcpConfigId = decodeURIComponent(parts.at(-1) ?? "");
+        const sessionId = decodeURIComponent(parts.at(-3) ?? "");
+        this.db.exec("DELETE FROM session_mcp_overrides WHERE session_id = ? AND mcp_config_id = ?", sessionId, mcpConfigId);
+        return Response.json({ deleted: true, sessionId, mcpConfigId });
+      }
+
+      if (request.method === "GET" && url.pathname.match(/^\/sessions\/[^/]+\/effective-mcp-configs$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        return Response.json({ configs: this.getEffectiveMcpConfigs(sessionId) });
       }
 
       // ─── Status ───
@@ -446,6 +476,15 @@ export class UserControl implements DurableObject {
         enabled INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS session_mcp_overrides (
+        session_id TEXT NOT NULL,
+        mcp_config_id TEXT NOT NULL,
+        enabled INTEGER NOT NULL,
+        PRIMARY KEY (session_id, mcp_config_id)
       )
     `);
 
@@ -835,6 +874,42 @@ export class UserControl implements DurableObject {
       headerKeys,
       enabled: Number(row.enabled) === 1,
     };
+  }
+
+  // ─── Session MCP Overrides ───
+
+  private listMcpOverrides(sessionId: string): Array<{ sessionId: string; mcpConfigId: string; enabled: boolean }> {
+    return this.db.all(
+      "SELECT session_id, mcp_config_id, enabled FROM session_mcp_overrides WHERE session_id = ? ORDER BY mcp_config_id ASC",
+      sessionId,
+    ).map((row) => ({
+      sessionId: String(row.session_id),
+      mcpConfigId: String(row.mcp_config_id),
+      enabled: Number(row.enabled) === 1,
+    }));
+  }
+
+  private setMcpOverride(sessionId: string, mcpConfigId: string, enabled: boolean): void {
+    this.db.exec(
+      `INSERT INTO session_mcp_overrides (session_id, mcp_config_id, enabled)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_id, mcp_config_id) DO UPDATE SET enabled = excluded.enabled`,
+      sessionId,
+      mcpConfigId,
+      enabled ? 1 : 0,
+    );
+  }
+
+  private getEffectiveMcpConfigs(sessionId: string): Array<McpGatekeeperConfig & { overridden: boolean }> {
+    const configs = this.listMcpConfigsSafe();
+    const overrides = this.listMcpOverrides(sessionId);
+    const overrideMap = new Map(overrides.map((o) => [o.mcpConfigId, o.enabled]));
+
+    return configs.map((config) => {
+      const hasOverride = overrideMap.has(config.id);
+      const effectiveEnabled = hasOverride ? overrideMap.get(config.id)! : config.enabled;
+      return { ...config, enabled: effectiveEnabled, overridden: hasOverride };
+    });
   }
 
   // ─── Onboarding ───

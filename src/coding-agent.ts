@@ -154,6 +154,20 @@ export class CodingAgent extends Agent<Env, SessionState> {
         return await this.openEventStream(request);
       }
 
+      if (request.method === "GET" && url.pathname === "/browser") {
+        const enabled = this.readMetadata("browser_enabled") === "true";
+        const sid = this.sessionId() || request.headers.get("x-dodo-session-id") || "";
+        return Response.json({ browserEnabled: enabled, sessionId: sid });
+      }
+
+      if (request.method === "PUT" && url.pathname === "/browser") {
+        const body = (await request.json()) as { enabled?: boolean };
+        const enabled = Boolean(body.enabled);
+        this.writeMetadata("browser_enabled", String(enabled));
+        const sid = this.sessionId() || request.headers.get("x-dodo-session-id") || "";
+        return Response.json({ browserEnabled: enabled, sessionId: sid });
+      }
+
       if (request.method === "GET" && url.pathname === "/files") {
         return await this.handleListFiles(url);
       }
@@ -230,6 +244,24 @@ export class CodingAgent extends Agent<Env, SessionState> {
         return await this.handleGitRemote(request);
       }
 
+      // ─── Approval Queue ───
+
+      if (request.method === "GET" && url.pathname === "/approvals") {
+        return Response.json({ approvals: this.listApprovals() });
+      }
+
+      if (request.method === "POST" && url.pathname.match(/^\/approvals\/[^/]+\/approve$/)) {
+        const approvalId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const resolvedBy = request.headers.get("x-author-email") ?? request.headers.get("x-owner-email") ?? undefined;
+        return Response.json(this.resolveApproval(approvalId, "approved", resolvedBy));
+      }
+
+      if (request.method === "POST" && url.pathname.match(/^\/approvals\/[^/]+\/reject$/)) {
+        const approvalId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const resolvedBy = request.headers.get("x-author-email") ?? request.headers.get("x-owner-email") ?? undefined;
+        return Response.json(this.resolveApproval(approvalId, "rejected", resolvedBy));
+      }
+
       if (request.method === "POST" && url.pathname === "/message") {
         return await this.handleMessage(request);
       }
@@ -256,6 +288,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
     const email = url.searchParams.get("email") ?? "anonymous";
     const displayName = url.searchParams.get("displayName") ?? email;
     const permission = url.searchParams.get("permission") ?? "readwrite";
+    const lastMessageCountParam = url.searchParams.get("lastMessageCount");
 
     this.presence.join(connection.id, {
       connectedAt: Date.now(),
@@ -264,12 +297,24 @@ export class CodingAgent extends Agent<Env, SessionState> {
       permission,
     });
 
-    // Send ready message with current state and presence
+    // Determine which messages to send in the ready payload.
+    // If the client provides lastMessageCount (reconnection), only send
+    // messages they haven't seen yet. Otherwise send the last 50.
+    const allMessages = this.listMessages();
+    let messages: ChatMessageRecord[];
+    if (lastMessageCountParam !== null) {
+      const lastCount = Math.max(0, parseInt(lastMessageCountParam, 10) || 0);
+      messages = allMessages.slice(lastCount);
+    } else {
+      messages = allMessages.slice(-50);
+    }
+
     const readyPayload = JSON.stringify({
       type: "ready",
       state: this.readSessionDetails(),
       presence: this.presence.getAll(),
-      messages: this.listMessages().slice(-20),
+      messages,
+      totalMessages: allMessages.length,
     });
     connection.send(readyPayload);
 
@@ -454,6 +499,18 @@ export class CodingAgent extends Agent<Env, SessionState> {
         description TEXT NOT NULL,
         prompt TEXT NOT NULL,
         created_at INTEGER NOT NULL
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS approval_queue (
+        id TEXT PRIMARY KEY,
+        tool_name TEXT NOT NULL,
+        tool_args TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        requested_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        resolved_by TEXT
       )
     `);
 
@@ -1121,6 +1178,67 @@ export class CodingAgent extends Agent<Env, SessionState> {
       type: entry.type,
       updatedAt: epochToIso(entry.updatedAt),
     };
+  }
+
+  // ─── Approval Queue ───
+
+  /** Submit a tool call for approval (used by the agentic loop in the future). */
+  submitApproval(toolName: string, toolArgs: unknown): string {
+    const id = crypto.randomUUID();
+    this.db.exec(
+      "INSERT INTO approval_queue (id, tool_name, tool_args, status, requested_at) VALUES (?, ?, ?, 'pending', ?)",
+      id,
+      toolName,
+      JSON.stringify(toolArgs),
+      nowEpoch(),
+    );
+    this.emitEvent({ data: { id, toolName, status: "pending" }, type: "approval" });
+    return id;
+  }
+
+  private listApprovals(statusFilter?: string): Array<{
+    id: string;
+    toolName: string;
+    toolArgs: unknown;
+    status: string;
+    requestedAt: string;
+    resolvedAt: string | null;
+    resolvedBy: string | null;
+  }> {
+    const rows = statusFilter
+      ? this.db.all("SELECT id, tool_name, tool_args, status, requested_at, resolved_at, resolved_by FROM approval_queue WHERE status = ? ORDER BY requested_at DESC", statusFilter)
+      : this.db.all("SELECT id, tool_name, tool_args, status, requested_at, resolved_at, resolved_by FROM approval_queue ORDER BY requested_at DESC");
+    return rows.map((row) => ({
+      id: String(row.id),
+      toolName: String(row.tool_name),
+      toolArgs: JSON.parse(String(row.tool_args)),
+      status: String(row.status),
+      requestedAt: epochToIso(row.requested_at),
+      resolvedAt: row.resolved_at === null ? null : epochToIso(row.resolved_at),
+      resolvedBy: row.resolved_by === null ? null : String(row.resolved_by),
+    }));
+  }
+
+  private resolveApproval(id: string, status: "approved" | "rejected", resolvedBy?: string): {
+    id: string;
+    status: string;
+    resolvedAt: string;
+    resolvedBy: string | null;
+  } {
+    const existing = this.db.one("SELECT status FROM approval_queue WHERE id = ?", id);
+    if (!existing) throw new Error(`Approval ${id} not found`);
+    if (String(existing.status) !== "pending") throw new Error(`Approval ${id} already resolved`);
+
+    const now = nowEpoch();
+    this.db.exec(
+      "UPDATE approval_queue SET status = ?, resolved_at = ?, resolved_by = ? WHERE id = ?",
+      status,
+      now,
+      resolvedBy ?? null,
+      id,
+    );
+    this.emitEvent({ data: { id, status, resolvedBy }, type: "approval" });
+    return { id, status, resolvedAt: epochToIso(now), resolvedBy: resolvedBy ?? null };
   }
 
   private openEventStream(request: Request): Response {

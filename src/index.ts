@@ -1,5 +1,6 @@
 import { getAgentByName } from "agents";
 import { createMcpHandler } from "agents/mcp";
+import { newRpcResponse } from "@hono/capnweb";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { AppControl } from "./app-control";
@@ -10,6 +11,7 @@ import { createDodoMcpServer } from "./mcp";
 import { MCP_CATALOG } from "./mcp-catalog";
 import { AllowlistOutbound } from "./outbound";
 import { RateLimiter } from "./rate-limit";
+import { DodoPublicApi } from "./rpc-api";
 import { signCookie, verifyCookie } from "./share";
 import { SharedIndex } from "./shared-index";
 import { UserControl } from "./user-control";
@@ -193,6 +195,13 @@ app.all("/mcp", async (c) => {
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
+// ─── Cap'n Web RPC (public API; auth via authenticate() method) ───
+
+app.all("/rpc", async (c) => {
+  const api = new DodoPublicApi(c.env);
+  return newRpcResponse(c, api);
+});
+
 // ─── Share link redemption (no auth required) ───
 
 app.get("/shared/:token", async (c) => {
@@ -231,7 +240,7 @@ app.get("/shared/:token", async (c) => {
 
 app.use("*", async (c, next) => {
   const path = new URL(c.req.raw.url).pathname;
-  if (path === "/health" || path === "/mcp" || path.startsWith("/shared/")) return next();
+  if (path === "/health" || path === "/mcp" || path === "/rpc" || path.startsWith("/shared/")) return next();
 
   let identity: AccessIdentity;
   try {
@@ -628,20 +637,64 @@ app.get("/api/identity", async (c) => {
 
 app.post("/session", async (c) => {
   const email = c.get("userEmail");
+  const body = await c.req.raw.json().catch(() => ({})) as { ownerOverride?: string };
   const sessionId = crypto.randomUUID();
-  await proxyToUserControl(c.env, email, "/sessions", {
-    body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }),
+
+  // Check for account-level create permission (delegation)
+  let ownerEmail = email;
+  let createdBy = email;
+  let autoGrantWrite = false;
+
+  if (body.ownerOverride && body.ownerOverride !== email) {
+    // Explicit override: verify the user has create permission for that account
+    const checkRes = await proxyToSharedIndex(c.env, `/account-permissions/check?grantee=${encodeURIComponent(email)}`);
+    const checkBody = (await checkRes.json()) as { hasCreate: boolean; accountOwner: string | null };
+    if (!checkBody.hasCreate || checkBody.accountOwner !== body.ownerOverride) {
+      return c.json({ error: "No create permission for the specified account" }, 403);
+    }
+    ownerEmail = body.ownerOverride;
+    createdBy = email;
+    autoGrantWrite = true;
+  } else if (!body.ownerOverride) {
+    // No explicit override: check if user has create permission (default to that account)
+    const checkRes = await proxyToSharedIndex(c.env, `/account-permissions/check?grantee=${encodeURIComponent(email)}`);
+    const checkBody = (await checkRes.json()) as { hasCreate: boolean; accountOwner: string | null };
+    if (checkBody.hasCreate && checkBody.accountOwner) {
+      ownerEmail = checkBody.accountOwner;
+      createdBy = email;
+      autoGrantWrite = true;
+    }
+  }
+
+  await proxyToUserControl(c.env, ownerEmail, "/sessions", {
+    body: JSON.stringify({ id: sessionId, ownerEmail, createdBy }),
     headers: { "content-type": "application/json" },
     method: "POST",
   });
-  log("info", "Session created", { email, sessionId });
+
+  // Auto-grant readwrite permission to creator when creating in another's namespace
+  if (autoGrantWrite && ownerEmail !== email) {
+    await proxyToSharedIndex(c.env, "/permissions", {
+      body: JSON.stringify({
+        sessionId,
+        ownerEmail,
+        granteeEmail: email,
+        permission: "readwrite",
+        grantedBy: "system",
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+  }
+
+  log("info", "Session created", { email, sessionId, ownerEmail, createdBy });
   // Increment global session counter
   await proxyToSharedIndex(c.env, "/stats/increment", {
     body: JSON.stringify({ stat: "sessionCount", delta: 1 }),
     headers: { "content-type": "application/json" },
     method: "POST",
   });
-  return c.json({ id: sessionId }, 201);
+  return c.json({ id: sessionId, ownerEmail, createdBy }, 201);
 });
 
 app.get("/session", async (c) => {
@@ -886,6 +939,44 @@ app.post("/session/:id/abort", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/abort");
 });
 
+app.get("/session/:id/browser", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser");
+});
+
+app.put("/session/:id/browser", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser");
+});
+
+// ─── Approval Queue ───
+
+app.get("/session/:id/approvals", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/approvals");
+});
+
+app.post("/session/:id/approvals/:approvalId/approve", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/approvals/${encodeURIComponent(c.req.param("approvalId"))}/approve`, {
+    "x-author-email": email,
+  });
+});
+
+app.post("/session/:id/approvals/:approvalId/reject", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/approvals/${encodeURIComponent(c.req.param("approvalId"))}/reject`, {
+    "x-author-email": email,
+  });
+});
+
 app.post("/session/:id/cron", async (c) => {
   const denied = requirePermission(c, "write");
   if (denied) return denied;
@@ -1011,6 +1102,39 @@ app.delete("/session/:id/permissions/:email", async (c) => {
   const sessionId = c.req.param("id");
   const granteeEmail = c.req.param("email");
   return proxyToSharedIndex(c.env, `/permissions/${encodeURIComponent(sessionId)}/${encodeURIComponent(granteeEmail)}`, { method: "DELETE" });
+});
+
+// ─── Session MCP Config Overrides ───
+
+app.get("/session/:id/mcp-configs", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/effective-mcp-configs`);
+});
+
+app.post("/session/:id/mcp-configs", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/mcp-overrides`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.delete("/session/:id/mcp-configs/:mcpId", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const mcpId = c.req.param("mcpId");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/mcp-overrides/${encodeURIComponent(mcpId)}`, {
+    method: "DELETE",
+  });
 });
 
 // ─── Admin: account-level permissions ───

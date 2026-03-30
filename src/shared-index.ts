@@ -225,6 +225,13 @@ export class SharedIndex implements DurableObject {
         return Response.json({ revoked: true, owner, email });
       }
 
+      if (request.method === "GET" && url.pathname === "/account-permissions/check") {
+        const grantee = url.searchParams.get("grantee") ?? "";
+        if (!grantee) return Response.json({ error: "grantee required" }, { status: 400 });
+        const result = this.checkAccountCreatePermission(grantee);
+        return Response.json(result);
+      }
+
       if (request.method === "GET" && url.pathname === "/account-permissions") {
         const owner = url.searchParams.get("owner") ?? "";
         if (!owner) return Response.json({ error: "owner required" }, { status: 400 });
@@ -736,6 +743,15 @@ export class SharedIndex implements DurableObject {
         createdAt: epochToIso(row.created_at),
         revokedAt: row.revoked_at === null ? null : epochToIso(row.revoked_at),
       }));
+  }
+
+  private checkAccountCreatePermission(granteeEmail: string): { hasCreate: boolean; accountOwner: string | null } {
+    const row = this.db.one(
+      "SELECT account_owner FROM account_permissions WHERE grantee_email = ? AND permission = 'create' AND revoked_at IS NULL",
+      granteeEmail,
+    );
+    if (!row) return { hasCreate: false, accountOwner: null };
+    return { hasCreate: true, accountOwner: String(row.account_owner) };
   }
 
   // ─── Admin stats ───

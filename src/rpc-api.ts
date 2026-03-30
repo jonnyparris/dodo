@@ -12,6 +12,8 @@
 
 import { RpcTarget } from "capnweb";
 import type { PresenceEntry } from "./presence";
+import type { Env } from "./types";
+import { getUserControlStub, isAdmin } from "./auth";
 
 // ─── Shared types ───
 
@@ -38,15 +40,43 @@ export interface RpcPresenceEntry {
 // ─── Public API (no auth required) ───
 
 export class DodoPublicApi extends RpcTarget {
-  private version: string;
+  private env: Env;
 
-  constructor(version: string) {
+  constructor(env: Env) {
     super();
-    this.version = version;
+    this.env = env;
   }
 
   health(): { status: string; version: string } {
-    return { status: "ok", version: this.version };
+    return { status: "ok", version: this.env.DODO_VERSION ?? "unknown" };
+  }
+
+  /**
+   * Authenticate with a user email and return a user-scoped API.
+   * In production, this would verify a CF Access JWT. For now, we accept
+   * the email directly (the Worker's auth middleware already verified it).
+   */
+  authenticate(email: string): DodoAuthenticatedApi {
+    const env = this.env;
+    return new DodoAuthenticatedApi({
+      userInfo: { email, isAdmin: isAdmin(email, env) },
+      listSessions: async () => {
+        const stub = getUserControlStub(env, email);
+        const res = await stub.fetch("https://user-control/sessions");
+        const body = (await res.json()) as { sessions: RpcSessionSummary[] };
+        return body.sessions;
+      },
+      createSession: async () => {
+        const sessionId = crypto.randomUUID();
+        const stub = getUserControlStub(env, email);
+        await stub.fetch("https://user-control/sessions", {
+          body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        });
+        return sessionId;
+      },
+    });
   }
 }
 

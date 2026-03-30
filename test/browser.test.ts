@@ -147,3 +147,82 @@ describe("Browser automation gating (Phase 6)", () => {
     expect(body.error).toContain("Admin");
   });
 });
+
+// ─── Per-session browser toggle ───
+
+describe("Per-session browser toggle", () => {
+  async function createSession(): Promise<string> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await fetchJson("/session", { method: "POST" });
+      if (response.status === 201) {
+        return ((await response.json()) as { id: string }).id;
+      }
+      if (response.status === 500 && attempt < 2) {
+        await new Promise(r => setTimeout(r, 10));
+        continue;
+      }
+      throw new Error(`Failed to create session: ${response.status}`);
+    }
+    throw new Error("Failed to create session after retries");
+  }
+
+  beforeAll(async () => {
+    for (let i = 0; i < 5; i++) {
+      try {
+        await fetchJson("/health");
+        break;
+      } catch {
+        await new Promise(r => setTimeout(r, 10));
+      }
+    }
+  });
+
+  it("browser defaults to disabled for new sessions", async () => {
+    const sessionId = await createSession();
+    const res = await fetchJson(`/session/${sessionId}/browser`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { browserEnabled: boolean; sessionId: string };
+    expect(body.browserEnabled).toBe(false);
+    expect(body.sessionId).toBe(sessionId);
+  });
+
+  it("enable browser via PUT /session/:id/browser", async () => {
+    const sessionId = await createSession();
+
+    const enableRes = await fetchJson(`/session/${sessionId}/browser`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(enableRes.status).toBe(200);
+    const enableBody = (await enableRes.json()) as { browserEnabled: boolean };
+    expect(enableBody.browserEnabled).toBe(true);
+
+    // Verify it persists
+    const getRes = await fetchJson(`/session/${sessionId}/browser`);
+    expect(getRes.status).toBe(200);
+    const getBody = (await getRes.json()) as { browserEnabled: boolean };
+    expect(getBody.browserEnabled).toBe(true);
+  });
+
+  it("disable browser via PUT /session/:id/browser", async () => {
+    const sessionId = await createSession();
+
+    // Enable first
+    await fetchJson(`/session/${sessionId}/browser`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+
+    // Disable
+    const disableRes = await fetchJson(`/session/${sessionId}/browser`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: false }),
+    });
+    expect(disableRes.status).toBe(200);
+    const body = (await disableRes.json()) as { browserEnabled: boolean };
+    expect(body.browserEnabled).toBe(false);
+  });
+});
