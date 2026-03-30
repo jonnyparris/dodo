@@ -36,6 +36,9 @@
   "browser": {
     "binding": "BROWSER"
   },
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  },
   "assets": {
     "directory": "./public"
   },

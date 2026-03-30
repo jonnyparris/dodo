@@ -238,6 +238,110 @@ export class SharedIndex implements DurableObject {
         return Response.json({ permissions: this.listAccountPermissions(owner) });
       }
 
+      // ─── Client error reporting ───
+
+      if (request.method === "POST" && url.pathname === "/errors") {
+        const body = (await request.json()) as {
+          message: string;
+          source?: string;
+          lineno?: number;
+          colno?: number;
+          stack?: string;
+          userAgent?: string;
+          email?: string;
+          url?: string;
+        };
+        if (!body.message) return Response.json({ error: "message required" }, { status: 400 });
+
+        // Rate limit: max 100 errors per email per hour
+        const email = body.email ?? "anonymous";
+        const oneHourAgo = nowEpoch() - 3600;
+        const countRow = this.db.one(
+          "SELECT COUNT(*) AS c FROM client_errors WHERE email = ? AND created_at > ?",
+          email,
+          oneHourAgo,
+        );
+        if (Number(countRow?.c ?? 0) >= 100) {
+          return Response.json({ error: "Rate limit exceeded" }, { status: 429 });
+        }
+
+        // Auto-prune errors older than 7 days
+        const sevenDaysAgo = nowEpoch() - 7 * 24 * 3600;
+        this.db.exec("DELETE FROM client_errors WHERE created_at < ?", sevenDaysAgo);
+
+        const id = crypto.randomUUID();
+        this.db.exec(
+          "INSERT INTO client_errors (id, message, source, lineno, colno, stack, user_agent, email, url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          id,
+          body.message,
+          body.source ?? null,
+          body.lineno ?? 0,
+          body.colno ?? 0,
+          body.stack ?? null,
+          body.userAgent ?? null,
+          body.email ?? null,
+          body.url ?? null,
+          nowEpoch(),
+        );
+        return Response.json({ id }, { status: 201 });
+      }
+
+      if (request.method === "GET" && url.pathname === "/errors") {
+        const hours = Number(url.searchParams.get("hours") ?? 24);
+        const limit = Math.min(Number(url.searchParams.get("limit") ?? 100), 500);
+        const emailFilter = url.searchParams.get("email");
+        const since = nowEpoch() - hours * 3600;
+
+        let query = "SELECT id, message, source, lineno, colno, stack, user_agent, email, url, created_at FROM client_errors WHERE created_at > ?";
+        const bindings: unknown[] = [since];
+        if (emailFilter) {
+          query += " AND email = ?";
+          bindings.push(emailFilter);
+        }
+        query += " ORDER BY created_at DESC LIMIT ?";
+        bindings.push(limit);
+
+        const errors = this.db.all(query, ...bindings).map((row) => ({
+          id: String(row.id),
+          message: String(row.message),
+          source: row.source === null ? null : String(row.source),
+          lineno: Number(row.lineno),
+          colno: Number(row.colno),
+          stack: row.stack === null ? null : String(row.stack),
+          userAgent: row.user_agent === null ? null : String(row.user_agent),
+          email: row.email === null ? null : String(row.email),
+          url: row.url === null ? null : String(row.url),
+          createdAt: epochToIso(row.created_at),
+        }));
+
+        const totalRow = this.db.one(
+          "SELECT COUNT(*) AS c FROM client_errors WHERE created_at > ?",
+          since,
+        );
+        return Response.json({ errors, total: Number(totalRow?.c ?? 0) });
+      }
+
+      if (request.method === "GET" && url.pathname === "/errors/summary") {
+        const since = nowEpoch() - 24 * 3600;
+        const groups = this.db
+          .all(
+            "SELECT message, COUNT(*) AS count, MAX(created_at) AS last_seen, source FROM client_errors WHERE created_at > ? GROUP BY message ORDER BY count DESC",
+            since,
+          )
+          .map((row) => ({
+            message: String(row.message),
+            count: Number(row.count),
+            lastSeen: epochToIso(row.last_seen),
+            source: row.source === null ? null : String(row.source),
+          }));
+        return Response.json({ groups });
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/errors") {
+        this.db.exec("DELETE FROM client_errors");
+        return Response.json({ cleared: true });
+      }
+
       // ─── Admin stats ───
 
       if (request.method === "GET" && url.pathname === "/stats") {
@@ -342,6 +446,23 @@ export class SharedIndex implements DurableObject {
     `);
     // Seed default stat keys
     this.db.exec("INSERT OR IGNORE INTO aggregate_stats (key, value) VALUES ('sessionCount', 0)");
+
+    // Client error reporting table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS client_errors (
+        id TEXT PRIMARY KEY,
+        message TEXT NOT NULL,
+        source TEXT,
+        lineno INTEGER,
+        colno INTEGER,
+        stack TEXT,
+        user_agent TEXT,
+        email TEXT,
+        url TEXT,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_errors_created ON client_errors(created_at)");
 
     // Phase 6: browser_enabled column (migration-safe)
     this.migrateAddBrowserEnabled();
