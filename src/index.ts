@@ -7,6 +7,7 @@ import { AuthError, checkAllowlist, getSharedIndexStub, getUserControlStub, isAd
 import { CodingAgent } from "./coding-agent";
 import { createDodoMcpServer } from "./mcp";
 import { AllowlistOutbound } from "./outbound";
+import { signCookie } from "./share";
 import { SharedIndex } from "./shared-index";
 import { UserControl } from "./user-control";
 import type { AccessIdentity, AppConfig, Env } from "./types";
@@ -87,11 +88,45 @@ app.all("/mcp", async (c) => {
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
+// ─── Share link redemption (no auth required) ───
+
+app.get("/shared/:token", async (c) => {
+  const token = c.req.param("token");
+  const verifyRes = await proxyToSharedIndex(c.env, "/shares/verify", {
+    body: JSON.stringify({ token }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  const result = (await verifyRes.json()) as { valid: boolean; sessionId?: string; permission?: string; ownerEmail?: string };
+  if (!result.valid || !result.sessionId) {
+    return c.json({ error: "Invalid or expired share link" }, 403);
+  }
+
+  const cookieSecret = c.env.COOKIE_SECRET;
+  if (!cookieSecret) {
+    return c.json({ error: "Sharing not configured" }, 500);
+  }
+
+  const payload = JSON.stringify({
+    sessionId: result.sessionId,
+    permission: result.permission,
+    ownerEmail: result.ownerEmail,
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+  });
+
+  const signed = await signCookie(payload, cookieSecret);
+  return c.json(
+    { sessionId: result.sessionId, permission: result.permission },
+    200,
+    { "Set-Cookie": `dodo_share=${signed}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400` },
+  );
+});
+
 // ─── Auth middleware ───
 
 app.use("*", async (c, next) => {
   const path = new URL(c.req.raw.url).pathname;
-  if (path === "/health" || path === "/mcp") return next();
+  if (path === "/health" || path === "/mcp" || path.startsWith("/shared/")) return next();
 
   let identity: AccessIdentity;
   try {
@@ -486,6 +521,94 @@ app.post("/session/:id/fork", async (c) => {
     return c.json({ error: await importResponse.text(), id: sessionId, sourceId }, 500);
   }
   return c.json({ id: sessionId, sourceId }, 201);
+});
+
+// ─── Share link management (session owner only) ───
+
+app.post("/session/:id/share", async (c) => {
+  const sessionId = c.req.param("id");
+  const email = c.get("userEmail");
+  const body = await c.req.raw.json() as Record<string, unknown>;
+  return proxyToSharedIndex(c.env, "/shares", {
+    body: JSON.stringify({
+      sessionId,
+      ownerEmail: email,
+      permission: body.permission ?? "readonly",
+      label: body.label,
+      expiresAt: body.expiresAt,
+      createdBy: email,
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.get("/session/:id/shares", async (c) => {
+  const sessionId = c.req.param("id");
+  return proxyToSharedIndex(c.env, `/shares?sessionId=${encodeURIComponent(sessionId)}`);
+});
+
+app.delete("/session/:id/share/:shareId", async (c) => {
+  const shareId = c.req.param("shareId");
+  return proxyToSharedIndex(c.env, `/shares/${encodeURIComponent(shareId)}`, { method: "DELETE" });
+});
+
+// ─── Permission management (session owner only) ───
+
+app.get("/session/:id/permissions", async (c) => {
+  const sessionId = c.req.param("id");
+  return proxyToSharedIndex(c.env, `/permissions?sessionId=${encodeURIComponent(sessionId)}`);
+});
+
+app.post("/session/:id/permissions", async (c) => {
+  const sessionId = c.req.param("id");
+  const email = c.get("userEmail");
+  const body = await c.req.raw.json() as Record<string, unknown>;
+  return proxyToSharedIndex(c.env, "/permissions", {
+    body: JSON.stringify({
+      sessionId,
+      ownerEmail: email,
+      granteeEmail: body.granteeEmail,
+      permission: body.permission ?? "readonly",
+      grantedBy: email,
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.delete("/session/:id/permissions/:email", async (c) => {
+  const sessionId = c.req.param("id");
+  const granteeEmail = c.req.param("email");
+  return proxyToSharedIndex(c.env, `/permissions/${encodeURIComponent(sessionId)}/${encodeURIComponent(granteeEmail)}`, { method: "DELETE" });
+});
+
+// ─── Admin: account-level permissions ───
+
+app.post("/api/admin/account-permissions", adminGuard as never, async (c) => {
+  const email = c.get("userEmail");
+  const body = await c.req.raw.json() as Record<string, unknown>;
+  return proxyToSharedIndex(c.env, "/account-permissions", {
+    body: JSON.stringify({
+      accountOwner: body.accountOwner,
+      granteeEmail: body.granteeEmail,
+      permission: body.permission,
+      grantedBy: email,
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.delete("/api/admin/account-permissions/:owner/:email", adminGuard as never, async (c) => {
+  const owner = c.req.param("owner");
+  const granteeEmail = c.req.param("email");
+  return proxyToSharedIndex(c.env, `/account-permissions/${encodeURIComponent(owner)}/${encodeURIComponent(granteeEmail)}`, { method: "DELETE" });
+});
+
+app.get("/api/admin/account-permissions", adminGuard as never, async (c) => {
+  const owner = new URL(c.req.raw.url).searchParams.get("owner") ?? "";
+  return proxyToSharedIndex(c.env, `/account-permissions?owner=${encodeURIComponent(owner)}`);
 });
 
 // ─── Migration endpoint (admin only, one-time) ───

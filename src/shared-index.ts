@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { hashShareToken } from "./share";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
 import type { AllowlistEntry, Env } from "./types";
 
@@ -100,6 +101,113 @@ export class SharedIndex implements DurableObject {
           this.db.exec("DELETE FROM models_cache");
         }
         return Response.json({ models: await this.getModels() });
+      }
+
+      // ─── Session shares ───
+
+      if (request.method === "POST" && url.pathname === "/shares") {
+        const body = z.object({
+          sessionId: z.string().min(1),
+          ownerEmail: z.string().email(),
+          permission: z.enum(["readonly", "readwrite"]).default("readonly"),
+          label: z.string().optional(),
+          expiresAt: z.string().optional(),
+          createdBy: z.string().email(),
+        }).parse(await request.json());
+
+        const token = await this.createShare(body);
+        return Response.json(token, { status: 201 });
+      }
+
+      if (request.method === "GET" && url.pathname === "/shares") {
+        const sessionId = url.searchParams.get("sessionId") ?? "";
+        if (!sessionId) return Response.json({ error: "sessionId required" }, { status: 400 });
+        return Response.json({ shares: this.listShares(sessionId) });
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/shares\/[^/]+$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        this.db.exec("UPDATE session_shares SET revoked_at = ? WHERE id = ?", nowEpoch(), id);
+        return Response.json({ revoked: true, id });
+      }
+
+      if (request.method === "POST" && url.pathname === "/shares/verify") {
+        const body = z.object({ token: z.string().min(1) }).parse(await request.json());
+        const result = await this.verifyShareToken(body.token);
+        return Response.json(result);
+      }
+
+      // ─── Session permissions ───
+
+      if (request.method === "GET" && url.pathname.match(/^\/permissions\/[^/]+\/[^/]+$/)) {
+        const parts = url.pathname.split("/");
+        const sessionId = decodeURIComponent(parts[2]);
+        const email = decodeURIComponent(parts[3]);
+        const perm = this.getPermission(sessionId, email);
+        if (!perm) return Response.json({ error: "No permission found" }, { status: 404 });
+        return Response.json(perm);
+      }
+
+      if (request.method === "POST" && url.pathname === "/permissions") {
+        const body = z.object({
+          sessionId: z.string().min(1),
+          ownerEmail: z.string().email(),
+          granteeEmail: z.string().email(),
+          permission: z.enum(["readonly", "readwrite"]).default("readonly"),
+          grantedBy: z.string().email(),
+        }).parse(await request.json());
+        this.grantPermission(body);
+        return Response.json({ granted: true, ...body }, { status: 201 });
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/permissions\/[^/]+\/[^/]+$/)) {
+        const parts = url.pathname.split("/");
+        const sessionId = decodeURIComponent(parts[2]);
+        const email = decodeURIComponent(parts[3]);
+        this.db.exec("DELETE FROM session_permissions WHERE session_id = ? AND grantee_email = ?", sessionId, email);
+        return Response.json({ revoked: true, sessionId, email });
+      }
+
+      if (request.method === "GET" && url.pathname === "/permissions") {
+        const sessionId = url.searchParams.get("sessionId");
+        const granteeEmail = url.searchParams.get("granteeEmail");
+        if (sessionId) {
+          return Response.json({ permissions: this.listPermissionsBySession(sessionId) });
+        }
+        if (granteeEmail) {
+          return Response.json({ permissions: this.listPermissionsByGrantee(granteeEmail) });
+        }
+        return Response.json({ error: "sessionId or granteeEmail required" }, { status: 400 });
+      }
+
+      // ─── Account permissions ───
+
+      if (request.method === "POST" && url.pathname === "/account-permissions") {
+        const body = z.object({
+          accountOwner: z.string().email(),
+          granteeEmail: z.string().email(),
+          permission: z.string().min(1),
+          grantedBy: z.string().email(),
+        }).parse(await request.json());
+        this.grantAccountPermission(body);
+        return Response.json({ granted: true, ...body }, { status: 201 });
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/account-permissions\/[^/]+\/[^/]+$/)) {
+        const parts = url.pathname.split("/");
+        const owner = decodeURIComponent(parts[2]);
+        const email = decodeURIComponent(parts[3]);
+        this.db.exec(
+          "UPDATE account_permissions SET revoked_at = ? WHERE account_owner = ? AND grantee_email = ?",
+          nowEpoch(), owner, email,
+        );
+        return Response.json({ revoked: true, owner, email });
+      }
+
+      if (request.method === "GET" && url.pathname === "/account-permissions") {
+        const owner = url.searchParams.get("owner") ?? "";
+        if (!owner) return Response.json({ error: "owner required" }, { status: 400 });
+        return Response.json({ permissions: this.listAccountPermissions(owner) });
       }
 
       return new Response("Not Found", { status: 404 });
@@ -353,5 +461,219 @@ export class SharedIndex implements DurableObject {
       costOutput: row.cost_output === null ? null : Number(row.cost_output),
       contextWindow: row.context_window === null ? null : Number(row.context_window),
     };
+  }
+
+  // ─── Session shares ───
+
+  private async createShare(input: {
+    sessionId: string;
+    ownerEmail: string;
+    permission: string;
+    label?: string;
+    expiresAt?: string;
+    createdBy: string;
+  }): Promise<{ id: string; token: string; permission: string; sessionId: string }> {
+    const { generateShareToken } = await import("./share");
+    const token = generateShareToken();
+    const tokenHash = await hashShareToken(token);
+    const now = nowEpoch();
+    const expiresAt = input.expiresAt ? Math.floor(new Date(input.expiresAt).getTime() / 1000) : null;
+
+    this.db.exec(
+      `INSERT INTO session_shares (id, session_id, owner_email, permission, created_by, created_at, expires_at, label)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      tokenHash,
+      input.sessionId,
+      input.ownerEmail,
+      input.permission,
+      input.createdBy,
+      now,
+      expiresAt,
+      input.label ?? null,
+    );
+
+    return { id: tokenHash, token, permission: input.permission, sessionId: input.sessionId };
+  }
+
+  private listShares(sessionId: string): Array<{
+    id: string;
+    sessionId: string;
+    ownerEmail: string;
+    permission: string;
+    label: string | null;
+    createdAt: string;
+    expiresAt: string | null;
+    revokedAt: string | null;
+  }> {
+    return this.db
+      .all("SELECT id, session_id, owner_email, permission, label, created_at, expires_at, revoked_at FROM session_shares WHERE session_id = ? ORDER BY created_at DESC", sessionId)
+      .map((row) => ({
+        id: String(row.id),
+        sessionId: String(row.session_id),
+        ownerEmail: String(row.owner_email),
+        permission: String(row.permission),
+        label: row.label === null ? null : String(row.label),
+        createdAt: epochToIso(row.created_at),
+        expiresAt: row.expires_at === null ? null : epochToIso(row.expires_at),
+        revokedAt: row.revoked_at === null ? null : epochToIso(row.revoked_at),
+      }));
+  }
+
+  private async verifyShareToken(token: string): Promise<{
+    valid: boolean;
+    sessionId?: string;
+    permission?: string;
+    ownerEmail?: string;
+  }> {
+    const tokenHash = await hashShareToken(token);
+    const row = this.db.one(
+      "SELECT session_id, owner_email, permission, expires_at, revoked_at FROM session_shares WHERE id = ?",
+      tokenHash,
+    );
+
+    if (!row) return { valid: false };
+    if (row.revoked_at !== null) return { valid: false };
+
+    // Check expiration
+    if (row.expires_at !== null) {
+      const expiresAt = Number(row.expires_at);
+      if (expiresAt <= nowEpoch()) return { valid: false };
+    }
+
+    return {
+      valid: true,
+      sessionId: String(row.session_id),
+      permission: String(row.permission),
+      ownerEmail: String(row.owner_email),
+    };
+  }
+
+  // ─── Session permissions ───
+
+  private getPermission(sessionId: string, email: string): {
+    sessionId: string;
+    ownerEmail: string;
+    granteeEmail: string;
+    permission: string;
+    grantedBy: string;
+    createdAt: string;
+  } | null {
+    const row = this.db.one(
+      "SELECT session_id, owner_email, grantee_email, permission, granted_by, created_at FROM session_permissions WHERE session_id = ? AND grantee_email = ?",
+      sessionId, email,
+    );
+    if (!row) return null;
+    return {
+      sessionId: String(row.session_id),
+      ownerEmail: String(row.owner_email),
+      granteeEmail: String(row.grantee_email),
+      permission: String(row.permission),
+      grantedBy: String(row.granted_by),
+      createdAt: epochToIso(row.created_at),
+    };
+  }
+
+  private grantPermission(input: {
+    sessionId: string;
+    ownerEmail: string;
+    granteeEmail: string;
+    permission: string;
+    grantedBy: string;
+  }): void {
+    this.db.exec(
+      `INSERT INTO session_permissions (session_id, owner_email, grantee_email, permission, granted_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id, grantee_email) DO UPDATE SET permission = excluded.permission, granted_by = excluded.granted_by`,
+      input.sessionId,
+      input.ownerEmail,
+      input.granteeEmail,
+      input.permission,
+      input.grantedBy,
+      nowEpoch(),
+    );
+  }
+
+  private listPermissionsBySession(sessionId: string): Array<{
+    sessionId: string;
+    ownerEmail: string;
+    granteeEmail: string;
+    permission: string;
+    grantedBy: string;
+    createdAt: string;
+  }> {
+    return this.db
+      .all("SELECT session_id, owner_email, grantee_email, permission, granted_by, created_at FROM session_permissions WHERE session_id = ? ORDER BY created_at ASC", sessionId)
+      .map((row) => this.mapPermissionRow(row));
+  }
+
+  private listPermissionsByGrantee(granteeEmail: string): Array<{
+    sessionId: string;
+    ownerEmail: string;
+    granteeEmail: string;
+    permission: string;
+    grantedBy: string;
+    createdAt: string;
+  }> {
+    return this.db
+      .all("SELECT session_id, owner_email, grantee_email, permission, granted_by, created_at FROM session_permissions WHERE grantee_email = ? ORDER BY created_at ASC", granteeEmail)
+      .map((row) => this.mapPermissionRow(row));
+  }
+
+  private mapPermissionRow(row: SqlRow): {
+    sessionId: string;
+    ownerEmail: string;
+    granteeEmail: string;
+    permission: string;
+    grantedBy: string;
+    createdAt: string;
+  } {
+    return {
+      sessionId: String(row.session_id),
+      ownerEmail: String(row.owner_email),
+      granteeEmail: String(row.grantee_email),
+      permission: String(row.permission),
+      grantedBy: String(row.granted_by),
+      createdAt: epochToIso(row.created_at),
+    };
+  }
+
+  // ─── Account permissions ───
+
+  private grantAccountPermission(input: {
+    accountOwner: string;
+    granteeEmail: string;
+    permission: string;
+    grantedBy: string;
+  }): void {
+    this.db.exec(
+      `INSERT INTO account_permissions (account_owner, grantee_email, permission, granted_by, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(account_owner, grantee_email, permission) DO UPDATE SET granted_by = excluded.granted_by, revoked_at = NULL`,
+      input.accountOwner,
+      input.granteeEmail,
+      input.permission,
+      input.grantedBy,
+      nowEpoch(),
+    );
+  }
+
+  private listAccountPermissions(owner: string): Array<{
+    accountOwner: string;
+    granteeEmail: string;
+    permission: string;
+    grantedBy: string;
+    createdAt: string;
+    revokedAt: string | null;
+  }> {
+    return this.db
+      .all("SELECT account_owner, grantee_email, permission, granted_by, created_at, revoked_at FROM account_permissions WHERE account_owner = ? ORDER BY created_at ASC", owner)
+      .map((row) => ({
+        accountOwner: String(row.account_owner),
+        granteeEmail: String(row.grantee_email),
+        permission: String(row.permission),
+        grantedBy: String(row.granted_by),
+        createdAt: epochToIso(row.created_at),
+        revokedAt: row.revoked_at === null ? null : epochToIso(row.revoked_at),
+      }));
   }
 }
