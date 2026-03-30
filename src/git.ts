@@ -2,6 +2,7 @@ import { WorkspaceFileSystem } from "@cloudflare/shell";
 import { createGit } from "@cloudflare/shell/git";
 import type { Workspace } from "@cloudflare/shell";
 import { getUserControlStub } from "./auth";
+import { log } from "./logger";
 import type { AppConfig, Env } from "./types";
 
 function hostFromUrl(url: string): string {
@@ -21,24 +22,34 @@ function secretKeyForHost(host: string): string | null {
 
 /**
  * Try to fetch a token from UserControl's encrypted secrets.
- * Falls back to env vars for backward compatibility.
+ * Returns undefined (with a warning log) if the lookup fails.
  */
 async function fetchUserToken(secretKey: string, env: Env, ownerEmail?: string): Promise<string | undefined> {
-  // Try per-user encrypted secrets first
-  if (ownerEmail) {
-    try {
-      const stub = getUserControlStub(env, ownerEmail);
-      const response = await stub.fetch(`https://user-control/internal/secret/${encodeURIComponent(secretKey)}`, {
-        headers: { "x-owner-email": ownerEmail },
-      });
-      if (response.ok) {
-        const { value } = (await response.json()) as { value: string };
-        if (value) return value;
-      }
-    } catch {
-      // Fall through to env vars
-    }
+  if (!ownerEmail) {
+    log("warn", "git: no ownerEmail provided, skipping per-user secret lookup", { secretKey });
+    return undefined;
   }
+
+  try {
+    const stub = getUserControlStub(env, ownerEmail);
+    const response = await stub.fetch(`https://user-control/internal/secret/${encodeURIComponent(secretKey)}`, {
+      headers: { "x-owner-email": ownerEmail },
+    });
+    if (response.ok) {
+      const { value } = (await response.json()) as { value: string };
+      if (value) {
+        log("info", "git: resolved per-user secret", { secretKey, ownerEmail });
+        return value;
+      }
+      log("warn", "git: per-user secret exists but value is empty", { secretKey, ownerEmail });
+    } else {
+      const body = await response.text().catch(() => "");
+      log("warn", "git: per-user secret lookup failed", { secretKey, ownerEmail, status: response.status, body: body.slice(0, 200) });
+    }
+  } catch (error) {
+    log("error", "git: per-user secret lookup threw", { secretKey, ownerEmail, error: error instanceof Error ? error.message : String(error) });
+  }
+
   return undefined;
 }
 
@@ -62,7 +73,10 @@ export async function resolveRemoteToken(input: {
   url?: string;
 }): Promise<string | undefined> {
   const resolvedUrl = input.url ?? await resolveRemoteUrl(input.git, input.dir, input.remote);
-  if (!resolvedUrl) return undefined;
+  if (!resolvedUrl) {
+    log("warn", "git: no remote URL resolved, cannot look up token", { dir: input.dir, remote: input.remote });
+    return undefined;
+  }
 
   const host = hostFromUrl(resolvedUrl);
   const secretKey = secretKeyForHost(host);
@@ -70,11 +84,20 @@ export async function resolveRemoteToken(input: {
   // Try per-user secret first
   if (secretKey && input.ownerEmail) {
     const userToken = await fetchUserToken(secretKey, input.env, input.ownerEmail);
-    if (userToken) return userToken;
+    if (userToken) {
+      log("info", "git: using per-user secret for auth", { host, secretKey });
+      return userToken;
+    }
   }
 
   // Fall back to env vars
-  return chooseTokenForUrl(resolvedUrl, input.env);
+  const envToken = chooseTokenForUrl(resolvedUrl, input.env);
+  if (envToken) {
+    log("info", "git: using env var fallback for auth", { host });
+  } else {
+    log("warn", "git: no token found — request will be unauthenticated", { host, secretKey, hasOwnerEmail: !!input.ownerEmail });
+  }
+  return envToken;
 }
 
 async function resolveRemoteUrl(git: ReturnType<typeof createGit>, dir?: string, remote?: string): Promise<string | undefined> {
