@@ -80,6 +80,49 @@
     .mobile-nav button{border:none;background:none;font-size:11px;color:var(--muted);padding:6px 12px;display:flex;flex-direction:column;align-items:center;gap:2px}
     .mobile-nav button.active{color:var(--accent)}
     .fab{display:none;position:fixed;bottom:72px;right:16px;width:48px;height:48px;border-radius:50%;background:var(--accent);color:#fff;border:none;font-size:24px;box-shadow:0 4px 12px rgba(0,0,0,.2);z-index:100}
+
+    /* Onboarding Wizard */
+    .wizard-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px}
+    .wizard-card{background:var(--panel);border-radius:16px;padding:32px;max-width:480px;width:100%;text-align:center;position:relative}
+    .wizard-card h3{font-size:20px;margin-bottom:8px;color:var(--text)}
+    .wizard-card p{color:var(--muted);line-height:1.5;margin-bottom:16px;font-size:13px}
+    .wizard-dots{display:flex;justify-content:center;gap:8px;margin-bottom:24px}
+    .wizard-dots .dot{width:10px;height:10px;border-radius:50%;background:var(--border);transition:background .2s}
+    .wizard-dots .dot.active{background:var(--accent)}
+    .wizard-dots .dot.done{background:var(--accent);opacity:.5}
+    .wizard-actions{display:flex;gap:8px;justify-content:center;margin-top:20px}
+    .wizard-card input,.wizard-card select{margin-bottom:8px}
+    .wizard-skip{position:absolute;top:16px;right:16px;font-size:11px;color:var(--muted);background:none;border:none;cursor:pointer;padding:4px 8px}
+    .wizard-skip:hover{color:var(--text)}
+
+    /* Integrations */
+    .integ-card{border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;margin-bottom:8px}
+    .integ-card .integ-name{font-weight:600;font-size:13px}
+    .integ-card .integ-desc{font-size:11px;color:var(--muted);margin:2px 0 6px}
+    .integ-card .integ-status{font-size:10px;text-transform:uppercase;letter-spacing:.05em}
+    .integ-card .integ-actions{display:flex;gap:4px;align-items:center;margin-top:6px}
+    .toggle-switch{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0}
+    .toggle-switch input{opacity:0;width:0;height:0}
+    .toggle-switch .slider{position:absolute;cursor:pointer;inset:0;background:var(--border);border-radius:20px;transition:.2s}
+    .toggle-switch .slider::before{content:'';position:absolute;height:14px;width:14px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+    .toggle-switch input:checked+.slider{background:var(--accent)}
+    .toggle-switch input:checked+.slider::before{transform:translateX(16px)}
+
+    /* Session Settings Overlay */
+    .settings-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1500;display:flex;align-items:center;justify-content:center;padding:16px}
+    .settings-content{background:var(--panel);border-radius:16px;padding:24px;max-width:600px;max-height:80vh;overflow-y:auto;width:90%}
+    .settings-content h3{margin-bottom:16px}
+    .settings-section{margin-bottom:20px}
+    .settings-section h4{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:8px}
+    .approval-card{border:1px solid var(--border);border-radius:var(--radius);padding:8px 12px;margin-bottom:6px;font-size:12px}
+    .approval-card .approval-actions{display:flex;gap:4px;margin-top:6px}
+
+    /* Presence */
+    .presence-bar{display:inline-flex;align-items:center;gap:4px;margin-left:8px}
+    .presence-avatar{width:22px;height:22px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;border:2px solid var(--panel);cursor:default;position:relative}
+    .presence-avatar[title]:hover::after{content:attr(title);position:absolute;bottom:-22px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--panel);padding:2px 6px;border-radius:4px;font-size:10px;white-space:nowrap;z-index:10}
+    .typing-indicator{align-self:flex-start;color:var(--muted);font-size:11px;font-style:italic;padding:4px 14px}
+
     @media(max-width:900px){
       .app{grid-template-columns:1fr;height:calc(100vh - 56px)}
       .sidebar,.right{display:none}
@@ -87,6 +130,8 @@
       .mobile-nav{display:block}
       .fab{display:flex;align-items:center;justify-content:center}
       .kanban{grid-template-columns:1fr 1fr}
+      .wizard-card{padding:24px 16px}
+      .settings-content{padding:16px}
     }
   </style>
 </head>
@@ -130,13 +175,15 @@
 
     <div class="center">
       <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--panel)">
-        <div>
+        <div style="display:flex;align-items:center">
           <span id="session-status-dot" class="status-dot idle"></span>
           <strong id="session-title-display">No session</strong>
           <span id="session-id-display" style="font-size:11px;color:var(--muted);margin-left:8px"></span>
           <span id="token-summary" class="token-summary" style="margin-left:8px"></span>
+          <div id="presence-bar" class="presence-bar"></div>
         </div>
         <div style="display:flex;gap:6px">
+          <button onclick="showSessionSettings()" title="Session settings — sharing, permissions, browser, approvals">Settings</button>
           <button onclick="showHelp()" title="Help — explains each feature and button">?</button>
           <button onclick="forkSession()" title="Fork — creates a copy of this session with all files and messages for branching experiments">Fork</button>
           <button id="abort-btn" onclick="abortPrompt()" disabled title="Abort — cancels the currently running async prompt">Abort</button>
@@ -158,6 +205,7 @@
           </div>
         </div>
       </div>
+      <div id="typing-indicator" class="typing-indicator" style="display:none"></div>
       <div class="input-bar">
         <input id="msg-input" placeholder="Ask Dodo to build something..." onkeydown="if(event.key==='Enter'&&!event.shiftKey)sendMessage()"/>
         <button class="primary" id="send-btn" onclick="sendMessage()">Send</button>
@@ -231,6 +279,17 @@
         </details>
       </div>
       <div class="section">
+        <h2>Integrations</h2>
+        <div id="integrations-list"></div>
+        <details style="margin-top:6px">
+          <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Add integration</summary>
+          <input id="integ-name" placeholder="Name" style="margin-top:6px;margin-bottom:4px"/>
+          <input id="integ-url" placeholder="URL (https://...)" style="margin-bottom:4px"/>
+          <input id="integ-auth-header" placeholder="Auth header value (optional)" style="margin-bottom:4px"/>
+          <button onclick="addIntegration()">Add</button>
+        </details>
+      </div>
+      <div class="section">
         <h2>Secrets</h2>
         <div id="passkey-status"></div>
         <div id="secrets-list"></div>
@@ -291,6 +350,8 @@
         <dt>Prompts</dt><dd>History of async prompts with their status (queued, running, completed, failed, aborted).</dd>
         <dt>Cron Jobs</dt><dd>Schedule delayed or recurring prompts that run automatically.</dd>
         <dt>Memory</dt><dd>Persistent key-value store with search. Survives across sessions.</dd>
+        <dt>Integrations</dt><dd>Connect external MCP servers (GitHub, Cloudflare, Sentry, etc.) to extend the agent's capabilities.</dd>
+        <dt>Session Settings</dt><dd>Manage sharing, permissions, browser tools, approvals, and per-session MCP overrides.</dd>
         <dt>Config</dt><dd>Switch LLM models and gateways. The model dropdown is populated from the available models on the OpenCode gateway.</dd>
         <dt>Allowlist</dt><dd>Hosts that sandboxed code execution is allowed to reach. Unlisted hosts are blocked.</dd>
       </dl>
@@ -298,8 +359,81 @@
     </div>
   </div>
 
+  <!-- Session Settings overlay -->
+  <div class="settings-overlay" id="settings-overlay" style="display:none" onclick="if(event.target===this)hideSessionSettings()">
+    <div class="settings-content">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3>Session Settings</h3>
+        <button onclick="hideSessionSettings()" class="sm">Close</button>
+      </div>
+
+      <!-- Sharing -->
+      <div class="settings-section">
+        <h4>Sharing</h4>
+        <div style="display:flex;gap:4px;margin-bottom:8px">
+          <select id="share-permission" style="width:auto;flex:0 0 auto">
+            <option value="readonly">Read-only</option>
+            <option value="readwrite">Read-write</option>
+          </select>
+          <button onclick="createShareLink()" class="primary" style="flex:0 0 auto">Create Share Link</button>
+        </div>
+        <div id="share-token-display" style="display:none;margin-bottom:8px;padding:8px;background:var(--accent-bg);border-radius:var(--radius);font-size:11px;font-family:var(--mono);word-break:break-all"></div>
+        <div id="shares-list"></div>
+      </div>
+
+      <!-- Permissions -->
+      <div class="settings-section">
+        <h4>Permissions</h4>
+        <div style="display:flex;gap:4px;margin-bottom:8px">
+          <input id="perm-email" placeholder="user@example.com" style="flex:1"/>
+          <select id="perm-level" style="width:auto;flex:0 0 auto">
+            <option value="readonly">Read-only</option>
+            <option value="readwrite">Read-write</option>
+          </select>
+          <button onclick="grantPermission()">Grant</button>
+        </div>
+        <div id="permissions-list"></div>
+      </div>
+
+      <!-- Browser -->
+      <div class="settings-section">
+        <h4>Browser Tools</h4>
+        <div style="display:flex;align-items:center;gap:8px">
+          <label class="toggle-switch">
+            <input type="checkbox" id="browser-toggle" onchange="toggleBrowser()"/>
+            <span class="slider"></span>
+          </label>
+          <span style="font-size:12px" id="browser-status">Loading...</span>
+        </div>
+      </div>
+
+      <!-- Approvals -->
+      <div class="settings-section">
+        <h4>Pending Approvals</h4>
+        <div id="approvals-list"></div>
+      </div>
+
+      <!-- Session MCP Overrides -->
+      <div class="settings-section">
+        <h4>MCP Integrations (Session Override)</h4>
+        <p style="font-size:11px;color:var(--muted);margin-bottom:8px">Toggle integrations on/off for this session only.</p>
+        <div id="session-mcp-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Onboarding Wizard overlay -->
+  <div class="wizard-overlay" id="wizard-overlay" style="display:none">
+    <div class="wizard-card">
+      <button class="wizard-skip" onclick="skipOnboarding()">Skip setup</button>
+      <div class="wizard-dots" id="wizard-dots"></div>
+      <div id="wizard-body"></div>
+    </div>
+  </div>
+
   <script>
     let currentSession=null,eventSource=null,isProcessing=false,streamingEl=null,expandedDirs=new Set(),activeTab='chat';
+    let wsConnection=null,presenceUsers=[],typingUsers=[];
 
     const $=(id)=>document.getElementById(id);
     const esc=(s)=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
@@ -330,7 +464,10 @@
     function hideThinking(){$("thinking-indicator")?.remove()}
     function useExample(el){if(!currentSession){createSession().then(()=>{$("msg-input").value=el.textContent});return}$("msg-input").value=el.textContent;$("msg-input").focus()}
 
-    async function boot(){await Promise.all([loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets()])}
+    async function boot(){
+      await Promise.all([loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets(),loadIntegrations()]);
+      checkOnboarding();
+    }
 
     // --- Identity ---
     async function loadIdentity(){
@@ -400,7 +537,7 @@
       updateTokenSummary(state);
       if(state.status==="running")setProcessing(true);
       const{messages}=await api(`/session/${id}/messages`);messages.forEach(renderMessage);
-      await Promise.all([loadFiles("/"),loadPrompts(),loadCron(),refreshGit()]);connectSSE(id);
+      await Promise.all([loadFiles("/"),loadPrompts(),loadCron(),refreshGit()]);connectSSE(id);connectWebSocket(id);
       if(window.innerWidth<=900)switchTab('chat');
     }
     function updateTokenSummary(state){
@@ -418,6 +555,7 @@
       eventSource.addEventListener("file",()=>loadFiles("/"));
       eventSource.addEventListener("prompt",()=>loadPrompts());
       eventSource.addEventListener("execution",(e)=>{const r=JSON.parse(e.data);const el=document.createElement("div");el.className="msg tool_call";el.textContent=r.error?`Error: ${r.error}`:`Result: ${JSON.stringify(r.result,null,2)}`;$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight});
+      eventSource.addEventListener("presence",(e)=>{const data=JSON.parse(e.data);presenceUsers=data.users||[];renderPresence()});
     }
 
     function renderMessage(msg){const el=document.createElement("div");el.className=`msg ${msg.role}`;el.textContent=msg.content;if(msg.role==="assistant"&&(msg.tokenInput||msg.tokenOutput)){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;el.appendChild(m)}$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
@@ -429,7 +567,7 @@
     async function sendAsync(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";setProcessing(true);showThinking();await json(`/session/${currentSession}/prompt`,{content})}
     async function abortPrompt(){if(!currentSession)return;await json(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
     async function forkSession(){if(!currentSession)return;const{id}=await json(`/session/${currentSession}/fork`,{});currentSession=id;await loadSessions();await selectSession(id)}
-    async function deleteSession(){if(!currentSession||!confirm("Delete this session?"))return;await api(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";await loadSessions()}
+    async function deleteSession(){if(!currentSession||!confirm("Delete this session?"))return;await api(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("presence-bar").innerHTML="";await loadSessions()}
 
     // --- Files (recursive expansion) ---
     async function loadFiles(path){
@@ -518,6 +656,384 @@
     async function gitInit(){if(!currentSession)return;await json(`/session/${currentSession}/git/init`,{});await refreshGit()}
     async function gitAddAll(){if(!currentSession)return;await json(`/session/${currentSession}/git/add`,{filepath:"."});await refreshGit()}
     async function gitCommitPrompt(){if(!currentSession)return;const message=prompt("Commit message:");if(!message)return;await json(`/session/${currentSession}/git/commit`,{message});await refreshGit()}
+
+    // =====================================================
+    // Feature 1: Onboarding Wizard
+    // =====================================================
+
+    const WIZARD_STEPS=["welcome","passkey","secrets","memory","integrations","complete"];
+
+    async function checkOnboarding(){
+      try{
+        const{completed,step}=await api("/api/onboarding/status");
+        if(!completed)showWizard(step);
+      }catch{}
+    }
+
+    function showWizard(step){
+      $("wizard-overlay").style.display="flex";
+      renderWizardStep(step);
+    }
+
+    function hideWizard(){
+      $("wizard-overlay").style.display="none";
+    }
+
+    function renderWizardDots(currentStep){
+      const idx=WIZARD_STEPS.indexOf(currentStep);
+      $("wizard-dots").innerHTML=WIZARD_STEPS.map((s,i)=>`<div class="dot ${i===idx?'active':i<idx?'done':''}"></div>`).join("");
+    }
+
+    function renderWizardStep(step){
+      renderWizardDots(step);
+      const body=$("wizard-body");
+      switch(step){
+        case "welcome":
+          body.innerHTML=`<h3>Welcome to Dodo</h3><p>Dodo is an autonomous coding agent running on Cloudflare Workers. Let's get you set up in a few quick steps.</p><p style="font-size:12px">You can skip any step and configure it later from the sidebar.</p><div class="wizard-actions"><button class="primary" onclick="advanceWizard('welcome',false)">Continue</button></div>`;
+          break;
+        case "passkey":
+          body.innerHTML=`<h3>Set a Passkey</h3><p>A passkey protects your secrets (API tokens, etc.) with envelope encryption. You can skip this and set one later.</p><input type="password" id="wiz-passkey" placeholder="Passkey (min 4 characters)" style="max-width:320px;margin:0 auto;display:block"/><div class="wizard-actions"><button class="primary" onclick="wizardSetPasskey()">Set Passkey</button><button onclick="advanceWizard('passkey',true)">Skip</button></div>`;
+          break;
+        case "secrets":
+          body.innerHTML=`<h3>Add Tokens</h3><p>Add your GitHub or GitLab token so Dodo can push/pull code on your behalf. These are encrypted at rest.</p><div style="max-width:320px;margin:0 auto;text-align:left"><label style="font-size:11px;color:var(--muted)">GitHub Token</label><input type="password" id="wiz-github" placeholder="ghp_..." style="margin-bottom:8px"/><label style="font-size:11px;color:var(--muted)">GitLab Token</label><input type="password" id="wiz-gitlab" placeholder="glpat-..." style="margin-bottom:8px"/></div><div class="wizard-actions"><button class="primary" onclick="wizardSetSecrets()">Save Tokens</button><button onclick="advanceWizard('secrets',true)">Skip</button></div>`;
+          break;
+        case "memory":
+          body.innerHTML=`<h3>Memory</h3><p>Dodo has a built-in persistent memory store. You can also connect an external Memory MCP server for richer cross-session memory.</p><p style="font-size:12px"><a href="https://github.com/jonnyparris/agent-memory-mcp" target="_blank" style="color:var(--accent)">Agent Memory MCP setup guide</a></p><div class="wizard-actions"><button class="primary" onclick="advanceWizard('memory',false)">Continue</button><button onclick="advanceWizard('memory',true)">Skip</button></div>`;
+          break;
+        case "integrations":
+          body.innerHTML=`<h3>Integrations</h3><p>Extend Dodo with MCP servers for GitHub, Cloudflare, Sentry, and more. Configure them in the Integrations panel after setup.</p><div id="wiz-catalog" style="text-align:left;max-width:360px;margin:0 auto"></div><div class="wizard-actions"><button class="primary" onclick="advanceWizard('integrations',false)">Continue</button><button onclick="advanceWizard('integrations',true)">Skip</button></div>`;
+          loadWizardCatalog();
+          break;
+        case "complete":
+          body.innerHTML=`<h3>You're all set!</h3><p>Dodo is ready to go. Create a session and start building.</p><div class="wizard-actions"><button class="primary" onclick="finishWizard()">Get Started</button></div>`;
+          break;
+      }
+    }
+
+    async function loadWizardCatalog(){
+      try{
+        const catalog=await api("/api/mcp-catalog");
+        const el=$("wiz-catalog");
+        if(el)el.innerHTML=catalog.map(c=>`<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px"><strong>${esc(c.name)}</strong> — <span style="color:var(--muted)">${esc(c.description)}</span></div>`).join("");
+      }catch{}
+    }
+
+    async function advanceWizard(step,skip){
+      try{
+        const next=await json("/api/onboarding/advance",{step,skip});
+        if(next.currentStep==="complete"){renderWizardStep("complete")}
+        else{renderWizardStep(next.currentStep)}
+      }catch(e){alert("Error: "+(e.message||e))}
+    }
+
+    async function wizardSetPasskey(){
+      const passkey=$("wiz-passkey")?.value;
+      if(!passkey||passkey.length<4)return alert("Passkey must be at least 4 characters");
+      try{
+        await json("/api/passkey/init",{passkey});
+        await loadPasskeyStatus();
+        await advanceWizard("passkey",false);
+      }catch(e){alert("Failed: "+(e.message||e))}
+    }
+
+    async function wizardSetSecrets(){
+      const github=$("wiz-github")?.value?.trim();
+      const gitlab=$("wiz-gitlab")?.value?.trim();
+      try{
+        if(github)await json("/api/secrets/github_token",{value:github},"PUT");
+        if(gitlab)await json("/api/secrets/gitlab_token",{value:gitlab},"PUT");
+        await loadSecrets();
+        await advanceWizard("secrets",!github&&!gitlab);
+      }catch(e){alert("Failed: "+(e.message||e))}
+    }
+
+    async function skipOnboarding(){
+      // Rapidly advance through all remaining steps
+      try{
+        const state=await api("/api/onboarding");
+        let current=state.currentStep;
+        while(current!=="complete"){
+          const next=await json("/api/onboarding/advance",{step:current,skip:true});
+          current=next.currentStep;
+        }
+      }catch{}
+      hideWizard();
+    }
+
+    function finishWizard(){
+      hideWizard();
+      loadPasskeyStatus();loadSecrets();loadIntegrations();
+    }
+
+    // =====================================================
+    // Feature 2: Integrations
+    // =====================================================
+
+    let mcpCatalog=[],mcpConfigs=[];
+
+    async function loadIntegrations(){
+      try{
+        const[catalog,configsRes]=await Promise.all([api("/api/mcp-catalog"),api("/api/mcp-configs")]);
+        mcpCatalog=Array.isArray(catalog)?catalog:[];
+        mcpConfigs=configsRes.configs||[];
+        renderIntegrations();
+      }catch{$("integrations-list").innerHTML='<div class="empty">Failed to load</div>'}
+    }
+
+    function renderIntegrations(){
+      const configMap=new Map(mcpConfigs.map(c=>[c.name.toLowerCase(),c]));
+      const cards=[];
+
+      // Catalog entries
+      mcpCatalog.forEach(cat=>{
+        const configured=configMap.get(cat.name.toLowerCase());
+        cards.push(renderIntegCard(cat.name,cat.description,cat.url,configured));
+        if(configured)configMap.delete(cat.name.toLowerCase());
+      });
+
+      // Custom configs not in catalog
+      configMap.forEach(cfg=>{
+        cards.push(renderIntegCard(cfg.name,cfg.url||"Custom integration",null,cfg));
+      });
+
+      $("integrations-list").innerHTML=cards.length?cards.join(""):'<div class="empty">No integrations</div>';
+    }
+
+    function renderIntegCard(name,description,catalogUrl,config){
+      const statusHtml=config
+        ?`<span class="integ-status" style="color:var(--accent)">Configured</span>`
+        :`<span class="integ-status" style="color:var(--muted)">Not configured</span>`;
+      let actionsHtml="";
+      if(config){
+        const checked=config.enabled?"checked":"";
+        actionsHtml=`<label class="toggle-switch"><input type="checkbox" ${checked} onchange="toggleIntegration('${esc(config.id)}',this.checked)"/><span class="slider"></span></label><button class="sm" onclick="testIntegration('${esc(config.id)}')">Test</button><button class="sm danger" onclick="deleteIntegration('${esc(config.id)}')">x</button>`;
+      }else if(catalogUrl){
+        actionsHtml=`<a href="${esc(catalogUrl)}" target="_blank" style="font-size:11px;color:var(--accent)">Setup guide</a>`;
+      }
+      return `<div class="integ-card"><div class="integ-name">${esc(name)}</div><div class="integ-desc">${esc(description)}</div>${statusHtml}<div class="integ-actions">${actionsHtml}</div></div>`;
+    }
+
+    async function addIntegration(){
+      const name=$("integ-name").value.trim();
+      const url=$("integ-url").value.trim();
+      const authHeader=$("integ-auth-header").value.trim();
+      if(!name||!url)return alert("Name and URL are required");
+      const body={name,url,type:"http",enabled:true};
+      if(authHeader)body.headers={Authorization:authHeader};
+      try{
+        await json("/api/mcp-configs",body);
+        $("integ-name").value="";$("integ-url").value="";$("integ-auth-header").value="";
+        await loadIntegrations();
+      }catch(e){alert("Failed: "+(e.error||e.message||e))}
+    }
+
+    async function toggleIntegration(id,enabled){
+      try{await json(`/api/mcp-configs/${encodeURIComponent(id)}`,{enabled},"PUT");await loadIntegrations()}
+      catch(e){alert("Failed: "+(e.message||e))}
+    }
+
+    async function testIntegration(id){
+      try{
+        const result=await json(`/api/mcp-configs/${encodeURIComponent(id)}/test`,{});
+        if(result.ok)alert(`Connection OK — ${result.toolCount} tool${result.toolCount!==1?'s':''} available`);
+        else alert(`Connection failed: ${result.error||'Unknown error'}`);
+      }catch(e){alert("Test failed: "+(e.message||e))}
+    }
+
+    async function deleteIntegration(id){
+      if(!confirm("Delete this integration?"))return;
+      await api(`/api/mcp-configs/${encodeURIComponent(id)}`,{method:"DELETE"});
+      await loadIntegrations();
+    }
+
+    // =====================================================
+    // Feature 3: Session Settings
+    // =====================================================
+
+    function showSessionSettings(){
+      if(!currentSession)return alert("Select a session first");
+      $("settings-overlay").style.display="flex";
+      loadSharesList();loadPermissionsList();loadBrowserStatus();loadApprovals();loadSessionMcpConfigs();
+    }
+    function hideSessionSettings(){$("settings-overlay").style.display="none"}
+
+    // Sharing
+    async function createShareLink(){
+      if(!currentSession)return;
+      const permission=$("share-permission").value;
+      try{
+        const result=await json(`/session/${currentSession}/share`,{permission});
+        if(result.token){
+          const shareUrl=`${location.origin}/shared/${result.token}`;
+          $("share-token-display").style.display="block";
+          $("share-token-display").innerHTML=`<strong>Share link (shown once):</strong><br/><a href="${esc(shareUrl)}" target="_blank" style="color:var(--accent)">${esc(shareUrl)}</a>`;
+        }
+        await loadSharesList();
+      }catch(e){alert("Failed: "+(e.message||e))}
+    }
+
+    async function loadSharesList(){
+      if(!currentSession)return;
+      try{
+        const{shares}=await api(`/session/${currentSession}/shares`);
+        $("shares-list").innerHTML=(shares||[]).length?(shares||[]).map(s=>`<div class="kv"><span style="font-size:11px">${esc(s.permission)} — ${esc(s.label||'unlabeled')}</span><button class="sm danger" onclick="revokeShare('${esc(s.id)}')">Revoke</button></div>`).join(""):'<div class="empty">No share links</div>';
+      }catch{$("shares-list").innerHTML='<div class="empty">No share links</div>'}
+    }
+
+    async function revokeShare(shareId){
+      if(!currentSession)return;
+      await api(`/session/${currentSession}/share/${encodeURIComponent(shareId)}`,{method:"DELETE"});
+      await loadSharesList();
+    }
+
+    // Permissions
+    async function loadPermissionsList(){
+      if(!currentSession)return;
+      try{
+        const{permissions}=await api(`/session/${currentSession}/permissions`);
+        $("permissions-list").innerHTML=(permissions||[]).length?(permissions||[]).map(p=>`<div class="kv"><span style="font-size:11px">${esc(p.granteeEmail)} — <span class="tag">${esc(p.permission)}</span></span><button class="sm danger" onclick="revokePermission('${esc(p.granteeEmail)}')">Revoke</button></div>`).join(""):'<div class="empty">No permissions granted</div>';
+      }catch{$("permissions-list").innerHTML='<div class="empty">No permissions</div>'}
+    }
+
+    async function grantPermission(){
+      if(!currentSession)return;
+      const email=$("perm-email").value.trim();
+      const permission=$("perm-level").value;
+      if(!email)return alert("Email is required");
+      try{
+        await json(`/session/${currentSession}/permissions`,{granteeEmail:email,permission});
+        $("perm-email").value="";
+        await loadPermissionsList();
+      }catch(e){alert("Failed: "+(e.message||e))}
+    }
+
+    async function revokePermission(email){
+      if(!currentSession)return;
+      await api(`/session/${currentSession}/permissions/${encodeURIComponent(email)}`,{method:"DELETE"});
+      await loadPermissionsList();
+    }
+
+    // Browser toggle
+    async function loadBrowserStatus(){
+      if(!currentSession)return;
+      try{
+        const result=await api(`/session/${currentSession}/browser`);
+        const enabled=result.enabled??false;
+        $("browser-toggle").checked=enabled;
+        $("browser-status").textContent=enabled?"Enabled":"Disabled";
+      }catch{
+        $("browser-toggle").checked=false;
+        $("browser-status").textContent="Unavailable";
+      }
+    }
+
+    async function toggleBrowser(){
+      if(!currentSession)return;
+      const enabled=$("browser-toggle").checked;
+      try{
+        await json(`/session/${currentSession}/browser`,{enabled},"PUT");
+        $("browser-status").textContent=enabled?"Enabled":"Disabled";
+      }catch(e){
+        $("browser-toggle").checked=!enabled;
+        alert("Failed: "+(e.message||e));
+      }
+    }
+
+    // Approvals
+    async function loadApprovals(){
+      if(!currentSession)return;
+      try{
+        const{approvals}=await api(`/session/${currentSession}/approvals`);
+        const pending=(approvals||[]).filter(a=>a.status==="pending");
+        $("approvals-list").innerHTML=pending.length?pending.map(a=>`<div class="approval-card"><div><strong>${esc(a.toolName||a.action||"Action")}</strong></div><div style="color:var(--muted)">${esc(a.description||JSON.stringify(a.args||{}).slice(0,100))}</div><div class="approval-actions"><button class="sm primary" onclick="approveAction('${esc(a.id)}')">Approve</button><button class="sm danger" onclick="rejectAction('${esc(a.id)}')">Reject</button></div></div>`).join(""):'<div class="empty">No pending approvals</div>';
+      }catch{$("approvals-list").innerHTML='<div class="empty">No approvals</div>'}
+    }
+
+    async function approveAction(approvalId){
+      if(!currentSession)return;
+      await json(`/session/${currentSession}/approvals/${encodeURIComponent(approvalId)}/approve`,{});
+      await loadApprovals();
+    }
+
+    async function rejectAction(approvalId){
+      if(!currentSession)return;
+      await json(`/session/${currentSession}/approvals/${encodeURIComponent(approvalId)}/reject`,{});
+      await loadApprovals();
+    }
+
+    // =====================================================
+    // Feature 4: Presence UI
+    // =====================================================
+
+    function connectWebSocket(sessionId){
+      if(wsConnection){try{wsConnection.close()}catch{}}
+      wsConnection=null;presenceUsers=[];typingUsers=[];renderPresence();
+      const protocol=location.protocol==="https:"?"wss:":"ws:";
+      try{
+        wsConnection=new WebSocket(`${protocol}//${location.host}/session/${sessionId}/ws`);
+        wsConnection.onmessage=(e)=>{
+          try{
+            const msg=JSON.parse(e.data);
+            if(msg.type==="presence"){presenceUsers=msg.users||[];renderPresence()}
+            if(msg.type==="typing"){typingUsers=msg.users||[];renderTypingIndicator()}
+          }catch{}
+        };
+        wsConnection.onclose=()=>{wsConnection=null};
+        wsConnection.onerror=()=>{};
+      }catch{}
+    }
+
+    function renderPresence(){
+      const bar=$("presence-bar");
+      if(!presenceUsers.length){bar.innerHTML="";return}
+      // Color palette for avatar backgrounds
+      const colors=["#0a7c66","#2980b9","#8e44ad","#c0392b","#d35400","#27ae60","#e67e22"];
+      bar.innerHTML=presenceUsers.map((u,i)=>{
+        const initial=(u.displayName||u.email||"?")[0].toUpperCase();
+        const color=colors[i%colors.length];
+        return `<div class="presence-avatar" style="background:${color}" title="${esc(u.displayName||u.email)}">${esc(initial)}</div>`;
+      }).join("");
+    }
+
+    function renderTypingIndicator(){
+      const el=$("typing-indicator");
+      const names=typingUsers.filter(u=>u.isTyping).map(u=>u.displayName||u.email);
+      if(!names.length){el.style.display="none";return}
+      el.style.display="block";
+      el.textContent=names.length===1?`${names[0]} is typing...`:`${names.join(", ")} are typing...`;
+    }
+
+    // =====================================================
+    // Feature 5: Session MCP Config Overrides
+    // =====================================================
+
+    async function loadSessionMcpConfigs(){
+      if(!currentSession)return;
+      try{
+        const{configs}=await api(`/session/${currentSession}/mcp-configs`);
+        $("session-mcp-list").innerHTML=(configs||[]).length?(configs||[]).map(c=>{
+          const checked=c.enabled?"checked":"";
+          const overrideTag=c.overridden?'<span class="tag">overridden</span>':"";
+          return `<div class="kv"><span style="font-size:12px">${esc(c.name)} ${overrideTag}</span><div style="display:flex;gap:6px;align-items:center"><label class="toggle-switch"><input type="checkbox" ${checked} onchange="setSessionMcpOverride('${esc(c.id)}',this.checked)"/><span class="slider"></span></label>${c.overridden?`<button class="sm" onclick="removeSessionMcpOverride('${esc(c.id)}')">Reset</button>`:""}</div></div>`;
+        }).join(""):'<div class="empty">No integrations configured</div>';
+      }catch{$("session-mcp-list").innerHTML='<div class="empty">Failed to load</div>'}
+    }
+
+    async function setSessionMcpOverride(mcpId,enabled){
+      if(!currentSession)return;
+      try{
+        await json(`/session/${currentSession}/mcp-configs`,{mcpConfigId:mcpId,enabled});
+        await loadSessionMcpConfigs();
+      }catch(e){alert("Failed: "+(e.message||e))}
+    }
+
+    async function removeSessionMcpOverride(mcpId){
+      if(!currentSession)return;
+      try{
+        await api(`/session/${currentSession}/mcp-configs/${encodeURIComponent(mcpId)}`,{method:"DELETE"});
+        await loadSessionMcpConfigs();
+      }catch(e){alert("Failed: "+(e.message||e))}
+    }
 
     boot();
   </script>
