@@ -69,6 +69,13 @@ export function buildBrowserTools(_env: Env, browserEnabled: boolean): Record<st
   return {};
 }
 
+// TODO: Memory strategy integration
+// When MCP tools are wired into the agentic loop, use resolveMemoryStrategy()
+// from ../memory-resolver.ts to determine whether to route memory tool calls
+// to the external MCP server or the built-in UserControl memory endpoints.
+// If external is selected but the connection fails, fall back to builtin.
+// See: src/memory-resolver.ts
+
 function buildMessages(messages: Array<{ content: string; role: string }>): ModelMessage[] {
   return messages
     .filter((m) => m.role === "user" || m.role === "assistant")

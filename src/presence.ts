@@ -58,6 +58,20 @@ export class PresenceTracker {
     return this.entries.has(connectionId);
   }
 
+  /** Track last-seen message count per connection for reconnection. */
+  setLastSeenMessage(connectionId: string, messageId: string): void {
+    const entry = this.entries.get(connectionId);
+    if (entry) {
+      (entry as PresenceEntry & { lastSeenMessageId?: string }).lastSeenMessageId = messageId;
+    }
+  }
+
+  /** Get last-seen message ID for a connection. */
+  getLastSeenMessage(connectionId: string): string | null {
+    const entry = this.entries.get(connectionId) as (PresenceEntry & { lastSeenMessageId?: string }) | undefined;
+    return entry?.lastSeenMessageId ?? null;
+  }
+
   /** Get deduplicated users by email (a user may have multiple connections). */
   getUniqueUsers(): PresenceEntry[] {
     const seen = new Map<string, PresenceEntry>();

@@ -17,6 +17,9 @@ export interface Env {
   OUTBOUND?: Fetcher;
   WORKSPACE_BUCKET?: R2Bucket;
 
+  // Browser rendering binding
+  BROWSER?: unknown;
+
   // Durable Object bindings
   CODING_AGENT: DurableObjectNamespace;
   USER_CONTROL: DurableObjectNamespace;
