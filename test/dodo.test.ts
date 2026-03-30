@@ -487,9 +487,10 @@ describe("Dodo foundation", () => {
     const deleteResponse = await fetchJson(`/session/${sessionId}`, { method: "DELETE" });
     expect(deleteResponse.status).toBe(200);
 
+    // After deletion, the session is removed from UserControl, so subsequent
+    // access is denied by the ownership check (403)
     const messagesResponse = await fetchJson(`/session/${sessionId}/messages`);
-    const messages = (await messagesResponse.json()) as { messages: unknown[] };
-    expect(messages.messages).toHaveLength(0);
+    expect(messagesResponse.status).toBe(403);
   });
 
   it("returns CORS headers on responses", async () => {

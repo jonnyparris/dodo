@@ -18,8 +18,11 @@ export default defineWorkersConfig({
             OPENCODE_GATEWAY_TOKEN: "opencode-token",
             AI_GATEWAY_KEY: "ai-gateway-key",
             DODO_MCP_TOKEN: "test-mcp-token",
-            DODO_VERSION: "0.2.0-test",
-            NTFY_TOPIC: ""
+            DODO_VERSION: "0.3.0-test",
+            NTFY_TOPIC: "",
+            SECRETS_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ADMIN_EMAIL: "admin@test.local",
+            COOKIE_SECRET: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
           }
         }
       }

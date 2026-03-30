@@ -961,7 +961,7 @@ export class CodingAgent extends Agent<Env, SessionState> {
       "abort",
       () => {
         this.clients.delete(writer);
-        void writer.close();
+        try { void writer.close(); } catch { /* stream may already be closed */ }
         this.setState({ ...this.readSessionDetails() });
       },
       { once: true },
