@@ -437,8 +437,11 @@
 
     const $=(id)=>document.getElementById(id);
     const esc=(s)=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-    const api=async(path,opts)=>{const r=await fetch(path,opts);return r.headers.get("content-type")?.includes("json")?r.json():r.text()};
+    const api=async(path,opts)=>{const r=await fetch(path,opts);const data=r.headers.get("content-type")?.includes("json")?await r.json():await r.text();if(!r.ok){const msg=typeof data==="object"?data.error||"Request failed":data;const e=new Error(msg);e.status=r.status;e.data=data;throw e}return data};
     const json=(path,body,method="POST")=>api(path,{method,headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    // Safe variants that return null on error (for UI loaders that shouldn't crash)
+    const apiSafe=async(path,opts)=>{try{return await api(path,opts)}catch{return null}};
+    const jsonSafe=async(path,body,method="POST")=>{try{return await json(path,body,method)}catch{return null}};
 
     // --- Mobile tab switching ---
     function switchTab(tab){
@@ -488,7 +491,7 @@
     }
     async function initPasskey(){
       const passkey=$("passkey-input").value;if(!passkey||passkey.length<4)return alert("Passkey must be at least 4 characters");
-      await json("/api/passkey/init",{passkey});$("passkey-input").value="";await loadPasskeyStatus();await loadSecrets()
+      await jsonSafe("/api/passkey/init",{passkey});$("passkey-input").value="";await loadPasskeyStatus();await loadSecrets()
     }
     async function changePasskey(){
       const current=$("passkey-current").value,newPk=$("passkey-new").value;
@@ -503,9 +506,9 @@
     }
     async function setSecret(){
       const key=$("secret-key").value,value=$("secret-value").value;if(!key||!value)return;
-      await json(`/api/secrets/${encodeURIComponent(key)}`,{value},"PUT");$("secret-value").value="";await loadSecrets()
+      await jsonSafe(`/api/secrets/${encodeURIComponent(key)}`,{value},"PUT");$("secret-value").value="";await loadSecrets()
     }
-    async function deleteSecret(key){await api(`/api/secrets/${encodeURIComponent(key)}`,{method:"DELETE"});await loadSecrets()}
+    async function deleteSecret(key){await apiSafe(`/api/secrets/${encodeURIComponent(key)}`,{method:"DELETE"});await loadSecrets()}
 
     // --- Status & models ---
     async function loadStatus(){
@@ -524,19 +527,19 @@
 
     // --- Sessions ---
     async function loadSessions(){
-      const{sessions}=await api("/session");const el=$("session-list");
+      const d=await apiSafe("/session");if(!d)return;const{sessions}=d;const el=$("session-list");
       if(!sessions.length){el.innerHTML='<div class="empty">No sessions yet</div>';return}
       el.innerHTML=sessions.map(s=>`<div class="session-item ${currentSession===s.id?'active':''}" onclick="selectSession('${esc(s.id)}')"><div class="session-title">${esc(s.title||s.id.slice(0,8))}</div><div class="session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`).join("")
     }
-    async function createSession(){const{id}=await json("/session",{});currentSession=id;await loadSessions();await selectSession(id)}
+    async function createSession(){const d=await jsonSafe("/session",{});if(!d)return;const{id}=d;currentSession=id;await loadSessions();await selectSession(id)}
     async function selectSession(id){
       currentSession=id;setProcessing(false);await loadSessions();$("chat").innerHTML="";$("onboarding")?.remove();
       $("session-id-display").textContent=id.slice(0,8);
-      const state=await api(`/session/${id}`);
+      const state=await apiSafe(`/session/${id}`);if(!state)return;
       $("session-title-display").textContent=state.title||id.slice(0,8);setStatusDot(state.status);
       updateTokenSummary(state);
       if(state.status==="running")setProcessing(true);
-      const{messages}=await api(`/session/${id}/messages`);messages.forEach(renderMessage);
+      const d=await apiSafe(`/session/${id}/messages`);if(!d)return;const{messages}=d;messages.forEach(renderMessage);
       await Promise.all([loadFiles("/"),loadPrompts(),loadCron(),refreshGit()]);connectSSE(id);connectWebSocket(id);
       if(window.innerWidth<=900)switchTab('chat');
     }
@@ -549,7 +552,7 @@
     function connectSSE(id){
       if(eventSource)eventSource.close();eventSource=new EventSource(`/session/${id}/events`);
       eventSource.addEventListener("text_delta",(e)=>{hideThinking();const{delta}=JSON.parse(e.data);if(!streamingEl){streamingEl=document.createElement("div");streamingEl.className="msg assistant";streamingEl.textContent="";$("chat").appendChild(streamingEl)}streamingEl.textContent+=delta;$("chat").scrollTop=$("chat").scrollHeight});
-      eventSource.addEventListener("message",(e)=>{hideThinking();const msg=JSON.parse(e.data);if(streamingEl){streamingEl.textContent=msg.content;if(msg.tokenInput||msg.tokenOutput){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;streamingEl.appendChild(m)}streamingEl=null}else{renderMessage(msg)}loadFiles("/");api(`/session/${id}`).then(updateTokenSummary)});
+      eventSource.addEventListener("message",(e)=>{hideThinking();const msg=JSON.parse(e.data);if(streamingEl){streamingEl.textContent=msg.content;if(msg.tokenInput||msg.tokenOutput){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;streamingEl.appendChild(m)}streamingEl=null}else{renderMessage(msg)}loadFiles("/");apiSafe(`/session/${id}`).then(s=>{if(s)updateTokenSummary(s)})});
       eventSource.addEventListener("state",(e)=>{const s=JSON.parse(e.data);setStatusDot(s.status);updateTokenSummary(s);if(s.status!=="running"){setProcessing(false);hideThinking();streamingEl=null;loadPrompts()}});
       eventSource.addEventListener("tool_call",(e)=>{hideThinking();if(streamingEl)streamingEl=null;renderToolCall(JSON.parse(e.data));loadFiles("/")});
       eventSource.addEventListener("file",()=>loadFiles("/"));
@@ -564,10 +567,10 @@
 
     // --- Chat ---
     async function sendMessage(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";setProcessing(true);showThinking();try{await json(`/session/${currentSession}/message`,{content})}finally{setProcessing(false);hideThinking();loadFiles("/")}}
-    async function sendAsync(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";setProcessing(true);showThinking();await json(`/session/${currentSession}/prompt`,{content})}
-    async function abortPrompt(){if(!currentSession)return;await json(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
-    async function forkSession(){if(!currentSession)return;const{id}=await json(`/session/${currentSession}/fork`,{});currentSession=id;await loadSessions();await selectSession(id)}
-    async function deleteSession(){if(!currentSession||!confirm("Delete this session?"))return;await api(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("presence-bar").innerHTML="";await loadSessions()}
+    async function sendAsync(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";setProcessing(true);showThinking();await jsonSafe(`/session/${currentSession}/prompt`,{content})}
+    async function abortPrompt(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
+    async function forkSession(){if(!currentSession)return;const d=await jsonSafe(`/session/${currentSession}/fork`,{});if(!d)return;const{id}=d;currentSession=id;await loadSessions();await selectSession(id)}
+    async function deleteSession(){if(!currentSession||!confirm("Delete this session?"))return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("presence-bar").innerHTML="";await loadSessions()}
 
     // --- Files (recursive expansion) ---
     async function loadFiles(path){
@@ -591,17 +594,17 @@
       if(expandedDirs.has(path)){expandedDirs.delete(path);loadFiles("/")}
       else{expandedDirs.add(path);await loadFiles("/");await loadFiles(path)}
     }
-    async function readFile(path){if(!currentSession)return;const{content}=await api(`/session/${currentSession}/file?path=${encodeURIComponent(path)}`);$("file-path").value=path;$("file-content").value=content??""}
-    async function writeFile(){if(!currentSession)return;const path=$("file-path").value.trim();const content=$("file-content").value;if(!path)return;await json(`/session/${currentSession}/file?path=${encodeURIComponent(path)}`,{content},"PUT");await loadFiles("/")}
+    async function readFile(path){if(!currentSession)return;const d=await apiSafe(`/session/${currentSession}/file?path=${encodeURIComponent(path)}`);if(!d)return;const{content}=d;$("file-path").value=path;$("file-content").value=content??""}
+    async function writeFile(){if(!currentSession)return;const path=$("file-path").value.trim();const content=$("file-content").value;if(!path)return;await jsonSafe(`/session/${currentSession}/file?path=${encodeURIComponent(path)}`,{content},"PUT");await loadFiles("/")}
 
     // --- Config ---
-    async function loadConfig(){const cfg=await api("/api/config");$("cfg-model").value=cfg.model;$("cfg-gateway").value=cfg.activeGateway;$("config-display").innerHTML=`<div class="kv"><span>Model</span><code>${esc(cfg.model)}</code></div><div class="kv"><span>Gateway</span><code>${esc(cfg.activeGateway)}</code></div><div class="kv"><span>Git</span><code>${esc(cfg.gitAuthorName)}</code></div>`}
-    async function saveConfig(){await json("/api/config",{model:$("cfg-model").value,activeGateway:$("cfg-gateway").value},"PUT");await loadConfig()}
+    async function loadConfig(){const cfg=await apiSafe("/api/config");if(!cfg)return;$("cfg-model").value=cfg.model;$("cfg-gateway").value=cfg.activeGateway;$("config-display").innerHTML=`<div class="kv"><span>Model</span><code>${esc(cfg.model)}</code></div><div class="kv"><span>Gateway</span><code>${esc(cfg.activeGateway)}</code></div><div class="kv"><span>Git</span><code>${esc(cfg.gitAuthorName)}</code></div>`}
+    async function saveConfig(){await jsonSafe("/api/config",{model:$("cfg-model").value,activeGateway:$("cfg-gateway").value},"PUT");await loadConfig()}
 
     // --- Allowlist ---
-    async function loadAllowlist(){const{hosts}=await api("/api/allowlist");$("allowlist-display").innerHTML=hosts.length?hosts.map(h=>`<div class="kv"><code>${esc(h.hostname)}</code><button onclick="removeHost('${esc(h.hostname)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No hosts</div>'}
-    async function addHost(){const hostname=$("allowlist-input").value.trim();if(!hostname)return;await json("/api/allowlist",{hostname});$("allowlist-input").value="";await loadAllowlist()}
-    async function removeHost(hostname){await api(`/api/allowlist/${encodeURIComponent(hostname)}`,{method:"DELETE"});await loadAllowlist()}
+    async function loadAllowlist(){const d=await apiSafe("/api/allowlist");if(!d)return;const{hosts}=d;$("allowlist-display").innerHTML=hosts.length?hosts.map(h=>`<div class="kv"><code>${esc(h.hostname)}</code><button onclick="removeHost('${esc(h.hostname)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No hosts</div>'}
+    async function addHost(){const hostname=$("allowlist-input").value.trim();if(!hostname)return;await jsonSafe("/api/allowlist",{hostname});$("allowlist-input").value="";await loadAllowlist()}
+    async function removeHost(hostname){await apiSafe(`/api/allowlist/${encodeURIComponent(hostname)}`,{method:"DELETE"});await loadAllowlist()}
 
     // --- Prompts ---
     async function loadPrompts(){
@@ -618,15 +621,15 @@
         board.innerHTML=`<div class="kanban">${Object.entries(cols).map(([status,items])=>`<div class="kanban-col"><h3>${esc(status.replace('_',' '))}</h3>${items.map(t=>`<div class="kanban-card" onclick="advanceTask('${esc(t.id)}','${esc(status)}')"><div>${esc(t.title)}</div><div class="priority">${esc(t.priority)}</div></div>`).join("")||'<div class="empty">-</div>'}</div>`).join("")}</div>`;
       }catch{$("task-board").innerHTML='<div class="empty">No tasks</div>'}
     }
-    async function createTask(){const title=$("task-title").value.trim();const desc=$("task-desc").value.trim();if(!title)return;await json("/api/tasks",{title,description:desc});$("task-title").value="";$("task-desc").value="";await loadTasks()}
+    async function createTask(){const title=$("task-title").value.trim();const desc=$("task-desc").value.trim();if(!title)return;await jsonSafe("/api/tasks",{title,description:desc});$("task-title").value="";$("task-desc").value="";await loadTasks()}
     async function advanceTask(id,currentStatus){
       const next={backlog:"todo",todo:"in_progress",in_progress:"done",done:"done"};
       const nextStatus=next[currentStatus]||currentStatus;
       if(nextStatus==="done"&&currentStatus==="done")return;
-      await json(`/api/tasks/${encodeURIComponent(id)}`,{status:nextStatus},"PUT");
+      await jsonSafe(`/api/tasks/${encodeURIComponent(id)}`,{status:nextStatus},"PUT");
       if(nextStatus==="in_progress"){
         const sessionId=await createSessionForTask(id);
-        if(sessionId)await json(`/api/tasks/${encodeURIComponent(id)}`,{session_id:sessionId},"PUT");
+        if(sessionId)await jsonSafe(`/api/tasks/${encodeURIComponent(id)}`,{session_id:sessionId},"PUT");
       }
       await loadTasks();
     }
@@ -641,21 +644,21 @@
 
     // --- Cron ---
     async function loadCron(){if(!currentSession)return;try{const{jobs}=await api(`/session/${currentSession}/cron`);$("cron-list").innerHTML=jobs.length?jobs.map(j=>`<div class="kv"><span>${esc(j.description)}</span><button onclick="deleteCron('${esc(j.id)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No cron jobs</div>'}catch{$("cron-list").innerHTML='<div class="empty">No cron jobs</div>'}}
-    async function createCron(){if(!currentSession)return;const desc=$("cron-desc").value.trim();const prompt=$("cron-prompt").value.trim();const delay=parseInt($("cron-delay").value,10);if(!desc||!prompt||!delay)return;await json(`/session/${currentSession}/cron`,{description:desc,prompt,type:"delayed",delayInSeconds:delay});$("cron-desc").value="";$("cron-prompt").value="";$("cron-delay").value="";await loadCron()}
-    async function deleteCron(id){if(!currentSession)return;await api(`/session/${currentSession}/cron/${encodeURIComponent(id)}`,{method:"DELETE"});await loadCron()}
+    async function createCron(){if(!currentSession)return;const desc=$("cron-desc").value.trim();const prompt=$("cron-prompt").value.trim();const delay=parseInt($("cron-delay").value,10);if(!desc||!prompt||!delay)return;await jsonSafe(`/session/${currentSession}/cron`,{description:desc,prompt,type:"delayed",delayInSeconds:delay});$("cron-desc").value="";$("cron-prompt").value="";$("cron-delay").value="";await loadCron()}
+    async function deleteCron(id){if(!currentSession)return;await apiSafe(`/session/${currentSession}/cron/${encodeURIComponent(id)}`,{method:"DELETE"});await loadCron()}
 
     // --- Memory ---
-    async function loadMemory(query){const q=query??$("mem-search")?.value??"";const{entries}=await api(`/api/memory${q?`?q=${encodeURIComponent(q)}`:""}`);$("memory-list").innerHTML=entries.length?entries.slice(0,15).map(e=>`<div class="kv" style="flex-wrap:wrap"><span style="cursor:pointer" onclick="editMemory('${esc(e.id)}')">${esc(e.title)}</span><span style="display:flex;gap:4px;align-items:center">${(e.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}<button onclick="deleteMemory('${esc(e.id)}')" class="sm">x</button></span></div>`).join(""):'<div class="empty">No entries</div>'}
-    async function editMemory(id){const entry=await api(`/api/memory/${encodeURIComponent(id)}`);$("mem-id").value=entry.id;$("mem-title").value=entry.title;$("mem-content").value=entry.content;$("mem-tags").value=(entry.tags||[]).join(", ");const details=$("mem-title").closest("details");if(details)details.open=true}
+    async function loadMemory(query){const q=query??$("mem-search")?.value??"";const d=await apiSafe(`/api/memory${q?`?q=${encodeURIComponent(q)}`:""}`);if(!d)return;const{entries}=d;$("memory-list").innerHTML=entries.length?entries.slice(0,15).map(e=>`<div class="kv" style="flex-wrap:wrap"><span style="cursor:pointer" onclick="editMemory('${esc(e.id)}')">${esc(e.title)}</span><span style="display:flex;gap:4px;align-items:center">${(e.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}<button onclick="deleteMemory('${esc(e.id)}')" class="sm">x</button></span></div>`).join(""):'<div class="empty">No entries</div>'}
+    async function editMemory(id){const entry=await apiSafe(`/api/memory/${encodeURIComponent(id)}`);if(!entry)return;$("mem-id").value=entry.id;$("mem-title").value=entry.title;$("mem-content").value=entry.content;$("mem-tags").value=(entry.tags||[]).join(", ");const details=$("mem-title").closest("details");if(details)details.open=true}
     function clearMemoryForm(){$("mem-id").value="";$("mem-title").value="";$("mem-content").value="";$("mem-tags").value=""}
-    async function saveMemory(){const id=$("mem-id").value;const title=$("mem-title").value.trim();const content=$("mem-content").value.trim();const tags=$("mem-tags").value.split(",").map(t=>t.trim()).filter(Boolean);if(!title||!content)return;if(id){await json(`/api/memory/${encodeURIComponent(id)}`,{title,content,tags},"PUT")}else{await json("/api/memory",{title,content,tags})}clearMemoryForm();await loadMemory()}
-    async function deleteMemory(id){await api(`/api/memory/${encodeURIComponent(id)}`,{method:"DELETE"});await loadMemory()}
+    async function saveMemory(){const id=$("mem-id").value;const title=$("mem-title").value.trim();const content=$("mem-content").value.trim();const tags=$("mem-tags").value.split(",").map(t=>t.trim()).filter(Boolean);if(!title||!content)return;if(id){await jsonSafe(`/api/memory/${encodeURIComponent(id)}`,{title,content,tags},"PUT")}else{await jsonSafe("/api/memory",{title,content,tags})}clearMemoryForm();await loadMemory()}
+    async function deleteMemory(id){await apiSafe(`/api/memory/${encodeURIComponent(id)}`,{method:"DELETE"});await loadMemory()}
 
     // --- Git ---
     async function refreshGit(){if(!currentSession){$("git-status-display").innerHTML="";return}try{const{entries}=await api(`/session/${currentSession}/git/status`);$("git-status-display").innerHTML=entries.length?entries.map(e=>`<div style="font-size:11px;font-family:var(--mono)">${esc(e.status)} ${esc(e.filepath)}</div>`).join(""):'<div class="empty">Clean or no repo</div>'}catch{$("git-status-display").innerHTML='<div class="empty">No repo</div>'}}
-    async function gitInit(){if(!currentSession)return;await json(`/session/${currentSession}/git/init`,{});await refreshGit()}
-    async function gitAddAll(){if(!currentSession)return;await json(`/session/${currentSession}/git/add`,{filepath:"."});await refreshGit()}
-    async function gitCommitPrompt(){if(!currentSession)return;const message=prompt("Commit message:");if(!message)return;await json(`/session/${currentSession}/git/commit`,{message});await refreshGit()}
+    async function gitInit(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/git/init`,{});await refreshGit()}
+    async function gitAddAll(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/git/add`,{filepath:"."});await refreshGit()}
+    async function gitCommitPrompt(){if(!currentSession)return;const message=prompt("Commit message:");if(!message)return;await jsonSafe(`/session/${currentSession}/git/commit`,{message});await refreshGit()}
 
     // =====================================================
     // Feature 1: Onboarding Wizard
@@ -748,13 +751,19 @@
     }
 
     async function skipOnboarding(){
-      // Rapidly advance through all remaining steps
+      // Rapidly advance through all remaining steps, stopping if a step can't be skipped
       try{
         const state=await api("/api/onboarding");
         let current=state.currentStep;
         while(current!=="complete"){
-          const next=await json("/api/onboarding/advance",{step:current,skip:true});
-          current=next.currentStep;
+          try{
+            const next=await json("/api/onboarding/advance",{step:current,skip:true});
+            current=next.currentStep;
+          }catch{
+            // Step can't be skipped (e.g. passkey without envelope) — show wizard on this step
+            renderWizardStep(current);
+            return;
+          }
         }
       }catch{}
       hideWizard();
@@ -842,7 +851,7 @@
 
     async function deleteIntegration(id){
       if(!confirm("Delete this integration?"))return;
-      await api(`/api/mcp-configs/${encodeURIComponent(id)}`,{method:"DELETE"});
+      await apiSafe(`/api/mcp-configs/${encodeURIComponent(id)}`,{method:"DELETE"});
       await loadIntegrations();
     }
 
@@ -882,7 +891,7 @@
 
     async function revokeShare(shareId){
       if(!currentSession)return;
-      await api(`/session/${currentSession}/share/${encodeURIComponent(shareId)}`,{method:"DELETE"});
+      await apiSafe(`/session/${currentSession}/share/${encodeURIComponent(shareId)}`,{method:"DELETE"});
       await loadSharesList();
     }
 
@@ -909,7 +918,7 @@
 
     async function revokePermission(email){
       if(!currentSession)return;
-      await api(`/session/${currentSession}/permissions/${encodeURIComponent(email)}`,{method:"DELETE"});
+      await apiSafe(`/session/${currentSession}/permissions/${encodeURIComponent(email)}`,{method:"DELETE"});
       await loadPermissionsList();
     }
 
@@ -951,13 +960,13 @@
 
     async function approveAction(approvalId){
       if(!currentSession)return;
-      await json(`/session/${currentSession}/approvals/${encodeURIComponent(approvalId)}/approve`,{});
+      await jsonSafe(`/session/${currentSession}/approvals/${encodeURIComponent(approvalId)}/approve`,{});
       await loadApprovals();
     }
 
     async function rejectAction(approvalId){
       if(!currentSession)return;
-      await json(`/session/${currentSession}/approvals/${encodeURIComponent(approvalId)}/reject`,{});
+      await jsonSafe(`/session/${currentSession}/approvals/${encodeURIComponent(approvalId)}/reject`,{});
       await loadApprovals();
     }
 
