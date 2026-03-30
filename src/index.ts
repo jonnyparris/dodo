@@ -23,12 +23,15 @@ const promptLimiter = new RateLimiter();
 const shareLimiter = new RateLimiter();
 const messageLimiter = new RateLimiter();
 
-// Cleanup expired windows every 5 minutes
-setInterval(() => {
-  promptLimiter.cleanup();
-  shareLimiter.cleanup();
-  messageLimiter.cleanup();
-}, 5 * 60 * 1000);
+// Cleanup expired windows on every 100th request (setInterval not allowed at global scope)
+let requestCount = 0;
+function maybeCleanupRateLimiters() {
+  if (++requestCount % 100 === 0) {
+    promptLimiter.cleanup();
+    shareLimiter.cleanup();
+    messageLimiter.cleanup();
+  }
+}
 
 type PermissionLevel = "readonly" | "readwrite" | "write" | "admin";
 
@@ -37,6 +40,12 @@ type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail
 const app = new Hono<HonoEnv>();
 
 app.use("*", cors({ origin: "*", allowHeaders: ["Content-Type", "x-dodo-session-id"], allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] }));
+
+// Clean up rate limiter windows periodically
+app.use("*", async (c, next) => {
+  maybeCleanupRateLimiters();
+  return next();
+});
 
 // ─── Helper functions ───
 
