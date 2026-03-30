@@ -11,6 +11,13 @@
     ]
   },
   "worker_loaders": [{ "binding": "LOADER" }],
+  "services": [
+    {
+      "binding": "OUTBOUND",
+      "service": "dodo",
+      "entrypoint": "AllowlistOutbound"
+    }
+  ],
   "migrations": [
     {
       "tag": "v1",

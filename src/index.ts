@@ -6,6 +6,7 @@ import { AppControl } from "./app-control";
 import { AuthError, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
 import { createDodoMcpServer } from "./mcp";
+import { AllowlistOutbound } from "./outbound";
 import type { AppConfig, Env } from "./types";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -295,7 +296,7 @@ app.post("/session/:id/fork", async (c) => {
   return c.json({ id: sessionId, sourceId }, 201);
 });
 
-export { AppControl, CodingAgent };
+export { AllowlistOutbound, AppControl, CodingAgent };
 
 export default {
   fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {

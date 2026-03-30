@@ -1,32 +1,33 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "./types";
 
 /**
- * Creates a Fetcher that checks the AppControl allowlist before proxying outbound requests.
- * Rejects requests to hosts not in the allowlist.
+ * WorkerEntrypoint that intercepts all outbound fetch() calls from sandboxed
+ * dynamic workers. Checks the hostname against the AppControl allowlist and
+ * blocks requests to hosts that are not explicitly allowed.
+ *
+ * Configured as a self-referencing service binding (OUTBOUND) in wrangler.jsonc
+ * and passed as `globalOutbound` to DynamicWorkerExecutor.
  */
-export function createAllowlistFetcher(env: Env): Fetcher {
-  return {
-    fetch: async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const url = typeof input === "string" ? new URL(input) : input instanceof URL ? input : new URL(input.url);
-      const hostname = url.hostname.toLowerCase();
+export class AllowlistOutbound extends WorkerEntrypoint<Env> {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const hostname = url.hostname.toLowerCase();
 
-      const stub = env.APP_CONTROL.get(env.APP_CONTROL.idFromName("global"));
-      const checkResponse = await stub.fetch(
-        `https://app-control/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
+    const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
+    const checkResponse = await stub.fetch(
+      `https://app-control/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
+    );
+    const { allowed } = (await checkResponse.json()) as { allowed: boolean };
+
+    if (!allowed) {
+      return new Response(
+        JSON.stringify({ error: `Outbound request to ${hostname} blocked — not in allowlist` }),
+        { status: 403, headers: { "content-type": "application/json" } },
       );
-      const { allowed } = (await checkResponse.json()) as { allowed: boolean };
+    }
 
-      if (!allowed) {
-        return new Response(
-          JSON.stringify({ error: `Outbound request to ${hostname} blocked — not in allowlist` }),
-          { status: 403, headers: { "content-type": "application/json" } },
-        );
-      }
-
-      return fetch(input, init);
-    },
-    connect: () => {
-      throw new Error("Outbound TCP connections are not allowed from sandboxed code");
-    },
-  } as unknown as Fetcher;
+    // Forward the request to the actual destination
+    return fetch(request);
+  }
 }

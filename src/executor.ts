@@ -2,7 +2,6 @@ import { DynamicWorkerExecutor, resolveProvider } from "@cloudflare/codemode";
 import type { Workspace } from "@cloudflare/shell";
 import { stateTools } from "@cloudflare/shell/workers";
 import type { ExecuteResult } from "@cloudflare/codemode";
-import { createAllowlistFetcher } from "./outbound";
 import type { Env } from "./types";
 
 export async function runSandboxedCode(input: {
@@ -15,7 +14,7 @@ export async function runSandboxedCode(input: {
   }
 
   const executor = new DynamicWorkerExecutor({
-    globalOutbound: createAllowlistFetcher(input.env),
+    globalOutbound: input.env.OUTBOUND ?? null,
     loader: input.env.LOADER,
     timeout: 30000,
   });

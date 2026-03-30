@@ -16,6 +16,7 @@ export interface Env {
   GIT_AUTHOR_NAME?: string;
   LOADER?: WorkerLoader;
   DODO_MCP_TOKEN?: string;
+  OUTBOUND?: Fetcher;
   DODO_VERSION?: string;
   NTFY_TOPIC?: string;
   OPENCODE_BASE_URL: string;
