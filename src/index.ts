@@ -5,12 +5,27 @@ import { cors } from "hono/cors";
 import { AppControl } from "./app-control";
 import { AuthError, checkAllowlist, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
+import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
 import { AllowlistOutbound } from "./outbound";
+import { RateLimiter } from "./rate-limit";
 import { signCookie } from "./share";
 import { SharedIndex } from "./shared-index";
 import { UserControl } from "./user-control";
 import type { AccessIdentity, AppConfig, Env } from "./types";
+
+// ─── Per-isolate rate limiters ───
+
+const promptLimiter = new RateLimiter();
+const shareLimiter = new RateLimiter();
+const messageLimiter = new RateLimiter();
+
+// Cleanup expired windows every 5 minutes
+setInterval(() => {
+  promptLimiter.cleanup();
+  shareLimiter.cleanup();
+  messageLimiter.cleanup();
+}, 5 * 60 * 1000);
 
 type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail: string } };
 
@@ -56,6 +71,20 @@ async function proxyToUserControl(env: Env, email: string, path: string, init?: 
 async function proxyToSharedIndex(env: Env, path: string, init?: RequestInit): Promise<Response> {
   const stub = getSharedIndexStub(env);
   return stub.fetch(`https://shared-index${path}`, init);
+}
+
+function rateLimitedResponse(result: { remaining: number; retryAfter?: number }, route: string, email: string): Response {
+  log("warn", "Rate limit hit", { email, route, retryAfter: result.retryAfter });
+  return Response.json(
+    { error: "Too many requests" },
+    {
+      status: 429,
+      headers: {
+        "Retry-After": String(result.retryAfter ?? 60),
+        "X-RateLimit-Remaining": "0",
+      },
+    },
+  );
 }
 
 async function readConfig(env: Env, email: string): Promise<AppConfig> {
@@ -133,12 +162,15 @@ app.use("*", async (c, next) => {
     identity = await verifyAccess(c.req.raw, c.env);
   } catch (error) {
     if (error instanceof AuthError) {
+      log("warn", "Auth failure", { source: "unknown", error: error.message });
       return c.json({ error: error.message }, error.status as 401 | 403);
     }
+    log("warn", "Auth failure", { source: "unknown", error: "Authentication failed" });
     return c.json({ error: "Authentication failed" }, 403);
   }
 
   if (!identity.email) {
+    log("warn", "Auth failure", { source: identity.source, error: "No email in token" });
     return c.json({ error: "No email in token" }, 403);
   }
 
@@ -146,10 +178,12 @@ app.use("*", async (c, next) => {
   if (!isDevMode(c.env)) {
     const { allowed } = await checkAllowlist(identity.email, c.env);
     if (!allowed) {
+      log("warn", "Auth failure", { email: identity.email, source: identity.source, error: "Not on allowlist" });
       return c.json({ error: "Not authorized — not on Dodo allowlist" }, 403);
     }
   }
 
+  log("info", "Auth success", { email: identity.email, source: identity.source });
   c.set("identity", identity);
   c.set("userEmail", identity.email);
   return next();
@@ -198,6 +232,15 @@ app.post("/api/admin/users/:email/block", adminGuard as never, async (c) =>
 app.delete("/api/admin/users/:email/block", adminGuard as never, async (c) =>
   proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/block`, { method: "DELETE" }),
 );
+
+app.get("/api/admin/stats", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/stats"));
+
+app.get("/api/admin/users/detailed", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users/detailed"));
+
+app.get("/api/admin/sessions", adminGuard as never, async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/sessions");
+});
 
 // ─── User config (per-user via UserControl) ───
 
@@ -377,6 +420,13 @@ app.post("/session", async (c) => {
     headers: { "content-type": "application/json" },
     method: "POST",
   });
+  log("info", "Session created", { email, sessionId });
+  // Increment global session counter
+  await proxyToSharedIndex(c.env, "/stats/increment", {
+    body: JSON.stringify({ stat: "sessionCount", delta: 1 }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
   return c.json({ id: sessionId }, 201);
 });
 
@@ -456,6 +506,8 @@ app.get("/session/:id/git/diff", async (c) => proxyToAgent(c.req.raw, c.env, c.r
 
 app.post("/session/:id/message", async (c) => {
   const email = c.get("userEmail");
+  const rl = messageLimiter.check(`msg:${email}`, 120, 60 * 60 * 1000);
+  if (!rl.allowed) return rateLimitedResponse(rl, "message", email);
   const config = await readConfig(c.env, email);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/message", {
     "x-dodo-ai-base-url": config.aiGatewayBaseURL,
@@ -469,6 +521,8 @@ app.post("/session/:id/message", async (c) => {
 
 app.post("/session/:id/prompt", async (c) => {
   const email = c.get("userEmail");
+  const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
+  if (!rl.allowed) return rateLimitedResponse(rl, "prompt", email);
   const config = await readConfig(c.env, email);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompt", {
     "x-dodo-ai-base-url": config.aiGatewayBaseURL,
@@ -556,8 +610,10 @@ app.post("/session/:id/fork", async (c) => {
 app.post("/session/:id/share", async (c) => {
   const sessionId = c.req.param("id");
   const email = c.get("userEmail");
+  const rl = shareLimiter.check(`share:${sessionId}`, 20, 60 * 60 * 1000);
+  if (!rl.allowed) return rateLimitedResponse(rl, "share", email);
   const body = await c.req.raw.json() as Record<string, unknown>;
-  return proxyToSharedIndex(c.env, "/shares", {
+  const result = await proxyToSharedIndex(c.env, "/shares", {
     body: JSON.stringify({
       sessionId,
       ownerEmail: email,
@@ -569,6 +625,8 @@ app.post("/session/:id/share", async (c) => {
     headers: { "content-type": "application/json" },
     method: "POST",
   });
+  log("info", "Share created", { email, sessionId, permission: body.permission ?? "readonly" });
+  return result;
 });
 
 app.get("/session/:id/shares", async (c) => {
@@ -578,6 +636,8 @@ app.get("/session/:id/shares", async (c) => {
 
 app.delete("/session/:id/share/:shareId", async (c) => {
   const shareId = c.req.param("shareId");
+  const email = c.get("userEmail");
+  log("info", "Share revoked", { email, sessionId: c.req.param("id"), shareId });
   return proxyToSharedIndex(c.env, `/shares/${encodeURIComponent(shareId)}`, { method: "DELETE" });
 });
 

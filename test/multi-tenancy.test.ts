@@ -39,22 +39,31 @@ async function fetchJson(path: string, init?: RequestInit): Promise<Response> {
 }
 
 async function createSession(): Promise<string> {
-  const response = await fetchJson("/session", { method: "POST" });
-  if (response.status !== 201) {
-    throw new Error(`Failed to create session: ${response.status} ${await response.text()}`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await fetchJson("/session", { method: "POST" });
+    if (response.status === 201) {
+      return ((await response.json()) as { id: string }).id;
+    }
+    if (response.status === 500 && attempt < 2) {
+      await new Promise(r => setTimeout(r, 10));
+      continue;
+    }
+    throw new Error(`Failed to create session: ${response.status}`);
   }
-  return ((await response.json()) as { id: string }).id;
+  throw new Error("Failed to create session after retries");
 }
 
 describe("Multi-tenancy integration", () => {
   // Warm up: absorb any DO invalidation from module changes between test files
   beforeAll(async () => {
-    for (let i = 0; i < 3; i++) {
-      const res = await fetchJson("/health");
-      if (res.status === 200) break;
+    for (let i = 0; i < 5; i++) {
+      try {
+        await fetchJson("/health");
+        break;
+      } catch {
+        await new Promise(r => setTimeout(r, 10));
+      }
     }
-    try { await fetchJson("/api/config"); } catch { /* absorb invalidation */ }
-    try { await fetchJson("/api/config"); } catch { /* retry */ }
   });
 
   // ─── 1. Session Ownership ───

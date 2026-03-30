@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import type { Env } from "../src/types";
 import { PresenceTracker } from "../src/presence";
@@ -35,13 +35,18 @@ async function fetchJson(path: string, init?: RequestInit): Promise<Response> {
 }
 
 async function createSession(): Promise<string> {
-  // Retry once to handle DO invalidation between test files in singleWorker mode
-  let response = await fetchJson("/session", { method: "POST" });
-  if (response.status === 500) {
-    response = await fetchJson("/session", { method: "POST" });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await fetchJson("/session", { method: "POST" });
+    if (response.status === 201) {
+      return ((await response.json()) as { id: string }).id;
+    }
+    if (response.status === 500 && attempt < 2) {
+      await new Promise(r => setTimeout(r, 10));
+      continue;
+    }
+    throw new Error(`Failed to create session: ${response.status}`);
   }
-  expect(response.status).toBe(201);
-  return ((await response.json()) as { id: string }).id;
+  throw new Error("Failed to create session after retries");
 }
 
 // ─── PresenceTracker Unit Tests ───
@@ -265,6 +270,17 @@ describe("AgentConnectionTransport", () => {
 // ─── WebSocket Route Integration Tests ───
 
 describe("WebSocket route", () => {
+  beforeAll(async () => {
+    for (let i = 0; i < 5; i++) {
+      try {
+        await fetchJson("/health");
+        break;
+      } catch {
+        await new Promise(r => setTimeout(r, 10));
+      }
+    }
+  });
+
   beforeEach(async () => {
     vi.restoreAllMocks();
     runAgenticChatMock.mockReset();

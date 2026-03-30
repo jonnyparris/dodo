@@ -210,6 +210,24 @@ export class SharedIndex implements DurableObject {
         return Response.json({ permissions: this.listAccountPermissions(owner) });
       }
 
+      // ─── Admin stats ───
+
+      if (request.method === "GET" && url.pathname === "/stats") {
+        return Response.json(this.getStats());
+      }
+
+      if (request.method === "GET" && url.pathname === "/users/detailed") {
+        return Response.json({ users: this.listUsersDetailed() });
+      }
+
+      // ─── Stat increment (internal, called from Worker) ───
+
+      if (request.method === "POST" && url.pathname === "/stats/increment") {
+        const body = (await request.json()) as { stat: string; delta?: number };
+        this.incrementStat(body.stat, body.delta ?? 1);
+        return Response.json({ ok: true });
+      }
+
       return new Response("Not Found", { status: 404 });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected request failure";
@@ -287,6 +305,15 @@ export class SharedIndex implements DurableObject {
         PRIMARY KEY (account_owner, grantee_email, permission)
       )
     `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS aggregate_stats (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    // Seed default stat keys
+    this.db.exec("INSERT OR IGNORE INTO aggregate_stats (key, value) VALUES ('sessionCount', 0)");
   }
 
   private seedAdmin(): void {
@@ -675,5 +702,42 @@ export class SharedIndex implements DurableObject {
         createdAt: epochToIso(row.created_at),
         revokedAt: row.revoked_at === null ? null : epochToIso(row.revoked_at),
       }));
+  }
+
+  // ─── Admin stats ───
+
+  private getStats(): {
+    userCount: number;
+    sessionCount: number;
+    totalShares: number;
+    totalPermissions: number;
+  } {
+    const userCount = Number(this.db.one("SELECT COUNT(*) AS c FROM users")?.c ?? 0);
+    const sessionCount = Number(this.db.one("SELECT value FROM aggregate_stats WHERE key = 'sessionCount'")?.value ?? 0);
+    const totalShares = Number(this.db.one("SELECT COUNT(*) AS c FROM session_shares WHERE revoked_at IS NULL")?.c ?? 0);
+    const totalPermissions = Number(this.db.one("SELECT COUNT(*) AS c FROM session_permissions")?.c ?? 0);
+    return { userCount, sessionCount, totalShares, totalPermissions };
+  }
+
+  private listUsersDetailed(): Array<{
+    email: string;
+    displayName: string | null;
+    role: string;
+    blockedAt: number | null;
+    createdAt: string;
+    lastSeenAt: string;
+  }> {
+    return this.db
+      .all("SELECT email, display_name, role, blocked_at, created_at, last_seen_at FROM users ORDER BY last_seen_at DESC")
+      .map((row) => this.mapUserRow(row));
+  }
+
+  private incrementStat(key: string, delta: number): void {
+    this.db.exec(
+      "INSERT INTO aggregate_stats (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = aggregate_stats.value + ?",
+      key,
+      delta,
+      delta,
+    );
   }
 }
