@@ -4,24 +4,40 @@ export interface Env {
   AI_GATEWAY_BASE_URL: string;
   AI_GATEWAY_KEY?: string;
   ALLOW_UNAUTHENTICATED_DEV?: string;
-  APP_CONTROL: DurableObjectNamespace;
   ASSETS?: Fetcher;
   CF_ACCESS_AUD: string;
   CF_ACCESS_TEAM_DOMAIN: string;
-  CODING_AGENT: DurableObjectNamespace;
   DEFAULT_MODEL: string;
-  GITHUB_TOKEN?: string;
-  GITLAB_TOKEN?: string;
+  DODO_MCP_TOKEN?: string;
+  DODO_VERSION?: string;
   GIT_AUTHOR_EMAIL?: string;
   GIT_AUTHOR_NAME?: string;
   LOADER?: WorkerLoader;
-  DODO_MCP_TOKEN?: string;
-  OUTBOUND?: Fetcher;
-  DODO_VERSION?: string;
-  NTFY_TOPIC?: string;
   OPENCODE_BASE_URL: string;
-  OPENCODE_GATEWAY_TOKEN?: string;
+  OUTBOUND?: Fetcher;
   WORKSPACE_BUCKET?: R2Bucket;
+
+  // Durable Object bindings
+  CODING_AGENT: DurableObjectNamespace;
+  USER_CONTROL: DurableObjectNamespace;
+  SHARED_INDEX: DurableObjectNamespace;
+
+  // Keep APP_CONTROL for migration / fallback (removed in v3)
+  APP_CONTROL: DurableObjectNamespace;
+
+  // Secrets (wrangler secret)
+  SECRETS_MASTER_KEY?: string;
+  COOKIE_SECRET?: string;
+
+  // Admin
+  ADMIN_EMAIL?: string;
+
+  // Per-user secrets (deprecated as env vars — now in UserControl encrypted_secrets)
+  // Kept temporarily for migration and fallback
+  GITHUB_TOKEN?: string;
+  GITLAB_TOKEN?: string;
+  NTFY_TOPIC?: string;
+  OPENCODE_GATEWAY_TOKEN?: string;
 }
 
 export interface AppConfig {
@@ -35,7 +51,7 @@ export interface AppConfig {
 
 export interface AccessIdentity {
   email: string | null;
-  source: "access" | "dev";
+  source: "access" | "dev" | "share";
 }
 
 export interface SessionState {
@@ -43,6 +59,7 @@ export interface SessionState {
   activePromptId?: string | null;
   createdAt: string;
   messageCount: number;
+  ownerEmail?: string;
   sessionId: string;
   status: "idle" | "running" | "deleted";
   totalTokenInput: number;
@@ -51,6 +68,7 @@ export interface SessionState {
 }
 
 export interface ChatMessageRecord {
+  authorEmail?: string | null;
   content: string;
   createdAt: string;
   id: string;
@@ -72,7 +90,9 @@ export interface UpdateConfigRequest {
 
 export interface SessionIndexRecord {
   createdAt: string;
+  createdBy: string;
   id: string;
+  ownerEmail: string;
   status: string;
   title: string | null;
   updatedAt: string;
@@ -84,6 +104,7 @@ export interface SessionEvent {
 }
 
 export interface PromptRecord {
+  authorEmail?: string | null;
   content: string;
   createdAt: string;
   error: string | null;
@@ -131,4 +152,30 @@ export interface SessionSnapshot {
   files: Array<{ content: string; path: string }>;
   messages: ChatMessageRecord[];
   title: string | null;
+}
+
+// ─── New multi-tenancy types ───
+
+export interface KeyEnvelope {
+  id: string;
+  pbkdf2Salt: string;
+  wrappedDekPasskey: string;
+  wrappedDekServer: string;
+  createdAt: string;
+  rotatedAt: string | null;
+}
+
+export interface EncryptedSecret {
+  key: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UserRecord {
+  email: string;
+  displayName: string | null;
+  role: "admin" | "user";
+  blockedAt: number | null;
+  createdAt: string;
+  lastSeenAt: string;
 }

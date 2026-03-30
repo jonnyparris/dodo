@@ -7,7 +7,9 @@
   "durable_objects": {
     "bindings": [
       { "name": "CODING_AGENT", "class_name": "CodingAgent" },
-      { "name": "APP_CONTROL", "class_name": "AppControl" }
+      { "name": "APP_CONTROL", "class_name": "AppControl" },
+      { "name": "USER_CONTROL", "class_name": "UserControl" },
+      { "name": "SHARED_INDEX", "class_name": "SharedIndex" }
     ]
   },
   "worker_loaders": [{ "binding": "LOADER" }],
@@ -22,7 +24,14 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["CodingAgent", "AppControl"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["UserControl", "SharedIndex"]
     }
+  ],
+  "r2_buckets": [
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" }
   ],
   "assets": {
     "directory": "./public"
@@ -33,6 +42,7 @@
     "DEFAULT_MODEL": "anthropic/claude-sonnet-4-5",
     "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
     "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1",
-    "DODO_VERSION": "0.2.1"
+    "DODO_VERSION": "0.3.0",
+    "ADMIN_EMAIL": "you@example.com"
   }
 }

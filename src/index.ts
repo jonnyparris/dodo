@@ -3,46 +3,21 @@ import { createMcpHandler } from "agents/mcp";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { AppControl } from "./app-control";
-import { AuthError, verifyAccess } from "./auth";
+import { AuthError, checkAllowlist, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
 import { createDodoMcpServer } from "./mcp";
 import { AllowlistOutbound } from "./outbound";
-import type { AppConfig, Env } from "./types";
+import { SharedIndex } from "./shared-index";
+import { UserControl } from "./user-control";
+import type { AccessIdentity, AppConfig, Env } from "./types";
 
-const app = new Hono<{ Bindings: Env }>();
+type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail: string } };
+
+const app = new Hono<HonoEnv>();
 
 app.use("*", cors({ origin: "*", allowHeaders: ["Content-Type", "x-dodo-session-id"], allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] }));
 
-async function getControlStub(env: Env): Promise<DurableObjectStub> {
-  return env.APP_CONTROL.get(env.APP_CONTROL.idFromName("global"));
-}
-
-async function readConfig(env: Env): Promise<AppConfig> {
-  const stub = await getControlStub(env);
-  const response = await stub.fetch("https://app-control/config");
-  return (await response.json()) as AppConfig;
-}
-
-async function proxyToControl(env: Env, path: string, init?: RequestInit): Promise<Response> {
-  const stub = await getControlStub(env);
-  return stub.fetch(`https://app-control${path}`, init);
-}
-
-async function requireAuth(c: { req: { raw: Request }; env: Env; json: (data: unknown, status?: number) => Response }, next: () => Promise<void>): Promise<Response | void> {
-  if (new URL(c.req.raw.url).pathname === "/health") {
-    return next();
-  }
-
-  try {
-    await verifyAccess(c.req.raw, c.env);
-  } catch (error) {
-    if (error instanceof AuthError) {
-      return c.json({ error: error.message }, error.status);
-    }
-    return c.json({ error: "Authentication failed" }, 403);
-  }
-  return next();
-}
+// ─── Helper functions ───
 
 function proxyRequest(url: string, request: Request, headers: Headers): Request {
   const init: RequestInit = {
@@ -70,6 +45,26 @@ async function proxyToAgent(request: Request, env: Env, sessionId: string, path:
   return agent.fetch(proxyRequest(`https://coding-agent${path}`, request, headers));
 }
 
+async function proxyToUserControl(env: Env, email: string, path: string, init?: RequestInit): Promise<Response> {
+  const stub = getUserControlStub(env, email);
+  const headers = new Headers(init?.headers);
+  headers.set("x-owner-email", email);
+  return stub.fetch(`https://user-control${path}`, { ...init, headers });
+}
+
+async function proxyToSharedIndex(env: Env, path: string, init?: RequestInit): Promise<Response> {
+  const stub = getSharedIndexStub(env);
+  return stub.fetch(`https://shared-index${path}`, init);
+}
+
+async function readConfig(env: Env, email: string): Promise<AppConfig> {
+  const stub = getUserControlStub(env, email);
+  const response = await stub.fetch("https://user-control/config");
+  return (await response.json()) as AppConfig;
+}
+
+// ─── MCP (token auth, no CF Access) ───
+
 app.all("/mcp", async (c) => {
   const token = c.req.header("Authorization")?.replace("Bearer ", "");
   if (!c.env.DODO_MCP_TOKEN || token !== c.env.DODO_MCP_TOKEN) {
@@ -80,17 +75,51 @@ app.all("/mcp", async (c) => {
   return handler(c.req.raw, c.env, c.executionCtx);
 });
 
-app.use("*", requireAuth);
+// ─── Health (no auth) ───
+
+app.get("/health", (c) => c.json({ status: "ok" }));
+
+// ─── Auth middleware ───
+
+app.use("*", async (c, next) => {
+  const path = new URL(c.req.raw.url).pathname;
+  if (path === "/health" || path === "/mcp") return next();
+
+  let identity: AccessIdentity;
+  try {
+    identity = await verifyAccess(c.req.raw, c.env);
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return c.json({ error: error.message }, error.status as 401 | 403);
+    }
+    return c.json({ error: "Authentication failed" }, 403);
+  }
+
+  if (!identity.email) {
+    return c.json({ error: "No email in token" }, 403);
+  }
+
+  // In dev mode, skip the allowlist check entirely
+  if (!isDevMode(c.env)) {
+    const { allowed } = await checkAllowlist(identity.email, c.env);
+    if (!allowed) {
+      return c.json({ error: "Not authorized — not on Dodo allowlist" }, 403);
+    }
+  }
+
+  c.set("identity", identity);
+  c.set("userEmail", identity.email);
+  return next();
+});
+
+// ─── Static assets ───
 
 app.get("/", async (c) => {
   if (c.env.ASSETS) {
     return c.env.ASSETS.fetch(c.req.raw);
   }
-
   return new Response("Dodo", { headers: { "content-type": "text/plain" } });
 });
-
-app.get("/health", (c) => c.json({ status: "ok" }));
 
 app.get("/docs", async (c) => {
   if (c.env.ASSETS) {
@@ -99,23 +128,56 @@ app.get("/docs", async (c) => {
   return new Response("Docs not available", { status: 404 });
 });
 
+// ─── Admin routes (admin only) ───
+
+const adminGuard = async (c: { get: (key: string) => unknown; env: Env; json: (data: unknown, status?: number) => Response }, next: () => Promise<void>): Promise<Response | void> => {
+  const email = c.get("userEmail") as string;
+  if (!isAdmin(email, c.env)) {
+    return c.json({ error: "Admin access required" }, 403);
+  }
+  return next();
+};
+
+app.get("/api/admin/users", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users"));
+app.post("/api/admin/users", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/users", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }),
+);
+app.delete("/api/admin/users/:email", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}`, { method: "DELETE" }),
+);
+app.post("/api/admin/users/:email/block", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/block`, { method: "POST" }),
+);
+app.delete("/api/admin/users/:email/block", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/block`, { method: "DELETE" }),
+);
+
+// ─── User config (per-user via UserControl) ───
+
 app.get("/api/config", async (c) => {
-  const stub = await getControlStub(c.env);
-  return stub.fetch("https://app-control/config");
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/config");
 });
 
 app.put("/api/config", async (c) => {
-  return proxyToControl(c.env, "/config", {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/config", {
     body: await c.req.raw.text(),
     headers: { "content-type": "application/json" },
     method: "PUT",
   });
 });
 
-app.get("/api/allowlist", async (c) => proxyToControl(c.env, "/allowlist"));
+// ─── Host allowlist (global via SharedIndex) ───
+
+app.get("/api/allowlist", async (c) => proxyToSharedIndex(c.env, "/allowlist"));
 
 app.post("/api/allowlist", async (c) =>
-  proxyToControl(c.env, "/allowlist", {
+  proxyToSharedIndex(c.env, "/allowlist", {
     body: await c.req.raw.text(),
     headers: { "content-type": "application/json" },
     method: "POST",
@@ -123,80 +185,170 @@ app.post("/api/allowlist", async (c) =>
 );
 
 app.delete("/api/allowlist/:hostname", async (c) =>
-  proxyToControl(c.env, `/allowlist/${encodeURIComponent(c.req.param("hostname"))}`, { method: "DELETE" }),
+  proxyToSharedIndex(c.env, `/allowlist/${encodeURIComponent(c.req.param("hostname"))}`, { method: "DELETE" }),
 );
 
-app.get("/api/allowlist/check", async (c) => proxyToControl(c.env, `/allowlist/check${new URL(c.req.raw.url).search}`));
+app.get("/api/allowlist/check", async (c) => proxyToSharedIndex(c.env, `/allowlist/check${new URL(c.req.raw.url).search}`));
 
-app.get("/api/memory", async (c) => proxyToControl(c.env, `/memory${new URL(c.req.raw.url).search}`));
+// ─── Memory (per-user via UserControl) ───
 
-app.post("/api/memory", async (c) =>
-  proxyToControl(c.env, "/memory", {
+app.get("/api/memory", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/memory${new URL(c.req.raw.url).search}`);
+});
+
+app.post("/api/memory", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/memory", {
     body: await c.req.raw.text(),
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  }),
-);
-
-app.get("/api/memory/:id", async (c) => proxyToControl(c.env, `/memory/${encodeURIComponent(c.req.param("id"))}`));
-
-app.put("/api/memory/:id", async (c) =>
-  proxyToControl(c.env, `/memory/${encodeURIComponent(c.req.param("id"))}`, {
-    body: await c.req.raw.text(),
-    headers: { "content-type": "application/json" },
-    method: "PUT",
-  }),
-);
-
-app.delete("/api/memory/:id", async (c) => proxyToControl(c.env, `/memory/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" }));
-
-app.get("/api/models", async (c) => proxyToControl(c.env, "/models"));
-
-app.get("/api/status", async (c) => proxyToControl(c.env, "/status"));
-
-app.get("/api/tasks", async (c) => proxyToControl(c.env, `/tasks${new URL(c.req.raw.url).search}`));
-
-app.post("/api/tasks", async (c) =>
-  proxyToControl(c.env, "/tasks", {
-    body: await c.req.raw.text(),
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  }),
-);
-
-app.put("/api/tasks/:id", async (c) =>
-  proxyToControl(c.env, `/tasks/${encodeURIComponent(c.req.param("id"))}`, {
-    body: await c.req.raw.text(),
-    headers: { "content-type": "application/json" },
-    method: "PUT",
-  }),
-);
-
-app.delete("/api/tasks/:id", async (c) => proxyToControl(c.env, `/tasks/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" }));
-
-app.post("/session", async (c) => {
-  const sessionId = crypto.randomUUID();
-  const stub = await getControlStub(c.env);
-  await stub.fetch("https://app-control/sessions", {
-    body: JSON.stringify({ id: sessionId }),
     headers: { "content-type": "application/json" },
     method: "POST",
   });
+});
 
+app.get("/api/memory/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/memory/${encodeURIComponent(c.req.param("id"))}`);
+});
+
+app.put("/api/memory/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/memory/${encodeURIComponent(c.req.param("id"))}`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/memory/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/memory/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" });
+});
+
+// ─── Models (global via SharedIndex) ───
+
+app.get("/api/models", async (c) => proxyToSharedIndex(c.env, `/models${new URL(c.req.raw.url).search}`));
+
+// ─── Status (per-user) ───
+
+app.get("/api/status", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/status");
+});
+
+// ─── Tasks (per-user via UserControl) ───
+
+app.get("/api/tasks", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/tasks${new URL(c.req.raw.url).search}`);
+});
+
+app.post("/api/tasks", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/tasks", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.put("/api/tasks/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(c.req.param("id"))}`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/tasks/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" });
+});
+
+// ─── Secrets (per-user via UserControl) ───
+
+app.get("/api/secrets", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/secrets");
+});
+
+app.put("/api/secrets/:key", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/secrets/${encodeURIComponent(c.req.param("key"))}`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/secrets/:key", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/secrets/${encodeURIComponent(c.req.param("key"))}`, { method: "DELETE" });
+});
+
+app.get("/api/secrets/:key/test", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/secrets/${encodeURIComponent(c.req.param("key"))}/test`);
+});
+
+// ─── Passkey / Onboarding ───
+
+app.get("/api/passkey/status", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/passkey/status");
+});
+
+app.post("/api/passkey/init", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/passkey/init", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.post("/api/passkey/change", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/passkey/change", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+// ─── Identity ───
+
+app.get("/api/identity", async (c) => {
+  const email = c.get("userEmail");
+  return c.json({ email, isAdmin: isAdmin(email, c.env) });
+});
+
+// ─── Sessions (per-user via UserControl) ───
+
+app.post("/session", async (c) => {
+  const email = c.get("userEmail");
+  const sessionId = crypto.randomUUID();
+  await proxyToUserControl(c.env, email, "/sessions", {
+    body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
   return c.json({ id: sessionId }, 201);
 });
 
 app.get("/session", async (c) => {
-  const stub = await getControlStub(c.env);
-  return stub.fetch("https://app-control/sessions");
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/sessions");
 });
 
-app.get("/session/:id", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/"));
+app.get("/session/:id", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/", { "x-owner-email": c.get("userEmail") }));
 
 app.delete("/session/:id", async (c) => {
   const sessionId = c.req.param("id");
+  const email = c.get("userEmail");
   const result = await proxyToAgent(c.req.raw, c.env, sessionId, "/");
-  await proxyToControl(c.env, `/sessions/${sessionId}`, { method: "DELETE" });
+  await proxyToUserControl(c.env, email, `/sessions/${sessionId}`, { method: "DELETE" });
   return result;
 });
 
@@ -223,35 +375,41 @@ app.post("/session/:id/search", async (c) => proxyToAgent(c.req.raw, c.env, c.re
 app.post("/session/:id/execute", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/execute"));
 
 app.post("/session/:id/git/init", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/init"));
-app.post("/session/:id/git/clone", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/clone"));
+app.post("/session/:id/git/clone", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/clone", { "x-owner-email": c.get("userEmail") }));
 app.post("/session/:id/git/add", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/add"));
 app.post("/session/:id/git/commit", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/commit"));
 app.post("/session/:id/git/branch", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/branch"));
 app.post("/session/:id/git/checkout", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/checkout"));
-app.post("/session/:id/git/pull", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/pull"));
-app.post("/session/:id/git/push", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/push"));
+app.post("/session/:id/git/pull", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/pull", { "x-owner-email": c.get("userEmail") }));
+app.post("/session/:id/git/push", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/push", { "x-owner-email": c.get("userEmail") }));
 app.post("/session/:id/git/remote", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/remote"));
 app.get("/session/:id/git/status", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/status${new URL(c.req.raw.url).search}`));
 app.get("/session/:id/git/log", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/log${new URL(c.req.raw.url).search}`));
 app.get("/session/:id/git/diff", async (c) => proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/diff${new URL(c.req.raw.url).search}`));
 
 app.post("/session/:id/message", async (c) => {
-  const config = await readConfig(c.env);
+  const email = c.get("userEmail");
+  const config = await readConfig(c.env, email);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/message", {
     "x-dodo-ai-base-url": config.aiGatewayBaseURL,
     "x-dodo-gateway": config.activeGateway,
     "x-dodo-model": config.model,
     "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    "x-author-email": email,
+    "x-owner-email": email,
   });
 });
 
 app.post("/session/:id/prompt", async (c) => {
-  const config = await readConfig(c.env);
+  const email = c.get("userEmail");
+  const config = await readConfig(c.env, email);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompt", {
     "x-dodo-ai-base-url": config.aiGatewayBaseURL,
     "x-dodo-gateway": config.activeGateway,
     "x-dodo-model": config.model,
     "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    "x-author-email": email,
+    "x-owner-email": email,
   });
 });
 
@@ -264,19 +422,20 @@ app.delete("/session/:id/cron/:cronId", async (c) =>
 );
 
 app.post("/session/:id/fork", async (c) => {
+  const email = c.get("userEmail");
   const sourceId = c.req.param("id");
   const sourceAgent = await getAgentByName(c.env.CODING_AGENT as never, sourceId);
   const snapshotResponse = await sourceAgent.fetch(new Request("https://coding-agent/snapshot", { method: "GET" }));
   const snapshot = await snapshotResponse.text();
-  const snapshotStoreResponse = await proxyToControl(c.env, "/fork-snapshots", {
+  const snapshotStoreResponse = await proxyToUserControl(c.env, email, "/fork-snapshots", {
     body: snapshot,
     headers: { "content-type": "application/json" },
     method: "POST",
   });
   const { id: snapshotId } = (await snapshotStoreResponse.json()) as { id: string };
   const sessionId = crypto.randomUUID();
-  await proxyToControl(c.env, "/sessions", {
-    body: JSON.stringify({ id: sessionId }),
+  await proxyToUserControl(c.env, email, "/sessions", {
+    body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }),
     headers: { "content-type": "application/json" },
     method: "POST",
   });
@@ -285,18 +444,101 @@ app.post("/session/:id/fork", async (c) => {
     new Request(`https://coding-agent/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`, {
       headers: {
         "x-dodo-session-id": sessionId,
+        "x-owner-email": email,
       },
       method: "POST",
     }),
   );
-  await proxyToControl(c.env, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
+  await proxyToUserControl(c.env, email, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
   if (!importResponse.ok) {
     return c.json({ error: await importResponse.text(), id: sessionId, sourceId }, 500);
   }
   return c.json({ id: sessionId, sourceId }, 201);
 });
 
-export { AllowlistOutbound, AppControl, CodingAgent };
+// ─── Migration endpoint (admin only, one-time) ───
+
+app.post("/api/admin/migrate", adminGuard as never, async (c) => {
+  const email = c.get("userEmail");
+  try {
+    // Read all data from AppControl
+    const appControlStub = c.env.APP_CONTROL.get(c.env.APP_CONTROL.idFromName("global"));
+
+    // Migrate sessions
+    const sessionsRes = await appControlStub.fetch("https://app-control/sessions");
+    const { sessions } = (await sessionsRes.json()) as { sessions: Array<{ id: string; title: string | null; status: string }> };
+    for (const session of sessions) {
+      await proxyToUserControl(c.env, email, "/sessions", {
+        body: JSON.stringify({ id: session.id, title: session.title, ownerEmail: email, createdBy: email }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+    }
+
+    // Migrate config
+    const configRes = await appControlStub.fetch("https://app-control/config");
+    const config = await configRes.json();
+    await proxyToUserControl(c.env, email, "/config", {
+      body: JSON.stringify(config),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+
+    // Migrate memory
+    const memoryRes = await appControlStub.fetch("https://app-control/memory");
+    const { entries } = (await memoryRes.json()) as { entries: Array<{ title: string; content: string; tags: string[] }> };
+    for (const entry of entries) {
+      await proxyToUserControl(c.env, email, "/memory", {
+        body: JSON.stringify({ title: entry.title, content: entry.content, tags: entry.tags }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+    }
+
+    // Migrate tasks
+    const tasksRes = await appControlStub.fetch("https://app-control/tasks");
+    const { tasks } = (await tasksRes.json()) as { tasks: Array<{ title: string; description: string; priority: string; status: string }> };
+    for (const task of tasks) {
+      const createRes = await proxyToUserControl(c.env, email, "/tasks", {
+        body: JSON.stringify({ title: task.title, description: task.description, priority: task.priority }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      if (task.status !== "backlog") {
+        const created = (await createRes.json()) as { id: string };
+        await proxyToUserControl(c.env, email, `/tasks/${created.id}`, {
+          body: JSON.stringify({ status: task.status }),
+          headers: { "content-type": "application/json" },
+          method: "PUT",
+        });
+      }
+    }
+
+    // Migrate allowlist
+    const allowlistRes = await appControlStub.fetch("https://app-control/allowlist");
+    const { hosts } = (await allowlistRes.json()) as { hosts: Array<{ hostname: string }> };
+    for (const host of hosts) {
+      await proxyToSharedIndex(c.env, "/allowlist", {
+        body: JSON.stringify({ hostname: host.hostname }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+    }
+
+    return c.json({
+      migrated: true,
+      sessions: sessions.length,
+      memory: entries.length,
+      tasks: tasks.length,
+      hosts: hosts.length,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Migration failed";
+    return c.json({ error: message }, 500);
+  }
+});
+
+export { AllowlistOutbound, AppControl, CodingAgent, SharedIndex, UserControl };
 
 export default {
   fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {

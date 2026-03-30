@@ -1,9 +1,10 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { getSharedIndexStub } from "./auth";
 import type { Env } from "./types";
 
 /**
  * WorkerEntrypoint that intercepts all outbound fetch() calls from sandboxed
- * dynamic workers. Checks the hostname against the AppControl allowlist and
+ * dynamic workers. Checks the hostname against the SharedIndex allowlist and
  * blocks requests to hosts that are not explicitly allowed.
  *
  * Configured as a self-referencing service binding (OUTBOUND) in wrangler.jsonc
@@ -14,9 +15,9 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     const url = new URL(request.url);
     const hostname = url.hostname.toLowerCase();
 
-    const stub = this.env.APP_CONTROL.get(this.env.APP_CONTROL.idFromName("global"));
+    const stub = getSharedIndexStub(this.env);
     const checkResponse = await stub.fetch(
-      `https://app-control/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
+      `https://shared-index/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
     );
     const { allowed } = (await checkResponse.json()) as { allowed: boolean };
 
