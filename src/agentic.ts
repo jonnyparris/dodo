@@ -1,6 +1,5 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
-import { createAllowlistFetcher } from "./outbound";
 import { createCodeTool } from "@cloudflare/codemode/ai";
 import { stateTools } from "@cloudflare/shell/workers";
 import { generateText, streamText, stepCountIs, type ModelMessage } from "ai";
@@ -46,7 +45,7 @@ function buildTools(env: Env, workspace: Workspace): Record<string, ReturnType<t
 
   if (env.LOADER) {
     const executor = new DynamicWorkerExecutor({
-      globalOutbound: createAllowlistFetcher(env),
+      globalOutbound: env.OUTBOUND ?? null,
       loader: env.LOADER,
       timeout: 30_000,
     });
