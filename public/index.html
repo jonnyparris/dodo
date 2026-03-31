@@ -57,6 +57,26 @@
     .msg.assistant a:hover{text-decoration:underline}
     .msg.assistant hr{border:none;border-top:1px solid var(--border);margin:12px 0}
     @keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+    
+    /* Mobile overflow menu */
+    .top-bar-overflow{position:relative;display:none}
+    .top-bar-overflow-btn{background:var(--bg);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:16px;padding:4px 8px;color:var(--fg)}
+    .top-bar-overflow-menu{display:none;position:absolute;right:0;top:100%;margin-top:4px;background:var(--panel);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:100;min-width:140px;padding:4px 0}
+    .top-bar-overflow-menu.open{display:block}
+    .top-bar-overflow-menu button{display:flex;align-items:center;gap:8px;width:100%;padding:8px 14px;border:none;background:none;cursor:pointer;font-size:13px;color:var(--fg);text-align:left;white-space:nowrap}
+    .top-bar-overflow-menu button:hover{background:var(--hover)}
+    .top-bar-overflow-menu button.danger{color:var(--danger)}
+    .top-bar-overflow-menu button.danger:hover{background:#fee}
+    [data-theme="dark"] .top-bar-overflow-menu button.danger:hover{background:#3a1a1a}
+  
+    /* Top bar */
+    .top-bar{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--panel);gap:8px}
+    .top-bar-left{display:flex;align-items:center;min-width:0;overflow:hidden}
+    .top-bar-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .top-bar-id{font-size:11px;color:var(--muted);margin-left:8px;white-space:nowrap}
+    .top-bar-actions{display:flex;gap:6px;flex-shrink:0}
+    .btn-icon{display:none}
+    .btn-label{display:inline}
     .input-bar{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);background:var(--panel);align-items:center}
     .input-bar input{flex:1}
     .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
@@ -151,6 +171,19 @@
     .typing-indicator{align-self:flex-start;color:var(--muted);font-size:11px;font-style:italic;padding:4px 14px}
 
     @media(max-width:900px){
+      .top-bar{padding:8px 10px;gap:4px}
+      .top-bar-left{flex:0 1 auto;max-width:35%}
+      .top-bar-title{font-size:12px}
+      .top-bar-id{display:none}
+      .top-bar .token-summary{display:none}
+      .top-bar .presence-bar{display:none}
+      .top-bar-actions{gap:3px;flex-wrap:nowrap}
+      .top-bar-actions .mobile-hide{display:none}
+      .top-bar-overflow{display:block}
+      .top-bar-actions button{padding:4px 6px;font-size:12px;min-width:28px}
+      .btn-icon{display:inline;font-size:14px}
+      .btn-label{display:none}
+      .theme-toggle{font-size:14px !important;padding:4px 6px !important}
       .app{grid-template-columns:1fr;height:calc(100dvh - 56px);height:calc(100vh - 56px)} /* dvh first, vh fallback */
       @supports(height:100dvh){.app{height:calc(100dvh - 56px)}}
       .sidebar,.right{display:none}
@@ -231,21 +264,29 @@
     </div>
 
     <div class="center">
-      <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--panel)">
-        <div style="display:flex;align-items:center">
+      <div class="top-bar">
+        <div class="top-bar-left">
           <span id="session-status-dot" class="status-dot idle"></span>
-          <strong id="session-title-display">No session</strong>
-          <span id="session-id-display" style="font-size:11px;color:var(--muted);margin-left:8px"></span>
-          <span id="token-summary" class="token-summary" style="margin-left:8px"></span>
+          <strong id="session-title-display" class="top-bar-title">No session</strong>
+          <span id="session-id-display" class="top-bar-id"></span>
+          <span id="token-summary" class="token-summary"></span>
           <div id="presence-bar" class="presence-bar"></div>
         </div>
-        <div style="display:flex;gap:6px">
-          <button onclick="showSessionSettings()" title="Session settings â sharing, permissions, browser, approvals">Settings</button>
-          <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle dark/light mode">ð</button>
-          <button onclick="showHelp()" title="Help â explains each feature and button">?</button>
-          <button onclick="forkSession()" title="Fork â creates a copy of this session with all files and messages for branching experiments">Fork</button>
-          <button id="abort-btn" onclick="abortPrompt()" disabled title="Abort â cancels the currently running async prompt">Abort</button>
-          <button class="danger" onclick="deleteSession()" title="Delete â permanently removes this session and all its data">Delete</button>
+        <div class="top-bar-actions">
+          <button onclick="showSessionSettings()" title="Session settings"><span class="btn-label">Settings</span><span class="btn-icon">⚙️</span></button>
+          <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle dark/light mode">🌙</button>
+          <button onclick="showHelp()" title="Help">?</button>
+          <button class="mobile-hide" onclick="forkSession()" title="Fork session"><span class="btn-label">Fork</span><span class="btn-icon">🔀</span></button>
+          <button class="mobile-hide" id="abort-btn" onclick="abortPrompt()" disabled title="Abort prompt"><span class="btn-label">Abort</span><span class="btn-icon">⏹</span></button>
+          <button class="danger mobile-hide" onclick="deleteSession()" title="Delete session"><span class="btn-label">Delete</span><span class="btn-icon">🗑</span></button>
+          <div class="top-bar-overflow">
+            <button class="top-bar-overflow-btn" onclick="toggleOverflowMenu(event)" title="More actions">⋯</button>
+            <div class="top-bar-overflow-menu" id="overflow-menu">
+              <button onclick="forkSession();closeOverflowMenu()">🔀 Fork session</button>
+              <button onclick="abortPrompt();closeOverflowMenu()" id="abort-btn-mobile">⏹ Abort prompt</button>
+              <button class="danger" onclick="deleteSession();closeOverflowMenu()">🗑 Delete session</button>
+            </div>
+          </div>
         </div>
       </div>
       <div class="chat" id="chat">
@@ -1198,7 +1239,29 @@
       setTimeout(() => window.location.reload(), 400);
     }
     boot();
-  </script>
+  
+    // --- Overflow menu ---
+    function toggleOverflowMenu(e){
+      e.stopPropagation();
+      const menu=document.getElementById('overflow-menu');
+      menu.classList.toggle('open');
+    }
+    function closeOverflowMenu(){
+      document.getElementById('overflow-menu').classList.remove('open');
+    }
+    document.addEventListener('click',()=>closeOverflowMenu());
+    // Sync abort button state with mobile overflow abort
+    const origAbortObserver=new MutationObserver(()=>{
+      const main=document.getElementById('abort-btn');
+      const mobile=document.getElementById('abort-btn-mobile');
+      if(main&&mobile){mobile.disabled=main.disabled;mobile.style.opacity=main.disabled?'0.4':'1'}
+    });
+    window.addEventListener('load',()=>{
+      const main=document.getElementById('abort-btn');
+      if(main)origAbortObserver.observe(main,{attributes:true,attributeFilter:['disabled']});
+    });
+  
+    </script>
 
   <!-- Floating refresh button (mobile) -->
   <button class="fab-refresh" id="fab-refresh" onclick="fabRefresh()" title="Refresh app">↻</button>
