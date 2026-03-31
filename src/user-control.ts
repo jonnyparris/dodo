@@ -935,11 +935,12 @@ export class UserControl implements DurableObject {
 
   // ─── Status ───
 
-  private getStatus(): { version: string; sessionCount: number; hasPasskey: boolean } {
+  private getStatus(): { version: string; commit: string; sessionCount: number; hasPasskey: boolean } {
     const sessionCount = Number(this.db.one("SELECT COUNT(*) AS count FROM sessions")?.count ?? 0);
     const hasPasskey = !!this.db.one("SELECT id FROM key_envelope WHERE id = 'default'");
     return {
       version: this.env.DODO_VERSION ?? "dev",
+      commit: this.env.DODO_COMMIT ?? "",
       sessionCount,
       hasPasskey,
     };

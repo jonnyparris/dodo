@@ -9,6 +9,7 @@ export interface Env {
   CF_ACCESS_TEAM_DOMAIN: string;
   DEFAULT_MODEL: string;
   DODO_MCP_TOKEN?: string;
+  DODO_COMMIT?: string;
   DODO_VERSION?: string;
   GIT_AUTHOR_EMAIL?: string;
   GIT_AUTHOR_NAME?: string;

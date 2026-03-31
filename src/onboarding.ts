@@ -1,4 +1,4 @@
-export type OnboardingStep = "welcome" | "passkey" | "secrets" | "memory" | "integrations" | "complete";
+export type OnboardingStep = "welcome" | "gateway" | "passkey" | "secrets" | "memory" | "integrations" | "complete";
 
 export interface OnboardingState {
   currentStep: OnboardingStep;
@@ -7,7 +7,7 @@ export interface OnboardingState {
   completedAt: string | null;
 }
 
-const STEP_ORDER: OnboardingStep[] = ["welcome", "passkey", "secrets", "memory", "integrations", "complete"];
+const STEP_ORDER: OnboardingStep[] = ["welcome", "gateway", "passkey", "secrets", "memory", "integrations", "complete"];
 
 export function getNextStep(current: OnboardingStep, _skip: boolean): OnboardingStep {
   const idx = STEP_ORDER.indexOf(current);
@@ -19,6 +19,8 @@ export function canSkipStep(step: OnboardingStep, hasKeyEnvelope: boolean): bool
   switch (step) {
     case "welcome":
       return true;
+    case "gateway":
+      return false; // Must configure own AI provider
     case "passkey":
       return hasKeyEnvelope;
     case "secrets":

@@ -553,7 +553,7 @@ export class AppControl implements DurableObject {
     );
   }
 
-  private getStatus(): { version: string; tokenExpiry: string | null; sessionCount: number; modelCount: number } {
+  private getStatus(): { version: string; commit: string; tokenExpiry: string | null; sessionCount: number; modelCount: number } {
     const sessionCount = Number(this.db.one("SELECT COUNT(*) AS count FROM sessions")?.count ?? 0);
     const modelCount = Number(this.db.one("SELECT COUNT(*) AS count FROM models_cache")?.count ?? 0);
 
@@ -575,6 +575,7 @@ export class AppControl implements DurableObject {
 
     return {
       version: this.env.DODO_VERSION ?? "dev",
+      commit: this.env.DODO_COMMIT ?? "",
       tokenExpiry,
       sessionCount,
       modelCount,
