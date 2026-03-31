@@ -78,6 +78,13 @@
     .onboarding p{margin-bottom:16px;line-height:1.5;max-width:480px;margin-left:auto;margin-right:auto}
     .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;margin-right:6px;vertical-align:middle}
     @keyframes spin{to{transform:rotate(360deg)}}
+    [data-theme="dark"]{--bg:#1a1a1a;--panel:#242424;--text:#e8e8e8;--muted:#999;--accent:#1db896;--accent-bg:rgba(29,184,150,.12);--border:#333;--red:#e74c3c;--tool-bg:#1e2a35;--tool-border:#2d4055}
+    [data-theme="dark"] .msg.assistant code{background:rgba(255,255,255,.08)}
+    [data-theme="dark"] .msg.assistant th{background:var(--bg)}
+    [data-theme="dark"] .banner.warn{background:#3d2e00;color:#ffc107;border-bottom-color:#5a4400}
+    [data-theme="dark"] .wizard-overlay,[data-theme="dark"] .help-overlay,[data-theme="dark"] .settings-overlay{background:rgba(0,0,0,.7)}
+    .theme-toggle{background:none;border:1px solid var(--border);border-radius:20px;padding:4px 10px;font-size:13px;cursor:pointer;color:var(--text);transition:background .2s}
+    .theme-toggle:hover{background:var(--accent-bg)}
     .banner{padding:8px 16px;font-size:12px;text-align:center}
     .banner.warn{background:#fef3cd;color:#856404;border-bottom:1px solid #ffc107}
     .footer{padding:6px 16px;font-size:10px;color:var(--muted);text-align:center;border-top:1px solid var(--border);background:var(--panel)}
@@ -207,6 +214,7 @@
         </div>
         <div style="display:flex;gap:6px">
           <button onclick="showSessionSettings()" title="Session settings — sharing, permissions, browser, approvals">Settings</button>
+          <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle dark/light mode">🌙</button>
           <button onclick="showHelp()" title="Help — explains each feature and button">?</button>
           <button onclick="forkSession()" title="Fork — creates a copy of this session with all files and messages for branching experiments">Fork</button>
           <button id="abort-btn" onclick="abortPrompt()" disabled title="Abort — cancels the currently running async prompt">Abort</button>
@@ -1135,6 +1143,26 @@
       // Update baseline on orientation change
       window.visualViewport.addEventListener("scroll",()=>{initialHeight=Math.max(initialHeight,window.visualViewport.height)});
     }
+
+
+    // --- Dark theme toggle ---
+    function applyTheme(theme){
+      document.documentElement.setAttribute('data-theme', theme);
+      const btn = $('theme-toggle-btn');
+      if(btn) btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+    }
+    function toggleTheme(){
+      const current = document.documentElement.getAttribute('data-theme') || 'light';
+      const next = current === 'dark' ? 'light' : 'dark';
+      localStorage.setItem('dodo-theme', next);
+      applyTheme(next);
+    }
+    // Apply saved theme immediately on load
+    (function(){
+      const saved = localStorage.getItem('dodo-theme');
+      const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      applyTheme(saved || (prefersDark ? 'dark' : 'light'));
+    })();
 
     boot();
   </script>
