@@ -126,7 +126,7 @@
     .mobile-nav-inner{display:flex;justify-content:space-around}
     .mobile-nav button{border:none;background:none;font-size:11px;color:var(--muted);padding:6px 12px;display:flex;flex-direction:column;align-items:center;gap:2px}
     .mobile-nav button.active{color:var(--accent)}
-    .fab{display:none;position:fixed;bottom:72px;left:16px;width:48px;height:48px;border-radius:50%;background:var(--accent);color:#fff;border:none;font-size:24px;box-shadow:0 4px 12px rgba(0,0,0,.2);z-index:100}
+    .fab{display:none;position:fixed;bottom:72px;right:16px;width:48px;height:48px;border-radius:50%;background:var(--accent);color:#fff;border:none;font-size:24px;box-shadow:0 4px 12px rgba(0,0,0,.2);z-index:100}
 
     /* Onboarding Wizard */
     .wizard-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px}
@@ -202,7 +202,7 @@
       display:none;
       position:fixed;
       bottom:130px;
-      left:16px;
+      right:16px;
       z-index:1000;
       width:48px;height:48px;
       border-radius:50%;
@@ -716,7 +716,7 @@
       $("session-title-display").textContent=state.title||id.slice(0,8);setStatusDot(state.status);
       updateTokenSummary(state);
       if(state.status==="running")setProcessing(true);
-      const d=await apiSafe(`/session/${id}/messages`);if(!d)return;const{messages}=d;messages.forEach(renderMessage);$("chat").scrollTop=$("chat").scrollHeight;
+      const d=await apiSafe(`/session/${id}/messages`);if(!d)return;const{messages}=d;messages.forEach(renderMessage);requestAnimationFrame(()=>{const c=$("chat");c.scrollTop=c.scrollHeight;});
       await Promise.all([loadFiles("/"),loadPrompts(),loadCron(),refreshGit()]);connectSSE(id);connectWebSocket(id);
       if(window.innerWidth<=900)switchTab('chat');
     }
@@ -739,7 +739,7 @@
     }
 
     function renderMessage(msg){const el=document.createElement("div");el.className=`msg ${msg.role}`;if(msg.role==="assistant"){el.innerHTML=renderMarkdown(msg.content)}else{el.textContent=msg.content}if(msg.role==="assistant"&&(msg.tokenInput||msg.tokenOutput)){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;el.appendChild(m)}$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
-    function renderToolCall(tc){const el=document.createElement("div");el.className="msg tool_call";el.innerHTML=`<details><summary>Tool call</summary><pre style="margin:6px 0 0;font-size:11px;white-space:pre-wrap;max-height:200px;overflow:auto">${esc(tc.code||"")}</pre><div style="margin-top:4px;font-size:11px;color:var(--muted)">${tc.result!=null?'Result: '+esc(JSON.stringify(tc.result,null,2)?.slice(0,500)):'✓ Done'}</div></details>`;$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
+    function renderToolCall(tc){const el=document.createElement("div");el.className="msg tool_call";const resultStr=tc.result!=null&&tc.result!=="null"&&JSON.stringify(tc.result)!=="null"?'Result: '+esc(JSON.stringify(tc.result,null,2)?.slice(0,500)):'✓ Done';el.innerHTML=`<details><summary>Tool call</summary><pre style="margin:6px 0 0;font-size:11px;white-space:pre-wrap;max-height:200px;overflow:auto">${esc(tc.code||"")}</pre><div style="margin-top:4px;font-size:11px;color:var(--muted)">${resultStr}</div></details>`;$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
     
     function scrollChatToBottom(){const c=$("chat");c.scrollTo({top:c.scrollHeight,behavior:"smooth"})}
     (function(){const c=$("chat");const btn=$("scroll-bottom-btn");if(!c||!btn)return;c.addEventListener("scroll",()=>{const distFromBottom=c.scrollHeight-c.scrollTop-c.clientHeight;if(distFromBottom>150){btn.classList.add("visible")}else{btn.classList.remove("visible")}})})();
