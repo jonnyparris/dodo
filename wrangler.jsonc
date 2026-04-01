@@ -27,6 +27,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["UserControl", "SharedIndex"]
+    },
+    {
+      "tag": "v3",
+      "deleted_classes": ["AppControl"]
     }
   ],
   "r2_buckets": [
