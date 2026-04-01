@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev -c wrangler.dev.jsonc",
     "deploy": "COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown') && wrangler deploy --var DODO_COMMIT:$COMMIT",
     "test": "vitest run",
     "test:watch": "vitest",
