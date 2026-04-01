@@ -4,7 +4,7 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Dodo</title>
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" id="favicon"/>
   <script defer src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2/src/regular/style.css" media="print" onload="this.media='all'"/>
   <noscript><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2/src/regular/style.css"/></noscript>
@@ -455,7 +455,7 @@
         <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel"><i class="ph ph-x"></i></button>
       </div>
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:8px 10px;background:var(--accent-bg);border-radius:var(--radius)">
-        <img src="/favicon.svg" alt="Dodo" class="dodo-logo sm"/>
+        <img src="/favicon.svg" alt="Dodo" class="dodo-logo sm dodo-logo-img"/>
         <div id="identity-display" style="font-size:11px;color:var(--muted)"></div>
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -525,7 +525,7 @@
       <div id="sse-banner" class="sse-banner">Connection lost — reconnecting…</div>
       <div class="chat" id="chat">
         <div class="onboarding" id="onboarding">
-          <img src="/favicon.svg" alt="Dodo" class="dodo-logo lg" style="margin-bottom:12px"/>
+          <img src="/favicon.svg" alt="Dodo" class="dodo-logo lg dodo-logo-img" style="margin-bottom:12px"/>
           <h3>Welcome to Dodo</h3>
           <p>Your AI coding assistant. Start typing or pick up where you left off.</p>
           <div id="onboarding-sessions" class="onboarding-sessions" style="margin-top:16px;text-align:left;max-width:400px;margin-left:auto;margin-right:auto">
@@ -553,7 +553,7 @@
       </div>
       <div class="footer" id="footer">
         <button class="ghost sm" onclick="togglePanel('sidebar')" title="Toggle left sidebar" aria-label="Toggle left sidebar" id="toggle-sidebar-btn">&laquo;</button>
-        <span id="footer-text" style="display:inline-flex;align-items:center;gap:4px"><img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7"/>Dodo</span>
+        <span id="footer-text" style="display:inline-flex;align-items:center;gap:4px"><img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/>Dodo</span>
         <button class="ghost sm" onclick="togglePanel('right')" title="Toggle right panel" aria-label="Toggle right panel" id="toggle-right-btn">&raquo;</button>
       </div>
     </div>
@@ -842,6 +842,11 @@
       const toggle=$('theme-toggle-btn');
       const icon=$('theme-icon');
       if(icon){icon.className=theme==='dark'?'ph ph-sun':'ph ph-moon'}
+      // Swap favicon and inline logos to match theme
+      const favSrc=theme==='dark'?'/favicon-dark.svg':'/favicon-light.svg';
+      const fav=$('favicon');
+      if(fav)fav.href=favSrc;
+      document.querySelectorAll('.dodo-logo-img').forEach(img=>{img.src=favSrc});
     }
     function toggleTheme(){
       const current=getTheme();
@@ -1399,7 +1404,8 @@
       const body=$("wizard-body");
       switch(step){
         case "welcome":
-          body.innerHTML=`<img src="/favicon.svg" alt="Dodo" class="dodo-logo md" style="margin-bottom:12px"/><h3>Welcome to Dodo</h3><p>Dodo is an autonomous coding agent running on Cloudflare Workers. Let's get you set up in a few quick steps.</p><p style="font-size:12px">You can skip any step and configure it later from the sidebar.</p><div class="wizard-actions"><button class="primary" onclick="advanceWizard('welcome',false)">Continue</button></div>`;
+          var _fav=getTheme()==='dark'?'/favicon-dark.svg':'/favicon-light.svg';
+          body.innerHTML=`<img src="${_fav}" alt="Dodo" class="dodo-logo md dodo-logo-img" style="margin-bottom:12px"/><h3>Welcome to Dodo</h3><p>Dodo is an autonomous coding agent running on Cloudflare Workers. Let's get you set up in a few quick steps.</p><p style="font-size:12px">You can skip any step and configure it later from the sidebar.</p><div class="wizard-actions"><button class="primary" onclick="advanceWizard('welcome',false)">Continue</button></div>`;
           break;
         case "gateway":
           body.innerHTML=`<h3>AI Provider</h3><p>Dodo needs an AI provider to work. Choose a gateway and configure your API credentials.</p><div style="max-width:360px;margin:0 auto;text-align:left"><label style="font-size:11px;color:var(--muted)">Gateway</label><select id="wiz-gateway" style="margin-bottom:8px" onchange="wizGatewayChanged()"><option value="ai-gateway">AI Gateway (Cloudflare)</option><option value="opencode">OpenCode Gateway</option></select><div id="wiz-gateway-fields"><label style="font-size:11px;color:var(--muted)">AI Gateway Base URL</label><input id="wiz-gw-url" placeholder="https://gateway.ai.cloudflare.com/v1/YOUR_ACCOUNT/YOUR_GATEWAY" style="margin-bottom:8px"/><label style="font-size:11px;color:var(--muted)">Model ID</label><input id="wiz-gw-model" placeholder="anthropic/claude-sonnet-4-5" value="anthropic/claude-sonnet-4-5" style="margin-bottom:8px"/></div></div><p style="font-size:11px;color:var(--muted)">You must bring your own AI provider. <a href="https://developers.cloudflare.com/ai-gateway/" target="_blank" style="color:var(--accent)">Set up an AI Gateway</a> or use any OpenAI-compatible endpoint.</p><div class="wizard-actions"><button class="primary" onclick="wizardSaveGateway()">Save &amp; Continue</button></div>`;
