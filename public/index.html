@@ -4,7 +4,9 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Dodo</title>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2/src/regular/style.css" media="print" onload="this.media='all'"/>
+  <noscript><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2/src/regular/style.css"/></noscript>
   <style>
     /* === Kumo Design Tokens === */
     :root{
@@ -148,6 +150,7 @@
     .msg.tool_call{align-self:flex-start;background:var(--recessed);border:1px solid var(--ring);border-radius:var(--radius);font-family:var(--mono);font-size:12px;max-width:90%}
     .msg.tool_call summary{cursor:pointer;color:var(--text-info);font-weight:600;padding:4px 0}
     .msg.thinking{align-self:flex-start;background:var(--brand-tint);border:1px dashed var(--brand);color:var(--text-info);font-style:italic}
+    .msg.error{align-self:flex-start;background:var(--danger-tint);border:1px solid var(--danger);color:var(--text-danger);font-size:13px}
     .thinking-dots::after{content:'';animation:dots 1.5s steps(4,end) infinite}
 
     /* === Message actions (copy button) === */
@@ -208,10 +211,11 @@
     .example-prompt{padding:10px 14px;border-radius:var(--radius);border:1px solid var(--line);cursor:pointer;font-size:13px;margin-bottom:8px;line-height:1.45;background:var(--base);transition:border-color .12s,background .12s,box-shadow .12s}
     .example-prompt:hover{border-color:var(--brand);background:var(--brand-tint);box-shadow:var(--shadow-sm)}
     .onboarding{padding:32px;text-align:center;color:var(--text-subtle)}
+    .onboarding-sessions{display:none}
     .onboarding h3{color:var(--text-default);margin-bottom:8px;font-size:18px;font-weight:600}
     .onboarding p{margin-bottom:16px;line-height:1.5;max-width:480px;margin-left:auto;margin-right:auto}
 
-    .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;margin-right:6px;vertical-align:middle}
+    .spinner{display:inline-block;width:14px;height:14px;border:2px solid light-dark(oklch(82% 0 0), var(--border));border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;margin-right:6px;vertical-align:middle}
     @keyframes spin{to{transform:rotate(360deg)}}
 
     /* === Loading skeleton — Kumo: randomized widths, staggered delays, fill color === */
@@ -221,6 +225,8 @@
 
     .banner{padding:8px 16px;font-size:12px;text-align:center}
     .banner.warn{background:var(--warning);color:var(--text-warning);border-bottom:1px solid var(--warning)}
+    .sse-banner{position:sticky;top:0;z-index:10;padding:6px 12px;font-size:12px;text-align:center;background:var(--danger-tint);color:var(--text-danger);border-bottom:1px solid var(--danger);display:none}
+    .sse-banner.visible{display:block}
     .footer{padding:8px 16px;font-size:11px;color:var(--text-subtle);text-align:center;border-top:1px solid var(--line);background:var(--base);display:flex;align-items:center;justify-content:center;gap:12px}
     .token-summary{font-size:11px;color:var(--text-subtle)}
 
@@ -245,6 +251,7 @@
     .mobile-nav button{border:none;background:none;font-size:11px;color:var(--text-subtle);padding:8px 16px;display:flex;flex-direction:column;align-items:center;gap:3px;min-height:48px;min-width:48px;border-radius:var(--radius);transition:color .12s,background .12s;box-shadow:none}
     .mobile-nav button.active{color:var(--brand);background:var(--brand-tint)}
     .mobile-nav button span.nav-icon{font-size:20px;line-height:1}
+    .mobile-nav button span.nav-icon i{vertical-align:middle}
 
     /* === FAB — hidden by default on mobile chat, shown on other tabs === */
     .fab{display:none;position:fixed;bottom:72px;right:16px;width:52px;height:52px;border-radius:50%;background:var(--brand);color:#fff;border:none;font-size:24px;box-shadow:var(--shadow-md);z-index:100;transition:transform .15s,background .15s}
@@ -326,6 +333,12 @@
     .theme-toggle{background:none;border:1px solid var(--line);cursor:pointer;font-size:16px;padding:4px;min-height:32px;min-width:32px;display:flex;align-items:center;justify-content:center;border-radius:var(--radius);transition:background .12s;box-shadow:none}
     .theme-toggle:hover{background:var(--fill-hover)}
 
+    /* === Confirm dialog — Kumo modal style, replaces native confirm() === */
+    .confirm-overlay{position:fixed;inset:0;background:light-dark(oklch(0% 0 0 / 0.4), oklch(0% 0 0 / 0.6));z-index:4000;display:flex;align-items:center;justify-content:center;padding:16px}
+    .confirm-card{background:var(--base);border-radius:12px;padding:24px;max-width:360px;width:100%;text-align:center;box-shadow:var(--shadow-md);border:1px solid var(--line)}
+    .confirm-card p{margin-bottom:20px;line-height:1.5;color:var(--text-default);font-size:14px}
+    .confirm-actions{display:flex;gap:8px;justify-content:center}
+
     /* === Toast notifications — Kumo: bottom-right, card style, variant icons === */
     .toast-container{position:fixed;bottom:16px;right:16px;z-index:3000;display:flex;flex-direction:column-reverse;gap:8px;align-items:flex-end;pointer-events:none}
     .toast{background:var(--base);color:var(--text-default);padding:12px 16px;border-radius:var(--radius);font-size:13px;box-shadow:var(--shadow-md);border:1px solid var(--line);opacity:0;transform:translateX(20px);animation:toast-in .25s ease forwards;pointer-events:auto;display:flex;gap:10px;align-items:flex-start;max-width:360px;min-width:240px}
@@ -362,13 +375,25 @@
       .sidebar.mobile-visible .mobile-panel-header,
       .right.mobile-visible .mobile-panel-header{display:flex}
 
+      /* Show recent sessions in onboarding on mobile */
+      .onboarding-sessions.has-sessions{display:block}
+
       .mobile-nav{display:block;transition:transform .2s}
       .mobile-nav.keyboard-open{transform:translateY(100%)}
       /* FAB hidden on chat (default), shown when switching to files/tools/settings */
       .fab{display:none}
 
-      /* Kanban — single column on small mobile */
-      .kanban{grid-template-columns:1fr}
+      /* Kanban — horizontal scroll with snap on mobile */
+      .kanban{display:flex;overflow-x:auto;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;gap:10px;padding-bottom:8px}
+      .kanban-col{min-width:75vw;max-width:85vw;flex-shrink:0;scroll-snap-align:start}
+
+      /* Message actions & code copy always visible on mobile (no hover) */
+      .msg-actions{display:flex !important;position:static;margin-top:8px;justify-content:flex-end}
+      .msg.assistant pre .copy-code{opacity:1}
+
+      /* Toasts above mobile nav */
+      .toast-container{bottom:calc(56px + env(safe-area-inset-bottom,4px) + 8px);right:12px;left:12px;align-items:stretch}
+      .toast{max-width:none;min-width:0}
 
       /* Touch-friendly session items */
       .session-item{padding:14px;min-height:52px}
@@ -381,8 +406,9 @@
       .input-bar{padding:10px 12px;padding-bottom:max(10px,env(safe-area-inset-bottom))}
       .input-bar textarea{font-size:16px /* prevent iOS zoom */}
 
-      /* Chat bubbles — wider on mobile */
+      /* Chat bubbles — wider on mobile; assistant full-width for code readability */
       .msg{max-width:90%;padding:12px 14px}
+      .msg.assistant,.msg.tool_call{max-width:100%}
 
       /* Header actions — collapse overflow on mobile */
       .header-actions{flex-wrap:nowrap;gap:3px;padding-bottom:2px}
@@ -418,8 +444,8 @@
   <div class="app" id="app">
     <div class="sidebar" id="sidebar-panel">
       <div class="mobile-panel-header">
-        <h3>Settings</h3>
-        <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel">&#10005;</button>
+        <h3>Menu</h3>
+        <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel"><i class="ph ph-x"></i></button>
       </div>
       <div id="identity-display" style="font-size:11px;color:var(--muted);margin-bottom:12px;padding:8px 10px;background:var(--accent-bg);border-radius:var(--radius)"></div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -470,27 +496,31 @@
           <div id="presence-bar" class="presence-bar"></div>
         </div>
         <div class="header-actions">
-          <button onclick="showSessionSettings()" title="Session settings" aria-label="Session settings"><span class="btn-label">Settings</span><span class="btn-icon">&#9881;&#65039;</span></button>
-          <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle dark/light mode">&#127763;</button>
-          <button onclick="showHelp()" title="Help" aria-label="Help">?</button>
-          <button class="mobile-hide" onclick="forkSession()" title="Fork session" aria-label="Fork session"><span class="btn-label">Fork</span><span class="btn-icon">&#128256;</span></button>
-          <button class="mobile-hide" id="abort-btn" onclick="abortPrompt()" disabled title="Abort prompt" aria-label="Abort prompt"><span class="btn-label">Abort</span><span class="btn-icon">&#9209;</span></button>
-          <button class="danger mobile-hide" onclick="deleteSession()" title="Delete session" aria-label="Delete session"><span class="btn-label">Delete</span><span class="btn-icon">&#128465;&#65039;</span></button>
+          <button onclick="showSessionSettings()" title="Session settings" aria-label="Session settings"><span class="btn-label">Settings</span><span class="btn-icon"><i class="ph ph-gear"></i></span></button>
+          <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle dark/light mode"><i class="ph ph-moon" id="theme-icon"></i></button>
+          <button onclick="showHelp()" title="Help" aria-label="Help"><i class="ph ph-question"></i></button>
+          <button class="mobile-hide" onclick="forkSession()" title="Fork session" aria-label="Fork session"><span class="btn-label">Fork</span><span class="btn-icon"><i class="ph ph-git-fork"></i></span></button>
+          <button class="mobile-hide" id="abort-btn" onclick="abortPrompt()" disabled title="Abort prompt" aria-label="Abort prompt"><span class="btn-label">Abort</span><span class="btn-icon"><i class="ph ph-stop-circle"></i></span></button>
+          <button class="danger mobile-hide" onclick="deleteSession()" title="Delete session" aria-label="Delete session"><span class="btn-label">Delete</span><span class="btn-icon"><i class="ph ph-trash"></i></span></button>
           <div class="top-bar-overflow">
-            <button class="top-bar-overflow-btn" onclick="toggleOverflowMenu(event)" title="More actions">&#8943;</button>
+            <button class="top-bar-overflow-btn" onclick="toggleOverflowMenu(event)" title="More actions"><i class="ph ph-dots-three-vertical"></i></button>
             <div class="top-bar-overflow-menu" id="overflow-menu">
-              <button onclick="forkSession();closeOverflowMenu()">&#128256; Fork session</button>
-              <button onclick="abortPrompt();closeOverflowMenu()" id="abort-btn-mobile">&#9209; Abort prompt</button>
-              <button class="danger" onclick="deleteSession();closeOverflowMenu()">&#128465;&#65039; Delete session</button>
+              <button onclick="forkSession();closeOverflowMenu()"><i class="ph ph-git-fork"></i> Fork session</button>
+              <button onclick="abortPrompt();closeOverflowMenu()" id="abort-btn-mobile"><i class="ph ph-stop-circle"></i> Abort prompt</button>
+              <button class="danger" onclick="deleteSession();closeOverflowMenu()"><i class="ph ph-trash"></i> Delete session</button>
             </div>
           </div>
         </div>
       </div>
+      <div id="sse-banner" class="sse-banner">Connection lost — reconnecting…</div>
       <div class="chat" id="chat">
         <div class="onboarding" id="onboarding">
           <h3>Welcome to Dodo</h3>
-          <p>Autonomous coding agent running on Cloudflare Workers. Create a session and start building.</p>
-          <p style="font-size:12px;color:var(--muted)">The agent can read/write workspace files, execute sandboxed code, and manage git repos autonomously.</p>
+          <p>Your AI coding assistant. Start typing or pick up where you left off.</p>
+          <div id="onboarding-sessions" class="onboarding-sessions" style="margin-top:16px;text-align:left;max-width:400px;margin-left:auto;margin-right:auto">
+            <h2>Recent sessions</h2>
+            <div id="onboarding-session-list"></div>
+          </div>
           <div style="margin-top:16px;text-align:left;max-width:400px;margin-left:auto;margin-right:auto">
             <h2>Try these prompts</h2>
             <div class="example-prompt" onclick="useExample(this)">Create a Cloudflare Worker that returns the current time as JSON. Write it to /src/index.ts</div>
@@ -522,7 +552,7 @@
     <div class="right" id="right-panel">
       <div class="mobile-panel-header">
         <h3 id="right-panel-title">Files &amp; Tools</h3>
-        <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel">&#10005;</button>
+        <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel"><i class="ph ph-x"></i></button>
       </div>
       <!-- Files group (shown on Files tab) -->
       <div id="files-group">
@@ -628,13 +658,13 @@
   <!-- Mobile navigation -->
   <div class="mobile-nav" id="mobile-nav">
     <div class="mobile-nav-inner">
-      <button class="active" onclick="switchTab('chat')" aria-label="Chat"><span class="nav-icon">&#128172;</span>Chat</button>
-      <button onclick="switchTab('files')" aria-label="Files"><span class="nav-icon">&#128196;</span>Files</button>
-      <button onclick="switchTab('tools')" aria-label="Tools"><span class="nav-icon">&#128295;</span>Tools</button>
-      <button onclick="switchTab('settings')" aria-label="Settings"><span class="nav-icon">&#9881;</span>Settings</button>
+      <button class="active" onclick="switchTab('chat')" aria-label="Chat"><span class="nav-icon"><i class="ph ph-chat-circle"></i></span>Chat</button>
+      <button onclick="switchTab('files')" aria-label="Files"><span class="nav-icon"><i class="ph ph-files"></i></span>Files</button>
+      <button onclick="switchTab('tools')" aria-label="Tools"><span class="nav-icon"><i class="ph ph-wrench"></i></span>Tools</button>
+      <button onclick="switchTab('settings')" aria-label="Settings"><span class="nav-icon"><i class="ph ph-sliders-horizontal"></i></span>Menu</button>
     </div>
   </div>
-  <button class="fab" onclick="createSession()" title="New session" aria-label="New session">+</button>
+  <button class="fab" onclick="createSession()" title="New session" aria-label="New session"><i class="ph ph-plus"></i></button>
 
   <!-- Help overlay -->
   <div class="help-overlay" id="help-overlay" style="display:none" onclick="if(event.target===this)hideHelp()">
@@ -799,7 +829,8 @@
     function applyTheme(theme){
       document.documentElement.setAttribute('data-mode',theme);
       const toggle=$('theme-toggle-btn');
-      if(toggle)toggle.textContent=theme==='dark'?'\u2600\uFE0F':'\uD83C\uDF13';
+      const icon=$('theme-icon');
+      if(icon){icon.className=theme==='dark'?'ph ph-sun':'ph ph-moon'}
     }
     function toggleTheme(){
       const current=getTheme();
@@ -819,10 +850,21 @@
     }
 
     // Markdown rendering for assistant messages
-    if(typeof marked!=="undefined"){marked.setOptions({breaks:true,gfm:true})}
+    let _markedConfigured=false;
     function renderMarkdown(text){
       if(typeof marked==="undefined")return esc(text);
+      if(!_markedConfigured){marked.setOptions({breaks:true,gfm:true});_markedConfigured=true}
       try{return marked.parse(text)}catch{return esc(text)}
+    }
+
+    // Incremental markdown streaming — accumulate text and render periodically
+    let streamingText="";
+    let streamingRenderTimer=null;
+    function renderStreamingMarkdown(){
+      if(!streamingEl)return;
+      streamingEl.innerHTML=renderMarkdown(streamingText);
+      streamingEl.querySelectorAll('pre').forEach(pre=>{pre.style.position='relative'});
+      $("chat").scrollTop=$("chat").scrollHeight;
     }
     const api=async(path,opts)=>{const r=await fetch(path,opts);const data=r.headers.get("content-type")?.includes("json")?await r.json():await r.text();if(!r.ok){const msg=typeof data==="object"?data.error||"Request failed":data;const e=new Error(msg);e.status=r.status;e.data=data;throw e}return data};
     const json=(path,body,method="POST")=>api(path,{method,headers:{"content-type":"application/json"},body:JSON.stringify(body)});
@@ -921,7 +963,7 @@
     })();
 
     // === Toast notifications — Kumo style ===
-    const TOAST_ICONS={success:'\u2713',error:'\u2717',warning:'\u26A0',info:'\u2139',default:''};
+    const TOAST_ICONS={success:'<i class="ph ph-check-circle"></i>',error:'<i class="ph ph-x-circle"></i>',warning:'<i class="ph ph-warning"></i>',info:'<i class="ph ph-info"></i>',default:''};
     function toast(titleOrMsg,type='default',duration=3500){
       const container=$('toast-container');
       const el=document.createElement('div');
@@ -936,6 +978,19 @@
         <button class="toast-close" onclick="this.parentElement.remove()" aria-label="Dismiss">&times;</button>`;
       container.appendChild(el);
       setTimeout(()=>{el.classList.add('fade-out');setTimeout(()=>el.remove(),200)},duration);
+    }
+
+    // --- In-app confirm dialog (replaces native confirm()) ---
+    function appConfirm(message,{confirmText='Delete',cancelText='Cancel',danger=true}={}){
+      return new Promise(resolve=>{
+        const overlay=document.createElement('div');overlay.className='confirm-overlay';
+        overlay.innerHTML=`<div class="confirm-card"><p>${esc(message)}</p><div class="confirm-actions"><button class="ghost" id="confirm-cancel">${esc(cancelText)}</button><button class="${danger?'danger':'primary'}" id="confirm-ok">${esc(confirmText)}</button></div></div>`;
+        document.body.appendChild(overlay);
+        overlay.querySelector('#confirm-ok').onclick=()=>{overlay.remove();resolve(true)};
+        overlay.querySelector('#confirm-cancel').onclick=()=>{overlay.remove();resolve(false)};
+        overlay.addEventListener('click',(e)=>{if(e.target===overlay){overlay.remove();resolve(false)}});
+        overlay.querySelector('#confirm-ok').focus();
+      });
     }
 
     // --- Mobile tab switching ---
@@ -972,18 +1027,36 @@
     function showHelp(){$('help-overlay').style.display='flex'}
     function hideHelp(){$('help-overlay').style.display='none'}
 
+    let sseActivityTimer=null;
+    let sseStallWarned=false;
+    function resetSseActivityTimer(){
+      if(sseActivityTimer)clearTimeout(sseActivityTimer);
+      sseStallWarned=false;
+      if(!isProcessing)return;
+      sseActivityTimer=setTimeout(()=>{if(isProcessing&&!sseStallWarned){sseStallWarned=true;toast({title:"No response from server",description:"The request may still be running. Try waiting or abort and retry."},"warning",8000)}},60000);
+    }
     function setProcessing(active){
       isProcessing=active;
       $("send-btn").disabled=active;$("async-btn").disabled=active;$("abort-btn").disabled=!active;$("msg-input").disabled=active;
       $("send-btn").innerHTML=active?'<span class="spinner"></span>':'Send';
+      if(active){resetSseActivityTimer()}else{if(sseActivityTimer){clearTimeout(sseActivityTimer);sseActivityTimer=null}sseStallWarned=false}
     }
     function showThinking(){const el=document.createElement("div");el.className="msg thinking";el.id="thinking-indicator";el.innerHTML='Dodo is thinking<span class="thinking-dots"></span>';$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
     function hideThinking(){$("thinking-indicator")?.remove()}
     function useExample(el){if(!currentSession){createSession().then(()=>{$("msg-input").value=el.textContent;autoResizeInput($("msg-input"))});return}$("msg-input").value=el.textContent;autoResizeInput($("msg-input"));$("msg-input").focus()}
 
     async function boot(){
-      await Promise.all([loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets(),loadIntegrations()]);
-      checkOnboarding();
+      await Promise.all([loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets(),loadIntegrations(),checkOnboarding()]);
+      renderOnboardingSessions();
+    }
+
+    function renderOnboardingSessions(){
+      const container=$('onboarding-sessions');
+      const list=$('onboarding-session-list');
+      if(!container||!list||!allSessions.length)return;
+      container.classList.add('has-sessions');
+      const recent=allSessions.slice(0,4);
+      list.innerHTML=recent.map(s=>`<div class="example-prompt" onclick="selectSession('${esc(s.id)}')"><strong>${esc(s.title||s.id.slice(0,8))}</strong><div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`).join('');
     }
 
     // --- Identity ---
@@ -1004,13 +1077,13 @@
       }catch{$("passkey-status").innerHTML=""}
     }
     async function initPasskey(){
-      const passkey=$("passkey-input").value;if(!passkey||passkey.length<4)return alert("Passkey must be at least 4 characters");
+      const passkey=$("passkey-input").value;if(!passkey||passkey.length<4)return toast("Passkey must be at least 4 characters","warning");
       await jsonSafe("/api/passkey/init",{passkey});$("passkey-input").value="";await loadPasskeyStatus();await loadSecrets()
     }
     async function changePasskey(){
       const current=$("passkey-current").value,newPk=$("passkey-new").value;
-      if(!current||!newPk||newPk.length<4)return alert("Both fields required, new passkey min 4 chars");
-      try{await json("/api/passkey/change",{currentPasskey:current,newPasskey:newPk});$("passkey-current").value="";$("passkey-new").value="";alert("Passkey changed")}catch(e){alert("Failed: "+(e.message||e))}
+      if(!current||!newPk||newPk.length<4)return toast("Both fields required, new passkey min 4 chars","warning");
+      try{await json("/api/passkey/change",{currentPasskey:current,newPasskey:newPk});$("passkey-current").value="";$("passkey-new").value="";toast("Passkey changed","success")}catch(e){toast("Failed: "+(e.message||e),"error")}
     }
     async function loadSecrets(){
       try{
@@ -1059,16 +1132,32 @@
       const filtered=allSessions.filter(s=>(s.title||s.id).toLowerCase().includes(q));
       renderSessionList(filtered);
     }
-    async function createSession(){const d=await jsonSafe("/session",{});if(!d)return;const{id}=d;currentSession=id;await loadSessions();await selectSession(id)}
+    async function createSession(){const d=await jsonSafe("/session",{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
     async function selectSession(id){
-      currentSession=id;setProcessing(false);await loadSessions();$("chat").innerHTML="";$("onboarding")?.remove();
+      currentSession=id;setProcessing(false);
+      $("chat").innerHTML="";$("onboarding")?.remove();
+      showSkeleton($("chat"),5);
       $("session-id-display").textContent=id.slice(0,8);
-      const state=await apiSafe(`/session/${id}`);if(!state)return;
-      $("session-title-display").textContent=state.title||id.slice(0,8);setStatusDot(state.status);
-      updateTokenSummary(state);
-      if(state.status==="running")setProcessing(true);
-      const d=await apiSafe(`/session/${id}/messages`);if(!d)return;const{messages}=d;messages.forEach(renderMessage);requestAnimationFrame(()=>{const c=$("chat");c.scrollTop=c.scrollHeight;});
-      await Promise.all([loadFiles("/"),loadPrompts(),loadCron(),refreshGit()]);connectSSE(id);connectWebSocket(id);
+      $("session-title-display").textContent=id.slice(0,8);
+      // Parallel fetch: session list, session state, messages, and panel data
+      const [,state,msgData]=await Promise.all([
+        loadSessions(),
+        apiSafe(`/session/${id}`),
+        apiSafe(`/session/${id}/messages`),
+        loadFiles("/"),loadPrompts(),loadCron(),refreshGit()
+      ]);
+      // Clear skeleton
+      $("chat").innerHTML="";
+      if(!state&&!msgData){
+        // Both critical fetches failed — show error, don't connect SSE/WS
+        const el=document.createElement("div");el.className="msg error";
+        el.textContent="Failed to load session. Check your connection and try again.";
+        $("chat").appendChild(el);return;
+      }
+      if(state){$("session-title-display").textContent=state.title||id.slice(0,8);setStatusDot(state.status);updateTokenSummary(state);if(state.status==="running")setProcessing(true)}
+      if(msgData){const{messages}=msgData;messages.forEach(renderMessage);requestAnimationFrame(()=>{const c=$("chat");c.scrollTop=c.scrollHeight})}
+      else{const el=document.createElement("div");el.className="msg error";el.textContent="Couldn\u2019t load messages. They may appear once the connection recovers.";$("chat").appendChild(el)}
+      connectSSE(id);connectWebSocket(id);
       if(window.innerWidth<=900)switchTab('chat');
     }
     function updateTokenSummary(state){
@@ -1079,18 +1168,21 @@
     // --- SSE ---
     function connectSSE(id){
       if(eventSource)eventSource.close();eventSource=new EventSource(`/session/${id}/events`);
-      eventSource.addEventListener("text_delta",(e)=>{hideThinking();const{delta}=JSON.parse(e.data);if(!streamingEl){streamingEl=document.createElement("div");streamingEl.className="msg assistant";streamingEl.textContent="";$("chat").appendChild(streamingEl)}streamingEl.textContent+=delta;$("chat").scrollTop=$("chat").scrollHeight});
-      eventSource.addEventListener("message",(e)=>{hideThinking();const msg=JSON.parse(e.data);if(streamingEl){streamingEl.innerHTML=renderMarkdown(msg.content);
+      eventSource.onopen=()=>{$("sse-banner").classList.remove("visible")};
+      eventSource.onerror=()=>{if(eventSource.readyState===EventSource.CLOSED){$("sse-banner").classList.add("visible")}else if(eventSource.readyState===EventSource.CONNECTING){$("sse-banner").classList.add("visible")}};
+      eventSource.addEventListener("text_delta",(e)=>{resetSseActivityTimer();hideThinking();const{delta}=JSON.parse(e.data);if(!streamingEl){streamingEl=document.createElement("div");streamingEl.className="msg assistant";streamingEl.textContent="";streamingText="";$("chat").appendChild(streamingEl)}streamingText+=delta;if(!streamingRenderTimer){streamingRenderTimer=setTimeout(()=>{streamingRenderTimer=null;renderStreamingMarkdown()},80)}});
+      eventSource.addEventListener("message",(e)=>{resetSseActivityTimer();hideThinking();const msg=JSON.parse(e.data);if(streamingRenderTimer){clearTimeout(streamingRenderTimer);streamingRenderTimer=null}streamingText="";if(streamingEl){streamingEl.innerHTML=renderMarkdown(msg.content);
         // Add copy buttons to code blocks in streamed message
         streamingEl.querySelectorAll('pre').forEach(pre=>{const btn=document.createElement('button');btn.className='copy-code';btn.textContent='Copy';btn.onclick=(ev)=>{ev.stopPropagation();const code=pre.querySelector('code')?.textContent||pre.textContent;navigator.clipboard.writeText(code).then(()=>{btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',1500)})};pre.style.position='relative';pre.appendChild(btn)});
         // Add message copy button
         const actions=document.createElement("div");actions.className="msg-actions";const copyBtn=document.createElement("button");copyBtn.textContent="Copy";copyBtn.title="Copy message";copyBtn.setAttribute("aria-label","Copy message");copyBtn.onclick=()=>{navigator.clipboard.writeText(msg.content).then(()=>{copyBtn.textContent="Copied!";setTimeout(()=>copyBtn.textContent="Copy",1500)})};actions.appendChild(copyBtn);streamingEl.appendChild(actions);
-        if(msg.tokenInput||msg.tokenOutput){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;streamingEl.appendChild(m)}streamingEl=null}else{renderMessage(msg)}loadFiles("/");apiSafe(`/session/${id}`).then(s=>{if(s)updateTokenSummary(s)})});
-      eventSource.addEventListener("state",(e)=>{const s=JSON.parse(e.data);setStatusDot(s.status);updateTokenSummary(s);if(s.status!=="running"){setProcessing(false);hideThinking();streamingEl=null;loadPrompts()}});
-      eventSource.addEventListener("tool_call",(e)=>{hideThinking();if(streamingEl)streamingEl=null;renderToolCall(JSON.parse(e.data));loadFiles("/")});
-      eventSource.addEventListener("file",()=>loadFiles("/"));
+        if(msg.tokenInput||msg.tokenOutput){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;streamingEl.appendChild(m)}streamingEl=null}else{renderMessage(msg)}loadFilesDebounced();apiSafe(`/session/${id}`).then(s=>{if(s)updateTokenSummary(s)})});
+      eventSource.addEventListener("state",(e)=>{resetSseActivityTimer();const s=JSON.parse(e.data);setStatusDot(s.status);updateTokenSummary(s);if(s.status!=="running"){setProcessing(false);hideThinking();if(streamingRenderTimer){clearTimeout(streamingRenderTimer);streamingRenderTimer=null}streamingText="";streamingEl=null;loadPrompts()}});
+      eventSource.addEventListener("tool_call",(e)=>{resetSseActivityTimer();hideThinking();if(streamingEl){if(streamingRenderTimer){clearTimeout(streamingRenderTimer);streamingRenderTimer=null}if(streamingText){renderStreamingMarkdown()}streamingText="";streamingEl=null}renderToolCall(JSON.parse(e.data));loadFilesDebounced()});
+      eventSource.addEventListener("file",()=>loadFilesDebounced());
       eventSource.addEventListener("prompt",()=>loadPrompts());
       eventSource.addEventListener("execution",(e)=>{const r=JSON.parse(e.data);const el=document.createElement("div");el.className="msg tool_call";el.textContent=r.error?`Error: ${r.error}`:r.result!=null?`Result: ${JSON.stringify(r.result,null,2)}`:'\u2713 Done';$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight});
+      eventSource.addEventListener("error_message",(e)=>{hideThinking();setProcessing(false);const{message}=JSON.parse(e.data);const el=document.createElement("div");el.className="msg error";el.textContent=message||"Something went wrong";$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight});
       eventSource.addEventListener("presence",(e)=>{const data=JSON.parse(e.data);presenceUsers=data.users||[];renderPresence()});
     }
 
@@ -1145,13 +1237,15 @@
     }
 
     // --- Chat ---
-    async function sendMessage(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";$("msg-input").style.height='auto';setProcessing(true);showThinking();try{await json(`/session/${currentSession}/message`,{content})}finally{setProcessing(false);hideThinking();loadFiles("/")}}
-    async function sendAsync(){if(!currentSession||isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;$("msg-input").value="";$("msg-input").style.height='auto';setProcessing(true);showThinking();const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});if(!result){setProcessing(false);hideThinking()}}
+    async function sendMessage(){if(isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}$("msg-input").value="";$("msg-input").style.height='auto';setProcessing(true);showThinking();try{await json(`/session/${currentSession}/message`,{content})}catch(e){hideThinking();const el=document.createElement("div");el.className="msg error";el.textContent=e.message||"Request failed";$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}finally{setProcessing(false);hideThinking();loadFilesDebounced()}}
+    async function sendAsync(){if(isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}$("msg-input").value="";$("msg-input").style.height='auto';setProcessing(true);showThinking();const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});if(!result){setProcessing(false);hideThinking()}}
     async function abortPrompt(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
-    async function forkSession(){if(!currentSession)return;const d=await jsonSafe(`/session/${currentSession}/fork`,{});if(!d)return;const{id}=d;currentSession=id;await loadSessions();await selectSession(id)}
-    async function deleteSession(){if(!currentSession||!confirm("Delete this session?"))return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("presence-bar").innerHTML="";await loadSessions()}
+    async function forkSession(){if(!currentSession)return;const d=await jsonSafe(`/session/${currentSession}/fork`,{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
+    async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("presence-bar").innerHTML="";await loadSessions()}
 
     // --- Files (recursive expansion) ---
+    let _loadFilesTimer=null;
+    function loadFilesDebounced(){if(_loadFilesTimer)return;_loadFilesTimer=setTimeout(()=>{_loadFilesTimer=null;loadFiles("/")},200)}
     async function loadFiles(path){
       if(!currentSession)return;
       if(path==="/"&&!$("file-tree").innerHTML)showSkeleton($("file-tree"),3);
@@ -1165,9 +1259,9 @@
       return entries.map(e=>{
         if(e.type==="directory"){
           const expanded=expandedDirs.has(e.path);
-          return `<div class="file-entry" onclick="toggleDir('${esc(e.path)}')"><span>${expanded?'&#9660;':'&#9654;'}</span><span>&#128193; ${esc(e.name)}</span></div>${expanded?`<div class="file-children" id="dir-${esc(e.path)}"></div>`:''}`
+          return `<div class="file-entry" onclick="toggleDir('${esc(e.path)}')"><span><i class="ph ph-caret-${expanded?'down':'right'}"></i></span><span><i class="ph ph-folder${expanded?'-open':''}"></i> ${esc(e.name)}</span></div>${expanded?`<div class="file-children" id="dir-${esc(e.path)}"></div>`:''}`
         }
-        return `<div class="file-entry" onclick="readFile('${esc(e.path)}')"><span>&#128196;</span><span>${esc(e.name)}</span></div>`
+        return `<div class="file-entry" onclick="readFile('${esc(e.path)}')"><span><i class="ph ph-file"></i></span><span>${esc(e.name)}</span></div>`
       }).join("")
     }
     async function toggleDir(path){
@@ -1331,7 +1425,7 @@
         const next=await json("/api/onboarding/advance",{step,skip});
         if(next.currentStep==="complete"){renderWizardStep("complete")}
         else{renderWizardStep(next.currentStep)}
-      }catch(e){alert("Error: "+(e.message||e))}
+      }catch(e){toast("Error: "+(e.message||e),"error")}
     }
 
     function wizGatewayChanged(){
@@ -1363,12 +1457,12 @@
 
     async function wizardSetPasskey(){
       const passkey=$("wiz-passkey")?.value;
-      if(!passkey||passkey.length<4)return alert("Passkey must be at least 4 characters");
+      if(!passkey||passkey.length<4)return toast("Passkey must be at least 4 characters","warning");
       try{
         await json("/api/passkey/init",{passkey});
         await loadPasskeyStatus();
         await advanceWizard("passkey",false);
-      }catch(e){alert("Failed: "+(e.message||e))}
+      }catch(e){toast("Failed: "+(e.message||e),"error")}
     }
 
     async function wizardSetSecrets(){
@@ -1379,7 +1473,7 @@
         if(gitlab)await json("/api/secrets/gitlab_token",{value:gitlab},"PUT");
         await loadSecrets();
         await advanceWizard("secrets",!github&&!gitlab);
-      }catch(e){alert("Failed: "+(e.message||e))}
+      }catch(e){toast("Failed: "+(e.message||e),"error")}
     }
 
     async function skipOnboarding(){
@@ -1458,31 +1552,31 @@
       const name=$("integ-name").value.trim();
       const url=$("integ-url").value.trim();
       const authHeader=$("integ-auth-header").value.trim();
-      if(!name||!url)return alert("Name and URL are required");
+      if(!name||!url)return toast("Name and URL are required","warning");
       const body={name,url,type:"http",enabled:true};
       if(authHeader)body.headers={Authorization:authHeader};
       try{
         await json("/api/mcp-configs",body);
         $("integ-name").value="";$("integ-url").value="";$("integ-auth-header").value="";
         await loadIntegrations();
-      }catch(e){alert("Failed: "+(e.error||e.message||e))}
+      }catch(e){toast("Failed: "+(e.error||e.message||e),"error")}
     }
 
     async function toggleIntegration(id,enabled){
       try{await json(`/api/mcp-configs/${encodeURIComponent(id)}`,{enabled},"PUT");await loadIntegrations()}
-      catch(e){alert("Failed: "+(e.message||e))}
+      catch(e){toast("Failed: "+(e.message||e),"error")}
     }
 
     async function testIntegration(id){
       try{
         const result=await json(`/api/mcp-configs/${encodeURIComponent(id)}/test`,{});
-        if(result.ok)alert(`Connection OK — ${result.toolCount} tool${result.toolCount!==1?'s':''} available`);
-        else alert(`Connection failed: ${result.error||'Unknown error'}`);
-      }catch(e){alert("Test failed: "+(e.message||e))}
+        if(result.ok)toast(`Connection OK — ${result.toolCount} tool${result.toolCount!==1?'s':''} available`,"success");
+        else toast(`Connection failed: ${result.error||'Unknown error'}`,"error");
+      }catch(e){toast("Test failed: "+(e.message||e),"error")}
     }
 
     async function deleteIntegration(id){
-      if(!confirm("Delete this integration?"))return;
+      const ok=await appConfirm("Delete this integration?");if(!ok)return;
       await apiSafe(`/api/mcp-configs/${encodeURIComponent(id)}`,{method:"DELETE"});
       await loadIntegrations();
     }
@@ -1492,7 +1586,7 @@
     // =====================================================
 
     function showSessionSettings(){
-      if(!currentSession)return alert("Select a session first");
+      if(!currentSession)return toast("Select a session first","warning");
       $("settings-overlay").style.display="flex";
       loadSharesList();loadPermissionsList();loadBrowserStatus();loadApprovals();loadSessionMcpConfigs();
     }
@@ -1510,7 +1604,7 @@
           $("share-token-display").innerHTML=`<strong>Share link (shown once):</strong><br/><a href="${esc(shareUrl)}" target="_blank" style="color:var(--accent)">${esc(shareUrl)}</a>`;
         }
         await loadSharesList();
-      }catch(e){alert("Failed: "+(e.message||e))}
+      }catch(e){toast("Failed: "+(e.message||e),"error")}
     }
 
     async function loadSharesList(){
@@ -1540,12 +1634,12 @@
       if(!currentSession)return;
       const email=$("perm-email").value.trim();
       const permission=$("perm-level").value;
-      if(!email)return alert("Email is required");
+      if(!email)return toast("Email is required","warning");
       try{
         await json(`/session/${currentSession}/permissions`,{granteeEmail:email,permission});
         $("perm-email").value="";
         await loadPermissionsList();
-      }catch(e){alert("Failed: "+(e.message||e))}
+      }catch(e){toast("Failed: "+(e.message||e),"error")}
     }
 
     async function revokePermission(email){
@@ -1576,7 +1670,7 @@
         $("browser-status").textContent=enabled?"Enabled":"Disabled";
       }catch(e){
         $("browser-toggle").checked=!enabled;
-        alert("Failed: "+(e.message||e));
+        toast("Failed: "+(e.message||e),"error");
       }
     }
 
@@ -1665,7 +1759,7 @@
       try{
         await json(`/session/${currentSession}/mcp-configs`,{mcpConfigId:mcpId,enabled});
         await loadSessionMcpConfigs();
-      }catch(e){alert("Failed: "+(e.message||e))}
+      }catch(e){toast("Failed: "+(e.message||e),"error")}
     }
 
     async function removeSessionMcpOverride(mcpId){
@@ -1673,7 +1767,7 @@
       try{
         await api(`/session/${currentSession}/mcp-configs/${encodeURIComponent(mcpId)}`,{method:"DELETE"});
         await loadSessionMcpConfigs();
-      }catch(e){alert("Failed: "+(e.message||e))}
+      }catch(e){toast("Failed: "+(e.message||e),"error")}
     }
 
     // --- Mobile keyboard handling (robust) ---
@@ -1707,6 +1801,33 @@
         setTimeout(()=>{initialHeight=window.visualViewport.height},200);
       });
     }
+
+    // --- Swipe between tabs (mobile) ---
+    (function(){
+      if(window.innerWidth>900)return;
+      const tabs=['chat','files','tools','settings'];
+      let touchStartX=0,touchStartY=0,swiping=false;
+      document.addEventListener('touchstart',(e)=>{
+        touchStartX=e.touches[0].clientX;touchStartY=e.touches[0].clientY;swiping=true;
+      },{passive:true});
+      document.addEventListener('touchmove',(e)=>{
+        if(!swiping)return;
+        const dx=e.touches[0].clientX-touchStartX;
+        const dy=e.touches[0].clientY-touchStartY;
+        // If vertical scroll dominates, cancel swipe detection
+        if(Math.abs(dy)>Math.abs(dx)){swiping=false}
+      },{passive:true});
+      document.addEventListener('touchend',(e)=>{
+        if(!swiping)return;swiping=false;
+        const dx=e.changedTouches[0].clientX-touchStartX;
+        if(Math.abs(dx)<60)return; // threshold
+        const currentIdx=tabs.indexOf(activeTab);
+        if(dx<0&&currentIdx<tabs.length-1)switchTab(tabs[currentIdx+1]);
+        else if(dx>0&&currentIdx>0)switchTab(tabs[currentIdx-1]);
+      },{passive:true});
+      // Re-check on resize (e.g. orientation change)
+      window.addEventListener('resize',()=>{/* swipe stays active below 900px naturally */});
+    })();
 
     // --- Scroll to bottom ---
     function scrollChatToBottom(){const c=$("chat");c.scrollTo({top:c.scrollHeight,behavior:"smooth"})}
