@@ -44,16 +44,18 @@ function buildGitTools(
 
   return {
     git_clone: tool({
-      description: "Clone a git repo into the workspace. Auth is automatic for GitHub/GitLab.",
+      description: "Clone a git repo into the workspace. Auth is automatic for GitHub/GitLab. Clones are shallow (depth 1) by default. Pass depth 0 for full history.",
       inputSchema: zodSchema(z.object({
         url: z.string().describe("Git repo URL (e.g. https://github.com/owner/repo)"),
         dir: z.string().optional().describe("Target directory (default: repo name)"),
         branch: z.string().optional().describe("Branch to clone"),
-        depth: z.number().optional().describe("Shallow clone depth"),
+        depth: z.number().optional().describe("Clone depth. Default: 1 (shallow). Use 0 for full history."),
       })),
       execute: async ({ url, dir, branch, depth }) => {
         const token = await resolveRemoteToken({ dir, env, git, url, ownerEmail });
-        return git.clone({ branch, depth, dir, singleBranch: true, token, url });
+        // depth 0 = full history (pass undefined to isomorphic-git), undefined = shallow default of 1
+        const cloneDepth = depth === 0 ? undefined : (depth ?? 1);
+        return git.clone({ branch, depth: cloneDepth, dir, singleBranch: true, token, url });
       },
     }),
 

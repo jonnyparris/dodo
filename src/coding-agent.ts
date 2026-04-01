@@ -28,7 +28,7 @@ import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, Se
 const sendMessageSchema = z.object({ content: z.string().trim().min(1) }).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
 const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
-const gitCloneSchema = z.object({ branch: z.string().optional(), depth: z.number().int().positive().optional(), dir: z.string().optional(), singleBranch: z.boolean().optional(), url: z.string().url() }).strict();
+const gitCloneSchema = z.object({ branch: z.string().optional(), depth: z.number().int().nonnegative().optional(), dir: z.string().optional(), singleBranch: z.boolean().optional(), url: z.string().url() }).strict();
 const gitDirSchema = z.object({ dir: z.string().optional(), filepath: z.string().optional() }).strict();
 const gitBranchSchema = z.object({ delete: z.string().optional(), dir: z.string().optional(), list: z.boolean().optional(), name: z.string().optional() }).strict();
 const gitCheckoutSchema = z.object({ branch: z.string().optional(), dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional() }).strict();
@@ -851,11 +851,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     const token = await resolveRemoteToken({ dir, env: this.env, git, url: body.url, ownerEmail });
+    // depth 0 = full history (pass undefined to isomorphic-git), undefined = shallow default of 1
+    const cloneDepth = body.depth === 0 ? undefined : (body.depth ?? 1);
     const result = await git.clone({
       branch: body.branch,
-      depth: body.depth,
+      depth: cloneDepth,
       dir,
-      singleBranch: body.singleBranch,
+      singleBranch: body.singleBranch ?? true,
       token,
       url: body.url,
     });
