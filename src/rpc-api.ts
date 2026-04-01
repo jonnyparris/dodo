@@ -7,11 +7,9 @@
  * API hierarchy:
  *   DodoPublicApi     — unauthenticated (health, version)
  *   DodoAuthenticatedApi — authenticated user (list sessions, create session)
- *   DodoSessionApi    — scoped to a specific session (send message, read files, presence)
  */
 
 import { RpcTarget } from "capnweb";
-import type { PresenceEntry } from "./presence";
 import type { Env } from "./types";
 import { getUserControlStub, isAdmin } from "./auth";
 
@@ -30,21 +28,16 @@ export interface RpcSessionSummary {
   ownerEmail: string;
 }
 
-export interface RpcPresenceEntry {
-  email: string;
-  displayName: string;
-  permission: string;
-  connectedAt: number;
-}
-
 // ─── Public API (no auth required) ───
 
 export class DodoPublicApi extends RpcTarget {
   private env: Env;
+  private authenticatedEmail: string | undefined;
 
-  constructor(env: Env) {
+  constructor(env: Env, email?: string) {
     super();
     this.env = env;
+    this.authenticatedEmail = email;
   }
 
   health(): { status: string; version: string } {
@@ -108,41 +101,5 @@ export class DodoAuthenticatedApi extends RpcTarget {
 
   async createSession(): Promise<string> {
     return this.createSessionFn();
-  }
-}
-
-// ─── Session API (permission-scoped) ───
-
-export class DodoSessionApi extends RpcTarget {
-  private sessionId: string;
-  private permission: string;
-  private getPresenceFn: () => PresenceEntry[];
-
-  constructor(opts: {
-    sessionId: string;
-    permission: string;
-    getPresence: () => PresenceEntry[];
-  }) {
-    super();
-    this.sessionId = opts.sessionId;
-    this.permission = opts.permission;
-    this.getPresenceFn = opts.getPresence;
-  }
-
-  getSessionId(): string {
-    return this.sessionId;
-  }
-
-  getPermission(): string {
-    return this.permission;
-  }
-
-  getPresence(): RpcPresenceEntry[] {
-    return this.getPresenceFn().map((p) => ({
-      connectedAt: p.connectedAt,
-      displayName: p.displayName,
-      email: p.email,
-      permission: p.permission,
-    }));
   }
 }
