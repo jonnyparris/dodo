@@ -13,6 +13,8 @@ import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
 import {
   Think,
   type DodoConfig,
+  type FiberCompleteContext,
+  type FiberRecoveryContext,
   type MessageMetadata,
   type StreamCallback,
   type UIMessage,
@@ -105,8 +107,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     updatedAt: "",
   };
 
-  /** Fibers disabled until Wave 5. */
-  override fibers = false;
+  /** Enable durable fiber recovery for async prompts. */
+  override fibers = true;
 
   private readonly activePromptControllers = new Map<string, AbortController>();
   private readonly clients = new Set<WritableStreamDefaultWriter<Uint8Array>>();
@@ -559,6 +561,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           connection.send(JSON.stringify({ type: "error", error: "No active prompt" }));
           return;
         }
+        // Try fiber cancellation first
+        if (this.isThinkChatEnabled()) {
+          const fiberId = this.readPromptFiberId(promptId);
+          if (fiberId) {
+            this.cancelFiber(fiberId);
+            await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
+            connection.send(JSON.stringify({ type: "aborted", promptId }));
+            break;
+          }
+        }
         const controller = this.activePromptControllers.get(promptId);
         if (controller) {
           controller.abort();
@@ -675,6 +687,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         status TEXT NOT NULL,
         error TEXT,
         result_message_id TEXT,
+        fiber_id TEXT,
         author_email TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -915,7 +928,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.writeMetadata("active_prompt_id", promptId);
     this.writeMetadata("status", "running");
     this.insertPrompt(promptId, payload.prompt, "queued", "cron");
-    await this.runAsyncPrompt(promptId, payload.prompt, await this.readAppConfig(), title, this.readMetadata("owner_email") ?? undefined);
+
+    if (this.isThinkChatEnabled()) {
+      // Ensure Think config for cron path
+      await this.readAppConfig(); // This populates Think config as a side effect
+      const fiberId = this.spawnFiber("runFiberPrompt", {
+        promptId,
+        content: payload.prompt,
+        authorEmail: "cron",
+        title,
+      }, { maxRetries: 3 });
+      this.setPromptFiberId(promptId, fiberId);
+    } else {
+      await this.runAsyncPrompt(promptId, payload.prompt, await this.readAppConfig(), title, this.readMetadata("owner_email") ?? undefined);
+    }
   }
 
   private listCronJobs(): CronJobRecord[] {
@@ -1197,7 +1223,19 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     await this.syncSessionIndex({ status: "running", title });
 
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-    void this.runAsyncPrompt(promptId, input.content, llmConfig, title, authorEmail ?? undefined);
+
+    if (this.isThinkChatEnabled()) {
+      // Fiber-backed async prompt
+      const fiberId = this.spawnFiber("runFiberPrompt", {
+        promptId,
+        content: input.content,
+        authorEmail: authorEmail ?? undefined,
+        title,
+      }, { maxRetries: 3 });
+      this.setPromptFiberId(promptId, fiberId);
+    } else {
+      void this.runAsyncPrompt(promptId, input.content, llmConfig, title, authorEmail ?? undefined);
+    }
 
     return Response.json({ promptId, status: "queued" }, { status: 202 });
   }
@@ -1206,6 +1244,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const promptId = this.readMetadata("active_prompt_id");
     if (!promptId) {
       return Response.json({ error: "No active prompt" }, { status: 409 });
+    }
+
+    // Try fiber cancellation first
+    if (this.isThinkChatEnabled()) {
+      const fiberId = this.readPromptFiberId(promptId);
+      if (fiberId) {
+        this.cancelFiber(fiberId);
+        await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
+        return Response.json({ aborted: true, promptId });
+      }
     }
 
     const controller = this.activePromptControllers.get(promptId);
@@ -1322,6 +1370,132 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.updatePrompt(promptId, patch);
     this.deleteMetadata("active_prompt_id");
     this.writeMetadata("status", "idle");
+  }
+
+  // ─── Fiber-aware prompt execution ───
+
+  /**
+   * Fiber-aware async prompt. Uses stashFiber() checkpoints so that
+   * if the DO is evicted mid-chat, recovery replays from the top and
+   * skips already-completed work.
+   */
+  async runFiberPrompt(payload: { promptId: string; content: string; authorEmail?: string; title: string }): Promise<void> {
+    const { promptId, content, authorEmail, title } = payload;
+
+    // Check fiber snapshot — if chat already completed, skip to finalization
+    const fiberId = this.readPromptFiberId(promptId);
+    if (fiberId) {
+      const fiber = this.getFiber(fiberId);
+      const snapshot = fiber?.snapshot as { chatCompleted?: boolean; assistantMessageId?: string; text?: string } | null;
+      if (snapshot?.chatCompleted) {
+        // Chat completed before eviction — just finalize
+        await this.finalizePromptFromFiber(promptId, title, snapshot);
+        return;
+      }
+    }
+
+    // Phase 1: Run chat via Think
+    try {
+      const result = await this.runThinkChat(content, { authorEmail });
+
+      // Phase 2: Checkpoint immediately after chat completes
+      this.stashFiber({
+        chatCompleted: true,
+        assistantMessageId: result.assistantMessageId,
+        text: result.text,
+      });
+
+      // Phase 3: Finalize
+      await this.finalizePromptFromFiber(promptId, title, {
+        chatCompleted: true,
+        assistantMessageId: result.assistantMessageId,
+        text: result.text,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Prompt failed";
+      await this.finishPrompt(promptId, { error: message, status: "failed" });
+      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+    } finally {
+      await this.syncSessionIndex({ status: "idle", title });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    }
+  }
+
+  /** Finalize a prompt from fiber snapshot data. */
+  private async finalizePromptFromFiber(
+    promptId: string,
+    title: string,
+    snapshot: { chatCompleted?: boolean; assistantMessageId?: string; text?: string },
+  ): Promise<void> {
+    const config = this.getConfig();
+    const text = snapshot.text ?? "";
+    const assistantRecord = uiMessageToChatRecord(
+      { id: snapshot.assistantMessageId ?? "", role: "assistant", parts: [{ type: "text", text }] },
+      { messageId: snapshot.assistantMessageId ?? "", model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: 0, tokenOutput: 0, authorEmail: null, createdAt: nowEpoch() },
+    );
+
+    await this.finishPrompt(promptId, { resultMessageId: snapshot.assistantMessageId, status: "completed" });
+    this.emitEvent({ data: assistantRecord, type: "message" });
+    sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+  }
+
+  /** Read the fiber_id from a prompt row. */
+  private readPromptFiberId(promptId: string): string | null {
+    const row = this.db.one("SELECT fiber_id FROM prompts WHERE id = ?", promptId);
+    return row?.fiber_id ? String(row.fiber_id) : null;
+  }
+
+  /** Store a fiber_id on a prompt row. */
+  private setPromptFiberId(promptId: string, fiberId: string): void {
+    this.db.exec("UPDATE prompts SET fiber_id = ? WHERE id = ?", fiberId, promptId);
+  }
+
+  /**
+   * Called when a fiber recovers after DO eviction.
+   * Updates the prompt status to "recovering" and emits an event.
+   */
+  async onFiberRecovered(ctx: FiberRecoveryContext): Promise<void> {
+    // Find the prompt associated with this fiber
+    const row = this.db.one("SELECT id FROM prompts WHERE fiber_id = ?", ctx.id);
+    if (row) {
+      const promptId = String(row.id);
+      this.updatePrompt(promptId, { status: "running" });
+      this.writeMetadata("active_prompt_id", promptId);
+      this.writeMetadata("status", "running");
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    }
+
+    // Default behavior: restart the fiber
+    this.restartFiber(ctx.id);
+  }
+
+  /**
+   * Called when a fiber completes (success, failure, or cancellation).
+   */
+  async onFiberComplete(ctx: FiberCompleteContext): Promise<void> {
+    // Find the associated prompt
+    const row = this.db.one("SELECT id, status FROM prompts WHERE fiber_id = ?", ctx.id);
+    if (!row) return;
+
+    const promptId = String(row.id);
+    const fiber = this.getFiber(ctx.id);
+
+    if (fiber?.status === "cancelled") {
+      await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
+      const title = this.readMetadata("title") ?? "Dodo prompt";
+      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (aborted)`, body: "Prompt was cancelled", tags: "stop_sign,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+    } else if (fiber?.status === "failed") {
+      const error = fiber.error ?? "Prompt failed after max retries";
+      await this.finishPrompt(promptId, { error, status: "failed" });
+      const title = this.readMetadata("title") ?? "Dodo prompt";
+      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: error, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+    }
+
+    await this.syncSessionIndex({ status: "idle" });
+    this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
   }
 
   // ─── Think chat integration ───
