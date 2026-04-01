@@ -4,6 +4,7 @@ import type { LanguageModel, ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
 import { getUserControlStub } from "./auth";
+import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { sendNotification } from "./notify";
 import { runSandboxedCode } from "./executor";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
@@ -182,6 +183,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private readonly db: SqlHelper;
   /** Captured token usage from the most recent onChatMessage() call. */
   private _lastUsage: { inputTokens: number; outputTokens: number } | null = null;
+  /** Connected MCP gatekeepers, populated by connectMcpServers(). */
+  private mcpGatekeepers: McpGatekeeper[] = [];
   private readonly presence = new PresenceTracker();
   readonly stateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
@@ -218,6 +221,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return buildToolsForThink(this.env, this.workspace, appConfig, {
       ownerEmail: this.readMetadata("owner_email") ?? undefined,
       stateBackend: this.stateBackend,
+      mcpGatekeepers: this.mcpGatekeepers,
     });
   }
 
@@ -1550,6 +1554,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     userContent: string,
     options?: { authorEmail?: string; signal?: AbortSignal },
   ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string }> {
+    // Connect MCP servers before Think calls getTools()
+    await this.connectMcpServers();
+
     // Insert user message metadata
     const userMsgId = crypto.randomUUID();
     const userMsg: UIMessage = {
@@ -1888,6 +1895,89 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private deleteMetadata(key: string): void {
     this.db.exec("DELETE FROM metadata WHERE key = ?", key);
+  }
+
+  /**
+   * Connect to enabled MCP servers for this session.
+   *
+   * Fetches the effective MCP configs from UserControl (respecting per-session
+   * overrides), resolves encrypted headers, connects each gatekeeper, and
+   * pre-fetches tool listings so getTools() can read them synchronously.
+   *
+   * Safe to call multiple times — disconnects previous gatekeepers first.
+   */
+  private async connectMcpServers(): Promise<void> {
+    const ownerEmail = this.readMetadata("owner_email");
+    if (!ownerEmail) return;
+
+    const sessionId = this.sessionId();
+    if (!sessionId) return;
+
+    // Disconnect any previously connected gatekeepers
+    for (const gk of this.mcpGatekeepers) {
+      gk.disconnect();
+    }
+    this.mcpGatekeepers = [];
+
+    try {
+      const stub = getUserControlStub(this.env, ownerEmail);
+
+      // Fetch effective configs (global configs + session overrides)
+      const configsRes = await stub.fetch(
+        `https://user-control/sessions/${encodeURIComponent(sessionId)}/effective-mcp-configs`,
+        { headers: { "x-owner-email": ownerEmail } },
+      );
+      if (!configsRes.ok) return;
+
+      const { configs } = (await configsRes.json()) as {
+        configs: Array<McpGatekeeperConfig & { overridden: boolean }>;
+      };
+
+      // Filter to enabled HTTP configs with URLs
+      const enabled = configs.filter((c) => c.enabled && c.type === "http" && c.url);
+      if (enabled.length === 0) return;
+
+      // Resolve encrypted headers and connect each gatekeeper
+      const connected: McpGatekeeper[] = [];
+      for (const config of enabled) {
+        try {
+          // Resolve headers via internal secret endpoint
+          let headers: Record<string, string> | undefined;
+          if (config.headerKeys?.length) {
+            headers = {};
+            for (const headerName of config.headerKeys) {
+              const secretRes = await stub.fetch(
+                `https://user-control/internal/secret/mcp:${encodeURIComponent(config.id)}:${encodeURIComponent(headerName)}`,
+                { headers: { "x-owner-email": ownerEmail } },
+              );
+              if (secretRes.ok) {
+                const { value } = (await secretRes.json()) as { value: string };
+                headers[headerName] = value;
+              }
+            }
+          }
+
+          const gk = new HttpMcpGatekeeper({
+            ...config,
+            headers,
+          });
+
+          await gk.connect();
+          await gk.listTools(); // Pre-populate cache for synchronous getTools()
+          connected.push(gk);
+        } catch (error) {
+          // Log but don't fail — one broken MCP server shouldn't block the session
+          console.warn(
+            `MCP connect failed for "${config.name}" (${config.id}):`,
+            error instanceof Error ? error.message : error,
+          );
+        }
+      }
+
+      this.mcpGatekeepers = connected;
+    } catch (error) {
+      console.warn("connectMcpServers failed:", error instanceof Error ? error.message : error);
+    }
   }
 
   private async readAppConfig(): Promise<AppConfig> {

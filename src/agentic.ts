@@ -1,9 +1,10 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { StateBackend } from "@cloudflare/shell";
-import { tool, zodSchema } from "ai";
+import { jsonSchema, tool, zodSchema } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
+import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env } from "./types";
 
@@ -196,14 +197,63 @@ function buildTools(
 
 /**
  * Build the tool set for Think's getTools() override.
+ * If mcpGatekeepers are provided, their tools are merged into the set.
  */
 export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; ownerEmail?: string; stateBackend?: StateBackend },
+  options?: { authorEmail?: string; ownerEmail?: string; stateBackend?: StateBackend; mcpGatekeepers?: McpGatekeeper[] },
 ): Record<string, AnyTool> {
-  return buildTools(env, workspace, config, options);
+  const tools = buildTools(env, workspace, config, options);
+
+  if (options?.mcpGatekeepers?.length) {
+    const mcpTools = buildMcpTools(options.mcpGatekeepers);
+    Object.assign(tools, mcpTools);
+  }
+
+  return tools;
+}
+
+/**
+ * Convert connected MCP gatekeeper tools into AI SDK tool() objects.
+ *
+ * Each gatekeeper's tools are already namespaced (e.g. "agent-memory__read")
+ * by the gatekeeper's listTools(). We use jsonSchema() passthrough for the
+ * input schema since MCP tools define JSON Schema directly, not Zod.
+ */
+function buildMcpTools(gatekeepers: McpGatekeeper[]): Record<string, AnyTool> {
+  const tools: Record<string, AnyTool> = {};
+
+  for (const gk of gatekeepers) {
+    // listTools() returns cached results after initial connect — synchronous-safe
+    // if the gatekeeper has already been connected and tools listed.
+    const cachedTools = gk.getCachedTools();
+    if (!cachedTools) continue;
+
+    for (const mcpTool of cachedTools) {
+      tools[mcpTool.name] = tool({
+        description: mcpTool.description ?? `MCP tool: ${mcpTool.name}`,
+        inputSchema: mcpTool.inputSchema
+          ? jsonSchema(mcpTool.inputSchema as Record<string, unknown>)
+          : jsonSchema({ type: "object", properties: {} }),
+        execute: async (args: unknown) => {
+          const result = await gk.callTool(mcpTool.name, args);
+          if (result.isError) {
+            const errText = result.content.map((c) => c.text ?? "").join("\n");
+            return { error: errText || "MCP tool call failed" };
+          }
+          // Return text content joined — the LLM can parse it
+          return result.content
+            .map((c) => c.text ?? "")
+            .filter(Boolean)
+            .join("\n");
+        },
+      });
+    }
+  }
+
+  return tools;
 }
 
 /**
