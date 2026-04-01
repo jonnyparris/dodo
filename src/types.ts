@@ -26,9 +26,6 @@ export interface Env {
   USER_CONTROL: DurableObjectNamespace;
   SHARED_INDEX: DurableObjectNamespace;
 
-  /** @deprecated Kept for migration only */
-  APP_CONTROL: DurableObjectNamespace;
-
   // Secrets (wrangler secret)
   SECRETS_MASTER_KEY?: string;
   COOKIE_SECRET?: string;
@@ -158,42 +155,3 @@ export interface SessionSnapshot {
   title: string | null;
 }
 
-// ─── New multi-tenancy types ───
-
-export interface KeyEnvelope {
-  id: string;
-  pbkdf2Salt: string;
-  wrappedDekPasskey: string;
-  wrappedDekServer: string;
-  createdAt: string;
-  rotatedAt: string | null;
-}
-
-export interface EncryptedSecret {
-  key: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface UserRecord {
-  email: string;
-  displayName: string | null;
-  role: "admin" | "user";
-  blockedAt: number | null;
-  browserEnabled: boolean;
-  createdAt: string;
-  lastSeenAt: string;
-}
-
-export interface ClientError {
-  id: string;
-  message: string;
-  source: string;
-  lineno: number;
-  colno: number;
-  stack: string;
-  userAgent: string;
-  email: string;
-  url: string;
-  createdAt: string;
-}

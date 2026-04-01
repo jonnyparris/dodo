@@ -142,36 +142,6 @@ describe("PresenceTracker", () => {
     expect(after).toBeGreaterThanOrEqual(before);
   });
 
-  it("returns unique users by email", () => {
-    // Same user, two connections
-    tracker.join("conn-1", {
-      connectedAt: 1000,
-      displayName: "Alice",
-      email: "alice@test.local",
-      permission: "readwrite",
-    });
-    tracker.join("conn-2", {
-      connectedAt: 2000,
-      displayName: "Alice",
-      email: "alice@test.local",
-      permission: "readwrite",
-    });
-    tracker.join("conn-3", {
-      connectedAt: 3000,
-      displayName: "Bob",
-      email: "bob@test.local",
-      permission: "readonly",
-    });
-
-    expect(tracker.count()).toBe(3);
-    const unique = tracker.getUniqueUsers();
-    expect(unique).toHaveLength(2);
-
-    const emails = unique.map((u) => u.email);
-    expect(emails).toContain("alice@test.local");
-    expect(emails).toContain("bob@test.local");
-  });
-
   it("ignores operations on non-existent connections", () => {
     // These should not throw
     tracker.leave("nonexistent");
@@ -181,26 +151,6 @@ describe("PresenceTracker", () => {
     expect(tracker.get("nonexistent")).toBeUndefined();
   });
 
-  it("tracks last-seen message per connection", () => {
-    tracker.join("conn-1", {
-      connectedAt: 1000,
-      displayName: "Alice",
-      email: "alice@test.local",
-      permission: "readwrite",
-    });
-
-    expect(tracker.getLastSeenMessage("conn-1")).toBeNull();
-
-    tracker.setLastSeenMessage("conn-1", "msg-42");
-    expect(tracker.getLastSeenMessage("conn-1")).toBe("msg-42");
-
-    tracker.setLastSeenMessage("conn-1", "msg-99");
-    expect(tracker.getLastSeenMessage("conn-1")).toBe("msg-99");
-  });
-
-  it("returns null for last-seen message on unknown connection", () => {
-    expect(tracker.getLastSeenMessage("nonexistent")).toBeNull();
-  });
 });
 
 // ─── AgentConnectionTransport Unit Tests ───
@@ -338,7 +288,6 @@ describe("Cap'n Web RPC API", () => {
       const api = await import("../src/rpc-api");
       expect(api.DodoPublicApi).toBeDefined();
       expect(api.DodoAuthenticatedApi).toBeDefined();
-      expect(api.DodoSessionApi).toBeDefined();
       imported = true;
     } catch (error) {
       // Cap'n Web import failed in test environment — this is expected

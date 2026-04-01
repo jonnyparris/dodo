@@ -74,9 +74,6 @@ export interface SnapshotV2 {
   }>;
 }
 
-/** Feature flag key stored in the metadata table. */
-export const USE_THINK_CHAT_KEY = "use_think_chat";
-
 // ─── Adapter functions ───
 
 import type { UIMessage } from "ai";

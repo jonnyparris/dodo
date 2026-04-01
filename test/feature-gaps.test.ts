@@ -15,8 +15,6 @@ vi.mock("../src/notify", () => ({
 }));
 
 import worker from "../src/index";
-import { resolveMemoryStrategy } from "../src/memory-resolver";
-import type { McpGatekeeperConfig } from "../src/mcp-gatekeeper";
 
 const BASE_URL = "https://dodo.example";
 
@@ -225,42 +223,4 @@ describe("Feature Gaps", () => {
     });
   });
 
-  // ─── Gap 4: Memory strategy resolver ───
-
-  describe("Gap 4: Memory strategy resolver", () => {
-    it("returns builtin when no memory MCP config exists", () => {
-      const configs: McpGatekeeperConfig[] = [
-        { id: "1", name: "GitHub", type: "http", url: "https://github-mcp.example/mcp", enabled: true },
-        { id: "2", name: "Slack", type: "http", url: "https://slack-mcp.example/mcp", enabled: true },
-      ];
-      expect(resolveMemoryStrategy(configs)).toBe("builtin");
-    });
-
-    it("returns builtin when memory MCP exists but is disabled", () => {
-      const configs: McpGatekeeperConfig[] = [
-        { id: "1", name: "Memory Store", type: "http", url: "https://memory.example/mcp", enabled: false },
-        { id: "2", name: "Slack", type: "http", url: "https://slack-mcp.example/mcp", enabled: true },
-      ];
-      expect(resolveMemoryStrategy(configs)).toBe("builtin");
-    });
-
-    it("returns external when memory MCP is configured and enabled", () => {
-      const configs: McpGatekeeperConfig[] = [
-        { id: "1", name: "External Memory", type: "http", url: "https://memory.example/mcp", enabled: true },
-        { id: "2", name: "Slack", type: "http", url: "https://slack-mcp.example/mcp", enabled: true },
-      ];
-      expect(resolveMemoryStrategy(configs)).toBe("external");
-    });
-
-    it("returns external for case-insensitive memory name match", () => {
-      const configs: McpGatekeeperConfig[] = [
-        { id: "1", name: "My MEMORY Server", type: "http", url: "https://mem.example/mcp", enabled: true },
-      ];
-      expect(resolveMemoryStrategy(configs)).toBe("external");
-    });
-
-    it("returns builtin for empty configs array", () => {
-      expect(resolveMemoryStrategy([])).toBe("builtin");
-    });
-  });
 });
