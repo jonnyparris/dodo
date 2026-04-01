@@ -181,6 +181,13 @@ export class SharedIndex implements DurableObject {
         return Response.json({ granted: true, ...body }, { status: 201 });
       }
 
+      if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/([^/]+)\/cleanup$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/")[2]);
+        this.db.exec("DELETE FROM session_shares WHERE session_id = ?", sessionId);
+        this.db.exec("DELETE FROM session_permissions WHERE session_id = ?", sessionId);
+        return Response.json({ cleaned: true }, { headers: { "content-type": "application/json" } });
+      }
+
       if (request.method === "DELETE" && url.pathname.match(/^\/permissions\/[^/]+\/[^/]+$/)) {
         const parts = url.pathname.split("/");
         const sessionId = decodeURIComponent(parts[2]);
