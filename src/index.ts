@@ -89,6 +89,16 @@ async function proxyToSharedIndex(env: Env, path: string, init?: RequestInit): P
   return stub.fetch(`https://shared-index${path}`, init);
 }
 
+/** Catalog knownHosts are implicitly allowed (avoids requiring admin to manually allowlist them). */
+const catalogHostnames = new Set(MCP_CATALOG.flatMap((entry) => entry.knownHosts ?? []).map((h) => h.toLowerCase()));
+
+async function isHostAllowed(env: Env, hostname: string): Promise<boolean> {
+  if (catalogHostnames.has(hostname)) return true;
+  const checkRes = await proxyToSharedIndex(env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
+  const checkBody = (await checkRes.json()) as { allowed: boolean };
+  return checkBody.allowed;
+}
+
 function rateLimitedResponse(result: { remaining: number; retryAfter?: number }, route: string, email: string): Response {
   log("warn", "Rate limit hit", { email, route, retryAfter: result.retryAfter });
   return Response.json(
@@ -586,14 +596,12 @@ app.get("/api/mcp-configs", async (c) => {
 app.post("/api/mcp-configs", async (c) => {
   const email = c.get("userEmail");
   const body = await c.req.raw.text();
-  // Validate URL hostname against host allowlist
+  // Validate URL hostname against host allowlist + catalog
   try {
     const parsed = JSON.parse(body) as { url?: string };
     if (parsed.url) {
       const hostname = new URL(parsed.url).hostname.toLowerCase();
-      const checkRes = await proxyToSharedIndex(c.env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
-      const checkBody = (await checkRes.json()) as { allowed: boolean };
-      if (!checkBody.allowed) {
+      if (!(await isHostAllowed(c.env, hostname))) {
         return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
       }
     }
@@ -613,14 +621,12 @@ app.post("/api/mcp-configs", async (c) => {
 app.put("/api/mcp-configs/:id", async (c) => {
   const email = c.get("userEmail");
   const body = await c.req.raw.text();
-  // Validate URL hostname against host allowlist
+  // Validate URL hostname against host allowlist + catalog
   try {
     const parsed = JSON.parse(body) as { url?: string };
     if (parsed.url) {
       const hostname = new URL(parsed.url).hostname.toLowerCase();
-      const checkRes = await proxyToSharedIndex(c.env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
-      const checkBody = (await checkRes.json()) as { allowed: boolean };
-      if (!checkBody.allowed) {
+      if (!(await isHostAllowed(c.env, hostname))) {
         return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
       }
     }
@@ -652,9 +658,7 @@ app.post("/api/mcp-configs/:id/test", async (c) => {
     if (config?.url) {
       try {
         const hostname = new URL(config.url).hostname.toLowerCase();
-        const checkRes = await proxyToSharedIndex(c.env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
-        const checkBody = (await checkRes.json()) as { allowed: boolean };
-        if (!checkBody.allowed) {
+        if (!(await isHostAllowed(c.env, hostname))) {
           return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
         }
       } catch (e) {
