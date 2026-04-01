@@ -636,7 +636,8 @@ export class UserControl implements DurableObject {
     const escaped = query.toLowerCase().replace(/[%_\\]/g, "\\$&");
     const pattern = `%${escaped}%`;
     return this.db.all(
-      "SELECT id, title, content, tags_json, created_at, updated_at FROM memory_entries WHERE lower(title) LIKE ? ESCAPE '\\' OR lower(content) LIKE ? ESCAPE '\\' ORDER BY updated_at DESC LIMIT 25",
+      "SELECT id, title, content, tags_json, created_at, updated_at FROM memory_entries WHERE lower(title) LIKE ? ESCAPE '\\' OR lower(content) LIKE ? ESCAPE '\\' OR lower(tags_json) LIKE ? ESCAPE '\\' ORDER BY updated_at DESC LIMIT 25",
+      pattern,
       pattern,
       pattern,
     ).map((row) => this.mapMemoryRow(row));
