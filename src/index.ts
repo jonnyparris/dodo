@@ -546,6 +546,86 @@ app.post("/api/tasks", async (c) => {
   });
 });
 
+// Batch dispatch: dispatch multiple tasks in parallel (must be before :id routes)
+app.post("/api/tasks/batch-dispatch", async (c) => {
+  const email = c.get("userEmail");
+  const body = (await c.req.json()) as { taskIds?: string[] };
+  const taskIds = body.taskIds;
+  if (!Array.isArray(taskIds) || taskIds.length === 0 || taskIds.length > 10) {
+    return c.json({ error: "taskIds must be an array of 1-10 task IDs" }, 400);
+  }
+
+  // Fetch all tasks
+  const listRes = await proxyToUserControl(c.env, email, "/tasks");
+  const listBody = (await listRes.json()) as { tasks: Array<{ id: string; title: string; description: string; priority: string; status: string; sessionId: string | null }> };
+  const taskMap = new Map(listBody.tasks.map((t) => [t.id, t]));
+
+  const config = await readConfig(c.env, email);
+  const checkRes = await proxyToSharedIndex(c.env, `/account-permissions/check?grantee=${encodeURIComponent(email)}`);
+  const checkBody = (await checkRes.json()) as { hasCreate: boolean; accountOwner: string | null };
+  const effectiveOwner = checkBody.hasCreate && checkBody.accountOwner ? checkBody.accountOwner : email;
+
+  const results: Array<{ taskId: string; sessionId?: string; error?: string }> = [];
+
+  for (const taskId of taskIds) {
+    const task = taskMap.get(taskId);
+    if (!task) { results.push({ taskId, error: "not found" }); continue; }
+    if (task.status === "in_progress" || task.status === "done") { results.push({ taskId, error: `already ${task.status}` }); continue; }
+
+    try {
+      const sessionId = crypto.randomUUID();
+      await proxyToUserControl(c.env, effectiveOwner, "/sessions", {
+        body: JSON.stringify({ id: sessionId, ownerEmail: effectiveOwner, createdBy: email }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      if (effectiveOwner !== email) {
+        await proxyToSharedIndex(c.env, "/permissions", {
+          body: JSON.stringify({ sessionId, ownerEmail: effectiveOwner, granteeEmail: email, permission: "readwrite", grantedBy: "system" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        });
+      }
+      await proxyToSharedIndex(c.env, "/stats/increment", {
+        body: JSON.stringify({ stat: "sessionCount", delta: 1 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+
+      const lines = [`# Task: ${task.title}`];
+      if (task.description) lines.push("", task.description);
+      lines.push("", `Priority: ${task.priority}`, "", "Complete this task. When finished, summarize what you did.");
+
+      const promptReq = new Request(`https://dodo.example/session/${sessionId}/prompt`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: lines.join("\n") }),
+      });
+      await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
+        "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+        "x-dodo-gateway": config.activeGateway,
+        "x-dodo-model": config.model,
+        "x-dodo-opencode-base-url": config.opencodeBaseURL,
+        "x-author-email": email,
+        "x-owner-email": email,
+      });
+
+      await proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(taskId)}`, {
+        body: JSON.stringify({ status: "in_progress", session_id: sessionId }),
+        headers: { "content-type": "application/json" },
+        method: "PUT",
+      });
+
+      results.push({ taskId, sessionId });
+    } catch {
+      results.push({ taskId, error: "dispatch failed" });
+    }
+  }
+
+  log("info", "Batch dispatch", { email, count: taskIds.length, dispatched: results.filter((r) => r.sessionId).length });
+  return c.json({ results });
+});
+
 app.put("/api/tasks/:id", async (c) => {
   const email = c.get("userEmail");
   return proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(c.req.param("id"))}`, {
@@ -558,6 +638,96 @@ app.put("/api/tasks/:id", async (c) => {
 app.delete("/api/tasks/:id", async (c) => {
   const email = c.get("userEmail");
   return proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" });
+});
+
+app.get("/api/tasks/:id/check", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(c.req.param("id"))}/check`);
+});
+
+// Dispatch a task: create a session, send a prompt, link them together
+app.post("/api/tasks/:id/dispatch", async (c) => {
+  const email = c.get("userEmail");
+  const taskId = c.req.param("id");
+
+  // 1. Fetch the task
+  const taskRes = await proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(taskId)}/check`);
+  if (!taskRes.ok) return c.json({ error: "Task not found" }, 404);
+
+  // Get full task data via list + filter (check only returns {found:true})
+  const listRes = await proxyToUserControl(c.env, email, "/tasks");
+  const listBody = (await listRes.json()) as { tasks: Array<{ id: string; title: string; description: string; priority: string; status: string; sessionId: string | null }> };
+  const task = listBody.tasks.find((t) => t.id === taskId);
+  if (!task) return c.json({ error: "Task not found" }, 404);
+
+  // 2. Create a new session
+  const sessionId = crypto.randomUUID();
+  const ownerEmail = email;
+  const createdBy = email;
+
+  // Check for delegation (same logic as POST /session)
+  const checkRes = await proxyToSharedIndex(c.env, `/account-permissions/check?grantee=${encodeURIComponent(email)}`);
+  const checkBody = (await checkRes.json()) as { hasCreate: boolean; accountOwner: string | null };
+  const effectiveOwner = checkBody.hasCreate && checkBody.accountOwner ? checkBody.accountOwner : ownerEmail;
+
+  await proxyToUserControl(c.env, effectiveOwner, "/sessions", {
+    body: JSON.stringify({ id: sessionId, ownerEmail: effectiveOwner, createdBy }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+
+  // Auto-grant write if delegated
+  if (effectiveOwner !== email) {
+    await proxyToSharedIndex(c.env, "/permissions", {
+      body: JSON.stringify({
+        sessionId,
+        ownerEmail: effectiveOwner,
+        granteeEmail: email,
+        permission: "readwrite",
+        grantedBy: "system",
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+  }
+
+  await proxyToSharedIndex(c.env, "/stats/increment", {
+    body: JSON.stringify({ stat: "sessionCount", delta: 1 }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+
+  // 3. Build a richer prompt
+  const lines = [`# Task: ${task.title}`];
+  if (task.description) lines.push("", task.description);
+  lines.push("", `Priority: ${task.priority}`);
+  lines.push("", "Complete this task. When finished, summarize what you did.");
+
+  // 4. Send the prompt to the new session
+  const config = await readConfig(c.env, email);
+  const promptReq = new Request(`https://dodo.example/session/${sessionId}/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content: lines.join("\n") }),
+  });
+  await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
+    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+    "x-dodo-gateway": config.activeGateway,
+    "x-dodo-model": config.model,
+    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    "x-author-email": email,
+    "x-owner-email": email,
+  });
+
+  // 5. Update task: set status to in_progress and link session
+  await proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(taskId)}`, {
+    body: JSON.stringify({ status: "in_progress", session_id: sessionId }),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+
+  log("info", "Task dispatched", { email, taskId, sessionId });
+  return c.json({ sessionId, taskId, status: "in_progress" });
 });
 
 // ─── Secrets (per-user via UserControl) ───

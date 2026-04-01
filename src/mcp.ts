@@ -363,12 +363,13 @@ export function createDodoMcpServer(env: Env): McpServer {
     }),
   );
 
-  server.tool("update_task", "Update a task's status, title, description, or priority", {
+  server.tool("update_task", "Update a task's status, title, description, priority, or linked session", {
     id: z.string().describe("Task ID"),
     title: z.string().optional().describe("New title"),
     description: z.string().optional().describe("New description"),
     status: z.enum(["backlog", "todo", "in_progress", "done", "cancelled"]).optional().describe("New status"),
     priority: z.enum(["low", "medium", "high"]).optional().describe("New priority"),
+    session_id: z.string().nullable().optional().describe("Session ID to link (null to unlink)"),
   }, async ({ id, ...patch }) =>
     jsonFetch(env, "user", `/tasks/${encodeURIComponent(id)}`, {
       init: { body: JSON.stringify(patch), headers: { "content-type": "application/json" }, method: "PUT" },
