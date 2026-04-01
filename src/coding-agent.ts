@@ -1,5 +1,6 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
-import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
+import { type Connection, type ConnectionContext, type WSMessage } from "agents";
+import type { LanguageModel, ToolSet } from "ai";
 import { z } from "zod";
 import { runAgenticChat, streamAgenticChat } from "./agentic";
 import { getUserControlStub } from "./auth";
@@ -9,6 +10,7 @@ import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
 import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc-transport";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
+import { Think, type DodoConfig } from "./think-adapter";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
 
 const sendMessageSchema = z.object({ content: z.string().trim().min(1) }).strict();
@@ -67,7 +69,7 @@ function normalizePath(path: string): string {
   return `/${resolved.join("/")}`;
 }
 
-export class CodingAgent extends Agent<Env, SessionState> {
+export class CodingAgent extends Think<Env, DodoConfig> {
   initialState: SessionState = {
     activePromptId: null,
     activeStreamCount: 0,
@@ -80,13 +82,16 @@ export class CodingAgent extends Agent<Env, SessionState> {
     updatedAt: "",
   };
 
+  /** Fibers disabled until Wave 5. */
+  override fibers = false;
+
   private readonly activePromptControllers = new Map<string, AbortController>();
   private readonly clients = new Set<WritableStreamDefaultWriter<Uint8Array>>();
   private readonly db: SqlHelper;
   private readonly presence = new PresenceTracker();
-  private readonly stateBackend;
+  readonly stateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
-  private readonly workspace: Workspace;
+  readonly workspace: Workspace;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -100,14 +105,93 @@ export class CodingAgent extends Agent<Env, SessionState> {
     this.stateBackend = createWorkspaceStateBackend(this.workspace);
   }
 
-  async onStart(): Promise<void> {
+  // ─── Think overrides ───
+
+  override getModel(): LanguageModel {
+    // Temporary: throw — we don't use Think's chat loop yet (Wave 3+4)
+    throw new Error("getModel() called before Think chat is enabled");
+  }
+
+  override getSystemPrompt(): string {
+    return SYSTEM_PROMPT;
+  }
+
+  override getTools(): ToolSet {
+    // Empty until Wave 2 — old tools still wired through agentic.ts
+    return {};
+  }
+
+  override getMaxSteps(): number {
+    return 10;
+  }
+
+  override getWorkspace(): Workspace {
+    return this.workspace;
+  }
+
+  override onStart(): void {
+    // Initialize Think: creates SessionManager, loads existing sessions,
+    // sets up protocol handlers, checks fibers if enabled.
+    super.onStart();
+
+    // Suppress Think's WebSocket chat protocol.
+    // super.onStart() wraps onMessage via _setupProtocolHandlers() to intercept
+    // cf_agent_chat_* messages. We re-wrap onMessage to skip those protocol
+    // messages entirely, routing everything through Dodo's own handlers.
+    const thinkWrappedOnMessage = this.onMessage.bind(this);
+    this.onMessage = async (connection: Connection, message: WSMessage) => {
+      if (typeof message === "string") {
+        try {
+          const data = JSON.parse(message);
+          // Block Think's chat protocol messages
+          if (data.type === "cf_agent_use_chat_request" ||
+              data.type === "cf_agent_chat_clear" ||
+              data.type === "cf_agent_chat_request_cancel") {
+            return;
+          }
+        } catch {
+          // Not JSON — let it through
+        }
+      }
+      return thinkWrappedOnMessage(connection, message);
+    };
+
+    // Enforce single Think session per Dodo DO
+    this.ensureSingleThinkSession();
+
+    // Dodo's existing init logic
     const details = this.readSessionDetails();
     this.setState({
-      ...this.state,
+      ...(this.state as SessionState),
       ...details,
       activeStreamCount: this.clients.size,
       messageCount: this.messageCount(),
-    });
+    } as never);
+  }
+
+  /**
+   * Ensure exactly one Think session exists per Dodo DO.
+   * Called from onStart() after super.onStart() initializes SessionManager.
+   */
+  private ensureSingleThinkSession(): void {
+    const existing = this.sessions.list();
+    if (existing.length === 0) {
+      // No session yet — create one. super.onStart() may have already
+      // created one if there were existing sessions, but not if the DO is fresh.
+      if (!this.getCurrentSessionId()) {
+        this.createSession("default");
+      }
+    } else if (existing.length > 1) {
+      // Multiple sessions — use most recent, delete extras
+      console.warn(`CodingAgent: found ${existing.length} Think sessions, expected 1. Using most recent.`);
+      const sorted = [...existing].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+      // Switch to the most recent
+      this.switchSession(sorted[0].id);
+      for (let i = 1; i < sorted.length; i++) {
+        this.sessions.delete(sorted[i].id);
+      }
+    }
+    // If exactly 1 exists, super.onStart() already loaded it
   }
 
   async onRequest(request: Request): Promise<Response> {
