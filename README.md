@@ -1,8 +1,10 @@
 # Dodo
 
-![Dodo](assets/dodo.svg)
+<p align="center">
+  <img src="assets/dodo.svg" alt="Dodo" width="120"/>
+</p>
 
-Self-hostable autonomous coding agent on Cloudflare Workers + Durable Objects.
+<p align="center">Self-hostable autonomous coding agent on Cloudflare Workers + Durable Objects.</p>
 
 ## What it does
 
