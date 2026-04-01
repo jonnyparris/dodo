@@ -3,7 +3,6 @@ import { createMcpHandler } from "agents/mcp";
 import { newRpcResponse } from "@hono/capnweb";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { AppControl } from "./app-control";
 import { AuthError, checkAllowlist, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
 import { runHealthCheck } from "./health-check";
@@ -23,6 +22,7 @@ import type { AccessIdentity, AppConfig, Env } from "./types";
 const promptLimiter = new RateLimiter();
 const shareLimiter = new RateLimiter();
 const messageLimiter = new RateLimiter();
+const errorLimiter = new RateLimiter();
 
 // Cleanup expired windows on every 100th request (setInterval not allowed at global scope)
 let requestCount = 0;
@@ -31,6 +31,7 @@ function maybeCleanupRateLimiters() {
     promptLimiter.cleanup();
     shareLimiter.cleanup();
     messageLimiter.cleanup();
+    errorLimiter.cleanup();
   }
 }
 
@@ -230,13 +231,6 @@ app.post("/api/bootstrap", async (c) => {
   return c.json({ bootstrapped: true, adminEmail }, 201);
 });
 
-// ─── Cap'n Web RPC (public API; auth via authenticate() method) ───
-
-app.all("/rpc", async (c) => {
-  const api = new DodoPublicApi(c.env);
-  return newRpcResponse(c, api);
-});
-
 // ─── Share link redemption (no auth required) ───
 
 app.get("/shared/:token", async (c) => {
@@ -274,6 +268,11 @@ app.get("/shared/:token", async (c) => {
 // ─── Error ingestion (no auth — errors can happen before/during auth) ───
 
 app.post("/api/errors", async (c) => {
+  const ip = c.req.header("cf-connecting-ip") ?? "unknown";
+  const rl = errorLimiter.check(ip, 30, 3600); // 30 errors per hour per IP
+  if (!rl.allowed) {
+    return c.json({ error: "Too many error reports" }, 429);
+  }
   const body = await c.req.json().catch(() => null);
   if (!body || !body.message) return c.json({ error: "Missing message" }, 400);
 
@@ -299,7 +298,7 @@ app.post("/api/errors", async (c) => {
 
 app.use("*", async (c, next) => {
   const path = new URL(c.req.raw.url).pathname;
-  if (path === "/health" || path === "/api/bootstrap" || path === "/api/errors" || path === "/mcp" || path === "/rpc" || path.startsWith("/shared/")) return next();
+  if (path === "/health" || path === "/api/bootstrap" || path === "/api/errors" || path === "/mcp" || path.startsWith("/shared/")) return next();
 
   let identity: AccessIdentity;
   try {
@@ -331,6 +330,13 @@ app.use("*", async (c, next) => {
   c.set("identity", identity);
   c.set("userEmail", identity.email);
   return next();
+});
+
+// ─── Cap'n Web RPC (authenticated) ───
+
+app.all("/rpc", async (c) => {
+  const api = new DodoPublicApi(c.env, c.get("userEmail"));
+  return newRpcResponse(c, api);
 });
 
 // ─── Static assets ───
@@ -606,8 +612,26 @@ app.post("/api/mcp-configs", async (c) => {
 
 app.put("/api/mcp-configs/:id", async (c) => {
   const email = c.get("userEmail");
+  const body = await c.req.raw.text();
+  // Validate URL hostname against host allowlist
+  try {
+    const parsed = JSON.parse(body) as { url?: string };
+    if (parsed.url) {
+      const hostname = new URL(parsed.url).hostname.toLowerCase();
+      const checkRes = await proxyToSharedIndex(c.env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
+      const checkBody = (await checkRes.json()) as { allowed: boolean };
+      if (!checkBody.allowed) {
+        return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
+      }
+    }
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      return c.json({ error: "Invalid JSON" }, 400);
+    }
+    if (!(e instanceof TypeError)) throw e;
+  }
   return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}`, {
-    body: await c.req.raw.text(),
+    body,
     headers: { "content-type": "application/json" },
     method: "PUT",
   });
@@ -633,7 +657,12 @@ app.post("/api/mcp-configs/:id/test", async (c) => {
         if (!checkBody.allowed) {
           return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
         }
-      } catch { /* URL parse error — let UserControl handle */ }
+      } catch (e) {
+        if (e instanceof TypeError) {
+          return c.json({ error: "Invalid MCP config URL" }, 400);
+        }
+        throw e;
+      }
     }
   }
   return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}/test`, { method: "POST" });
@@ -811,6 +840,19 @@ app.get("/session/:id", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/", { "x-owner-email": c.get("userEmail") });
 });
 
+app.patch("/session/:id", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  const email = c.get("userEmail");
+  const body = await c.req.raw.text();
+  return proxyToUserControl(c.env, email, `/sessions/${sessionId}`, {
+    body,
+    headers: { "content-type": "application/json" },
+    method: "PATCH",
+  });
+});
+
 app.delete("/session/:id", async (c) => {
   const denied = requirePermission(c, "admin");
   if (denied) return denied;
@@ -818,6 +860,8 @@ app.delete("/session/:id", async (c) => {
   const email = c.get("userEmail");
   const result = await proxyToAgent(c.req.raw, c.env, sessionId, "/", { "x-owner-email": email });
   await proxyToUserControl(c.env, email, `/sessions/${sessionId}`, { method: "DELETE" });
+  // Cascade: clean up shares and permissions for this session
+  await proxyToSharedIndex(c.env, `/sessions/${encodeURIComponent(sessionId)}/cleanup`, { method: "DELETE" });
   return result;
 });
 
@@ -1243,89 +1287,7 @@ app.get("/api/admin/account-permissions", adminGuard as never, async (c) => {
   return proxyToSharedIndex(c.env, `/account-permissions?owner=${encodeURIComponent(owner)}`);
 });
 
-// ─── Migration endpoint (admin only, one-time) ───
-
-app.post("/api/admin/migrate", adminGuard as never, async (c) => {
-  const email = c.get("userEmail");
-  try {
-    // Read all data from AppControl
-    const appControlStub = c.env.APP_CONTROL.get(c.env.APP_CONTROL.idFromName("global"));
-
-    // Migrate sessions
-    const sessionsRes = await appControlStub.fetch("https://app-control/sessions");
-    const { sessions } = (await sessionsRes.json()) as { sessions: Array<{ id: string; title: string | null; status: string }> };
-    for (const session of sessions) {
-      await proxyToUserControl(c.env, email, "/sessions", {
-        body: JSON.stringify({ id: session.id, title: session.title, ownerEmail: email, createdBy: email }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      });
-    }
-
-    // Migrate config
-    const configRes = await appControlStub.fetch("https://app-control/config");
-    const config = await configRes.json();
-    await proxyToUserControl(c.env, email, "/config", {
-      body: JSON.stringify(config),
-      headers: { "content-type": "application/json" },
-      method: "PUT",
-    });
-
-    // Migrate memory
-    const memoryRes = await appControlStub.fetch("https://app-control/memory");
-    const { entries } = (await memoryRes.json()) as { entries: Array<{ title: string; content: string; tags: string[] }> };
-    for (const entry of entries) {
-      await proxyToUserControl(c.env, email, "/memory", {
-        body: JSON.stringify({ title: entry.title, content: entry.content, tags: entry.tags }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      });
-    }
-
-    // Migrate tasks
-    const tasksRes = await appControlStub.fetch("https://app-control/tasks");
-    const { tasks } = (await tasksRes.json()) as { tasks: Array<{ title: string; description: string; priority: string; status: string }> };
-    for (const task of tasks) {
-      const createRes = await proxyToUserControl(c.env, email, "/tasks", {
-        body: JSON.stringify({ title: task.title, description: task.description, priority: task.priority }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      });
-      if (task.status !== "backlog") {
-        const created = (await createRes.json()) as { id: string };
-        await proxyToUserControl(c.env, email, `/tasks/${created.id}`, {
-          body: JSON.stringify({ status: task.status }),
-          headers: { "content-type": "application/json" },
-          method: "PUT",
-        });
-      }
-    }
-
-    // Migrate allowlist
-    const allowlistRes = await appControlStub.fetch("https://app-control/allowlist");
-    const { hosts } = (await allowlistRes.json()) as { hosts: Array<{ hostname: string }> };
-    for (const host of hosts) {
-      await proxyToSharedIndex(c.env, "/allowlist", {
-        body: JSON.stringify({ hostname: host.hostname }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      });
-    }
-
-    return c.json({
-      migrated: true,
-      sessions: sessions.length,
-      memory: entries.length,
-      tasks: tasks.length,
-      hosts: hosts.length,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Migration failed";
-    return c.json({ error: message }, 500);
-  }
-});
-
-export { AllowlistOutbound, AppControl, CodingAgent, SharedIndex, UserControl };
+export { AllowlistOutbound, CodingAgent, SharedIndex, UserControl };
 
 export default {
   fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {
