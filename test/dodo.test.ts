@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 
 const { runSandboxedCodeMock, runAgenticChatMock, streamAgenticChatMock, sendNotificationMock } = vi.hoisted(() => ({
@@ -16,6 +17,7 @@ vi.mock("../src/executor", () => ({
 vi.mock("../src/agentic", () => ({
   runAgenticChat: runAgenticChatMock,
   streamAgenticChat: streamAgenticChatMock,
+  buildToolsForThink: vi.fn().mockReturnValue({}),
 }));
 
 vi.mock("../src/notify", () => ({

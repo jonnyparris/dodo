@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 import { PresenceTracker } from "../src/presence";
 import { AgentConnectionTransport } from "../src/rpc-transport";
@@ -17,6 +18,7 @@ vi.mock("../src/executor", () => ({
 vi.mock("../src/agentic", () => ({
   runAgenticChat: runAgenticChatMock,
   streamAgenticChat: streamAgenticChatMock,
+  buildToolsForThink: vi.fn().mockReturnValue({}),
 }));
 
 vi.mock("../src/notify", () => ({

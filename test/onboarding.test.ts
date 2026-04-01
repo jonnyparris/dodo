@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 
 vi.mock("../src/executor", () => ({
@@ -8,6 +9,7 @@ vi.mock("../src/executor", () => ({
 vi.mock("../src/agentic", () => ({
   runAgenticChat: vi.fn().mockResolvedValue({ gateway: "opencode", model: "test", steps: 0, text: "", toolCalls: [] }),
   streamAgenticChat: vi.fn().mockResolvedValue({ gateway: "opencode", model: "test", steps: 0, text: "", tokenInput: 0, tokenOutput: 0, toolCalls: [] }),
+  buildToolsForThink: vi.fn().mockReturnValue({}),
 }));
 vi.mock("../src/notify", () => ({
   sendNotification: vi.fn(),
@@ -39,8 +41,12 @@ describe("Onboarding", () => {
   // ─── Unit tests for state machine ───
 
   describe("state machine: getNextStep()", () => {
-    it("welcome → passkey", () => {
-      expect(getNextStep("welcome", false)).toBe("passkey");
+    it("welcome → gateway", () => {
+      expect(getNextStep("welcome", false)).toBe("gateway");
+    });
+
+    it("gateway → passkey", () => {
+      expect(getNextStep("gateway", false)).toBe("passkey");
     });
 
     it("passkey → secrets", () => {
@@ -67,6 +73,11 @@ describe("Onboarding", () => {
   describe("state machine: canSkipStep()", () => {
     it("welcome is always skippable", () => {
       expect(canSkipStep("welcome", false)).toBe(true);
+    });
+
+    it("gateway is never skippable", () => {
+      expect(canSkipStep("gateway", false)).toBe(false);
+      expect(canSkipStep("gateway", true)).toBe(false);
     });
 
     it("passkey is skippable only with key envelope", () => {
@@ -102,10 +113,10 @@ describe("Onboarding", () => {
   });
 
   describe("state machine: advanceStep()", () => {
-    it("advances from welcome to passkey", () => {
+    it("advances from welcome to gateway", () => {
       const state = getInitialState();
       const next = advanceStep(state, "welcome", false, false);
-      expect(next.currentStep).toBe("passkey");
+      expect(next.currentStep).toBe("gateway");
       expect(next.completedSteps).toContain("welcome");
       expect(next.completedAt).toBeNull();
     });
@@ -116,12 +127,12 @@ describe("Onboarding", () => {
     });
 
     it("throws when skipping passkey without key envelope", () => {
-      const state = { ...getInitialState(), currentStep: "passkey" as const, completedSteps: ["welcome" as const] };
+      const state = { ...getInitialState(), currentStep: "passkey" as const, completedSteps: ["welcome" as const, "gateway" as const] };
       expect(() => advanceStep(state, "passkey", true, false)).toThrow("cannot be skipped");
     });
 
     it("allows skipping passkey with key envelope", () => {
-      const state = { ...getInitialState(), currentStep: "passkey" as const, completedSteps: ["welcome" as const] };
+      const state = { ...getInitialState(), currentStep: "passkey" as const, completedSteps: ["welcome" as const, "gateway" as const] };
       const next = advanceStep(state, "passkey", true, true);
       expect(next.currentStep).toBe("secrets");
       expect(next.completedSteps).toContain("passkey");
@@ -130,6 +141,7 @@ describe("Onboarding", () => {
     it("advances through all steps to complete", () => {
       let state = getInitialState();
       state = advanceStep(state, "welcome", false, false);
+      state = advanceStep(state, "gateway", false, false);
       state = advanceStep(state, "passkey", false, true);
       state = advanceStep(state, "secrets", false, false);
       state = advanceStep(state, "memory", false, false);
@@ -142,6 +154,7 @@ describe("Onboarding", () => {
     it("returns same state when already complete", () => {
       let state = getInitialState();
       state = advanceStep(state, "welcome", false, false);
+      state = advanceStep(state, "gateway", false, false);
       state = advanceStep(state, "passkey", true, true);
       state = advanceStep(state, "secrets", true, false);
       state = advanceStep(state, "memory", true, false);
@@ -168,7 +181,7 @@ describe("Onboarding", () => {
       expect(body.completedAt).toBeNull();
     });
 
-    it("POST /api/onboarding/advance with welcome → moves to passkey", async () => {
+    it("POST /api/onboarding/advance with welcome → moves to gateway", async () => {
       await fetchJson("/api/onboarding/reset", { method: "POST" });
 
       const res = await fetchJson("/api/onboarding/advance", {
@@ -178,16 +191,23 @@ describe("Onboarding", () => {
       });
       expect(res.status).toBe(200);
       const body = (await res.json()) as { currentStep: string; completedSteps: string[] };
-      expect(body.currentStep).toBe("passkey");
+      expect(body.currentStep).toBe("gateway");
       expect(body.completedSteps).toContain("welcome");
     });
 
     it("skip passkey without envelope → rejected", async () => {
       await fetchJson("/api/onboarding/reset", { method: "POST" });
 
-      // Advance to passkey step first
+      // Advance to gateway step first
       await fetchJson("/api/onboarding/advance", {
         body: JSON.stringify({ step: "welcome" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+
+      // Advance to passkey step
+      await fetchJson("/api/onboarding/advance", {
+        body: JSON.stringify({ step: "gateway" }),
         headers: { "content-type": "application/json" },
         method: "POST",
       });
@@ -220,9 +240,16 @@ describe("Onboarding", () => {
         });
       }
 
-      // Advance to passkey step
+      // Advance to gateway step
       await fetchJson("/api/onboarding/advance", {
         body: JSON.stringify({ step: "welcome" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+
+      // Advance to passkey step
+      await fetchJson("/api/onboarding/advance", {
+        body: JSON.stringify({ step: "gateway" }),
         headers: { "content-type": "application/json" },
         method: "POST",
       });
@@ -256,6 +283,12 @@ describe("Onboarding", () => {
       // Walk through all steps
       await fetchJson("/api/onboarding/advance", {
         body: JSON.stringify({ step: "welcome" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+
+      await fetchJson("/api/onboarding/advance", {
+        body: JSON.stringify({ step: "gateway" }),
         headers: { "content-type": "application/json" },
         method: "POST",
       });
