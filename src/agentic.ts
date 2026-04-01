@@ -1,23 +1,11 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { StateBackend } from "@cloudflare/shell";
-import { generateText, streamText, stepCountIs, tool, zodSchema, type ModelMessage } from "ai";
+import { tool, zodSchema } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env } from "./types";
-
-const MAX_TOOL_STEPS = 10;
-
-export interface AgenticResult {
-  gateway: string;
-  model: string;
-  steps: number;
-  text: string;
-  tokenInput: number;
-  tokenOutput: number;
-  toolCalls: Array<{ code: string; result: unknown }>;
-}
 
 function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
@@ -206,7 +194,6 @@ function buildTools(
 
 /**
  * Build the tool set for Think's getTools() override.
- * Same as buildTools but exported and with explicit stateBackend option.
  */
 export function buildToolsForThink(
   env: Env,
@@ -218,157 +205,9 @@ export function buildToolsForThink(
 }
 
 /**
- * Browser tools are conditionally loaded based on user's browser_enabled flag.
- * This will be wired up when agents/browser/ai is available.
- */
-export function buildBrowserTools(_env: Env, browserEnabled: boolean): Record<string, unknown> {
-  if (!browserEnabled) return {};
-  // TODO: import createBrowserTools from agents/browser/ai when available
-  return {};
-}
-
-// TODO: Memory strategy integration
-// When MCP tools are wired into the agentic loop, use resolveMemoryStrategy()
-// from ../memory-resolver.ts to determine whether to route memory tool calls
-// to the external MCP server or the built-in UserControl memory endpoints.
-// If external is selected but the connection fails, fall back to builtin.
-// See: src/memory-resolver.ts
-
-// TODO: Approval queue integration
-// When MCP tools are included in the agentic tool set:
-// 1. Before executing a side-effecting MCP tool call, submit to approval queue
-// 2. Await approval from the user (via WebSocket callback or polling)
-// 3. Only execute if approved
-// See: CodingAgent.submitApproval() for the queue infrastructure
-
-function buildMessages(messages: Array<{ content: string; role: string }>): ModelMessage[] {
-  return messages
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => ({ content: m.content, role: m.role as "user" | "assistant" }));
-}
-
-function extractToolCalls(steps: Array<{ toolCalls: unknown[]; toolResults: unknown[] }>): AgenticResult["toolCalls"] {
-  const toolCalls: AgenticResult["toolCalls"] = [];
-  for (const step of steps) {
-    for (const call of step.toolCalls) {
-      const args = "args" in (call as Record<string, unknown>) ? ((call as Record<string, unknown>).args as unknown) : undefined;
-      const code = typeof args === "object" && args !== null && "code" in args ? String((args as { code: string }).code) : "";
-      const toolCallId = "toolCallId" in (call as Record<string, unknown>) ? (call as Record<string, unknown>).toolCallId : undefined;
-      const toolResult = step.toolResults.find((r) => "toolCallId" in (r as Record<string, unknown>) && (r as Record<string, unknown>).toolCallId === toolCallId);
-      const resultValue = toolResult && "result" in (toolResult as Record<string, unknown>) ? (toolResult as Record<string, unknown>).result : null;
-      toolCalls.push({ code, result: resultValue });
-    }
-  }
-  return toolCalls;
-}
-
-/**
  * Check if the caller is the session owner (i.e. should have access to memory tools).
- * Non-owner guests should not have access to the owner's memory tools.
  */
 export function isCallerOwner(authorEmail?: string, ownerEmail?: string): boolean {
-  if (!authorEmail || !ownerEmail) return true; // default to owner if unknown
+  if (!authorEmail || !ownerEmail) return true;
   return authorEmail === ownerEmail;
-}
-
-/**
- * Non-streaming agentic chat. Used for async prompts and cron callbacks.
- */
-export async function runAgenticChat(input: {
-  authorEmail?: string;
-  config: AppConfig;
-  env: Env;
-  messages: Array<{ content: string; role: "assistant" | "system" | "tool" | "user" }>;
-  ownerEmail?: string;
-  signal?: AbortSignal;
-  stateBackend?: StateBackend;
-  systemPrompt: string;
-  workspace: Workspace;
-}): Promise<AgenticResult> {
-  const provider = buildProvider(input.config, input.env);
-  const model = provider.chatModel(input.config.model);
-  const tools = buildTools(input.env, input.workspace, input.config, {
-    authorEmail: input.authorEmail,
-    ownerEmail: input.ownerEmail,
-    stateBackend: input.stateBackend,
-  });
-
-  const result = await generateText({
-    abortSignal: input.signal,
-    stopWhen: stepCountIs(MAX_TOOL_STEPS),
-    system: input.systemPrompt,
-    messages: buildMessages(input.messages),
-    model,
-    temperature: 0.2,
-    tools,
-  });
-
-  return {
-    gateway: input.config.activeGateway,
-    model: input.config.model,
-    steps: result.steps.length,
-    text: result.text,
-    tokenInput: result.usage?.inputTokens ?? 0,
-    tokenOutput: result.usage?.outputTokens ?? 0,
-    toolCalls: extractToolCalls(result.steps as Array<{ toolCalls: unknown[]; toolResults: unknown[] }>),
-  };
-}
-
-/**
- * Streaming agentic chat. Used for synchronous /message endpoint.
- * Calls onTextDelta for each token chunk and onToolCall for each tool invocation.
- * Returns the full AgenticResult once the stream is consumed.
- */
-export async function streamAgenticChat(input: {
-  authorEmail?: string;
-  config: AppConfig;
-  env: Env;
-  messages: Array<{ content: string; role: "assistant" | "system" | "tool" | "user" }>;
-  onTextDelta: (delta: string) => void;
-  onToolCall: (tc: { code: string; result: unknown }) => void;
-  ownerEmail?: string;
-  signal?: AbortSignal;
-  stateBackend?: StateBackend;
-  systemPrompt: string;
-  workspace: Workspace;
-}): Promise<AgenticResult> {
-  const provider = buildProvider(input.config, input.env);
-  const model = provider.chatModel(input.config.model);
-  const tools = buildTools(input.env, input.workspace, input.config, {
-    authorEmail: input.authorEmail,
-    ownerEmail: input.ownerEmail,
-    stateBackend: input.stateBackend,
-  });
-
-  const result = streamText({
-    abortSignal: input.signal,
-    stopWhen: stepCountIs(MAX_TOOL_STEPS),
-    system: input.systemPrompt,
-    messages: buildMessages(input.messages),
-    model,
-    temperature: 0.2,
-    tools,
-    onStepFinish: (event) => {
-      const stepToolCalls = extractToolCalls([event as unknown as { toolCalls: unknown[]; toolResults: unknown[] }]);
-      for (const tc of stepToolCalls) {
-        input.onToolCall(tc);
-      }
-    },
-  });
-
-  for await (const delta of result.textStream) {
-    input.onTextDelta(delta);
-  }
-
-  const [text, totalUsage, steps] = await Promise.all([result.text, result.totalUsage, result.steps]);
-
-  return {
-    gateway: input.config.activeGateway,
-    model: input.config.model,
-    steps: steps.length,
-    text,
-    tokenInput: totalUsage?.inputTokens ?? 0,
-    tokenOutput: totalUsage?.outputTokens ?? 0,
-    toolCalls: extractToolCalls(steps as Array<{ toolCalls: unknown[]; toolResults: unknown[] }>),
-  };
 }
