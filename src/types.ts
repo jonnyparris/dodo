@@ -116,13 +116,13 @@ export interface PromptRecord {
 }
 
 export interface WorkspaceEntry {
-  createdAt: string;
+  createdAt: string | null;
   mimeType: string;
   name: string;
   path: string;
   size: number;
   type: "file" | "directory" | "symlink";
-  updatedAt: string;
+  updatedAt: string | null;
 }
 
 export interface AllowlistEntry {

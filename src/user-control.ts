@@ -137,10 +137,36 @@ export class UserControl implements DurableObject {
         return Response.json({ found: true });
       }
 
-      if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/[^/]+$/) && !url.pathname.includes("/mcp-overrides")) {
+      if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/[^/]+$/) && !url.pathname.includes("/mcp-overrides") && !url.pathname.includes("/soft-delete") && !url.pathname.includes("/restore")) {
         const sessionId = url.pathname.split("/").at(-1) ?? "";
         this.db.exec("DELETE FROM sessions WHERE id = ?", sessionId);
-        return Response.json({ deleted: true, id: sessionId });
+        return Response.json({ deleted: true, sessionId });
+      }
+
+      // Soft-delete: mark session as deleted with a TTL for recovery
+      if (request.method === "POST" && url.pathname.match(/^\/sessions\/[^/]+\/soft-delete$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const row = this.db.one("SELECT id FROM sessions WHERE id = ?", sessionId);
+        if (!row) return Response.json({ error: `Session '${sessionId}' not found` }, { status: 404 });
+        const deleteExpiry = nowEpoch() + 300; // 5 minutes
+        this.db.exec("UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?", deleteExpiry, nowEpoch(), sessionId);
+        return Response.json({ deleted: true, sessionId, recoverable: true, recoverableUntil: epochToIso(deleteExpiry) });
+      }
+
+      // Restore a soft-deleted session
+      if (request.method === "POST" && url.pathname.match(/^\/sessions\/[^/]+\/restore$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const row = this.db.one("SELECT id, status, deleted_at FROM sessions WHERE id = ?", sessionId);
+        if (!row) return Response.json({ error: `Session '${sessionId}' not found. It may have been permanently deleted.` }, { status: 404 });
+        if (String(row.status) !== "deleted") return Response.json({ error: `Session '${sessionId}' is not deleted.` }, { status: 400 });
+        const expiry = Number(row.deleted_at ?? 0);
+        if (expiry > 0 && nowEpoch() > expiry) {
+          // Past recovery window — permanently delete
+          this.db.exec("DELETE FROM sessions WHERE id = ?", sessionId);
+          return Response.json({ error: `Recovery window expired. Session '${sessionId}' has been permanently deleted.` }, { status: 410 });
+        }
+        this.db.exec("UPDATE sessions SET status = 'idle', deleted_at = NULL, updated_at = ? WHERE id = ?", nowEpoch(), sessionId);
+        return Response.json(this.getSession(sessionId));
       }
 
       // ─── Memory ───
@@ -188,8 +214,17 @@ export class UserControl implements DurableObject {
         return Response.json(this.updateTask(id, body));
       }
 
+      if (request.method === "GET" && url.pathname.match(/^\/tasks\/[^/]+\/check$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const row = this.db.one("SELECT id FROM tasks WHERE id = ?", id);
+        if (!row) return Response.json({ error: "Task not found" }, { status: 404 });
+        return Response.json({ found: true });
+      }
+
       if (request.method === "DELETE" && url.pathname.startsWith("/tasks/")) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        const row = this.db.one("SELECT id FROM tasks WHERE id = ?", id);
+        if (!row) return Response.json({ error: `Task '${id}' not found. Run list tasks to see available tasks.` }, { status: 404 });
         this.db.exec("DELETE FROM tasks WHERE id = ?", id);
         return Response.json({ deleted: true, id });
       }
@@ -410,9 +445,15 @@ export class UserControl implements DurableObject {
         owner_email TEXT NOT NULL,
         created_by TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        deleted_at INTEGER
       )
     `);
+
+    // Add deleted_at column if missing (migration for existing DBs)
+    try {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN deleted_at INTEGER");
+    } catch { /* column already exists */ }
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS memory_entries (
@@ -579,7 +620,10 @@ export class UserControl implements DurableObject {
   }
 
   private listSessions(): SessionIndexRecord[] {
-    return this.db.all("SELECT id, title, status, owner_email, created_by, created_at, updated_at FROM sessions ORDER BY updated_at DESC")
+    // Purge expired soft-deleted sessions
+    this.db.exec("DELETE FROM sessions WHERE status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at < ?", nowEpoch());
+    // Exclude soft-deleted sessions from listing
+    return this.db.all("SELECT id, title, status, owner_email, created_by, created_at, updated_at FROM sessions WHERE status != 'deleted' ORDER BY updated_at DESC")
       .map((row) => this.mapSessionRow(row));
   }
 
@@ -590,13 +634,14 @@ export class UserControl implements DurableObject {
   }
 
   private mapSessionRow(row: SqlRow): SessionIndexRecord {
+    const rawTitle = row.title === null ? null : String(row.title);
     return {
       createdAt: epochToIso(row.created_at),
       id: String(row.id),
       ownerEmail: String(row.owner_email),
       createdBy: String(row.created_by),
       status: String(row.status),
-      title: row.title === null ? null : String(row.title),
+      title: rawTitle,
       updatedAt: epochToIso(row.updated_at),
     };
   }

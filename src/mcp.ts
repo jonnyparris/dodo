@@ -47,7 +47,11 @@ function textResult(data: unknown): { content: Array<{ type: "text"; text: strin
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
 
-async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: string, opts?: { sessionId?: string; init?: RequestInit }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+function errorResult(data: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
+  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }], isError: true };
+}
+
+async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: string, opts?: { sessionId?: string; init?: RequestInit }): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: true }> {
   let res: Response;
   if (fetcher === "user") {
     res = await userControlFetch(env, path, opts?.init);
@@ -57,6 +61,9 @@ async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: s
     res = await agentFetch(env, opts?.sessionId ?? "", path, opts?.init);
   }
   const data = await res.json();
+  if (!res.ok) {
+    return errorResult(data);
+  }
   return textResult(data);
 }
 
@@ -72,25 +79,52 @@ export function createDodoMcpServer(env: Env): McpServer {
   server.tool("create_session", "Create a new Dodo coding session", {}, async () => {
     const sessionId = crypto.randomUUID();
     const email = mcpUserEmail(env);
-    await userControlFetch(env, "/sessions", {
+    const res = await userControlFetch(env, "/sessions", {
       body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }),
       headers: { "content-type": "application/json" },
       method: "POST",
     });
-    return textResult({ id: sessionId });
+    const session = await res.json();
+    return textResult(session);
   });
 
-  server.tool("get_session", "Get the state of a Dodo session", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) =>
-    jsonFetch(env, "agent", "/", { sessionId }),
-  );
+  server.tool("get_session", "Get the state of a Dodo session", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
+    // Verify the session exists in UserControl before querying the agent
+    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`);
+    if (!checkRes.ok) {
+      return errorResult({ error: `Session '${sessionId}' not found. Run list_sessions to see available sessions.` });
+    }
+    return jsonFetch(env, "agent", "/", { sessionId });
+  });
 
-  server.tool("delete_session", "Delete a Dodo session and its storage", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
+  server.tool("delete_session", "Delete a Dodo session and its storage. The session can be restored within 5 minutes using restore_session.", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
+    // Verify the session exists before deleting
+    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`);
+    if (!checkRes.ok) {
+      return errorResult({ error: `Session '${sessionId}' not found. Run list_sessions to see available sessions.` });
+    }
     const result = await agentFetch(env, sessionId, "/", { method: "DELETE" });
-    await userControlFetch(env, `/sessions/${sessionId}`, { method: "DELETE" });
-    return textResult(await result.json());
+    // Soft-delete in UserControl (marks as deleted, auto-purges after 5 minutes)
+    await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/soft-delete`, { method: "POST" });
+    const data = await result.json();
+    return textResult({ ...data as object, sessionId, recoverable: true, recoverableUntil: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
+  });
+
+  server.tool("restore_session", "Restore a recently deleted session (within 5 minutes of deletion)", { sessionId: z.string().describe("Session ID to restore") }, async ({ sessionId }) => {
+    const res = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/restore`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) {
+      return errorResult(data);
+    }
+    return textResult(data);
   });
 
   server.tool("fork_session", "Fork a session (copy files + messages into a new session)", { sessionId: z.string().describe("Source session ID") }, async ({ sessionId }) => {
+    // Verify the source session exists
+    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`);
+    if (!checkRes.ok) {
+      return errorResult({ error: `Source session '${sessionId}' not found. Run list_sessions to see available sessions.` });
+    }
     const snapshotRes = await agentFetch(env, sessionId, "/snapshot");
     const snapshot = await snapshotRes.text();
     const storeRes = await userControlFetch(env, "/fork-snapshots", { body: snapshot, headers: { "content-type": "application/json" }, method: "POST" });
@@ -100,7 +134,7 @@ export function createDodoMcpServer(env: Env): McpServer {
     await userControlFetch(env, "/sessions", { body: JSON.stringify({ id: newId, ownerEmail: email, createdBy: email }), headers: { "content-type": "application/json" }, method: "POST" });
     await agentFetch(env, newId, `/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`, { method: "POST" });
     await userControlFetch(env, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
-    return textResult({ id: newId, sourceId: sessionId });
+    return textResult({ sessionId: newId, sourceSessionId: sessionId, forkedAt: new Date().toISOString() });
   });
 
   // --- File tools ---
@@ -130,14 +164,14 @@ export function createDodoMcpServer(env: Env): McpServer {
     }),
   );
 
-  server.tool("search_files", "Search workspace files by glob pattern and content query", {
+  server.tool("search_files", "Search workspace files by glob pattern and optional content query", {
     sessionId: z.string().describe("Session ID"),
     pattern: z.string().describe("Glob pattern (e.g. **/*.ts)"),
-    query: z.string().describe("Content search query"),
+    query: z.string().optional().describe("Content search query (omit to match by filename only)"),
   }, async ({ sessionId, pattern, query }) =>
     jsonFetch(env, "agent", "/search", {
       sessionId,
-      init: { body: JSON.stringify({ pattern, query }), headers: { "content-type": "application/json" }, method: "POST" },
+      init: { body: JSON.stringify({ pattern, query: query ?? "" }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
 
@@ -155,7 +189,7 @@ export function createDodoMcpServer(env: Env): McpServer {
 
   // --- Chat tools ---
 
-  server.tool("send_message", "Send a synchronous message to the Dodo coding agent (waits for full response)", {
+  server.tool("send_message", "Send a synchronous message to the Dodo coding agent and wait for the full response", {
     sessionId: z.string().describe("Session ID"),
     content: z.string().describe("Message content"),
   }, async ({ sessionId, content }) =>
@@ -165,7 +199,7 @@ export function createDodoMcpServer(env: Env): McpServer {
     }),
   );
 
-  server.tool("send_prompt", "Dispatch an async prompt to Dodo (returns immediately, runs in background)", {
+  server.tool("send_prompt", "Send an async message to the Dodo coding agent (returns immediately, runs in background). Use get_prompts to check status.", {
     sessionId: z.string().describe("Session ID"),
     content: z.string().describe("Prompt content"),
   }, async ({ sessionId, content }) =>
@@ -343,9 +377,14 @@ export function createDodoMcpServer(env: Env): McpServer {
 
   server.tool("delete_task", "Delete a task from the backlog", {
     id: z.string().describe("Task ID"),
-  }, async ({ id }) =>
-    jsonFetch(env, "user", `/tasks/${encodeURIComponent(id)}`, { init: { method: "DELETE" } }),
-  );
+  }, async ({ id }) => {
+    // Verify the task exists before deleting
+    const checkRes = await userControlFetch(env, `/tasks/${encodeURIComponent(id)}/check`);
+    if (!checkRes.ok) {
+      return errorResult({ error: `Task '${id}' not found. Run list_tasks to see available tasks.` });
+    }
+    return jsonFetch(env, "user", `/tasks/${encodeURIComponent(id)}`, { init: { method: "DELETE" } });
+  });
 
   return server;
 }
