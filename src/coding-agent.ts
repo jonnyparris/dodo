@@ -1227,8 +1227,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     } catch (error) {
       this.writeMetadata("status", "idle");
       await this.syncSessionIndex({ status: "idle", title });
-      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
       const message = error instanceof Error ? error.message : "Unknown LLM failure";
+      this.emitEvent({ data: { message }, type: "error_message" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
       sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
       return Response.json({ error: message, sessionId }, { status: 502 });
     }
@@ -1338,6 +1339,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Prompt failed";
+      this.emitEvent({ data: { message }, type: "error_message" });
       await this.finishPrompt(promptId, { error: message, status: "failed" });
       sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
     } finally {
