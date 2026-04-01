@@ -29,6 +29,8 @@ export interface McpGatekeeper {
   connect(): Promise<void>;
   disconnect(): void;
   listTools(): Promise<McpToolInfo[]>;
+  /** Return tools from cache without async call. Null if not yet listed. */
+  getCachedTools(): McpToolInfo[] | null;
   callTool(name: string, args: unknown): Promise<McpToolResult>;
   testConnection(): Promise<{ ok: boolean; toolCount?: number; error?: string }>;
   isConnected(): boolean;
@@ -145,6 +147,10 @@ export class HttpMcpGatekeeper implements McpGatekeeper {
       const message = error instanceof Error ? error.message : "Connection failed";
       return { ok: false, error: message };
     }
+  }
+
+  getCachedTools(): McpToolInfo[] | null {
+    return this.cachedTools;
   }
 
   isConnected(): boolean {
