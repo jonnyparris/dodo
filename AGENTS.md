@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Autonomous coding agent repo for Dodo on Cloudflare Workers.
+Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sandboxed.
 
 ## Focus
 
@@ -29,7 +29,7 @@ Autonomous coding agent repo for Dodo on Cloudflare Workers.
 ## File Map
 
 - `src/index.ts` — Worker router (Hono), all HTTP routes, auth middleware, session fork, admin routes
-- `src/coding-agent.ts` — per-session agent DO (extends Think, chat via Think.chat(), fibers, workspace, git, cron, prompts, snapshots, SSE)
+- `src/coding-agent.ts` — per-session agent DO (extends Think, chat via Think.chat(), fibers, workspace, git, cron, prompts, snapshots, SSE). **Contains the system prompt.**
 - `src/think-adapter.ts` — Think integration boundary: re-exports, types (DodoConfig, MessageMetadata, SnapshotV2), adapter functions
 - `src/agentic.ts` — LLM provider construction (buildProvider), tool composition (buildToolsForThink), git tools
 - `src/user-control.ts` — per-user DO (config, sessions, memory, tasks, key envelope, encrypted secrets, fork snapshots)
@@ -77,3 +77,61 @@ Worker (Hono router + CF Access auth)
 5. Snapshot import handles both v1 and v2
 6. Git auth flows through Dodo's `resolveRemoteToken()`
 7. SSE/WS event protocol unchanged from client perspective
+
+---
+
+## System Prompt Design
+
+The system prompt lives in `src/coding-agent.ts` as `const SYSTEM_PROMPT`. It's a static string — not dynamically assembled from config or user preferences. The `CodingAgent` class returns it via `getSystemPrompt()`.
+
+### Design principles
+
+**Teach the tools, not the model.** The prompt documents what tools exist and when to use each one. It doesn't teach the model how to code — that's what the model already knows. The prompt bridges the gap between the model's general capabilities and Dodo's specific tool surface.
+
+**Match reality.** Every tool mentioned in the prompt must actually exist. Every constraint mentioned (30s timeout, 10-step limit, sandboxed network) must be accurate. The prompt is a contract with the model.
+
+**Concise over exhaustive.** A Sonnet-class model doesn't need 1500 lines of instruction. Cover identity, tool surface, key behaviors, safety rules, and limits. Trust the model for everything else.
+
+**No sycophancy instructions.** The model should be direct and technically accurate. No "Great question!" or "I'd be happy to help." Focus on the work.
+
+### Sections
+
+| Section | Purpose |
+|---------|---------|
+| Identity | "You are Dodo" — establishes the agent's name and platform |
+| Tone and style | Concise, markdown, no emojis, prefer edits over new files |
+| Doing tasks | Read-before-write, plan multi-step work, stay focused, delete dead code, security awareness |
+| Workspace tools | Documents read_file, write_file, search_files, replace_in_file |
+| Code execution | Documents codemode: sandboxed JS, fetch with auto-auth, 30s timeout |
+| Git | Documents all git tools, auto-auth for GitHub/GitLab |
+| Git safety | Stage specific files, clear commit messages, no force-push |
+| Working with errors | State what failed, fix it, move on |
+| Limits | 10-step cap, ephemeral workspace, no shell |
+
+### Changing the prompt
+
+When modifying the system prompt:
+
+1. Keep it factual. If you add a section about a tool, verify the tool exists in `buildToolsForThink()`.
+2. Test with real prompts. The prompt shapes every interaction — small wording changes can have outsized effects on behavior.
+3. Don't duplicate tool descriptions. The AI SDK sends tool schemas automatically. The prompt should explain *when* and *why* to use tools, not re-document their parameters.
+4. The max steps limit (10) is set in `getMaxSteps()` on the `CodingAgent` class. If you change it, update the prompt too.
+
+### Tool surface
+
+These tools are available to the agent at runtime (built in `src/agentic.ts`):
+
+**Workspace tools** (from `@cloudflare/think/tools/workspace`):
+- `read_file` — read file contents
+- `write_file` — create or overwrite a file
+- `search_files` — glob + content search
+- `replace_in_file` — find-and-replace within a file
+
+**Git tools** (built in `buildGitTools()`):
+- `git_clone`, `git_status`, `git_add`, `git_commit`, `git_push`, `git_pull`
+- `git_branch`, `git_checkout`, `git_diff`, `git_log`
+
+**Code execution** (from `@cloudflare/think/tools/execute`):
+- `codemode` — sandboxed JS execution with workspace filesystem and git access, gated outbound fetch
+
+All tools are registered as top-level tools. Codemode also has access to workspace and git tools internally as providers.

@@ -40,23 +40,89 @@ const cronCreateSchema = z.discriminatedUnion("type", [
   z.object({ description: z.string().min(1), prompt: z.string().min(1), type: z.literal("interval"), intervalSeconds: z.number().int().positive() }).strict(),
 ]);
 const replaceFileSchema = z.object({ replacement: z.string(), search: z.string().min(1) }).strict();
-const searchFilesSchema = z.object({ pattern: z.string().min(1), query: z.string().min(1) }).strict();
+const searchFilesSchema = z.object({ pattern: z.string().min(1), query: z.string().default("") }).strict();
 const writeFileSchema = z.object({ content: z.string(), mimeType: z.string().optional() }).strict();
 
+/**
+ * Sanitize workspace filesystem timestamps.
+ * Container filesystems can report epoch-zero or overflow timestamps that
+ * serialize to dates thousands of years in the future. Return null for those
+ * instead of corrupted ISO strings.
+ */
+function sanitizeTimestamp(epochSeconds: number): string | null {
+  if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) return null;
+  // Reject dates beyond year 2100 — almost certainly a filesystem bug
+  if (epochSeconds > 4_102_444_800) return null;
+  return new Date(epochSeconds * 1000).toISOString();
+}
+
 const SYSTEM_PROMPT = [
-  "You are Dodo, a Cloudflare Workers coding agent.",
-  "Be concise, direct, and implementation-focused.",
-  "Prefer concrete next actions over long explanations.",
+  "You are Dodo, an autonomous coding agent running on Cloudflare Workers.",
+  "You help users build, modify, and understand software projects inside a sandboxed workspace.",
+  "",
+  "## Tone and style",
+  "",
+  "Be concise and direct. Prefer concrete actions over long explanations.",
+  "Use GitHub-flavored markdown for formatting.",
+  "Only use emojis if the user explicitly requests them.",
+  "Never create files unless necessary to achieve the goal — prefer editing existing files.",
+  "",
+  "## Doing tasks",
+  "",
+  "When the user asks you to build or modify code:",
+  "",
+  "1. **Read before writing.** Always read a file before editing it. Understand existing code before suggesting changes.",
+  "2. **Plan multi-step work.** For non-trivial tasks, outline your approach before diving in. State what you'll do, then do it.",
+  "3. **Stay focused.** Only make changes that are directly requested or clearly necessary. Don't refactor surrounding code, add comments to unchanged lines, or introduce abstractions for one-time operations.",
+  "4. **Delete unused code.** If something is no longer needed, remove it completely. No commented-out code, no `_unused` renames.",
+  "5. **Be security-conscious.** Don't introduce command injection, XSS, SQL injection, or other common vulnerabilities. Never commit secrets or credentials.",
+  "",
+  "## Workspace tools",
+  "",
+  "You have workspace tools for file operations:",
+  "- **read_file** — read a file's contents",
+  "- **write_file** — create or overwrite a file",
+  "- **search_files** — search by glob pattern and content query",
+  "- **replace_in_file** — find and replace within a file",
+  "",
+  "Use these tools for all file operations. Prefer `replace_in_file` for targeted edits over rewriting entire files.",
+  "",
+  "## Code execution",
+  "",
+  "The **codemode** tool runs JavaScript in a sandboxed Worker with access to the workspace filesystem and git.",
+  "Use it for:",
+  "- Running build scripts, tests, or one-off computations",
+  "- Calling external APIs via fetch() (GitHub and GitLab have auth injected automatically)",
+  "- Complex file transformations that are easier to express in code",
+  "",
+  "The sandbox has a 30-second timeout and no access to the network except explicitly allowed hosts.",
   "",
   "## Git",
-  "You have git tools: git_clone, git_status, git_add, git_commit, git_push, git_pull,",
-  "git_branch, git_checkout, git_diff, git_log. Authentication for GitHub and GitLab is automatic.",
-  "Use these for cloning repos, making changes, and pushing commits.",
   "",
-  "## External APIs",
-  "You can use fetch() in codemode to call external APIs. Requests to GitHub",
-  "(api.github.com, raw.githubusercontent.com) and GitLab hosts have auth headers",
-  "injected automatically — you do NOT need a token.",
+  "You have git tools: git_clone, git_status, git_add, git_commit, git_push, git_pull,",
+  "git_branch, git_checkout, git_diff, git_log.",
+  "Authentication for GitHub and GitLab is automatic — you do NOT need tokens.",
+  "",
+  "### Git safety rules",
+  "",
+  "- Always run git_status before committing to understand what will be staged.",
+  "- Stage specific files rather than using '.' when possible, to avoid committing unintended changes.",
+  "- Write clear, concise commit messages that explain *why*, not just *what*.",
+  "- Never force-push unless the user explicitly asks.",
+  "- Check git_log to match the repository's commit message style.",
+  "",
+  "## Working with errors",
+  "",
+  "When something fails:",
+  "1. State what failed and why.",
+  "2. Fix it or suggest a fix.",
+  "3. Move on. Don't apologize repeatedly or over-explain.",
+  "",
+  "## Limits",
+  "",
+  "- You have a maximum of 10 tool-call steps per prompt. Plan efficiently.",
+  "- The workspace is ephemeral per session. Clone repos if you need their contents.",
+  "- You cannot install system packages or run shell commands directly — use codemode for computation.",
 ].join("\n");
 
 /** Build a LanguageModel from DodoConfig (Think per-session config). */
@@ -549,7 +615,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         }
 
         await this.readAppConfig(); // Ensure Think config is populated
-        const title = this.readMetadata("title") ?? content.slice(0, 72);
+        const title = this.readMetadata("title") ?? (content.length > 72 ? content.slice(0, 72) + "…" : content);
 
         this.writeMetadata("title", title);
         this.writeMetadata("active_prompt_id", promptId);
@@ -799,7 +865,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private async handleGitAdd(request: Request): Promise<Response> {
     const body = z.object({ dir: z.string().optional(), filepath: z.string().min(1) }).strict().parse(await request.json());
     const git = createWorkspaceGit(this.workspace);
-    return Response.json(await git.add({ dir: body.dir ? normalizePath(body.dir) : undefined, filepath: body.filepath }));
+    try {
+      return Response.json(await git.add({ dir: body.dir ? normalizePath(body.dir) : undefined, filepath: body.filepath }));
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError") || msg.includes("Could not find .git")) {
+        return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
   }
 
   private async handleGitCommit(request: Request): Promise<Response> {
@@ -809,29 +883,70 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       this.writeMetadata("owner_email", ownerEmail);
     }
     const git = createWorkspaceGit(this.workspace);
-    const config = await this.readAppConfig();
-    return Response.json(
-      await git.commit({ author: defaultAuthor(config), dir: body.dir ? normalizePath(body.dir) : undefined, message: body.message }),
-    );
+    try {
+      const config = await this.readAppConfig();
+      const result = await git.commit({ author: defaultAuthor(config), dir: body.dir ? normalizePath(body.dir) : undefined, message: body.message });
+      return Response.json(result);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      // Translate common git errors into actionable messages
+      if (msg.includes("startsWith") || msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        // Check if git is initialized
+        try {
+          await git.log({ depth: 1, dir: body.dir ? normalizePath(body.dir) : undefined });
+        } catch {
+          return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+        }
+        return Response.json({ error: "Nothing to commit. Stage files with git_add before committing." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
   }
 
   private async handleGitStatus(url: URL): Promise<Response> {
     const git = createWorkspaceGit(this.workspace);
     const dir = url.searchParams.get("dir");
-    return Response.json({ entries: await git.status({ dir: dir ? normalizePath(dir) : undefined }) });
+    try {
+      const entries = await git.status({ dir: dir ? normalizePath(dir) : undefined });
+      return Response.json({ entries });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
   }
 
   private async handleGitLog(url: URL): Promise<Response> {
     const git = createWorkspaceGit(this.workspace);
     const dir = url.searchParams.get("dir");
     const depth = url.searchParams.get("depth");
-    return Response.json({ entries: await git.log({ depth: depth ? Number(depth) : undefined, dir: dir ? normalizePath(dir) : undefined }) });
+    try {
+      const entries = await git.log({ depth: depth ? Number(depth) : undefined, dir: dir ? normalizePath(dir) : undefined });
+      return Response.json({ entries });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        return Response.json({ error: "No git history found. Run git_init to create a repository, or git_clone to clone an existing one." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
   }
 
   private async handleGitDiff(url: URL): Promise<Response> {
     const git = createWorkspaceGit(this.workspace);
     const dir = url.searchParams.get("dir");
-    return Response.json({ entries: await git.diff({ dir: dir ? normalizePath(dir) : undefined }) });
+    try {
+      const entries = await git.diff({ dir: dir ? normalizePath(dir) : undefined });
+      return Response.json({ entries });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
   }
 
   private async handleGitBranch(request: Request): Promise<Response> {
@@ -863,8 +978,19 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const git = createWorkspaceGit(this.workspace);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
-    const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote, ownerEmail });
-    return Response.json(await git.push({ dir, force: body.force, ref: body.ref, remote: body.remote, token }));
+    try {
+      const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote, ownerEmail });
+      return Response.json(await git.push({ dir, force: body.force, ref: body.ref, remote: body.remote, token }));
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+      }
+      if (msg.includes("remote") || msg.includes("getRemoteInfo")) {
+        return Response.json({ error: "No remote configured. Run git_clone to work with a remote repository, or add a remote with git_remote." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
   }
 
   private async handleGitRemote(request: Request): Promise<Response> {
@@ -1076,7 +1202,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const ownerEmail = request.headers.get("x-owner-email");
     this.ensureMetadata(sessionId, ownerEmail);
 
-    const title = this.readMetadata("title") ?? input.content.slice(0, 72);
+    const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
     this.writeMetadata("title", title);
     this.writeMetadata("status", "running");
     await this.syncSessionIndex({ status: "running", title });
@@ -1122,7 +1248,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.ensureThinkConfig(request);
 
     const promptId = crypto.randomUUID();
-    const title = this.readMetadata("title") ?? input.content.slice(0, 72);
+    const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
 
     this.writeMetadata("title", title);
     this.writeMetadata("active_prompt_id", promptId);
@@ -1589,13 +1715,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     updatedAt: number;
   }): WorkspaceEntry {
     return {
-      createdAt: epochToIso(entry.createdAt),
+      createdAt: sanitizeTimestamp(entry.createdAt),
       mimeType: entry.mimeType,
       name: entry.name,
       path: entry.path,
       size: entry.size,
       type: entry.type,
-      updatedAt: epochToIso(entry.updatedAt),
+      updatedAt: sanitizeTimestamp(entry.updatedAt),
     };
   }
 
