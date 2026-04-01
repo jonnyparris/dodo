@@ -2,7 +2,7 @@ import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
 import type { LanguageModel, ToolSet } from "ai";
 import { z } from "zod";
-import { runAgenticChat, streamAgenticChat } from "./agentic";
+import { buildProvider, buildToolsForThink, runAgenticChat, streamAgenticChat } from "./agentic";
 import { getUserControlStub } from "./auth";
 import { sendNotification } from "./notify";
 import { runSandboxedCode } from "./executor";
@@ -10,7 +10,17 @@ import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
 import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc-transport";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
-import { Think, type DodoConfig } from "./think-adapter";
+import {
+  Think,
+  type DodoConfig,
+  type MessageMetadata,
+  type StreamCallback,
+  type UIMessage,
+  USE_THINK_CHAT_KEY,
+  uiMessageToChatRecord,
+  chatRecordToUIMessage,
+} from "./think-adapter";
+import type { SnapshotV2 } from "./think-adapter";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
 
 const sendMessageSchema = z.object({ content: z.string().trim().min(1) }).strict();
@@ -46,6 +56,19 @@ const SYSTEM_PROMPT = [
   "(api.github.com, raw.githubusercontent.com) and GitLab hosts have auth headers",
   "injected automatically — you do NOT need a token.",
 ].join("\n");
+
+/** Build a LanguageModel from DodoConfig (Think per-session config). */
+function buildProviderFromConfig(config: DodoConfig, env: Env): LanguageModel {
+  const appConfig: AppConfig = {
+    activeGateway: config.activeGateway,
+    aiGatewayBaseURL: config.aiGatewayBaseURL,
+    gitAuthorEmail: env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
+    gitAuthorName: env.GIT_AUTHOR_NAME ?? "Dodo",
+    model: config.model,
+    opencodeBaseURL: config.opencodeBaseURL,
+  };
+  return buildProvider(appConfig, env).chatModel(config.model);
+}
 
 function normalizePath(path: string): string {
   const trimmed = path.trim();
@@ -108,8 +131,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   // ─── Think overrides ───
 
   override getModel(): LanguageModel {
-    // Temporary: throw — we don't use Think's chat loop yet (Wave 3+4)
-    throw new Error("getModel() called before Think chat is enabled");
+    const config = this.getConfig();
+    if (!config) {
+      throw new Error("getModel(): no Think config — session not configured yet");
+    }
+    return buildProviderFromConfig(config, this.env);
   }
 
   override getSystemPrompt(): string {
@@ -117,8 +143,34 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   override getTools(): ToolSet {
-    // Empty until Wave 2 — old tools still wired through agentic.ts
-    return {};
+    const appConfig = this.getAppConfigFromThink();
+    return buildToolsForThink(this.env, this.workspace, appConfig, {
+      ownerEmail: this.readMetadata("owner_email") ?? undefined,
+      stateBackend: this.stateBackend,
+    });
+  }
+
+  /** Build an AppConfig from Think's per-session config, falling back to env defaults. */
+  private getAppConfigFromThink(): AppConfig {
+    const config = this.getConfig();
+    if (config) {
+      return {
+        activeGateway: config.activeGateway,
+        aiGatewayBaseURL: config.aiGatewayBaseURL,
+        gitAuthorEmail: this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
+        gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
+        model: config.model,
+        opencodeBaseURL: config.opencodeBaseURL,
+      };
+    }
+    return {
+      activeGateway: "opencode",
+      aiGatewayBaseURL: this.env.AI_GATEWAY_BASE_URL,
+      gitAuthorEmail: this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
+      gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
+      model: this.env.DEFAULT_MODEL,
+      opencodeBaseURL: this.env.OPENCODE_BASE_URL,
+    };
   }
 
   override getMaxSteps(): number {
@@ -602,7 +654,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
-
+    // Sidecar metadata for Think messages — Dodo-specific fields
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS message_metadata (
+        message_id TEXT PRIMARY KEY,
+        author_email TEXT,
+        model TEXT,
+        provider TEXT,
+        token_input INTEGER NOT NULL DEFAULT 0,
+        token_output INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      )
+    `);
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS prompts (
@@ -879,7 +942,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     };
   }
 
-  private async exportSnapshot(): Promise<SessionSnapshot> {
+  private async exportSnapshot(): Promise<SessionSnapshot | SnapshotV2> {
     const paths = await this.workspace._getAllPaths();
     const files: Array<{ content: string; path: string }> = [];
 
@@ -894,6 +957,31 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
     }
 
+    if (this.isThinkChatEnabled()) {
+      // V2 snapshot: Think messages + sidecar metadata
+      const thinkSessionId = this.getCurrentSessionId();
+      const history = thinkSessionId ? this.sessions.getHistory(thinkSessionId) : [];
+      return {
+        version: 2,
+        title: this.readMetadata("title"),
+        files,
+        messages: history.map((msg) => {
+          const meta = this.readMessageMetadata(msg.id);
+          return {
+            uiMessage: msg,
+            metadata: {
+              authorEmail: meta?.authorEmail,
+              model: meta?.model,
+              provider: meta?.provider,
+              tokenInput: meta?.tokenInput ?? 0,
+              tokenOutput: meta?.tokenOutput ?? 0,
+            },
+          };
+        }),
+      } satisfies SnapshotV2;
+    }
+
+    // V1 snapshot: flat ChatMessageRecord[]
     return {
       files,
       messages: this.listMessages(),
@@ -918,6 +1006,37 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       snapshotInput = await request.json();
     }
 
+    const raw = snapshotInput as Record<string, unknown>;
+    const version = typeof raw.version === "number" ? raw.version : 1;
+
+    if (version === 2) {
+      // V2 import: UIMessages + sidecar metadata → Think session
+      const v2 = snapshotInput as SnapshotV2;
+      if (v2.title) this.writeMetadata("title", v2.title);
+      for (const file of v2.files) {
+        await this.workspace.writeFile(normalizePath(file.path), file.content);
+      }
+      const thinkSessionId = this.getCurrentSessionId();
+      if (thinkSessionId) {
+        for (const entry of v2.messages) {
+          this.sessions.append(thinkSessionId, entry.uiMessage);
+          this.insertMessageMetadata({
+            messageId: entry.uiMessage.id,
+            authorEmail: entry.metadata.authorEmail,
+            model: entry.metadata.model,
+            provider: entry.metadata.provider,
+            tokenInput: entry.metadata.tokenInput,
+            tokenOutput: entry.metadata.tokenOutput,
+          });
+        }
+        this.messages = this.sessions.getHistory(thinkSessionId);
+      }
+      // Enable Think chat for imported v2 sessions
+      this.writeMetadata(USE_THINK_CHAT_KEY, "true");
+      return Response.json({ imported: true, version: 2, messages: v2.messages.length, files: v2.files.length });
+    }
+
+    // V1 import: flat ChatMessageRecord[] → legacy tables + Think session
     const snapshot = z.object({ files: z.array(z.object({ content: z.string(), path: z.string().min(1) })), messages: z.array(z.object({ content: z.string(), createdAt: z.string(), id: z.string(), model: z.string().nullable(), provider: z.string().nullable(), role: z.enum(["assistant", "system", "tool", "user"]) })), title: z.string().nullable() }).parse(snapshotInput) as SessionSnapshot;
 
     if (snapshot.title) {
@@ -928,8 +1047,27 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       await this.workspace.writeFile(normalizePath(file.path), file.content);
     }
 
+    // Import into legacy messages table
     for (const message of snapshot.messages) {
       this.insertMessage({ content: message.content, model: message.model, provider: message.provider, role: message.role });
+    }
+
+    // Also import into Think session for forward compatibility
+    const thinkSessionId = this.getCurrentSessionId();
+    if (thinkSessionId) {
+      for (const message of snapshot.messages) {
+        const uiMsg = chatRecordToUIMessage(message);
+        this.sessions.append(thinkSessionId, uiMsg);
+        this.insertMessageMetadata({
+          messageId: uiMsg.id,
+          authorEmail: message.authorEmail,
+          model: message.model,
+          provider: message.provider,
+          tokenInput: message.tokenInput,
+          tokenOutput: message.tokenOutput,
+        });
+      }
+      this.messages = this.sessions.getHistory(thinkSessionId);
     }
 
     return Response.json({ imported: true, messages: snapshot.messages.length, files: snapshot.files.length });
@@ -947,6 +1085,36 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.writeMetadata("status", "running");
     await this.syncSessionIndex({ status: "running", title });
 
+    if (this.isThinkChatEnabled()) {
+      // Think-backed sync chat path
+      this.ensureThinkConfig(request);
+      try {
+        const result = await this.runThinkChat(input.content, { authorEmail: authorEmail ?? undefined });
+
+        const config = this.getConfig();
+        const assistantRecord = uiMessageToChatRecord(
+          { id: result.assistantMessageId, role: "assistant", parts: [{ type: "text", text: result.text }] },
+          { messageId: result.assistantMessageId, model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: result.tokenInput, tokenOutput: result.tokenOutput, authorEmail: null, createdAt: nowEpoch() },
+        );
+
+        this.writeMetadata("status", "idle");
+        await this.syncSessionIndex({ status: "idle", title });
+        this.emitEvent({ data: assistantRecord, type: "message" });
+        this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+        sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+
+        return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, sessionId, steps: 0, toolCalls: [] });
+      } catch (error) {
+        this.writeMetadata("status", "idle");
+        await this.syncSessionIndex({ status: "idle", title });
+        this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+        const message = error instanceof Error ? error.message : "Unknown LLM failure";
+        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+        return Response.json({ error: message, sessionId }, { status: 502 });
+      }
+    }
+
+    // Legacy chat path
     const userMessage = this.insertMessage({
       authorEmail,
       content: input.content,
@@ -1013,6 +1181,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return Response.json({ error: "A prompt is already running" }, { status: 409 });
     }
 
+    // Ensure Think config is set from request headers
+    if (this.isThinkChatEnabled()) {
+      this.ensureThinkConfig(request);
+    }
+
     const promptId = crypto.randomUUID();
     const llmConfig = this.readGatewayConfig(request);
     const title = this.readMetadata("title") ?? input.content.slice(0, 72);
@@ -1051,6 +1224,42 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.updatePrompt(promptId, { status: "running" });
     this.emitEvent({ data: this.listPrompts(), type: "prompt" });
 
+    if (this.isThinkChatEnabled()) {
+      // Think-backed async prompt path
+      try {
+        const result = await this.runThinkChat(content, {
+          authorEmail,
+          signal: controller.signal,
+        });
+
+        const config = this.getConfig();
+        const assistantRecord = uiMessageToChatRecord(
+          { id: result.assistantMessageId, role: "assistant", parts: [{ type: "text", text: result.text }] },
+          { messageId: result.assistantMessageId, model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: result.tokenInput, tokenOutput: result.tokenOutput, authorEmail: null, createdAt: nowEpoch() },
+        );
+
+        await this.finishPrompt(promptId, { resultMessageId: result.assistantMessageId, status: "completed" });
+        this.emitEvent({ data: assistantRecord, type: "message" });
+        sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
+          sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (aborted)`, body: "Prompt was cancelled", tags: "stop_sign,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+        } else {
+          const message = error instanceof Error ? error.message : "Prompt failed";
+          await this.finishPrompt(promptId, { error: message, status: "failed" });
+          sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+        }
+      } finally {
+        this.activePromptControllers.delete(promptId);
+        await this.syncSessionIndex({ status: "idle", title });
+        this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+        this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      }
+      return;
+    }
+
+    // Legacy async prompt path
     const userMessage = this.insertMessage({
       content,
       model: null,
@@ -1115,6 +1324,183 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.writeMetadata("status", "idle");
   }
 
+  // ─── Think chat integration ───
+
+  /** Check if Think-backed chat is enabled for this session. */
+  private isThinkChatEnabled(): boolean {
+    return this.readMetadata(USE_THINK_CHAT_KEY) === "true";
+  }
+
+  /**
+   * Configure the Think session from request headers (first-time setup).
+   * Copies the user's config into Think.configure() so getModel() can read it.
+   */
+  private ensureThinkConfig(request: Request): void {
+    if (this.getConfig()) return; // Already configured
+    const config: DodoConfig = {
+      sessionId: this.sessionId(),
+      ownerEmail: this.readMetadata("owner_email") ?? "",
+      createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
+      browserEnabled: this.readMetadata("browser_enabled") === "true",
+      activeGateway: (request.headers.get("x-dodo-gateway") === "ai-gateway" ? "ai-gateway" : "opencode"),
+      model: request.headers.get("x-dodo-model") ?? this.env.DEFAULT_MODEL,
+      opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? this.env.OPENCODE_BASE_URL,
+      aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? this.env.AI_GATEWAY_BASE_URL,
+    };
+    this.configure(config);
+  }
+
+  /** Insert a metadata record for a Think message. */
+  private insertMessageMetadata(input: {
+    messageId: string;
+    authorEmail?: string | null;
+    model?: string | null;
+    provider?: string | null;
+    tokenInput?: number;
+    tokenOutput?: number;
+  }): void {
+    this.db.exec(
+      "INSERT OR REPLACE INTO message_metadata (message_id, author_email, model, provider, token_input, token_output, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      input.messageId,
+      input.authorEmail ?? null,
+      input.model ?? null,
+      input.provider ?? null,
+      input.tokenInput ?? 0,
+      input.tokenOutput ?? 0,
+      nowEpoch(),
+    );
+  }
+
+  /** Read metadata for a Think message. */
+  private readMessageMetadata(messageId: string): MessageMetadata | null {
+    const row = this.db.one(
+      "SELECT message_id, author_email, model, provider, token_input, token_output, created_at FROM message_metadata WHERE message_id = ?",
+      messageId,
+    );
+    if (!row) return null;
+    return {
+      messageId: String(row.message_id),
+      authorEmail: row.author_email === null ? null : String(row.author_email),
+      model: row.model === null ? null : String(row.model),
+      provider: row.provider === null ? null : String(row.provider),
+      tokenInput: Number(row.token_input ?? 0),
+      tokenOutput: Number(row.token_output ?? 0),
+      createdAt: Number(row.created_at),
+    };
+  }
+
+  /**
+   * List messages from Think storage, joined with sidecar metadata.
+   * Returns ChatMessageRecord[] for backward compatibility.
+   */
+  private listThinkMessages(): ChatMessageRecord[] {
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) return [];
+    const history = this.sessions.getHistory(thinkSessionId);
+    return history.map((msg) => {
+      const meta = this.readMessageMetadata(msg.id);
+      return uiMessageToChatRecord(msg, meta ?? undefined);
+    });
+  }
+
+  /**
+   * Run a chat turn via Think.chat().
+   * Bridges Think streaming events to Dodo's SSE/WS event format.
+   * Returns the assistant message ID and token usage.
+   */
+  private async runThinkChat(
+    userContent: string,
+    options?: { authorEmail?: string; signal?: AbortSignal },
+  ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string }> {
+    // Insert user message metadata
+    const userMsgId = crypto.randomUUID();
+    const userMsg: UIMessage = {
+      id: userMsgId,
+      role: "user",
+      parts: [{ type: "text", text: userContent }],
+    };
+
+    this.insertMessageMetadata({
+      messageId: userMsgId,
+      authorEmail: options?.authorEmail,
+    });
+
+    // Emit user message event in Dodo format
+    const userRecord = uiMessageToChatRecord(userMsg, {
+      messageId: userMsgId,
+      authorEmail: options?.authorEmail ?? null,
+      model: null,
+      provider: null,
+      tokenInput: 0,
+      tokenOutput: 0,
+      createdAt: nowEpoch(),
+    });
+    this.emitEvent({ data: userRecord, type: "message" });
+
+    // Track assistant response metadata
+    let assistantMessageId = "";
+    let tokenInput = 0;
+    let tokenOutput = 0;
+    let fullText = "";
+
+    const callback: StreamCallback = {
+      onEvent: (json: string) => {
+        try {
+          const chunk = JSON.parse(json);
+          // Bridge Think chunk events to Dodo SSE format
+          if (chunk.type === "text-delta") {
+            const delta = chunk.textDelta ?? "";
+            fullText += delta;
+            this.emitEvent({ data: { delta }, type: "text_delta" });
+          } else if (chunk.type === "tool-call") {
+            this.emitEvent({
+              data: { code: chunk.args ?? "", result: chunk.toolCallId },
+              type: "tool_call",
+            });
+          }
+        } catch {
+          // Skip unparseable chunks
+        }
+      },
+      onDone: () => {
+        // After chat completes, find the latest assistant message
+        const history = this.getHistory();
+        const lastAssistant = [...history].reverse().find((m) => m.role === "assistant");
+        if (lastAssistant) {
+          assistantMessageId = lastAssistant.id;
+          // Extract text from parts
+          fullText = lastAssistant.parts
+            .filter((p): p is { type: "text"; text: string } => p.type === "text")
+            .map((p) => p.text)
+            .join("");
+        }
+      },
+      onError: (error: string) => {
+        console.error("Think chat error:", error);
+      },
+    };
+
+    await this.chat(userMsg, callback, { signal: options?.signal });
+
+    // Get config for provider info
+    const config = this.getConfig();
+    const model = config?.model ?? this.env.DEFAULT_MODEL;
+    const gateway = config?.activeGateway ?? "opencode";
+
+    // Insert assistant message metadata
+    if (assistantMessageId) {
+      this.insertMessageMetadata({
+        messageId: assistantMessageId,
+        model,
+        provider: gateway,
+        tokenInput,
+        tokenOutput,
+      });
+    }
+
+    return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
+  }
+
   private readGatewayConfig(request: Request): AppConfig {
     const activeGateway = request.headers.get("x-dodo-gateway") === "ai-gateway" ? "ai-gateway" : "opencode";
     return {
@@ -1132,6 +1518,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (!this.readMetadata("session_id")) {
       this.writeMetadata("session_id", sessionId);
       this.writeMetadata("created_at", new Date(now * 1000).toISOString());
+      // Enable Think chat for all new sessions
+      this.writeMetadata(USE_THINK_CHAT_KEY, "true");
     }
     if (ownerEmail && !this.readMetadata("owner_email")) {
       this.writeMetadata("owner_email", ownerEmail);
@@ -1156,7 +1544,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // Fire-and-forget sync to UserControl
       void this.syncSessionIndex({ status: "idle" }).catch(() => {});
     }
-    const totals = this.db.one("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM messages");
+    // Get token totals from the appropriate source
+    let totalTokenInput = 0;
+    let totalTokenOutput = 0;
+    if (this.isThinkChatEnabled()) {
+      const metaTotals = this.db.one("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM message_metadata");
+      totalTokenInput = Number(metaTotals?.total_in ?? 0);
+      totalTokenOutput = Number(metaTotals?.total_out ?? 0);
+    } else {
+      const totals = this.db.one("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM messages");
+      totalTokenInput = Number(totals?.total_in ?? 0);
+      totalTokenOutput = Number(totals?.total_out ?? 0);
+    }
     return {
       activePromptId,
       activeStreamCount: this.clients.size,
@@ -1165,8 +1564,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       ownerEmail,
       sessionId,
       status,
-      totalTokenInput: Number(totals?.total_in ?? 0),
-      totalTokenOutput: Number(totals?.total_out ?? 0),
+      totalTokenInput,
+      totalTokenOutput,
       updatedAt,
     };
   }
@@ -1216,6 +1615,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private listMessages(): ChatMessageRecord[] {
+    if (this.isThinkChatEnabled()) {
+      return this.listThinkMessages();
+    }
     return this.db.all(
       "SELECT id, role, content, model, provider, author_email, created_at, token_input, token_output FROM messages ORDER BY created_at ASC, rowid ASC",
     ).map((row) => this.mapMessageRow(row));
@@ -1230,6 +1632,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private messageCount(): number {
+    if (this.isThinkChatEnabled()) {
+      const thinkSessionId = this.getCurrentSessionId();
+      if (!thinkSessionId) return 0;
+      return this.sessions.getMessageCount(thinkSessionId);
+    }
     return Number(this.db.one("SELECT COUNT(*) AS count FROM messages")?.count ?? 0);
   }
 
@@ -1458,7 +1865,24 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
     const stub = getUserControlStub(this.env, ownerEmail);
     const response = await stub.fetch("https://user-control/config");
-    return (await response.json()) as AppConfig;
+    const appConfig = (await response.json()) as AppConfig;
+
+    // Ensure Think config is populated for Think chat path
+    if (this.isThinkChatEnabled() && !this.getConfig()) {
+      const dodoConfig: DodoConfig = {
+        sessionId: this.sessionId(),
+        ownerEmail,
+        createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
+        browserEnabled: this.readMetadata("browser_enabled") === "true",
+        activeGateway: appConfig.activeGateway,
+        model: appConfig.model,
+        opencodeBaseURL: appConfig.opencodeBaseURL,
+        aiGatewayBaseURL: appConfig.aiGatewayBaseURL,
+      };
+      this.configure(dodoConfig);
+    }
+
+    return appConfig;
   }
 
   private async syncSessionIndex(patch: { status?: string; title?: string | null }): Promise<void> {
@@ -1481,9 +1905,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async destroyStorage(): Promise<void> {
     this.db.exec("DELETE FROM messages");
+    this.db.exec("DELETE FROM message_metadata");
     this.db.exec("DELETE FROM prompts");
     this.db.exec("DELETE FROM cron_jobs");
     this.db.exec("DELETE FROM metadata");
+    // Clean up Think sessions
+    const thinkSessionId = this.getCurrentSessionId();
+    if (thinkSessionId) {
+      this.sessions.delete(thinkSessionId);
+    }
 
     try {
       await this.workspace.rm("/", { force: true, recursive: true });

@@ -23,7 +23,7 @@ function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
 
-function buildProvider(config: AppConfig, env: Env) {
+export function buildProvider(config: AppConfig, env: Env) {
   const isOpencode = config.activeGateway === "opencode";
   const baseURL = isOpencode
     ? `${trimBaseUrl(config.opencodeBaseURL)}`
@@ -202,6 +202,19 @@ function buildTools(
   Object.assign(tools, gitTools);
 
   return tools;
+}
+
+/**
+ * Build the tool set for Think's getTools() override.
+ * Same as buildTools but exported and with explicit stateBackend option.
+ */
+export function buildToolsForThink(
+  env: Env,
+  workspace: Workspace,
+  config: AppConfig,
+  options?: { authorEmail?: string; ownerEmail?: string; stateBackend?: StateBackend },
+): Record<string, AnyTool> {
+  return buildTools(env, workspace, config, options);
 }
 
 /**
