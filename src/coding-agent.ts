@@ -971,6 +971,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           this.emitEvent({ data: { code: tc.code, result: tc.result }, type: "tool_call" });
         },
         ownerEmail: this.readMetadata("owner_email") ?? undefined,
+        stateBackend: this.stateBackend,
         systemPrompt: SYSTEM_PROMPT,
         workspace: this.workspace,
       });
@@ -1067,6 +1068,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         messages: history,
         ownerEmail: this.readMetadata("owner_email") ?? undefined,
         signal: controller.signal,
+        stateBackend: this.stateBackend,
         systemPrompt: SYSTEM_PROMPT,
         workspace: this.workspace,
       });
