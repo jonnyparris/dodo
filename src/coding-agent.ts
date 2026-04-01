@@ -9,7 +9,7 @@ import { runSandboxedCode } from "./executor";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
 import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc-transport";
-import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
+import { epochToIso, nowEpoch, SqlHelper } from "./sql-helpers";
 import {
   Think,
   type DodoConfig,
@@ -110,7 +110,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /** Enable durable fiber recovery for async prompts. */
   override fibers = true;
 
-  private readonly activePromptControllers = new Map<string, AbortController>();
   private readonly clients = new Set<WritableStreamDefaultWriter<Uint8Array>>();
   private readonly db: SqlHelper;
   private readonly presence = new PresenceTracker();
@@ -501,6 +500,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return;
     }
 
+    // Enforce permission: readonly clients cannot perform write actions
+    const writeActions = new Set(["prompt", "message", "abort", "cron-create", "cron-delete", "approval-approve", "approval-reject"]);
+    if (writeActions.has(parsed.type)) {
+      const permission = this.getConnectionPermission(connection);
+      if (permission === "readonly") {
+        return; // silently drop — readonly clients cannot perform write actions
+      }
+    }
+
     switch (parsed.type) {
       case "ping":
         connection.send(JSON.stringify({ type: "pong" }));
@@ -572,17 +580,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const fiberId = this.readPromptFiberId(promptId);
         if (fiberId) {
           this.cancelFiber(fiberId);
-          await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
-          connection.send(JSON.stringify({ type: "aborted", promptId }));
-          break;
         }
-        // Fallback for legacy in-memory prompts
-        const controller = this.activePromptControllers.get(promptId);
-        if (controller) {
-          controller.abort();
-        } else {
-          await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
-        }
+        await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
         connection.send(JSON.stringify({ type: "aborted", promptId }));
         break;
       }
@@ -634,6 +633,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
   }
 
+  /** Get the permission level for a WebSocket connection. */
+  private getConnectionPermission(connection: Connection): string {
+    const entry = this.presence.get(connection.id);
+    return entry?.permission ?? "readonly";
+  }
+
   /** Broadcast current presence list to all WebSocket clients. */
   private broadcastPresence(): void {
     const payload = JSON.stringify({
@@ -643,32 +648,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.broadcastToWebSockets(payload);
   }
 
-  /** Get current presence entries (used by RPC API). */
-  getPresenceEntries() {
-    return this.presence.getAll();
-  }
-
   private initializeSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
-      )
-    `);
-
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT,
-        model TEXT,
-        provider TEXT,
-        author_email TEXT,
-        created_at INTEGER NOT NULL,
-        token_input INTEGER NOT NULL DEFAULT 0,
-        token_output INTEGER NOT NULL DEFAULT 0
       )
     `);
 
@@ -720,8 +705,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         resolved_by TEXT
       )
     `);
-
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)");
 
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
   }
@@ -1054,7 +1037,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return Response.json({ imported: true, version: 2, messages: v2.messages.length, files: v2.files.length });
     }
 
-    // V1 import: flat ChatMessageRecord[] → legacy tables + Think session
+    // V1 import: flat ChatMessageRecord[] → Think session
     const snapshot = z.object({ files: z.array(z.object({ content: z.string(), path: z.string().min(1) })), messages: z.array(z.object({ content: z.string(), createdAt: z.string(), id: z.string(), model: z.string().nullable(), provider: z.string().nullable(), role: z.enum(["assistant", "system", "tool", "user"]) })), title: z.string().nullable() }).parse(snapshotInput) as SessionSnapshot;
 
     if (snapshot.title) {
@@ -1065,12 +1048,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       await this.workspace.writeFile(normalizePath(file.path), file.content);
     }
 
-    // Import into legacy messages table
-    for (const message of snapshot.messages) {
-      this.insertMessage({ content: message.content, model: message.model, provider: message.provider, role: message.role });
-    }
-
-    // Also import into Think session for forward compatibility
+    // Import into Think session
     const thinkSessionId = this.getCurrentSessionId();
     if (thinkSessionId) {
       for (const message of snapshot.messages) {
@@ -1176,17 +1154,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const fiberId = this.readPromptFiberId(promptId);
     if (fiberId) {
       this.cancelFiber(fiberId);
-      await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
-      return Response.json({ aborted: true, promptId });
     }
-
-    // Fallback for legacy in-memory prompts
-    const controller = this.activePromptControllers.get(promptId);
-    if (controller) {
-      controller.abort();
-    } else {
-      await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
-    }
+    await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
 
     return Response.json({ aborted: true, promptId });
   }
@@ -1457,6 +1426,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               type: "tool_call",
             });
           }
+          if (chunk.type === "step-finish" && chunk.usage) {
+            tokenInput += chunk.usage.promptTokens ?? 0;
+            tokenOutput += chunk.usage.completionTokens ?? 0;
+          }
         } catch {
           // Skip unparseable chunks
         }
@@ -1500,18 +1473,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
   }
 
-  private readGatewayConfig(request: Request): AppConfig {
-    const activeGateway = request.headers.get("x-dodo-gateway") === "ai-gateway" ? "ai-gateway" : "opencode";
-    return {
-      activeGateway,
-      aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? this.env.AI_GATEWAY_BASE_URL,
-      gitAuthorEmail: this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
-      gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
-      model: request.headers.get("x-dodo-model") ?? this.env.DEFAULT_MODEL,
-      opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? this.env.OPENCODE_BASE_URL,
-    };
-  }
-
   private ensureMetadata(sessionId: string, ownerEmail?: string | null): void {
     const now = nowEpoch();
     if (!this.readMetadata("session_id")) {
@@ -1536,7 +1497,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const activePromptId = this.readMetadata("active_prompt_id");
     let status = (this.readMetadata("status") as SessionState["status"] | null) ?? "idle";
     // Reconcile stale "running" status when no prompt is active
-    if (status === "running" && !activePromptId && !this.activePromptControllers.size) {
+    if (status === "running" && !activePromptId) {
       this.writeMetadata("status", "idle");
       status = "idle";
       // Fire-and-forget sync to UserControl
@@ -1560,50 +1521,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     };
   }
 
-  private insertMessage(input: {
-    authorEmail?: string | null;
-    content: string;
-    model: string | null;
-    provider: string | null;
-    role: ChatMessageRecord["role"];
-    tokenInput?: number;
-    tokenOutput?: number;
-  }): ChatMessageRecord {
-    const sessionId = this.sessionId();
-    const messageId = crypto.randomUUID();
-    const createdAtEpoch = nowEpoch();
-    const createdAt = new Date(createdAtEpoch * 1000).toISOString();
-
-    this.db.exec(
-      "INSERT INTO messages (id, session_id, role, content, model, provider, author_email, created_at, token_input, token_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      messageId,
-      sessionId,
-      input.role,
-      input.content,
-      input.model,
-      input.provider,
-      input.authorEmail ?? null,
-      createdAtEpoch,
-      input.tokenInput ?? 0,
-      input.tokenOutput ?? 0,
-    );
-
-    this.writeMetadata("updated_at", createdAt);
-    this.setState({ ...this.readSessionDetails() });
-
-    return {
-      authorEmail: input.authorEmail ?? null,
-      content: input.content,
-      createdAt,
-      id: messageId,
-      model: input.model,
-      provider: input.provider,
-      role: input.role,
-      tokenInput: input.tokenInput ?? 0,
-      tokenOutput: input.tokenOutput ?? 0,
-    };
-  }
-
   private listMessages(): ChatMessageRecord[] {
     return this.listThinkMessages();
   }
@@ -1612,20 +1529,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const thinkSessionId = this.getCurrentSessionId();
     if (!thinkSessionId) return 0;
     return this.sessions.getMessageCount(thinkSessionId);
-  }
-
-  private mapMessageRow(row: SqlRow): ChatMessageRecord {
-    return {
-      authorEmail: row.author_email === null || row.author_email === undefined ? null : String(row.author_email),
-      content: String(row.content ?? ""),
-      createdAt: epochToIso(row.created_at),
-      id: String(row.id),
-      model: row.model === null ? null : String(row.model),
-      provider: row.provider === null ? null : String(row.provider),
-      role: row.role as ChatMessageRecord["role"],
-      tokenInput: Number(row.token_input ?? 0),
-      tokenOutput: Number(row.token_output ?? 0),
-    };
   }
 
   private insertPrompt(promptId: string, content: string, status: PromptRecord["status"], authorEmail?: string | null): void {
@@ -1697,20 +1600,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   // ─── Approval Queue ───
-
-  /** Submit a tool call for approval (used by the agentic loop in the future). */
-  submitApproval(toolName: string, toolArgs: unknown): string {
-    const id = crypto.randomUUID();
-    this.db.exec(
-      "INSERT INTO approval_queue (id, tool_name, tool_args, status, requested_at) VALUES (?, ?, ?, 'pending', ?)",
-      id,
-      toolName,
-      JSON.stringify(toolArgs),
-      nowEpoch(),
-    );
-    this.emitEvent({ data: { id, toolName, status: "pending" }, type: "approval" });
-    return id;
-  }
 
   private listApprovals(statusFilter?: string): Array<{
     id: string;
@@ -1878,7 +1767,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private async destroyStorage(): Promise<void> {
-    this.db.exec("DELETE FROM messages");
     this.db.exec("DELETE FROM message_metadata");
     this.db.exec("DELETE FROM prompts");
     this.db.exec("DELETE FROM cron_jobs");
