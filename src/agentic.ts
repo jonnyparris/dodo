@@ -1,11 +1,10 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { DynamicWorkerExecutor } from "@cloudflare/codemode";
-import { createCodeTool } from "@cloudflare/codemode/ai";
-import { stateTools } from "@cloudflare/shell/workers";
+import type { StateBackend } from "@cloudflare/shell";
 import { generateText, streamText, stepCountIs, tool, zodSchema, type ModelMessage } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
+import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env } from "./types";
 
 const MAX_TOOL_STEPS = 10;
@@ -176,32 +175,31 @@ function buildTools(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; ownerEmail?: string },
+  options?: { authorEmail?: string; ownerEmail?: string; stateBackend?: StateBackend },
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
+  const workspaceTools = createWorkspaceTools(workspace);
+  const gitTools = buildGitTools(env, workspace, config, options?.ownerEmail);
+
   if (env.LOADER) {
-    const executor = new DynamicWorkerExecutor({
-      globalOutbound: env.OUTBOUND ?? null,
+    tools.codemode = createExecuteTool({
+      tools: workspaceTools,
+      state: options?.stateBackend,
       loader: env.LOADER,
       timeout: 30_000,
-    });
-
-    tools.codemode = createCodeTool({
-      executor,
-      tools: [stateTools(workspace)],
+      globalOutbound: env.OUTBOUND ?? null,
+      providers: [
+        { name: "git", tools: gitTools },
+      ],
     });
   }
 
-  // Git tools — always available
-  Object.assign(tools, buildGitTools(env, workspace, config, options?.ownerEmail));
+  // Workspace tools — available as top-level tools alongside codemode
+  Object.assign(tools, workspaceTools);
 
-  // Memory tools: only include for session owner.
-  // When memory tools are added to the agentic loop's tool set:
-  // if (isCallerOwner(options?.authorEmail, options?.ownerEmail)) {
-  //   tools.memory = memoryTools;
-  // }
-  // Non-owner guests should not have access to the owner's memory tools.
+  // Git tools — always available as top-level tools
+  Object.assign(tools, gitTools);
 
   return tools;
 }
@@ -270,6 +268,7 @@ export async function runAgenticChat(input: {
   messages: Array<{ content: string; role: "assistant" | "system" | "tool" | "user" }>;
   ownerEmail?: string;
   signal?: AbortSignal;
+  stateBackend?: StateBackend;
   systemPrompt: string;
   workspace: Workspace;
 }): Promise<AgenticResult> {
@@ -278,6 +277,7 @@ export async function runAgenticChat(input: {
   const tools = buildTools(input.env, input.workspace, input.config, {
     authorEmail: input.authorEmail,
     ownerEmail: input.ownerEmail,
+    stateBackend: input.stateBackend,
   });
 
   const result = await generateText({
@@ -315,6 +315,7 @@ export async function streamAgenticChat(input: {
   onToolCall: (tc: { code: string; result: unknown }) => void;
   ownerEmail?: string;
   signal?: AbortSignal;
+  stateBackend?: StateBackend;
   systemPrompt: string;
   workspace: Workspace;
 }): Promise<AgenticResult> {
@@ -323,6 +324,7 @@ export async function streamAgenticChat(input: {
   const tools = buildTools(input.env, input.workspace, input.config, {
     authorEmail: input.authorEmail,
     ownerEmail: input.ownerEmail,
+    stateBackend: input.stateBackend,
   });
 
   const result = streamText({
