@@ -1,0 +1,60 @@
+{
+  /**
+   * Local development config — extends wrangler.jsonc but collapses migrations
+   * to avoid the "Cannot apply deleted_classes to non-existent class" error.
+   *
+   * Usage: wrangler dev -c wrangler.dev.jsonc
+   *
+   * IMPORTANT: Keep everything in sync with wrangler.jsonc except migrations.
+   * If you add a new DO class or binding in wrangler.jsonc, add it here too.
+   */
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dodo",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CODING_AGENT", "class_name": "CodingAgent" },
+      { "name": "USER_CONTROL", "class_name": "UserControl" },
+      { "name": "SHARED_INDEX", "class_name": "SharedIndex" }
+    ]
+  },
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "services": [
+    {
+      "binding": "OUTBOUND",
+      "service": "dodo",
+      "entrypoint": "AllowlistOutbound"
+    }
+  ],
+  // Collapsed migration — fresh local dev doesn't need the historical chain.
+  // Production uses wrangler.jsonc which has the full v1→v2→v3 history.
+  "migrations": [
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["CodingAgent", "UserControl", "SharedIndex"]
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" }
+  ],
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  },
+  "assets": {
+    "directory": "./public"
+  },
+  "vars": {
+    "CF_ACCESS_AUD": "6cca309aa2e3338f27f0c6294046fdb1a9b3e9850f526296c3f89057293752bc",
+    "CF_ACCESS_TEAM_DOMAIN": "https://jonnyparris.cloudflareaccess.com",
+    "DEFAULT_MODEL": "anthropic/claude-sonnet-4-5",
+    "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
+    "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1",
+    "DODO_VERSION": "0.3.0-dev",
+    "ADMIN_EMAIL": "ruskin.constant@gmail.com"
+  }
+}
