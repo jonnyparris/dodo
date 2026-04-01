@@ -1426,10 +1426,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               type: "tool_call",
             });
           }
-          if (chunk.type === "step-finish" && chunk.usage) {
-            tokenInput += chunk.usage.promptTokens ?? 0;
-            tokenOutput += chunk.usage.completionTokens ?? 0;
-          }
+          // Note: toUIMessageStream() does not emit step-finish events, so token
+          // usage from the AI SDK stream is not available here. This requires
+          // Think to expose usage data via StreamCallback or a post-chat hook.
+          // See feedback for @cloudflare/think.
         } catch {
           // Skip unparseable chunks
         }
