@@ -12,11 +12,13 @@ import { AgentConnectionTransport } from "./rpc-transport";
 import { epochToIso, nowEpoch, SqlHelper } from "./sql-helpers";
 import {
   Think,
+  type ChatMessageOptions,
   type DodoConfig,
   type FiberCompleteContext,
   type FiberRecoveryContext,
   type MessageMetadata,
   type StreamCallback,
+  type StreamableResult,
   type UIMessage,
 
   uiMessageToChatRecord,
@@ -178,6 +180,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private readonly clients = new Set<WritableStreamDefaultWriter<Uint8Array>>();
   private readonly db: SqlHelper;
+  /** Captured token usage from the most recent onChatMessage() call. */
+  private _lastUsage: { inputTokens: number; outputTokens: number } | null = null;
   private readonly presence = new PresenceTracker();
   readonly stateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
@@ -215,6 +219,38 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       ownerEmail: this.readMetadata("owner_email") ?? undefined,
       stateBackend: this.stateBackend,
     });
+  }
+
+  /**
+   * Override onChatMessage to capture token usage from the streamText() result.
+   *
+   * Think's chat() only reads toUIMessageStream() which strips usage data.
+   * We wrap the result to attach a background listener on totalUsage that
+   * stores the counts on `this._lastUsage` for runThinkChat() to read.
+   */
+  override async onChatMessage(options?: ChatMessageOptions): Promise<StreamableResult> {
+    this._lastUsage = null;
+    const result = await super.onChatMessage(options);
+
+    // The AI SDK streamText() result exposes totalUsage as a PromiseLike
+    // that resolves once the stream is fully consumed. Attach a listener
+    // so usage is captured by the time chat() calls onDone().
+    const streamResult = result as StreamableResult & {
+      totalUsage?: PromiseLike<{ inputTokens?: number; outputTokens?: number }>;
+    };
+    if (streamResult.totalUsage) {
+      streamResult.totalUsage.then(
+        (usage) => {
+          this._lastUsage = {
+            inputTokens: usage.inputTokens ?? 0,
+            outputTokens: usage.outputTokens ?? 0,
+          };
+        },
+        () => { /* ignore errors — usage is best-effort */ },
+      );
+    }
+
+    return result;
   }
 
   /** Build an AppConfig from Think's per-session config, falling back to env defaults. */
@@ -1314,7 +1350,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const fiberId = this.readPromptFiberId(promptId);
     if (fiberId) {
       const fiber = this.getFiber(fiberId);
-      const snapshot = fiber?.snapshot as { chatCompleted?: boolean; assistantMessageId?: string; text?: string } | null;
+      const snapshot = fiber?.snapshot as { chatCompleted?: boolean; assistantMessageId?: string; text?: string; tokenInput?: number; tokenOutput?: number } | null;
       if (snapshot?.chatCompleted) {
         // Chat completed before eviction — just finalize
         await this.finalizePromptFromFiber(promptId, title, snapshot);
@@ -1331,6 +1367,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         chatCompleted: true,
         assistantMessageId: result.assistantMessageId,
         text: result.text,
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
       });
 
       // Phase 3: Finalize
@@ -1338,6 +1376,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         chatCompleted: true,
         assistantMessageId: result.assistantMessageId,
         text: result.text,
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Prompt failed";
@@ -1355,13 +1395,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private async finalizePromptFromFiber(
     promptId: string,
     title: string,
-    snapshot: { chatCompleted?: boolean; assistantMessageId?: string; text?: string },
+    snapshot: { chatCompleted?: boolean; assistantMessageId?: string; text?: string; tokenInput?: number; tokenOutput?: number },
   ): Promise<void> {
     const config = this.getConfig();
     const text = snapshot.text ?? "";
     const assistantRecord = uiMessageToChatRecord(
       { id: snapshot.assistantMessageId ?? "", role: "assistant", parts: [{ type: "text", text }] },
-      { messageId: snapshot.assistantMessageId ?? "", model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: 0, tokenOutput: 0, authorEmail: null, createdAt: nowEpoch() },
+      { messageId: snapshot.assistantMessageId ?? "", model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: snapshot.tokenInput ?? 0, tokenOutput: snapshot.tokenOutput ?? 0, authorEmail: null, createdAt: nowEpoch() },
     );
 
     await this.finishPrompt(promptId, { resultMessageId: snapshot.assistantMessageId, status: "completed" });
@@ -1537,8 +1577,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     // Track assistant response metadata
     let assistantMessageId = "";
-    let tokenInput = 0;
-    let tokenOutput = 0;
     let fullText = "";
 
     const callback: StreamCallback = {
@@ -1556,10 +1594,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               type: "tool_call",
             });
           }
-          // Note: toUIMessageStream() does not emit step-finish events, so token
-          // usage from the AI SDK stream is not available here. This requires
-          // Think to expose usage data via StreamCallback or a post-chat hook.
-          // See feedback for @cloudflare/think.
+          // Token usage is captured via onChatMessage() override — see _lastUsage.
         } catch {
           // Skip unparseable chunks
         }
@@ -1588,6 +1623,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const config = this.getConfig();
     const model = config?.model ?? this.env.DEFAULT_MODEL;
     const gateway = config?.activeGateway ?? "opencode";
+
+    // Read captured token usage from onChatMessage() override
+    const tokenInput = this._lastUsage?.inputTokens ?? 0;
+    const tokenOutput = this._lastUsage?.outputTokens ?? 0;
 
     // Insert assistant message metadata
     if (assistantMessageId) {
