@@ -12,11 +12,12 @@ Dodo is a turnkey coding agent backend and UI. Each session gets its own Durable
 
 - **Sessions** -- create, list, delete, fork sessions with full state
 - **Chat** -- synchronous `POST /session/:id/message` and async `POST /session/:id/prompt` with abort
-- **Think-backed persistence** -- messages stored via Think's SessionManager with sidecar metadata
+- **Think-backed persistence** -- messages stored via Think's SessionManager with sidecar metadata (author, model, provider, token counts)
 - **Durable fibers** -- async prompts survive DO eviction via replay-from-checkpoint recovery
-- **Workspace** -- file CRUD, search, in-file replace via `@cloudflare/shell`
+- **Workspace** -- file CRUD, search, in-file replace via `@cloudflare/shell` (SQLite + optional R2 spill)
 - **Code execution** -- sandboxed JS via `createExecuteTool()` with workspace + git providers
 - **Git** -- init, clone, add, commit, branch, checkout, pull, push, diff, remote (isomorphic-git)
+- **Git auth** -- automatic token injection for GitHub/GitLab via per-user encrypted secrets or env fallback
 - **Cron** -- schedule delayed, cron, or interval tasks that run prompts
 - **Session forking** -- snapshot files + messages into a new session (v1 and v2 format)
 - **Config** -- per-session model config via Think.configure(), switchable LLM gateway
@@ -25,8 +26,11 @@ Dodo is a turnkey coding agent backend and UI. Each session gets its own Durable
 - **Tasks** -- per-user Kanban backlog with auto-dispatch to sessions
 - **Secrets** -- encrypted per-user secret storage (envelope encryption with passkey + server key)
 - **MCP** -- Model Context Protocol server exposing all tools (sessions, files, git, memory, tasks)
+- **MCP configs** -- per-user MCP server configurations with encrypted header secrets
 - **Notifications** -- push notifications via ntfy.sh on completion/failure
 - **SSE** -- real-time event stream per session for messages, state, files, prompts, execution
+- **WebSocket** -- presence tracking, typing indicators, and session events broadcast to all connected clients
+- **Session sharing** -- share tokens with readonly/readwrite permissions, expiration, and revocation
 - **Web UI** -- three-panel responsive app: session list + config, chat, workspace + git + prompts + cron + memory + secrets
 - **Auth** -- Cloudflare Access JWT verification, user allowlist, admin controls
 - **Multi-tenant** -- per-user isolation via UserControl DOs, admin user management
@@ -75,11 +79,14 @@ Worker (Hono router + CF Access auth)
 
 ### Key design decisions
 
-- **One Think session per Dodo DO.** Think's multi-session capabilities are not exposed to users.
+- **One Think session per Dodo DO.** Think's multi-session capabilities are not exposed to users. `ensureSingleThinkSession()` enforces this invariant.
 - **Per-session config.** Model/gateway settings are stored in Think config, not injected per-request.
 - **Dodo-level snapshots/forks.** Think's `SessionManager.fork()` is not used for user-visible branching. Dodo forks clone files plus transcript into a new DO.
 - **Suppressed WebSocket chat protocol.** Think's `cf_agent_chat_*` handlers are intercepted and dropped to prevent a parallel chat path.
-- **Fibers replay from scratch.** On recovery, the fiber method re-runs from the beginning and uses `stashFiber()` checkpoints to skip completed work.
+- **Fibers replay from scratch.** On recovery, the fiber method re-runs from the beginning and uses `stashFiber()` checkpoints and `snapshot.chatCompleted` to skip completed work.
+- **Message metadata sidecar.** Think stores core messages; Dodo stores author/model/provider/tokens in `message_metadata` table.
+- **Git token hierarchy.** Per-user encrypted secrets (`github_token`, `gitlab_token`) are tried first, then env vars (`GITHUB_TOKEN`, `GITLAB_TOKEN`).
+- **MCP header encryption.** Config stores header names in `headers_json`; actual values stored as `mcp:{configId}:{headerName}` encrypted secrets.
 
 ## License
 
