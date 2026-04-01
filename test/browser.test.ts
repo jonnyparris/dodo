@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 
 // Mock modules that depend on unavailable packages in the test runtime
@@ -10,6 +11,7 @@ vi.mock("../src/agentic", () => ({
   buildBrowserTools: vi.fn().mockReturnValue({}),
   runAgenticChat: vi.fn().mockResolvedValue({ gateway: "opencode", model: "test", steps: 0, text: "", toolCalls: [] }),
   streamAgenticChat: vi.fn().mockResolvedValue({ gateway: "opencode", model: "test", steps: 0, text: "", tokenInput: 0, tokenOutput: 0, toolCalls: [] }),
+  buildToolsForThink: vi.fn().mockReturnValue({}),
 }));
 vi.mock("../src/notify", () => ({
   sendNotification: vi.fn(),
