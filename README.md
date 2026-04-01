@@ -6,18 +6,20 @@ Self-hostable autonomous coding agent on Cloudflare Workers + Durable Objects.
 
 ## What it does
 
-Dodo is a turnkey coding agent backend and UI. Each session gets its own Durable Object with a persistent SQLite-backed workspace, chat history, sandboxed code execution, and git operations. Per-user state (config, sessions, memory, tasks, encrypted secrets) lives in a UserControl DO. A shared index manages the user allowlist, host allowlist, and models cache.
+Dodo is a turnkey coding agent backend and UI. Each session gets its own Durable Object built on `@cloudflare/think` — providing persistent message storage, an agentic chat loop, workspace tools, sandboxed code execution, and durable fibers for async prompt recovery. Per-user state (config, sessions, memory, tasks, encrypted secrets) lives in a UserControl DO. A shared index manages the user allowlist, host allowlist, and models cache.
 
 ## Features
 
 - **Sessions** -- create, list, delete, fork sessions with full state
 - **Chat** -- synchronous `POST /session/:id/message` and async `POST /session/:id/prompt` with abort
+- **Think-backed persistence** -- messages stored via Think's SessionManager with sidecar metadata
+- **Durable fibers** -- async prompts survive DO eviction via replay-from-checkpoint recovery
 - **Workspace** -- file CRUD, search, in-file replace via `@cloudflare/shell`
-- **Code execution** -- sandboxed JS via Worker Loaders and `@cloudflare/codemode`
+- **Code execution** -- sandboxed JS via `createExecuteTool()` with workspace + git providers
 - **Git** -- init, clone, add, commit, branch, checkout, pull, push, diff, remote (isomorphic-git)
 - **Cron** -- schedule delayed, cron, or interval tasks that run prompts
-- **Session forking** -- snapshot files + messages into a new session
-- **Config** -- switchable LLM gateway (OpenCode / AI Gateway), model, git author
+- **Session forking** -- snapshot files + messages into a new session (v1 and v2 format)
+- **Config** -- per-session model config via Think.configure(), switchable LLM gateway
 - **Allowlist** -- manage outbound hostnames the sandbox can access
 - **Memory** -- per-user key-value memory store with text search
 - **Tasks** -- per-user Kanban backlog with auto-dispatch to sessions
@@ -28,7 +30,6 @@ Dodo is a turnkey coding agent backend and UI. Each session gets its own Durable
 - **Web UI** -- three-panel responsive app: session list + config, chat, workspace + git + prompts + cron + memory + secrets
 - **Auth** -- Cloudflare Access JWT verification, user allowlist, admin controls
 - **Multi-tenant** -- per-user isolation via UserControl DOs, admin user management
-- **Tests** -- 24 integration tests covering all major flows
 
 ## Commands
 
@@ -61,13 +62,24 @@ Worker (Hono router + CF Access auth)
 |   +-- user_config, sessions, memory_entries, tasks
 |   +-- key_envelope, encrypted_secrets (envelope encryption)
 |   +-- fork_snapshots, mcp_configs
-+-- CodingAgent DO (one per session, extends Agent SDK)
-|   +-- metadata, messages, prompts, cron_jobs
++-- CodingAgent DO (one per session, extends Think<Env, DodoConfig>)
+|   +-- Think-managed: assistant_sessions, assistant_messages, _think_config, cf_agents_fibers
+|   +-- Dodo-owned: metadata, message_metadata, prompts, cron_jobs, approval_queue
 |   +-- Workspace (@cloudflare/shell, SQLite + optional R2 spill)
-|   +-- DynamicWorkerExecutor (@cloudflare/codemode)
+|   +-- createExecuteTool (@cloudflare/think/tools/execute, gated outbound)
+|   +-- One Think session per DO (single-session invariant)
+|   +-- Durable fibers for async prompt recovery
 +-- AllowlistOutbound (WorkerEntrypoint, gated sandbox fetch)
 +-- AppControl DO (legacy, kept for migration)
 ```
+
+### Key design decisions
+
+- **One Think session per Dodo DO.** Think's multi-session capabilities are not exposed to users.
+- **Per-session config.** Model/gateway settings are stored in Think config, not injected per-request.
+- **Dodo-level snapshots/forks.** Think's `SessionManager.fork()` is not used for user-visible branching. Dodo forks clone files plus transcript into a new DO.
+- **Suppressed WebSocket chat protocol.** Think's `cf_agent_chat_*` handlers are intercepted and dropped to prevent a parallel chat path.
+- **Fibers replay from scratch.** On recovery, the fiber method re-runs from the beginning and uses `stashFiber()` checkpoints to skip completed work.
 
 ## License
 

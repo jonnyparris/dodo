@@ -28,7 +28,7 @@
   <main>
     <a href="/" class="back">&larr; Back to Dodo</a>
     <h1>How Dodo Works</h1>
-    <p>Dodo is a self-hostable autonomous coding agent running on Cloudflare Workers and Durable Objects.</p>
+    <p>Dodo is a self-hostable autonomous coding agent running on Cloudflare Workers and Durable Objects, built on <code>@cloudflare/think</code>.</p>
 
     <h2>Architecture</h2>
     <div class="diagram">
@@ -37,24 +37,26 @@
         <rect x="10" y="10" width="700" height="60" rx="12" fill="#e8f5e9" stroke="#0a7c66" stroke-width="1.5"/>
         <text x="360" y="35" text-anchor="middle" font-size="14" font-weight="600" fill="#0a7c66">Hono Worker Router</text>
         <text x="360" y="55" text-anchor="middle" font-size="11" fill="#666">CORS, Auth, MCP, Static Assets</text>
-        <!-- AppControl DO -->
+        <!-- UserControl DO -->
         <rect x="10" y="100" width="320" height="120" rx="12" fill="#fff3e0" stroke="#e65100" stroke-width="1.5"/>
-        <text x="170" y="125" text-anchor="middle" font-size="13" font-weight="600" fill="#e65100">AppControl DO (singleton)</text>
-        <text x="170" y="148" text-anchor="middle" font-size="11" fill="#666">Config &middot; Sessions &middot; Allowlist</text>
-        <text x="170" y="166" text-anchor="middle" font-size="11" fill="#666">Memory &middot; Tasks &middot; Models Cache</text>
+        <text x="170" y="125" text-anchor="middle" font-size="13" font-weight="600" fill="#e65100">UserControl DO (per user)</text>
+        <text x="170" y="148" text-anchor="middle" font-size="11" fill="#666">Config &middot; Sessions &middot; Memory</text>
+        <text x="170" y="166" text-anchor="middle" font-size="11" fill="#666">Tasks &middot; Secrets &middot; MCP Configs</text>
         <text x="170" y="184" text-anchor="middle" font-size="11" fill="#666">Fork Snapshots</text>
         <rect x="30" y="198" width="100" height="14" rx="4" fill="#fff8e1"/>
         <text x="80" y="209" text-anchor="middle" font-size="9" fill="#e65100">SQLite</text>
         <!-- CodingAgent DO -->
         <rect x="370" y="100" width="340" height="120" rx="12" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
         <text x="540" y="125" text-anchor="middle" font-size="13" font-weight="600" fill="#1565c0">CodingAgent DO (per session)</text>
-        <text x="540" y="148" text-anchor="middle" font-size="11" fill="#666">Chat &middot; Prompts &middot; Cron &middot; Git</text>
-        <text x="540" y="166" text-anchor="middle" font-size="11" fill="#666">Workspace &middot; Executor &middot; SSE</text>
-        <text x="540" y="184" text-anchor="middle" font-size="11" fill="#666">Agentic Tool Loop &middot; Notifications</text>
+        <text x="540" y="148" text-anchor="middle" font-size="11" fill="#666">Think Chat Loop &middot; Fibers &middot; Git</text>
+        <text x="540" y="166" text-anchor="middle" font-size="11" fill="#666">Workspace &middot; Codemode &middot; SSE</text>
+        <text x="540" y="184" text-anchor="middle" font-size="11" fill="#666">Prompts &middot; Cron &middot; Notifications</text>
         <rect x="390" y="198" width="60" height="14" rx="4" fill="#e8eaf6"/>
         <text x="420" y="209" text-anchor="middle" font-size="9" fill="#1565c0">SQLite</text>
         <rect x="460" y="198" width="60" height="14" rx="4" fill="#e8eaf6"/>
         <text x="490" y="209" text-anchor="middle" font-size="9" fill="#1565c0">Shell</text>
+        <rect x="530" y="198" width="60" height="14" rx="4" fill="#e8eaf6"/>
+        <text x="560" y="209" text-anchor="middle" font-size="9" fill="#1565c0">Think</text>
         <!-- External services -->
         <rect x="10" y="260" width="160" height="50" rx="12" fill="#fce4ec" stroke="#c62828" stroke-width="1"/>
         <text x="90" y="283" text-anchor="middle" font-size="12" font-weight="600" fill="#c62828">LLM Gateway</text>
@@ -88,7 +90,7 @@
         <rect x="130" y="10" width="80" height="40" rx="8" fill="#e8f5e9" stroke="#0a7c66"/>
         <text x="170" y="35" text-anchor="middle" font-size="11" font-weight="600" fill="#0a7c66">Router</text>
         <rect x="250" y="10" width="100" height="40" rx="8" fill="#e3f2fd" stroke="#1565c0"/>
-        <text x="300" y="35" text-anchor="middle" font-size="11" font-weight="600" fill="#1565c0">Agent DO</text>
+        <text x="300" y="35" text-anchor="middle" font-size="11" font-weight="600" fill="#1565c0">Think DO</text>
         <rect x="390" y="10" width="80" height="40" rx="8" fill="#fce4ec" stroke="#c62828"/>
         <text x="430" y="35" text-anchor="middle" font-size="11" font-weight="600" fill="#c62828">LLM</text>
         <rect x="510" y="10" width="90" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/>
@@ -104,7 +106,7 @@
         <!-- Step labels -->
         <text x="50" y="75" text-anchor="middle" font-size="10" fill="#666">1. Send message</text>
         <text x="170" y="75" text-anchor="middle" font-size="10" fill="#666">2. Auth + route</text>
-        <text x="300" y="75" text-anchor="middle" font-size="10" fill="#666">3. Save + stream</text>
+        <text x="300" y="75" text-anchor="middle" font-size="10" fill="#666">3. Think.chat()</text>
         <text x="430" y="75" text-anchor="middle" font-size="10" fill="#666">4. Generate</text>
         <text x="555" y="75" text-anchor="middle" font-size="10" fill="#666">5. Tool calls</text>
         <text x="675" y="75" text-anchor="middle" font-size="10" fill="#666">6. Read/Write</text>
@@ -113,19 +115,26 @@
         <text x="360" y="118" text-anchor="middle" font-size="10" fill="#0a7c66">7. SSE text_delta events stream back as tokens arrive</text>
         <!-- Detailed steps -->
         <text x="10" y="150" font-size="12" fill="#1a1a1a" font-weight="600">Detailed Flow:</text>
-        <text x="10" y="170" font-size="11" fill="#666">1. User sends message via UI or MCP &rarr; 2. Hono router authenticates (CF Access or Bearer token) and injects gateway config</text>
-        <text x="10" y="188" font-size="11" fill="#666">3. CodingAgent DO saves user message, calls streamAgenticChat &rarr; 4. AI SDK streams text via LLM gateway</text>
-        <text x="10" y="206" font-size="11" fill="#666">5. LLM may invoke codemode tool (sandboxed, allowlist-enforced) &rarr; 6. Tool reads/writes workspace files &rarr; 7. Tokens stream to UI via SSE</text>
+        <text x="10" y="170" font-size="11" fill="#666">1. User sends message via UI or MCP &rarr; 2. Hono router authenticates (CF Access or Bearer token) and routes to CodingAgent DO</text>
+        <text x="10" y="188" font-size="11" fill="#666">3. CodingAgent calls Think.chat() which persists user message, runs agentic loop &rarr; 4. AI SDK streams text via LLM gateway</text>
+        <text x="10" y="206" font-size="11" fill="#666">5. LLM may invoke codemode tool (sandboxed, allowlist-enforced) &rarr; 6. Tool reads/writes workspace files &rarr; 7. Tokens bridge to UI via SSE</text>
         <defs><marker id="arrow2" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#999"/></marker></defs>
       </svg>
     </div>
 
+    <h2>Async Prompt Durability</h2>
+    <p>Async prompts (<code>POST /session/:id/prompt</code>) run inside durable fibers. If the DO is evicted mid-prompt, the fiber replays from scratch on recovery. A <code>stashFiber()</code> checkpoint after the LLM call completes ensures that recovered prompts skip the expensive chat and go straight to finalization.</p>
+
+    <h2>Session Branching</h2>
+    <p>Forking creates a new Dodo session/DO with copied files and transcript. Think's internal <code>SessionManager.fork()</code> is not used for user-visible branching — Dodo snapshots handle this at the DO level. Snapshot v2 stores UIMessages with sidecar metadata; v1 import is supported for backward compatibility.</p>
+
     <h2>Features</h2>
+
     <table>
       <tr><th>Feature</th><th>Description</th></tr>
       <tr><td>Sessions</td><td>Isolated workspaces with their own files, git, and message history. Create, list, delete, fork.</td></tr>
-      <tr><td>Streaming Chat</td><td>Synchronous messages stream tokens via SSE. Async prompts run in the background with push notifications.</td></tr>
-      <tr><td>Agentic Tool Loop</td><td>The LLM autonomously reads/writes workspace files via <code>@cloudflare/codemode</code> tool calls.</td></tr>
+      <tr><td>Streaming Chat</td><td>Synchronous messages stream tokens via SSE. Async prompts run in fiber-backed background tasks with push notifications.</td></tr>
+      <tr><td>Think Chat Loop</td><td>The LLM autonomously reads/writes workspace files via <code>@cloudflare/think</code>'s agentic loop with <code>createExecuteTool</code>.</td></tr>
       <tr><td>Workspace</td><td>Virtual filesystem backed by SQLite (via <code>@cloudflare/shell</code>). Full CRUD, search, and in-file replace.</td></tr>
       <tr><td>Code Execution</td><td>Sandboxed JavaScript execution via Worker Loaders. Outbound network gated by the host allowlist.</td></tr>
       <tr><td>Git</td><td>Full isomorphic-git: init, clone, add, commit, branch, checkout, push, pull, diff. Auto-injects GitHub/GitLab tokens.</td></tr>
@@ -133,13 +142,14 @@
       <tr><td>Tasks</td><td>Kanban backlog (backlog/todo/in_progress/done). Click to advance. Moving to "in progress" auto-dispatches a prompt.</td></tr>
       <tr><td>Cron</td><td>Schedule delayed, cron, or interval tasks that fire prompts via the Agents SDK scheduler.</td></tr>
       <tr><td>Memory</td><td>Persistent key-value store with text search and tags. Survives across sessions.</td></tr>
-      <tr><td>Model Selector</td><td>Dropdown populated from the <code>models.dev</code> OpenCode provider, cached for 24 hours.</td></tr>
+      <tr><td>Model Selector</td><td>Per-session config via Think.configure(). Models populated from the OpenCode provider, cached for 24 hours.</td></tr>
       <tr><td>Push Notifications</td><td>Via ntfy.sh on prompt completion, failure, or abort.</td></tr>
-      <tr><td>Token Tracking</td><td>Per-message and per-session token usage with cost display.</td></tr>
+      <tr><td>Token Tracking</td><td>Per-message and per-session token usage via message_metadata sidecar.</td></tr>
     </table>
 
     <h2>API Reference</h2>
     <h3>Global</h3>
+
     <table>
       <tr><th>Method</th><th>Path</th><th>Description</th></tr>
       <tr><td>GET</td><td><code>/health</code></td><td>Health check</td></tr>
@@ -153,6 +163,7 @@
       <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server (Bearer auth)</td></tr>
     </table>
     <h3>Session</h3>
+
     <table>
       <tr><th>Method</th><th>Path</th><th>Description</th></tr>
       <tr><td>POST</td><td><code>/session</code></td><td>Create session</td></tr>
@@ -160,9 +171,9 @@
       <tr><td>GET</td><td><code>/session/:id</code></td><td>Session state (includes token totals)</td></tr>
       <tr><td>DELETE</td><td><code>/session/:id</code></td><td>Delete session + storage</td></tr>
       <tr><td>POST</td><td><code>/session/:id/fork</code></td><td>Fork session</td></tr>
-      <tr><td>POST</td><td><code>/session/:id/message</code></td><td>Sync message (streaming)</td></tr>
-      <tr><td>POST</td><td><code>/session/:id/prompt</code></td><td>Async prompt</td></tr>
-      <tr><td>POST</td><td><code>/session/:id/abort</code></td><td>Abort running prompt</td></tr>
+      <tr><td>POST</td><td><code>/session/:id/message</code></td><td>Sync message (streaming via Think.chat())</td></tr>
+      <tr><td>POST</td><td><code>/session/:id/prompt</code></td><td>Async prompt (fiber-backed)</td></tr>
+      <tr><td>POST</td><td><code>/session/:id/abort</code></td><td>Abort running prompt (fiber cancellation)</td></tr>
       <tr><td>GET</td><td><code>/session/:id/events</code></td><td>SSE stream</td></tr>
       <tr><td>*</td><td><code>/session/:id/file</code></td><td>File CRUD</td></tr>
       <tr><td>GET</td><td><code>/session/:id/files</code></td><td>List files</td></tr>
