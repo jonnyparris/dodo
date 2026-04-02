@@ -13,7 +13,7 @@ Dodo is a turnkey coding agent backend and UI. Each session gets its own Durable
 ## Features
 
 - **Sessions** -- create, list, delete, fork sessions with full state
-- **Chat** -- synchronous `POST /session/:id/message` and async `POST /session/:id/prompt` with abort
+- **Chat** -- `POST /session/:id/message` for synchronous callers, `POST /session/:id/prompt` for UI-driven prompt execution with abort
 - **Think-backed persistence** -- messages stored via Think's SessionManager with sidecar metadata (author, model, provider, token counts)
 - **Durable fibers** -- async prompts survive DO eviction via replay-from-checkpoint recovery
 - **Workspace** -- file CRUD, search, in-file replace via `@cloudflare/shell` (SQLite + optional R2 spill)
@@ -30,7 +30,7 @@ Dodo is a turnkey coding agent backend and UI. Each session gets its own Durable
 - **MCP** -- Model Context Protocol server exposing all tools (sessions, files, git, memory, tasks)
 - **MCP configs** -- per-user MCP server configurations with encrypted header secrets
 - **Notifications** -- push notifications via ntfy.sh on completion/failure
-- **SSE** -- real-time event stream per session for messages, state, files, prompts, execution
+- **SSE** -- real-time event stream per session for text deltas, messages, state, files, prompts, execution
 - **WebSocket** -- presence tracking, typing indicators, and session events broadcast to all connected clients
 - **Session sharing** -- share tokens with readonly/readwrite permissions, expiration, and revocation
 - **Web UI** -- three-panel responsive app: session list + config, chat, workspace + git + prompts + cron + memory + secrets
@@ -89,6 +89,8 @@ Worker (Hono router + CF Access auth)
 - **Message metadata sidecar.** Think stores core messages; Dodo stores author/model/provider/tokens in `message_metadata` table.
 - **Git token hierarchy.** Per-user encrypted secrets (`github_token`, `gitlab_token`) are tried first, then env vars (`GITHUB_TOKEN`, `GITLAB_TOKEN`).
 - **MCP header encryption.** Config stores header names in `headers_json`; actual values stored as `mcp:{configId}:{headerName}` encrypted secrets.
+- **Streaming UI.** The web UI appends raw text deltas immediately, then upgrades the message to markdown a few times per second so long responses stay responsive.
+- **Build visibility.** The header shows the deployed build hash when `DODO_COMMIT` is present, which makes it easier to confirm which revision a user is running.
 
 ## License
 

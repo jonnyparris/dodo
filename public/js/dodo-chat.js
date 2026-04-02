@@ -85,6 +85,7 @@ function _streamIdleCheck(){
 
 function _cleanupStreaming(){
   if(_streamMarkdownTimer){clearTimeout(_streamMarkdownTimer);_streamMarkdownTimer=null}
+  if(_streamIdleTimer){clearTimeout(_streamIdleTimer);_streamIdleTimer=null}
   if(_streamRafId){cancelAnimationFrame(_streamRafId);_streamRafId=null}
   if(_streamScrollSentinel){_streamScrollSentinel.remove();_streamScrollSentinel=null}
   _streamRawSpan=null;

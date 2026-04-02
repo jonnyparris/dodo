@@ -193,17 +193,19 @@
 
     <!-- ─── Chat ─── -->
     <h2 id="chat">Chat &amp; Streaming</h2>
-    <p>Two ways to talk to the agent:</p>
+    <p>The web UI uses the prompt path and streams responses into the chat over SSE as the agent works.</p>
     <table>
       <tr><th>Mode</th><th>Button</th><th>How it works</th></tr>
-      <tr><td><strong>Send</strong></td><td>Send</td><td>Synchronous. Tokens stream back in real time via SSE. The input is disabled while the agent works.</td></tr>
-      <tr><td><strong>Async</strong></td><td>Async</td><td>Queues a background prompt. You get a push notification when it finishes. Navigate away, check later.</td></tr>
+      <tr><td><strong>Send</strong></td><td>Send</td><td>Starts a prompt, returns immediately, and streams output into the open chat over SSE. The input is disabled while the agent works.</td></tr>
+      <tr><td><strong>Prompt Recovery</strong></td><td>Automatic</td><td>Prompts are fiber-backed. If the Durable Object is evicted or the page reconnects, Dodo resumes and finishes the prompt instead of starting over.</td></tr>
     </table>
     <div class="callout"><p>Async prompts are fiber-backed: if the Durable Object is evicted mid-prompt, it replays from a checkpoint on recovery rather than re-running the full LLM call.</p></div>
     <ul>
-      <li><strong>Abort</strong> — cancels a running async prompt immediately.</li>
-      <li><strong>Markdown</strong> — assistant messages render GitHub-flavored markdown with syntax-highlighted code blocks. Each code block has a copy button.</li>
+      <li><strong>Abort</strong> — cancels a running prompt immediately.</li>
+      <li><strong>Streaming renderer</strong> — text appears immediately as deltas arrive, then Dodo upgrades it into full markdown a few times per second so long messages stay responsive.</li>
+      <li><strong>Markdown</strong> — assistant messages render GitHub-flavored markdown. Each code block has a copy button.</li>
       <li><strong>Presence</strong> — when multiple users share a session, you see avatar dots in the header and typing indicators.</li>
+      <li><strong>Build marker</strong> — the header shows the deployed build hash when available, so you can confirm which revision the UI is running.</li>
     </ul>
 
     <!-- ─── Files ─── -->

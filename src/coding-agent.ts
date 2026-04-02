@@ -1248,6 +1248,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const ownerEmail = request.headers.get("x-owner-email");
     this.ensureMetadata(sessionId, ownerEmail);
 
+    if (this.readMetadata("active_prompt_id")) {
+      return Response.json({ error: "A prompt is already running" }, { status: 409 });
+    }
+
     const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
     this.writeMetadata("title", title);
     this.writeMetadata("status", "running");
