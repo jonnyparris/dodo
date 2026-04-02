@@ -725,9 +725,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         }
 
         await this.readAppConfig(); // Ensure Think config is populated
-        const title = this.readMetadata("title") ?? (content.length > 72 ? content.slice(0, 72) + "…" : content);
+        const existingTitle = this.readMetadata("title");
+        const title = existingTitle || (content.length > 50 ? content.slice(0, 50) + "..." : content);
 
-        this.writeMetadata("title", title);
+        if (!existingTitle) this.writeMetadata("title", title);
         this.writeMetadata("active_prompt_id", promptId);
         this.writeMetadata("status", "running");
         this.insertPrompt(promptId, content, "queued", entry?.email);
@@ -1839,12 +1840,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         tokenInput,
         tokenOutput,
       });
-    }
-
-    if (this.messageCount() <= 2 && !this.readMetadata("title")) {
-      const title = userContent.length > 50 ? userContent.slice(0, 50) + "..." : userContent;
-      this.writeMetadata("title", title);
-      void this.syncSessionIndex({ title }).catch(() => {});
     }
 
     return { assistantMessageId, tokenInput, tokenOutput, text: fullText };

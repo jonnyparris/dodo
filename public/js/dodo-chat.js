@@ -197,7 +197,7 @@ function renderMessage(msg){
   }
   const actions=document.createElement("div");actions.className="msg-actions";
   const copyBtn=document.createElement("button");copyBtn.textContent="Copy";copyBtn.title="Copy message";copyBtn.setAttribute("aria-label","Copy message");
-  copyBtn.onclick=()=>{const text=msg.role==="assistant"?msg.content:el.textContent;navigator.clipboard.writeText(text).then(()=>{copyBtn.textContent="Copied!";setTimeout(()=>copyBtn.textContent="Copy",1500)})};
+  copyBtn.onclick=()=>{navigator.clipboard.writeText(msg.content).then(()=>{copyBtn.textContent="Copied!";setTimeout(()=>copyBtn.textContent="Copy",1500)})};
   actions.appendChild(copyBtn);el.appendChild(actions);
   if(msg.role==="assistant"&&(msg.tokenInput||msg.tokenOutput)){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;el.appendChild(m)}
   $("chat").appendChild(el);_smoothScrollToBottom()
