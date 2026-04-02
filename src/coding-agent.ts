@@ -1841,6 +1841,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
     }
 
+    if (this.messageCount() <= 2 && !this.readMetadata("title")) {
+      const title = userContent.length > 50 ? userContent.slice(0, 50) + "..." : userContent;
+      this.writeMetadata("title", title);
+      void this.syncSessionIndex({ title }).catch(() => {});
+    }
+
     return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
   }
 
