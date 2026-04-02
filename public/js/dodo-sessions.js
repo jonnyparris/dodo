@@ -29,7 +29,7 @@ async function selectSession(id){
     loadSessions(),
     apiSafe(`/session/${id}`),
     apiSafe(`/session/${id}/messages`),
-    loadFiles("/"),loadPrompts(),loadCron(),refreshGit()
+    loadFiles("/"),loadCron(),refreshGit()
   ]);
   $("chat").innerHTML="";
   if(!state&&!msgData){
