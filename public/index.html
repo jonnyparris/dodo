@@ -516,12 +516,14 @@
         </details>
       </div>
       <div class="section">
-        <h2>Allowlist</h2>
-        <div id="allowlist-display"></div>
-        <div style="display:flex;gap:4px;margin-top:6px">
-          <input id="allowlist-input" placeholder="hostname" style="flex:1"/>
-          <button onclick="addHost()">+</button>
-        </div>
+        <details>
+          <summary>Manage hosts</summary>
+          <div id="allowlist-display"></div>
+          <div style="display:flex;gap:4px;margin-top:6px">
+            <input id="allowlist-input" placeholder="hostname" style="flex:1"/>
+            <button onclick="addHost()">+</button>
+          </div>
+        </details>
       </div>
       <div id="sidebar-version" style="font-size:11px;color:var(--text-inactive);text-align:center;margin-top:16px;padding:8px 0"></div>
     </div>
