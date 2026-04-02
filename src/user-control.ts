@@ -14,7 +14,7 @@ import {
 import { HttpMcpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
-import type { AppConfig, Env, MemoryEntry, SessionIndexRecord, UpdateConfigRequest } from "./types";
+import type { AppConfig, Env, FailureSnapshotRecord, MemoryEntry, SessionIndexRecord, UpdateConfigRequest, WorkerRunRecord, WorkerRunStatus } from "./types";
 
 const updateConfigSchema = z
   .object({
@@ -54,6 +54,33 @@ const mcpConfigUpdateSchema = z
     enabled: z.boolean().optional(),
   })
   .strict();
+
+const workerRunCreateSchema = z.object({
+  sessionId: z.string().min(1),
+  parentSessionId: z.string().min(1).nullable().optional(),
+  repoId: z.string().min(1),
+  repoUrl: z.string().url(),
+  repoDir: z.string().min(1),
+  branch: z.string().min(1),
+  baseBranch: z.string().min(1).default("main"),
+  strategy: z.enum(["deterministic", "agent"]),
+  title: z.string().min(1),
+  commitMessage: z.string().min(1).nullable().optional(),
+  expectedFiles: z.array(z.string()).default([]),
+  status: z.enum(["session_created", "repo_ready", "branch_created", "edit_applied", "commit_created", "prompt_running", "push_verified", "done", "failed"]).default("session_created"),
+}).strict();
+
+const workerRunUpdateSchema = z.object({
+  status: z.enum(["session_created", "repo_ready", "branch_created", "edit_applied", "commit_created", "prompt_running", "push_verified", "done", "failed"]).optional(),
+  lastError: z.string().nullable().optional(),
+  failureSnapshotId: z.string().nullable().optional(),
+  verification: z.record(z.string(), z.unknown()).nullable().optional(),
+}).strict();
+
+const failureSnapshotCreateSchema = z.object({
+  runId: z.string().min(1),
+  payload: z.record(z.string(), z.unknown()),
+}).strict();
 
 /**
  * UserControl DO — one per user (`idFromName(email)`).
@@ -232,6 +259,39 @@ export class UserControl implements DurableObject {
         if (!row) return Response.json({ error: `Task '${id}' not found. Run list tasks to see available tasks.` }, { status: 404 });
         this.db.exec("DELETE FROM tasks WHERE id = ?", id);
         return Response.json({ deleted: true, id });
+      }
+
+      // ─── Worker runs / orchestration state ───
+
+      if (request.method === "GET" && url.pathname === "/worker-runs") {
+        const sessionId = url.searchParams.get("sessionId") ?? undefined;
+        return Response.json({ runs: this.listWorkerRuns(sessionId) });
+      }
+
+      if (request.method === "POST" && url.pathname === "/worker-runs") {
+        const body = workerRunCreateSchema.parse(await request.json());
+        return Response.json(this.createWorkerRun(body), { status: 201 });
+      }
+
+      if (request.method === "GET" && url.pathname.match(/^\/worker-runs\/[^/]+$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        return Response.json(this.getWorkerRun(id));
+      }
+
+      if (request.method === "PUT" && url.pathname.match(/^\/worker-runs\/[^/]+$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        const body = workerRunUpdateSchema.parse(await request.json());
+        return Response.json(this.updateWorkerRun(id, body));
+      }
+
+      if (request.method === "POST" && url.pathname === "/failure-snapshots") {
+        const body = failureSnapshotCreateSchema.parse(await request.json());
+        return Response.json(this.createFailureSnapshot(body.runId, body.payload), { status: 201 });
+      }
+
+      if (request.method === "GET" && url.pathname.match(/^\/failure-snapshots\/[^/]+$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        return Response.json(this.getFailureSnapshot(id));
       }
 
       // ─── Fork snapshots ───
@@ -513,6 +573,38 @@ export class UserControl implements DurableObject {
     `);
 
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS worker_runs (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        parent_session_id TEXT,
+        repo_id TEXT NOT NULL,
+        repo_url TEXT NOT NULL,
+        repo_dir TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        strategy TEXT NOT NULL,
+        title TEXT NOT NULL,
+        commit_message TEXT,
+        expected_files_json TEXT NOT NULL DEFAULT '[]',
+        verification_json TEXT,
+        last_error TEXT,
+        failure_snapshot_id TEXT,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS failure_snapshots (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS mcp_configs (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -537,6 +629,8 @@ export class UserControl implements DurableObject {
     // TTL cleanup: remove fork snapshots older than 1 hour
     const oneHourAgo = nowEpoch() - 3600;
     this.db.exec("DELETE FROM fork_snapshots WHERE created_at < ?", oneHourAgo);
+    // Keep failure snapshots for 7 days
+    this.db.exec("DELETE FROM failure_snapshots WHERE created_at < ?", nowEpoch() - 604800);
   }
 
   private seedDefaults(): void {
@@ -648,6 +742,121 @@ export class UserControl implements DurableObject {
       status: String(row.status),
       title: rawTitle,
       updatedAt: epochToIso(row.updated_at),
+    };
+  }
+
+  // ─── Worker runs / failure snapshots ───
+
+  private createWorkerRun(input: z.infer<typeof workerRunCreateSchema>): WorkerRunRecord {
+    const id = crypto.randomUUID();
+    const now = nowEpoch();
+    this.db.exec(
+      `INSERT INTO worker_runs (
+        id, session_id, parent_session_id, repo_id, repo_url, repo_dir, branch, base_branch,
+        strategy, title, commit_message, expected_files_json, verification_json, last_error,
+        failure_snapshot_id, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id,
+      input.sessionId,
+      input.parentSessionId ?? null,
+      input.repoId,
+      input.repoUrl,
+      input.repoDir,
+      input.branch,
+      input.baseBranch,
+      input.strategy,
+      input.title,
+      input.commitMessage ?? null,
+      JSON.stringify(input.expectedFiles),
+      null,
+      null,
+      null,
+      input.status,
+      now,
+      now,
+    );
+    return this.getWorkerRun(id);
+  }
+
+  private updateWorkerRun(id: string, patch: z.infer<typeof workerRunUpdateSchema>): WorkerRunRecord {
+    const current = this.getWorkerRun(id);
+    this.db.exec(
+      `UPDATE worker_runs
+       SET status = ?,
+           last_error = ?,
+           failure_snapshot_id = ?,
+           verification_json = ?,
+           updated_at = ?
+       WHERE id = ?`,
+      patch.status ?? current.status,
+      patch.lastError === undefined ? current.lastError : patch.lastError,
+      patch.failureSnapshotId === undefined ? current.failureSnapshotId : patch.failureSnapshotId,
+      patch.verification === undefined
+        ? (current.verification === null ? null : JSON.stringify(current.verification))
+        : (patch.verification === null ? null : JSON.stringify(patch.verification)),
+      nowEpoch(),
+      id,
+    );
+    return this.getWorkerRun(id);
+  }
+
+  private listWorkerRuns(sessionId?: string): WorkerRunRecord[] {
+    const rows = sessionId
+      ? this.db.all("SELECT * FROM worker_runs WHERE session_id = ? OR parent_session_id = ? ORDER BY created_at DESC", sessionId, sessionId)
+      : this.db.all("SELECT * FROM worker_runs ORDER BY created_at DESC");
+    return rows.map((row) => this.mapWorkerRunRow(row));
+  }
+
+  private getWorkerRun(id: string): WorkerRunRecord {
+    const row = this.db.one("SELECT * FROM worker_runs WHERE id = ?", id);
+    if (!row) throw new Error(`Worker run ${id} not found`);
+    return this.mapWorkerRunRow(row);
+  }
+
+  private mapWorkerRunRow(row: SqlRow): WorkerRunRecord {
+    return {
+      baseBranch: String(row.base_branch),
+      branch: String(row.branch),
+      commitMessage: row.commit_message === null ? null : String(row.commit_message),
+      createdAt: epochToIso(row.created_at),
+      expectedFiles: JSON.parse(String(row.expected_files_json ?? "[]")) as string[],
+      failureSnapshotId: row.failure_snapshot_id === null ? null : String(row.failure_snapshot_id),
+      id: String(row.id),
+      lastError: row.last_error === null ? null : String(row.last_error),
+      parentSessionId: row.parent_session_id === null ? null : String(row.parent_session_id),
+      repoDir: String(row.repo_dir),
+      repoId: String(row.repo_id),
+      repoUrl: String(row.repo_url),
+      sessionId: String(row.session_id),
+      status: String(row.status) as WorkerRunStatus,
+      strategy: String(row.strategy) as WorkerRunRecord["strategy"],
+      title: String(row.title),
+      updatedAt: epochToIso(row.updated_at),
+      verification: row.verification_json === null ? null : JSON.parse(String(row.verification_json)) as Record<string, unknown>,
+    };
+  }
+
+  private createFailureSnapshot(runId: string, payload: Record<string, unknown>): FailureSnapshotRecord {
+    const id = crypto.randomUUID();
+    const now = nowEpoch();
+    this.db.exec(
+      "INSERT INTO failure_snapshots (id, run_id, payload, created_at) VALUES (?, ?, ?, ?)",
+      id,
+      runId,
+      JSON.stringify(payload),
+      now,
+    );
+    return this.getFailureSnapshot(id);
+  }
+
+  private getFailureSnapshot(id: string): FailureSnapshotRecord {
+    const row = this.db.one("SELECT id, run_id, payload, created_at FROM failure_snapshots WHERE id = ?", id);
+    if (!row) throw new Error(`Failure snapshot ${id} not found`);
+    return {
+      createdAt: epochToIso(row.created_at),
+      id: String(row.id),
+      payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
+      runId: String(row.run_id),
     };
   }
 

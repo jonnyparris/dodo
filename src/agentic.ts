@@ -3,9 +3,10 @@ import type { StateBackend } from "@cloudflare/shell";
 import { jsonSchema, tool, zodSchema } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
-import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
+import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { wrapOutboundWithOwner } from "./executor";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
+import { getKnownRepo, listKnownRepos } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env } from "./types";
 
@@ -41,10 +42,35 @@ function buildGitTools(
   ownerEmail?: string,
 ): Record<string, AnyTool> {
   const git = createWorkspaceGit(workspace);
+  const knownRepoIds = listKnownRepos().map((repo) => repo.id) as [string, ...string[]];
 
   const dirSchema = zodSchema(z.object({ dir: z.string().optional().describe("Repo directory") }));
 
   return {
+    git_clone_known: tool({
+      description: "Clone a built-in known repository by id. Use this instead of free-form URLs when possible.",
+      inputSchema: zodSchema(z.object({
+        repoId: z.enum(knownRepoIds as ["dodo"]).describe("Known repo id"),
+        dir: z.string().optional().describe("Target directory (defaults to repo's standard dir)"),
+        branch: z.string().optional().describe("Branch to clone (defaults to repo default branch)"),
+        depth: z.number().optional().describe("Clone depth. Default: 1. Use 0 for full history."),
+      })),
+      execute: async ({ repoId, dir, branch, depth }) => {
+        const repo = getKnownRepo(repoId);
+        const targetDir = dir ?? repo.dir;
+        const token = await resolveRemoteToken({ dir: targetDir, env, git, ownerEmail, url: repo.url });
+        const cloneDepth = depth === 0 ? undefined : (depth ?? 1);
+        return git.clone({
+          branch: branch ?? repo.defaultBranch,
+          depth: cloneDepth,
+          dir: targetDir,
+          singleBranch: true,
+          token,
+          url: repo.url,
+        });
+      },
+    }),
+
     git_clone: tool({
       description: "Clone a git repo into the workspace. Auth is automatic for GitHub/GitLab. Clones are shallow (depth 1) by default. Pass depth 0 for full history.",
       inputSchema: zodSchema(z.object({
@@ -85,8 +111,13 @@ function buildGitTools(
         message: z.string().describe("Commit message"),
         dir: z.string().optional().describe("Repo directory"),
       })),
-      execute: async ({ message, dir }) =>
-        git.commit({ author: defaultAuthor(config), dir, message }),
+      execute: async ({ message, dir }) => {
+        const status = await git.status({ dir });
+        if (!Array.isArray(status) || status.length === 0) {
+          throw new Error("Nothing to commit. Make sure you edited files and staged them before committing.");
+        }
+        return git.commit({ author: defaultAuthor(config), dir, message });
+      },
     }),
 
     git_push: tool({
@@ -96,8 +127,10 @@ function buildGitTools(
         remote: z.string().optional().describe("Remote name (default: origin)"),
         ref: z.string().optional().describe("Branch ref to push"),
         force: z.boolean().optional().describe("Force push"),
+        baseRef: z.string().optional().describe("Base branch to verify against after push (default: main)"),
+        expectedFiles: z.array(z.string()).optional().describe("Files that must be present in the remote branch diff"),
       })),
-      execute: async ({ dir, remote, ref, force }) => {
+      execute: async ({ dir, remote, ref, force, baseRef, expectedFiles }) => {
         const token = await resolveRemoteToken({ dir, env, git, remote, ownerEmail });
         const result = await git.push({ dir, force, ref, remote, token });
         if (!result.ok) {
@@ -113,10 +146,98 @@ function buildGitTools(
         if (pushedRefs.length === 0) {
           throw new Error("Push was a no-op — no refs were pushed. Make sure you are on the correct branch and have committed changes. Use git_branch to verify your current branch, then retry with ref set to your branch name.");
         }
-        // Check if all refs were already up to date (remote already had these commits)
-        const alreadyUpToDate = Object.values(refs).every((v) => v.ok && !v.error);
+        if (ref) {
+          const verification = await verifyRemoteBranch({
+            baseRef,
+            dir,
+            env,
+            expectedFiles,
+            git,
+            ownerEmail,
+            ref,
+            remote,
+          });
+          if (!verification.ok) {
+            throw new Error(verification.error ?? `Branch '${ref}' did not verify after push`);
+          }
+          return {
+            ok: true,
+            refs: pushedRefs.join(", "),
+            verification,
+            message: `Pushed ${ref} and verified it is ahead of ${verification.baseRef}`,
+          };
+        }
         const pushed = pushedRefs.join(", ");
         return { ok: true, refs: pushed, message: `Pushed ${pushed} to ${remote || "origin"}` };
+      },
+    }),
+
+    git_push_checked: tool({
+      description: "Push a branch and verify that the remote branch exists, is ahead of the base branch, and optionally contains expected changed files.",
+      inputSchema: zodSchema(z.object({
+        dir: z.string().optional().describe("Repo directory"),
+        remote: z.string().optional().describe("Remote name (default: origin)"),
+        ref: z.string().min(1).describe("Branch ref to push and verify"),
+        force: z.boolean().optional().describe("Force push"),
+        baseRef: z.string().optional().describe("Base branch to compare against (default: main)"),
+        expectedFiles: z.array(z.string()).optional().describe("Files that must appear in the remote diff"),
+      })),
+      execute: async ({ dir, remote, ref, force, baseRef, expectedFiles }) => {
+        const token = await resolveRemoteToken({ dir, env, git, remote, ownerEmail });
+        const result = await git.push({ dir, force, ref, remote, token });
+        if (!result.ok) {
+          const refErrors = Object.entries(result.refs ?? {})
+            .filter(([, v]) => !v.ok)
+            .map(([k, v]) => `${k}: ${v.error}`)
+            .join("; ");
+          throw new Error(`Push failed: ${refErrors || "remote rejected the push"}`);
+        }
+        const verification = await verifyRemoteBranch({
+          baseRef,
+          dir,
+          env,
+          expectedFiles,
+          git,
+          ownerEmail,
+          ref,
+          remote,
+        });
+        if (!verification.ok) {
+          throw new Error(verification.error ?? `Branch '${ref}' did not verify after push`);
+        }
+        return {
+          ok: true,
+          refs: Object.keys(result.refs ?? {}).join(", "),
+          verification,
+          message: `Pushed ${ref} and verified it is ahead of ${verification.baseRef}`,
+        };
+      },
+    }),
+
+    git_verify_remote_branch: tool({
+      description: "Verify a remote branch is ahead of its base branch and inspect changed files.",
+      inputSchema: zodSchema(z.object({
+        dir: z.string().optional().describe("Repo directory"),
+        remote: z.string().optional().describe("Remote name (default: origin)"),
+        ref: z.string().min(1).describe("Branch ref to verify"),
+        baseRef: z.string().optional().describe("Base branch to compare against (default: main)"),
+        expectedFiles: z.array(z.string()).optional().describe("Files that must appear in the remote diff"),
+      })),
+      execute: async ({ dir, remote, ref, baseRef, expectedFiles }) => {
+        const verification = await verifyRemoteBranch({
+          baseRef,
+          dir,
+          env,
+          expectedFiles,
+          git,
+          ownerEmail,
+          ref,
+          remote,
+        });
+        if (!verification.ok) {
+          throw new Error(verification.error ?? `Branch '${ref}' failed verification`);
+        }
+        return verification;
       },
     }),
 

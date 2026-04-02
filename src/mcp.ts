@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub } from "./auth";
+import { getKnownRepo, listKnownRepos } from "./repos";
 import type { Env } from "./types";
 
 // MCP uses the admin email for all operations since MCP is token-authenticated
@@ -42,6 +43,146 @@ async function agentFetch(env: Env, sessionId: string, path: string, init?: Requ
   }
 
   return agent.fetch(new Request(`https://coding-agent${path}`, { ...init, headers }));
+}
+
+async function readJson<T>(response: Response): Promise<T> {
+  return await response.json() as T;
+}
+
+async function userJson<T>(env: Env, path: string, init?: RequestInit): Promise<T> {
+  const res = await userControlFetch(env, path, init);
+  const data = await readJson<T | { error?: string }>(res);
+  if (!res.ok) {
+    throw new Error((data as { error?: string }).error ?? `UserControl request failed (${res.status})`);
+  }
+  return data as T;
+}
+
+async function agentJson<T>(env: Env, sessionId: string, path: string, init?: RequestInit, depth = 0): Promise<T> {
+  const res = await agentFetch(env, sessionId, path, init, depth);
+  const data = await readJson<T | { error?: string }>(res);
+  if (!res.ok) {
+    throw new Error((data as { error?: string }).error ?? `Agent request failed (${res.status})`);
+  }
+  return data as T;
+}
+
+async function patchSession(env: Env, sessionId: string, patch: { status?: string; title?: string | null }): Promise<void> {
+  await userJson(env, `/sessions/${encodeURIComponent(sessionId)}`, {
+    body: JSON.stringify(patch),
+    headers: { "content-type": "application/json" },
+    method: "PATCH",
+  });
+}
+
+async function createSessionWithTitle(env: Env, title: string | null): Promise<{ id: string; title: string | null }> {
+  const id = crypto.randomUUID();
+  const email = mcpUserEmail(env);
+  await userJson(env, "/sessions", {
+    body: JSON.stringify({ id, title, ownerEmail: email, createdBy: email }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  return { id, title };
+}
+
+async function createWorkerRun(env: Env, input: {
+  baseBranch: string;
+  branch: string;
+  commitMessage: string | null;
+  expectedFiles: string[];
+  parentSessionId?: string | null;
+  repoDir: string;
+  repoId: string;
+  repoUrl: string;
+  sessionId: string;
+  status: string;
+  strategy: "deterministic" | "agent";
+  title: string;
+}) {
+  return userJson<{ id: string } & Record<string, unknown>>(env, "/worker-runs", {
+    body: JSON.stringify(input),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+}
+
+async function updateWorkerRun(env: Env, runId: string, patch: { status?: string; lastError?: string | null; failureSnapshotId?: string | null; verification?: Record<string, unknown> | null }) {
+  return userJson<Record<string, unknown>>(env, `/worker-runs/${encodeURIComponent(runId)}`, {
+    body: JSON.stringify(patch),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+}
+
+async function createFailureSnapshot(env: Env, runId: string, payload: Record<string, unknown>) {
+  return userJson<{ id: string } & Record<string, unknown>>(env, "/failure-snapshots", {
+    body: JSON.stringify({ runId, payload }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+}
+
+async function captureFailureSnapshot(env: Env, runId: string, sessionId: string, repoDir: string, depth: number): Promise<{ id: string } & Record<string, unknown>> {
+  const [snapshot, status, diff, log, prompts, messages] = await Promise.all([
+    agentJson<Record<string, unknown>>(env, sessionId, "/snapshot", undefined, depth).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })),
+    agentJson<Record<string, unknown>>(env, sessionId, `/git/status?dir=${encodeURIComponent(repoDir)}`, undefined, depth).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })),
+    agentJson<Record<string, unknown>>(env, sessionId, `/git/diff?dir=${encodeURIComponent(repoDir)}`, undefined, depth).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })),
+    agentJson<Record<string, unknown>>(env, sessionId, `/git/log?dir=${encodeURIComponent(repoDir)}&depth=10`, undefined, depth).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })),
+    agentJson<Record<string, unknown>>(env, sessionId, "/prompts", undefined, depth).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })),
+    agentJson<Record<string, unknown>>(env, sessionId, "/messages", undefined, depth).catch((error) => ({ error: error instanceof Error ? error.message : String(error) })),
+  ]);
+  return createFailureSnapshot(env, runId, { diff, log, messages, prompts, repoDir, sessionId, snapshot, status });
+}
+
+async function getOrCreateSeedSession(env: Env, repoId: string, baseBranch: string, depth: number): Promise<{ repoDir: string; repoUrl: string; sessionId: string; title: string }> {
+  const repo = getKnownRepo(repoId);
+  const title = `[Seed:${repo.id}@${baseBranch}]`;
+  const existing = await userJson<{ sessions: Array<{ id: string; title?: string | null }> }>(env, "/sessions");
+  const found = existing.sessions.find((session) => session.title === title);
+  if (found) {
+    return { repoDir: repo.dir, repoUrl: repo.url, sessionId: found.id, title };
+  }
+
+  const seed = await createSessionWithTitle(env, title);
+  await agentJson(env, seed.id, "/git/clone", {
+    body: JSON.stringify({ branch: baseBranch, dir: repo.dir, url: repo.url }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }, depth);
+  return { repoDir: repo.dir, repoUrl: repo.url, sessionId: seed.id, title };
+}
+
+async function forkSeedSession(env: Env, sourceSessionId: string, title: string, depth: number): Promise<{ sessionId: string }> {
+  const snapshotRes = await agentFetch(env, sourceSessionId, "/snapshot", undefined, depth);
+  const snapshot = await snapshotRes.text();
+  const snapshotStore = await userJson<{ id: string }>(env, "/fork-snapshots", {
+    body: snapshot,
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  const created = await createSessionWithTitle(env, title);
+  await agentJson(env, created.id, `/snapshot/import?snapshotId=${encodeURIComponent(snapshotStore.id)}`, { method: "POST" }, depth);
+  await userJson(env, `/fork-snapshots/${encodeURIComponent(snapshotStore.id)}`, { method: "DELETE" });
+  return { sessionId: created.id };
+}
+
+async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, branch: string, baseBranch: string, depth: number): Promise<void> {
+  await agentJson(env, sessionId, "/git/checkout", {
+    body: JSON.stringify({ branch: baseBranch, dir: repoDir, force: true }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }, depth).catch(() => undefined);
+  await agentJson(env, sessionId, "/git/branch", {
+    body: JSON.stringify({ dir: repoDir, name: branch }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }, depth).catch(() => undefined);
+  await agentJson(env, sessionId, "/git/checkout", {
+    body: JSON.stringify({ branch, dir: repoDir, force: true }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }, depth);
 }
 
 function textResult(data: unknown): { content: Array<{ type: "text"; text: string }> } {
@@ -165,6 +306,244 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     await userControlFetch(env, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
     return textResult({ sessionId: newId, sourceSessionId: sessionId, forkedAt: new Date().toISOString() });
   });
+
+  server.tool("list_known_repos", "List built-in repositories that the orchestrator can clone without relying on prompt text.", {}, async () =>
+    textResult({ repos: listKnownRepos() }),
+  );
+
+  server.tool("get_or_create_seed_session", "Get or create a seed session for a known repo. The seed session clones the repo once, then later runs can fork it instead of cloning repeatedly.", {
+    repoId: z.string().describe("Known repo id (for example: dodo)"),
+    baseBranch: z.string().default("main").describe("Base branch to keep in the seed session"),
+  }, async ({ repoId, baseBranch }) => {
+    const seed = await getOrCreateSeedSession(env, repoId, baseBranch, depth);
+    return textResult(seed);
+  });
+
+  server.tool("fork_seed_session", "Fork a seed session into a new worker session with the repo already present.", {
+    seedSessionId: z.string().describe("Seed session id"),
+    title: z.string().min(1).describe("New worker session title"),
+  }, async ({ seedSessionId, title }) => {
+    const forked = await forkSeedSession(env, seedSessionId, title, depth);
+    return textResult(forked);
+  });
+
+  server.tool("verify_branch", "Verify that a pushed branch is ahead of the base branch and optionally contains expected changed files.", {
+    sessionId: z.string().describe("Worker session id with the repo checkout"),
+    dir: z.string().describe("Repo directory path"),
+    ref: z.string().min(1).describe("Branch ref to verify"),
+    baseRef: z.string().default("main").describe("Base branch to compare against"),
+    expectedFiles: z.array(z.string()).optional().describe("Files that must appear in the remote diff"),
+  }, async ({ sessionId, dir, ref, baseRef, expectedFiles }) =>
+    jsonFetch(env, "agent", "/git/verify-branch", {
+      sessionId,
+      depth,
+      init: {
+        body: JSON.stringify({ baseRef, dir, expectedFiles, ref }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      },
+    }),
+  );
+
+  server.tool("run_repo_edits", "Run a deterministic repo task end-to-end: fork a seeded repo session, create a branch, apply text edits, commit, push, verify, and record state transitions.", {
+    repoId: z.string().describe("Known repo id (for example: dodo)"),
+    title: z.string().min(1).describe("Human-readable task title"),
+    branch: z.string().min(1).describe("Branch to create and push"),
+    baseBranch: z.string().default("main").describe("Base branch to branch from"),
+    commitMessage: z.string().min(1).describe("Commit message"),
+    expectedFiles: z.array(z.string()).default([]).describe("Files expected to change on the branch"),
+    edits: z.array(z.object({
+      path: z.string().min(1).describe("File path inside the repo"),
+      search: z.string().min(1).describe("Exact text to replace"),
+      replacement: z.string().describe("Replacement text"),
+    })).min(1).describe("Deterministic text edits to apply in order"),
+  }, async ({ repoId, title, branch, baseBranch, commitMessage, expectedFiles, edits }) => {
+    const repo = getKnownRepo(repoId);
+    const seed = await getOrCreateSeedSession(env, repoId, baseBranch, depth);
+    const worker = await forkSeedSession(env, seed.sessionId, title, depth);
+    const run = await createWorkerRun(env, {
+      baseBranch,
+      branch,
+      commitMessage,
+      expectedFiles,
+      parentSessionId: seed.sessionId,
+      repoDir: repo.dir,
+      repoId: repo.id,
+      repoUrl: repo.url,
+      sessionId: worker.sessionId,
+      status: "session_created",
+      strategy: "deterministic",
+      title,
+    });
+
+    try {
+      await updateWorkerRun(env, String(run.id), { status: "repo_ready" });
+      await prepareRepoBranch(env, worker.sessionId, repo.dir, branch, baseBranch, depth);
+      await updateWorkerRun(env, String(run.id), { status: "branch_created" });
+
+      for (const edit of edits) {
+        await agentJson(env, worker.sessionId, `/file?path=${encodeURIComponent(edit.path)}`, {
+          body: JSON.stringify({ replacement: edit.replacement, search: edit.search }),
+          headers: { "content-type": "application/json" },
+          method: "PATCH",
+        }, depth);
+      }
+      await updateWorkerRun(env, String(run.id), { status: "edit_applied" });
+
+      const status = await agentJson<{ entries?: unknown[] }>(env, worker.sessionId, `/git/status?dir=${encodeURIComponent(repo.dir)}`, undefined, depth);
+      if (!Array.isArray(status.entries) || status.entries.length === 0) {
+        throw new Error("No changed files detected after applying deterministic edits");
+      }
+
+      for (const file of Array.from(new Set(edits.map((edit) => edit.path)))) {
+        await agentJson(env, worker.sessionId, "/git/add", {
+          body: JSON.stringify({ dir: repo.dir, filepath: file }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        }, depth);
+      }
+
+      await agentJson(env, worker.sessionId, "/git/commit", {
+        body: JSON.stringify({ dir: repo.dir, message: commitMessage }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth);
+      await updateWorkerRun(env, String(run.id), { status: "commit_created" });
+
+      const push = await agentJson<Record<string, unknown>>(env, worker.sessionId, "/git/push-checked", {
+        body: JSON.stringify({ baseRef: baseBranch, dir: repo.dir, expectedFiles, ref: branch }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth);
+      await updateWorkerRun(env, String(run.id), { status: "done", verification: push });
+      return textResult({ run, sessionId: worker.sessionId, verification: push });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failure = await captureFailureSnapshot(env, String(run.id), worker.sessionId, repo.dir, depth);
+      await updateWorkerRun(env, String(run.id), { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
+      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: worker.sessionId });
+    }
+  });
+
+  server.tool("dispatch_repo_prompt", "Dispatch a complex repo task to a worker session using a seeded repo fork, with tracked worker state and later branch verification.", {
+    repoId: z.string().describe("Known repo id (for example: dodo)"),
+    title: z.string().min(1).describe("Human-readable task title"),
+    branch: z.string().min(1).describe("Branch to create and push"),
+    baseBranch: z.string().default("main").describe("Base branch to branch from"),
+    commitMessage: z.string().min(1).describe("Commit message the worker should use"),
+    expectedFiles: z.array(z.string()).default([]).describe("Files expected to change on the branch"),
+    prompt: z.string().min(1).describe("Worker prompt. The repo is already cloned and the branch is already checked out."),
+  }, async ({ repoId, title, branch, baseBranch, commitMessage, expectedFiles, prompt }) => {
+    const repo = getKnownRepo(repoId);
+    const seed = await getOrCreateSeedSession(env, repoId, baseBranch, depth);
+    const worker = await forkSeedSession(env, seed.sessionId, title, depth);
+    const run = await createWorkerRun(env, {
+      baseBranch,
+      branch,
+      commitMessage,
+      expectedFiles,
+      parentSessionId: seed.sessionId,
+      repoDir: repo.dir,
+      repoId: repo.id,
+      repoUrl: repo.url,
+      sessionId: worker.sessionId,
+      status: "session_created",
+      strategy: "agent",
+      title,
+    });
+
+    try {
+      await updateWorkerRun(env, String(run.id), { status: "repo_ready" });
+      await prepareRepoBranch(env, worker.sessionId, repo.dir, branch, baseBranch, depth);
+      await updateWorkerRun(env, String(run.id), { status: "branch_created" });
+
+      const content = [
+        `Repository is already cloned at ${repo.dir}.`,
+        `You are already on branch ${branch}.`,
+        `Do not clone again. Do not change branch names.`,
+        `Use commit message: ${commitMessage}`,
+        "Push with git_push_checked and ref set to the current branch.",
+        prompt,
+      ].join("\n\n");
+
+      const promptRes = await agentJson<Record<string, unknown>>(env, worker.sessionId, "/prompt", {
+        body: JSON.stringify({ content }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth);
+      await updateWorkerRun(env, String(run.id), { status: "prompt_running" });
+      return textResult({ prompt: promptRes, run, sessionId: worker.sessionId });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failure = await captureFailureSnapshot(env, String(run.id), worker.sessionId, repo.dir, depth);
+      await updateWorkerRun(env, String(run.id), { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
+      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: worker.sessionId });
+    }
+  });
+
+  server.tool("verify_worker_run", "Verify a tracked worker run. For prompt-based runs, waits for prompt completion and then verifies the remote branch before marking it done.", {
+    runId: z.string().min(1).describe("Worker run id"),
+  }, async ({ runId }) => {
+    const run = await userJson<{
+      baseBranch: string;
+      branch: string;
+      expectedFiles: string[];
+      id: string;
+      repoDir: string;
+      sessionId: string;
+      status: string;
+      strategy: "deterministic" | "agent";
+    }>(env, `/worker-runs/${encodeURIComponent(runId)}`);
+
+    if (run.strategy === "deterministic" && run.status === "done") {
+      return textResult(run);
+    }
+
+    try {
+      const prompts = await agentJson<{ prompts: Array<{ error: string | null; status: string }> }>(env, run.sessionId, "/prompts", undefined, depth);
+      const active = prompts.prompts[0];
+      if (!active || active.status === "queued" || active.status === "running") {
+        return textResult({ runId, sessionId: run.sessionId, status: "running" });
+      }
+      if (active.status === "failed" || active.status === "aborted") {
+        const failure = await captureFailureSnapshot(env, runId, run.sessionId, run.repoDir, depth);
+        const message = active.error ?? `Worker prompt ${active.status}`;
+        const updated = await updateWorkerRun(env, runId, { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
+        return errorResult({ failureSnapshotId: failure.id, run: updated });
+      }
+
+      const verification = await agentJson<Record<string, unknown>>(env, run.sessionId, "/git/verify-branch", {
+        body: JSON.stringify({ baseRef: run.baseBranch, dir: run.repoDir, expectedFiles: run.expectedFiles, ref: run.branch }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth);
+      const updated = await updateWorkerRun(env, runId, { status: "done", verification });
+      return textResult({ run: updated, verification });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failure = await captureFailureSnapshot(env, runId, run.sessionId, run.repoDir, depth);
+      const updated = await updateWorkerRun(env, runId, { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
+      return errorResult({ error: message, failureSnapshotId: failure.id, run: updated });
+    }
+  });
+
+  server.tool("list_worker_runs", "List tracked worker runs, optionally filtered by session id.", {
+    sessionId: z.string().optional().describe("Filter runs for a specific orchestrator or worker session"),
+  }, async ({ sessionId }) =>
+    jsonFetch(env, "user", `/worker-runs${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ""}`),
+  );
+
+  server.tool("get_worker_run", "Get a tracked worker run by id.", {
+    runId: z.string().min(1).describe("Worker run id"),
+  }, async ({ runId }) =>
+    jsonFetch(env, "user", `/worker-runs/${encodeURIComponent(runId)}`),
+  );
+
+  server.tool("get_failure_snapshot", "Get the captured failure snapshot for a failed worker run.", {
+    snapshotId: z.string().min(1).describe("Failure snapshot id"),
+  }, async ({ snapshotId }) =>
+    jsonFetch(env, "user", `/failure-snapshots/${encodeURIComponent(snapshotId)}`),
+  );
 
   // --- File tools ---
 
