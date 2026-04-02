@@ -288,7 +288,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   override getMaxSteps(): number {
-    return 10;
+    return 20;
   }
 
   /**
