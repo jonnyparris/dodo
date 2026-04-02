@@ -146,6 +146,7 @@ function togglePanel(panel){
   localStorage.setItem('dodo-'+panel+'-collapsed',collapsed?'1':'0');
 }
 function updateGridColumns(){
+  if(window.innerWidth<=900)return;
   const app=$('app');
   const sidebarCollapsed=$('sidebar-panel').classList.contains('collapsed');
   const rightCollapsed=$('right-panel').classList.contains('collapsed');
