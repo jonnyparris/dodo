@@ -47,7 +47,9 @@ async function loadStatus(){
     let commit=s.commit||'';
     if(!commit){try{const v=await(await fetch("/version.json")).json();commit=v.commit||''}catch{}}
     const commitStr=commit?` (${esc(commit.slice(0,7))})`:'';
-    $("footer-text").innerHTML=`<img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/> Dodo v${esc(s.version)}${commitStr}`;
+    const versionLabel=`Dodo v${esc(s.version)}${commitStr}`;
+    $("footer-text").innerHTML=`<img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/> ${versionLabel}`;
+    const sv=$("sidebar-version");if(sv)sv.textContent=versionLabel;
     if(!_bootCommit&&commit)_bootCommit=commit;
   }catch{}
 }
