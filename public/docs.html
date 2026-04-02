@@ -148,6 +148,10 @@
     </div>
 
     <!-- ─── Sessions ─── -->
+    <h2 id="session-lifecycle">Session Lifecycle</h2>
+    <p>Sessions can be <strong>soft-deleted</strong> via <code>DELETE /session/:id</code> and recovered within 5 minutes using <code>POST /session/:id/restore</code>. After 5 minutes, deleted sessions are permanently purged.</p>
+    <p>Use <code>POST /api/sessions/:id/fork</code> to copy a session's files, git history, and conversation into a new session.</p>
+
     <h2 id="sessions">Sessions</h2>
     <p>Each session is an isolated workspace with its own files, git repo, message history, and token budget. Sessions run in separate Durable Objects, so they never interfere with each other.</p>
     <div class="diagram">
