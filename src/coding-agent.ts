@@ -7,7 +7,7 @@ import { getUserControlStub } from "./auth";
 import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { sendNotification } from "./notify";
 import { runSandboxedCode } from "./executor";
-import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
+import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc-transport";
 import { epochToIso, nowEpoch, SqlHelper } from "./sql-helpers";
@@ -103,8 +103,8 @@ const SYSTEM_PROMPT = [
   "",
   "## Git",
   "",
-  "You have git tools: git_clone, git_status, git_add, git_commit, git_push, git_pull,",
-  "git_branch, git_checkout, git_diff, git_log.",
+  "You have git tools: git_clone_known, git_clone, git_status, git_add, git_commit, git_push_checked, git_push, git_pull,",
+  "git_branch, git_checkout, git_diff, git_log, git_verify_remote_branch.",
   "Authentication for GitHub and GitLab is automatic — you do NOT need tokens.",
   "",
   "### Git safety rules",
@@ -124,11 +124,12 @@ const SYSTEM_PROMPT = [
   "",
   "## Limits",
   "",
-  "- You have a maximum of 10 tool-call steps per prompt. Plan efficiently — every tool call counts.",
+  "- You have a maximum of 20 tool-call steps per prompt. Plan efficiently — every tool call counts.",
   "- Large file reads are truncated in context. Use `search_files` to find specific lines before reading. Use `replace_in_file` for edits instead of rewriting entire files with `write_file`.",
   "- The workspace is ephemeral per session. Clone repos if you need their contents.",
   "- You cannot install system packages or run shell commands directly — use codemode for computation.",
-  "- When pushing, always specify the branch ref explicitly (e.g. `ref: 'feat/my-branch'`) to avoid no-op pushes.",
+  "- Prefer `git_clone_known` over `git_clone` for built-in repos. It prevents repo URL mistakes.",
+  "- When pushing, use `git_push_checked` and specify the branch ref explicitly (e.g. `ref: 'feat/my-branch'`). It verifies the remote branch is actually ahead of the base branch.",
 ].join("\n");
 
 /** Build a LanguageModel from DodoConfig (Think per-session config). */
@@ -554,6 +555,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
       if (request.method === "POST" && url.pathname === "/git/push") {
         return await this.handleGitPush(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/push-checked") {
+        return await this.handleGitPushChecked(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/verify-branch") {
+        return await this.handleGitVerifyBranch(request);
       }
 
       if (request.method === "POST" && url.pathname === "/git/remote") {
@@ -989,8 +998,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
     const git = createWorkspaceGit(this.workspace);
     try {
+      const dir = body.dir ? normalizePath(body.dir) : undefined;
+      const statusEntries = await git.status({ dir });
+      if (!Array.isArray(statusEntries) || statusEntries.length === 0) {
+        return Response.json({ error: "Nothing to commit. Make sure you edited files and staged them before committing." }, { status: 400 });
+      }
       const config = await this.readAppConfig();
-      const result = await git.commit({ author: defaultAuthor(config), dir: body.dir ? normalizePath(body.dir) : undefined, message: body.message });
+      const result = await git.commit({ author: defaultAuthor(config), dir, message: body.message });
       return Response.json(result);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -1079,7 +1093,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private async handleGitPush(request: Request): Promise<Response> {
-    const body = z.object({ dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional(), remote: z.string().optional() }).strict().parse(await request.json());
+    const body = z.object({ dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional(), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
     const git = createWorkspaceGit(this.workspace);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
@@ -1098,6 +1112,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       if (Object.keys(refs).length === 0) {
         return Response.json({ error: "Push was a no-op — no refs were pushed. Verify you are on the correct branch and have committed changes.", refs }, { status: 422 });
       }
+      if (body.ref) {
+        const verification = await verifyRemoteBranch({
+          baseRef: body.baseRef,
+          dir,
+          env: this.env,
+          expectedFiles: body.expectedFiles,
+          git,
+          ownerEmail,
+          ref: body.ref,
+          remote: body.remote,
+        });
+        if (!verification.ok) {
+          return Response.json({ error: verification.error ?? `Branch '${body.ref}' failed verification after push`, refs, verification }, { status: 422 });
+        }
+        return Response.json({ ...result, verification });
+      }
       return Response.json(result);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -1109,6 +1139,36 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
       return Response.json({ error: msg }, { status: 400 });
     }
+  }
+
+  private async handleGitPushChecked(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().min(1), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
+    return this.handleGitPush(new Request(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: JSON.stringify(body),
+    }));
+  }
+
+  private async handleGitVerifyBranch(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), ref: z.string().min(1), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    const verification = await verifyRemoteBranch({
+      baseRef: body.baseRef,
+      dir,
+      env: this.env,
+      expectedFiles: body.expectedFiles,
+      git,
+      ownerEmail,
+      ref: body.ref,
+      remote: body.remote,
+    });
+    if (!verification.ok) {
+      return Response.json(verification, { status: 422 });
+    }
+    return Response.json(verification);
   }
 
   private async handleGitRemote(request: Request): Promise<Response> {

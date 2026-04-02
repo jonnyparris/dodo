@@ -115,6 +115,45 @@ export interface PromptRecord {
   updatedAt: string;
 }
 
+export type WorkerRunStatus =
+  | "session_created"
+  | "repo_ready"
+  | "branch_created"
+  | "edit_applied"
+  | "commit_created"
+  | "prompt_running"
+  | "push_verified"
+  | "done"
+  | "failed";
+
+export interface WorkerRunRecord {
+  baseBranch: string;
+  branch: string;
+  commitMessage: string | null;
+  createdAt: string;
+  expectedFiles: string[];
+  failureSnapshotId: string | null;
+  id: string;
+  lastError: string | null;
+  parentSessionId: string | null;
+  repoDir: string;
+  repoId: string;
+  repoUrl: string;
+  sessionId: string;
+  status: WorkerRunStatus;
+  strategy: "deterministic" | "agent";
+  title: string;
+  updatedAt: string;
+  verification: Record<string, unknown> | null;
+}
+
+export interface FailureSnapshotRecord {
+  createdAt: string;
+  id: string;
+  payload: Record<string, unknown>;
+  runId: string;
+}
+
 export interface WorkspaceEntry {
   createdAt: string | null;
   mimeType: string;
@@ -154,4 +193,3 @@ export interface SessionSnapshot {
   messages: ChatMessageRecord[];
   title: string | null;
 }
-
