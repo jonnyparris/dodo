@@ -109,12 +109,15 @@ async function loadIntegrations(){
 
 function renderIntegrations(){
   const configMap=new Map(mcpConfigs.map(c=>[c.name.toLowerCase(),c]));
+  const getHostname=url=>{try{return new URL(url).hostname;}catch{return null;}};
   const connected=[],suggestions=[];
   mcpCatalog.forEach(cat=>{
-    const configured=configMap.get(cat.name.toLowerCase());
+    const catHostname=cat.url?getHostname(cat.url):null;
+    const configured=configMap.get(cat.name.toLowerCase())
+      ||[...configMap.values()].find(c=>catHostname&&c.url&&getHostname(c.url)===catHostname);
     if(configured){
       connected.push(renderIntegCard(cat.name,cat.description,cat.url,configured));
-      configMap.delete(cat.name.toLowerCase());
+      configMap.delete(configured.name.toLowerCase());
     }else{
       suggestions.push(renderIntegCard(cat.name,cat.description,cat.url,null));
     }
