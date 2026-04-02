@@ -22,6 +22,7 @@ import {
   type StreamableResult,
   type UIMessage,
 
+  truncateToolOutput,
   uiMessageToChatRecord,
   chatRecordToUIMessage,
 } from "./think-adapter";
@@ -123,9 +124,11 @@ const SYSTEM_PROMPT = [
   "",
   "## Limits",
   "",
-  "- You have a maximum of 10 tool-call steps per prompt. Plan efficiently.",
+  "- You have a maximum of 10 tool-call steps per prompt. Plan efficiently — every tool call counts.",
+  "- Large file reads are truncated in context. Use `search_files` to find specific lines before reading. Use `replace_in_file` for edits instead of rewriting entire files with `write_file`.",
   "- The workspace is ephemeral per session. Clone repos if you need their contents.",
   "- You cannot install system packages or run shell commands directly — use codemode for computation.",
+  "- When pushing, always specify the branch ref explicitly (e.g. `ref: 'feat/my-branch'`) to avoid no-op pushes.",
 ].join("\n");
 
 /** Build a LanguageModel from DodoConfig (Think per-session config). */
@@ -286,6 +289,60 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   override getMaxSteps(): number {
     return 10;
+  }
+
+  /**
+   * Override assembleContext to apply compaction guardrails:
+   * 1. Truncate large tool results (file reads, search results) to prevent
+   *    context window bloat. Workers were burning 200-450k input tokens per
+   *    turn — mostly from reading large files like index.html.
+   * 2. Older assistant messages beyond a threshold get their tool-call
+   *    results summarized.
+   */
+  override async assembleContext() {
+    const messages = await super.assembleContext();
+
+    // Max chars per tool result — ~16k chars ≈ ~4k tokens. Generous for file reads,
+    // tight enough to prevent a single index.html from consuming 100k tokens.
+    const MAX_TOOL_OUTPUT_CHARS = 16_000;
+    // Older tool results (beyond this message index from the end) get aggressively truncated
+    const RECENT_MESSAGE_WINDOW = 6;
+
+    const totalMessages = messages.length;
+
+    for (let i = 0; i < totalMessages; i++) {
+      const msg = messages[i];
+      if (msg.role !== "tool") continue;
+
+      const isRecent = i >= totalMessages - RECENT_MESSAGE_WINDOW;
+      const maxChars = isRecent ? MAX_TOOL_OUTPUT_CHARS : Math.floor(MAX_TOOL_OUTPUT_CHARS / 4);
+
+      for (const part of msg.content) {
+        if (part.type !== "tool-result" || part.output === undefined) continue;
+        const output = part.output as { type?: string; value?: unknown };
+        if (!output || typeof output !== "object") continue;
+
+        // Serialize the value to measure size
+        const value = output.value;
+        const serialized = typeof value === "string" ? value : JSON.stringify(value);
+        if (serialized.length <= maxChars) continue;
+
+        const truncated = truncateToolOutput(serialized, {
+          maxChars,
+          strategy: "middle",
+        });
+
+        // Preserve the output shape but replace the value with truncated text
+        if (output.type === "text") {
+          (output as { value: string }).value = truncated;
+        } else {
+          // Convert JSON output to text with truncation notice
+          (part as { output: unknown }).output = { type: "text", value: truncated };
+        }
+      }
+    }
+
+    return messages;
   }
 
   override getWorkspace(): Workspace {
@@ -1035,6 +1092,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           .map(([k, v]) => `${k}: ${v.error}`)
           .join("; ");
         return Response.json({ error: `Push failed: ${refErrors || "remote rejected the push"}`, refs: result.refs }, { status: 422 });
+      }
+      // Detect no-op pushes: ok=true but no refs changed
+      const refs = result.refs ?? {};
+      if (Object.keys(refs).length === 0) {
+        return Response.json({ error: "Push was a no-op — no refs were pushed. Verify you are on the correct branch and have committed changes.", refs }, { status: 422 });
       }
       return Response.json(result);
     } catch (error) {

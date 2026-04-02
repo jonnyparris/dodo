@@ -24,6 +24,7 @@ export type {
 export { createWorkspaceTools } from "@cloudflare/think/tools/workspace";
 export { createExecuteTool } from "@cloudflare/think/tools/execute";
 export type { CreateExecuteToolOptions } from "@cloudflare/think/tools/execute";
+export { truncateToolOutput } from "@cloudflare/think/session";
 
 // ─── Re-exports from AI SDK (used alongside Think) ───
 
