@@ -1596,7 +1596,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           const chunk = JSON.parse(json);
           // Bridge Think chunk events to Dodo SSE format
           if (chunk.type === "text-delta") {
-            const delta = chunk.textDelta ?? "";
+            const delta = chunk.delta ?? "";
             fullText += delta;
             this.emitEvent({ data: { delta }, type: "text_delta" });
           } else if (chunk.type === "tool-call") {
