@@ -232,6 +232,9 @@
 
     .banner{padding:8px 16px;font-size:12px;text-align:center}
     .banner.warn{background:var(--warning);color:var(--text-warning);border-bottom:1px solid var(--warning)}
+    .update-banner{padding:8px 16px;font-size:12px;text-align:center;background:var(--brand-tint);color:var(--text-info);border-bottom:1px solid var(--brand);display:flex;align-items:center;justify-content:center;gap:6px;animation:banner-in .3s ease}
+    .update-banner button{font-size:12px;padding:3px 10px;min-height:24px}
+    @keyframes banner-in{from{opacity:0;transform:translateY(-100%)}to{opacity:1;transform:translateY(0)}}
     .sse-banner{position:sticky;top:0;z-index:10;padding:6px 12px;font-size:12px;text-align:center;background:var(--danger-tint);color:var(--text-danger);border-bottom:1px solid var(--danger);display:none}
     .sse-banner.visible{display:block}
     .footer{padding:8px 16px;font-size:11px;color:var(--text-subtle);text-align:center;border-top:1px solid var(--line);background:var(--base);display:flex;align-items:center;justify-content:center;gap:12px}

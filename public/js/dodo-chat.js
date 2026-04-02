@@ -21,7 +21,7 @@ function renderStreamingMarkdown(){
 // --- SSE ---
 function connectSSE(id){
   if(eventSource)eventSource.close();eventSource=new EventSource(`/session/${id}/events`);
-  eventSource.onopen=()=>{$("sse-banner").classList.remove("visible")};
+  eventSource.onopen=()=>{$("sse-banner").classList.remove("visible");checkVersionOnReconnect()};
   eventSource.onerror=()=>{if(eventSource.readyState===EventSource.CLOSED){$("sse-banner").classList.add("visible")}else if(eventSource.readyState===EventSource.CONNECTING){$("sse-banner").classList.add("visible")}};
   eventSource.addEventListener("text_delta",(e)=>{resetSseActivityTimer();hideThinking();const{delta}=JSON.parse(e.data);if(!streamingEl){streamingEl=document.createElement("div");streamingEl.className="msg assistant";streamingEl.textContent="";streamingText="";$("chat").appendChild(streamingEl)}streamingText+=delta;if(!streamingRenderTimer){streamingRenderTimer=setTimeout(()=>{streamingRenderTimer=null;renderStreamingMarkdown()},80)}});
   eventSource.addEventListener("message",(e)=>{resetSseActivityTimer();hideThinking();const msg=JSON.parse(e.data);if(streamingRenderTimer){clearTimeout(streamingRenderTimer);streamingRenderTimer=null}streamingText="";if(streamingEl){streamingEl.innerHTML=renderMarkdown(msg.content);

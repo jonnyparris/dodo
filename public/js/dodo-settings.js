@@ -39,12 +39,46 @@ async function setSecret(){
 async function deleteSecret(key){await apiSafe(`/api/secrets/${encodeURIComponent(key)}`,{method:"DELETE"});await loadSecrets()}
 
 // --- Status & models ---
+let _bootCommit=null;
+
 async function loadStatus(){
   try{
     const s=await api("/api/status");
     const commitStr=s.commit?` (${esc(s.commit.slice(0,7))})`:'';
     $("footer-text").innerHTML=`<img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/> Dodo v${esc(s.version)}${commitStr}`;
+    if(!_bootCommit&&s.commit)_bootCommit=s.commit;
   }catch{}
+}
+
+// Called on SSE reconnect — a deploy restarts the DO, which drops and
+// re-establishes the SSE connection.  One fetch on reconnect, zero polling.
+async function checkVersionOnReconnect(){
+  if(!_bootCommit)return;
+  try{
+    const s=await api("/api/status");
+    if(s.commit&&s.commit!==_bootCommit)showUpdateBanner(s.commit);
+  }catch{/* transient failure, next reconnect will try again */}
+}
+
+function showUpdateBanner(commit){
+  const banner=$("banner-container");
+  if(!banner||banner.querySelector('.update-banner'))return;
+  const short=commit?commit.slice(0,7):'';
+  const el=document.createElement('div');
+  el.className='update-banner';
+  el.innerHTML=`<span>New version deployed${short?` (${esc(short)})`:''} \u2014 </span><button onclick="location.reload()">Reload</button><button class="ghost sm" onclick="this.parentElement.remove()" style="margin-left:4px;padding:2px 6px;font-size:11px" aria-label="Dismiss">\u00d7</button>`;
+  banner.appendChild(el);
+  // Auto-reload background tabs that aren't mid-prompt
+  if(document.hidden&&!isProcessing){
+    setTimeout(()=>{if(document.hidden&&!isProcessing)location.reload()},3000);
+  }
+  // Auto-reload when user returns to a stale tab
+  document.addEventListener('visibilitychange',function _autoReload(){
+    if(!document.hidden&&!isProcessing&&banner.querySelector('.update-banner')){
+      document.removeEventListener('visibilitychange',_autoReload);
+      location.reload();
+    }
+  });
 }
 async function loadModels(){
   try{
