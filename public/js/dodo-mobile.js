@@ -64,18 +64,23 @@ if(window.visualViewport){
   if(window.innerWidth>900)return;
   const tabs=['chat','files','tools','settings'];
   let touchStartX=0,touchStartY=0,swiping=false;
+  const app=document.querySelector('.app');
   document.addEventListener('touchstart',(e)=>{
     touchStartX=e.touches[0].clientX;touchStartY=e.touches[0].clientY;swiping=true;
+    if(app){app.style.transition='none'}
   },{passive:true});
   document.addEventListener('touchmove',(e)=>{
     if(!swiping)return;
     const dx=e.touches[0].clientX-touchStartX;
     const dy=e.touches[0].clientY-touchStartY;
-    if(Math.abs(dy)>Math.abs(dx)){swiping=false}
+    if(Math.abs(dy)>Math.abs(dx)){swiping=false;if(app)app.style.transform=''}
+    else if(app){app.style.transform=`translateX(${dx}px)`}
   },{passive:true});
   document.addEventListener('touchend',(e)=>{
-    if(!swiping)return;swiping=false;
+    if(!swiping){if(app){app.style.transition='';app.style.transform=''}return}
+    swiping=false;
     const dx=e.changedTouches[0].clientX-touchStartX;
+    if(app){app.style.transition='transform 0.3s ease-out';app.style.transform=''}
     if(Math.abs(dx)<60)return;
     const currentIdx=tabs.indexOf(activeTab);
     if(dx<0&&currentIdx<tabs.length-1)switchTab(tabs[currentIdx+1]);
