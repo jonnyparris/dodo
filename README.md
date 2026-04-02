@@ -4,7 +4,7 @@
   <img src="assets/dodo.svg" alt="Dodo" width="120"/>
 </p>
 
-<p align="center">Self-hostable autonomous coding agent on Cloudflare Workers + Durable Objects.</p>
+<p align="center">Self-hostable platform for dispatching long-running autonomous coding agents on Cloudflare Workers.</p>
 
 ## What it does
 
