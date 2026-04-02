@@ -186,10 +186,10 @@ function renderMessage(msg){
       pre.style.position='relative';pre.appendChild(btn);
     });
   }else{
-    const authorEmail=msg.author||msg.email||(typeof currentUserEmail!=="undefined"?currentUserEmail:null);
+    const authorEmail=msg.authorEmail||msg.author||msg.email||null;
     const label=document.createElement("div");
     label.style.cssText="font-size:10px;margin-bottom:2px;";
-    if(authorEmail&&typeof currentUserEmail!=="undefined"&&authorEmail!==currentUserEmail){
+    if(authorEmail&&window._userEmail&&authorEmail!==window._userEmail){
       label.style.color=emailColor(authorEmail);label.textContent=authorEmail;
     }else{label.style.color=emailColor(authorEmail||"you");label.textContent="You"}
     el.appendChild(label);
@@ -222,8 +222,7 @@ function renderToolCall(tc){
 function setStatusDot(status){$("session-status-dot").className=`status-dot ${status==="running"?"running":"idle"}`}
 function updateTokenSummary(state){
   const ti=state.totalTokenInput??0,to=state.totalTokenOutput??0;
-  const total=ti+to;
-  const contextStr=total?` · Context: ${Math.round(total/1000)}k / 200k`:'';
+  const contextStr=ti?` · Context: ${Math.round(ti/1000)}k`:'';
   $("token-summary").textContent=ti||to?`${(ti/1000).toFixed(1)}k in / ${(to/1000).toFixed(1)}k out${contextStr}`:'';
 }
 
