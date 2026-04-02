@@ -49,6 +49,7 @@ async function loadStatus(){
     const commitStr=commit?` (${esc(commit.slice(0,7))})`:'';
     const versionLabel=`Dodo v${esc(s.version)}${commitStr}`;
     $("footer-text").innerHTML=`<img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/> ${versionLabel}`;
+    const bv=$("build-version");if(bv)bv.textContent=commit?`build ${esc(commit.slice(0,7))}`:`v${esc(s.version)}`;
     const sv=$("sidebar-version");if(sv)sv.textContent=versionLabel;
     if(!_bootCommit&&commit)_bootCommit=commit;
   }catch{}
