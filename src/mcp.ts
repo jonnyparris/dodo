@@ -354,30 +354,35 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     })).min(1).describe("Deterministic text edits to apply in order"),
   }, async ({ repoId, title, branch, baseBranch, commitMessage, expectedFiles, edits }) => {
     const repo = getKnownRepo(repoId);
-    const seed = await getOrCreateSeedSession(env, repoId, baseBranch, depth);
-    const worker = await forkSeedSession(env, seed.sessionId, title, depth);
+    const worker = await createSessionWithTitle(env, title);
     const run = await createWorkerRun(env, {
       baseBranch,
       branch,
       commitMessage,
       expectedFiles,
-      parentSessionId: seed.sessionId,
+      parentSessionId: null,
       repoDir: repo.dir,
       repoId: repo.id,
       repoUrl: repo.url,
-      sessionId: worker.sessionId,
+      sessionId: worker.id,
       status: "session_created",
       strategy: "deterministic",
       title,
     });
 
     try {
+      // Clone fresh (avoids fork binary corruption issues)
+      await agentJson(env, worker.id, "/git/clone", {
+        body: JSON.stringify({ branch: baseBranch, dir: repo.dir, url: repo.url }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth);
       await updateWorkerRun(env, String(run.id), { status: "repo_ready" });
-      await prepareRepoBranch(env, worker.sessionId, repo.dir, branch, baseBranch, depth);
+      await prepareRepoBranch(env, worker.id, repo.dir, branch, baseBranch, depth);
       await updateWorkerRun(env, String(run.id), { status: "branch_created" });
 
       for (const edit of edits) {
-        await agentJson(env, worker.sessionId, `/file?path=${encodeURIComponent(edit.path)}`, {
+        await agentJson(env, worker.id, `/file?path=${encodeURIComponent(edit.path)}`, {
           body: JSON.stringify({ replacement: edit.replacement, search: edit.search }),
           headers: { "content-type": "application/json" },
           method: "PATCH",
@@ -385,38 +390,38 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
       }
       await updateWorkerRun(env, String(run.id), { status: "edit_applied" });
 
-      const status = await agentJson<{ entries?: unknown[] }>(env, worker.sessionId, `/git/status?dir=${encodeURIComponent(repo.dir)}`, undefined, depth);
+      const status = await agentJson<{ entries?: unknown[] }>(env, worker.id, `/git/status?dir=${encodeURIComponent(repo.dir)}`, undefined, depth);
       if (!Array.isArray(status.entries) || status.entries.length === 0) {
         throw new Error("No changed files detected after applying deterministic edits");
       }
 
       for (const file of Array.from(new Set(edits.map((edit) => edit.path)))) {
-        await agentJson(env, worker.sessionId, "/git/add", {
+        await agentJson(env, worker.id, "/git/add", {
           body: JSON.stringify({ dir: repo.dir, filepath: file }),
           headers: { "content-type": "application/json" },
           method: "POST",
         }, depth);
       }
 
-      await agentJson(env, worker.sessionId, "/git/commit", {
+      await agentJson(env, worker.id, "/git/commit", {
         body: JSON.stringify({ dir: repo.dir, message: commitMessage }),
         headers: { "content-type": "application/json" },
         method: "POST",
       }, depth);
       await updateWorkerRun(env, String(run.id), { status: "commit_created" });
 
-      const push = await agentJson<Record<string, unknown>>(env, worker.sessionId, "/git/push-checked", {
+      const push = await agentJson<Record<string, unknown>>(env, worker.id, "/git/push-checked", {
         body: JSON.stringify({ baseRef: baseBranch, dir: repo.dir, expectedFiles, ref: branch }),
         headers: { "content-type": "application/json" },
         method: "POST",
       }, depth);
       await updateWorkerRun(env, String(run.id), { status: "done", verification: push });
-      return textResult({ run, sessionId: worker.sessionId, verification: push });
+      return textResult({ run, sessionId: worker.id, verification: push });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failure = await captureFailureSnapshot(env, String(run.id), worker.sessionId, repo.dir, depth);
+      const failure = await captureFailureSnapshot(env, String(run.id), worker.id, repo.dir, depth);
       await updateWorkerRun(env, String(run.id), { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
-      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: worker.sessionId });
+      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: worker.id });
     }
   });
 
@@ -430,49 +435,54 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     prompt: z.string().min(1).describe("Worker prompt. The repo is already cloned and the branch is already checked out."),
   }, async ({ repoId, title, branch, baseBranch, commitMessage, expectedFiles, prompt }) => {
     const repo = getKnownRepo(repoId);
-    const seed = await getOrCreateSeedSession(env, repoId, baseBranch, depth);
-    const worker = await forkSeedSession(env, seed.sessionId, title, depth);
+    const worker = await createSessionWithTitle(env, title);
     const run = await createWorkerRun(env, {
       baseBranch,
       branch,
       commitMessage,
       expectedFiles,
-      parentSessionId: seed.sessionId,
+      parentSessionId: null,
       repoDir: repo.dir,
       repoId: repo.id,
       repoUrl: repo.url,
-      sessionId: worker.sessionId,
+      sessionId: worker.id,
       status: "session_created",
       strategy: "agent",
       title,
     });
 
     try {
+      // Clone fresh
+      await agentJson(env, worker.id, "/git/clone", {
+        body: JSON.stringify({ branch: baseBranch, dir: repo.dir, url: repo.url }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth);
       await updateWorkerRun(env, String(run.id), { status: "repo_ready" });
-      await prepareRepoBranch(env, worker.sessionId, repo.dir, branch, baseBranch, depth);
+      await prepareRepoBranch(env, worker.id, repo.dir, branch, baseBranch, depth);
       await updateWorkerRun(env, String(run.id), { status: "branch_created" });
 
       const content = [
         `Repository is already cloned at ${repo.dir}.`,
-        `You are already on branch ${branch}.`,
+        `You are on the main branch. Push to remote branch '${branch}' when done.`,
         `Do not clone again. Do not change branch names.`,
         `Use commit message: ${commitMessage}`,
-        "Push with git_push_checked and ref set to the current branch.",
+        `Push with git_push_checked and ref set to '${branch}'.`,
         prompt,
       ].join("\n\n");
 
-      const promptRes = await agentJson<Record<string, unknown>>(env, worker.sessionId, "/prompt", {
+      const promptRes = await agentJson<Record<string, unknown>>(env, worker.id, "/prompt", {
         body: JSON.stringify({ content }),
         headers: { "content-type": "application/json" },
         method: "POST",
       }, depth);
       await updateWorkerRun(env, String(run.id), { status: "prompt_running" });
-      return textResult({ prompt: promptRes, run, sessionId: worker.sessionId });
+      return textResult({ prompt: promptRes, run, sessionId: worker.id });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failure = await captureFailureSnapshot(env, String(run.id), worker.sessionId, repo.dir, depth);
+      const failure = await captureFailureSnapshot(env, String(run.id), worker.id, repo.dir, depth);
       await updateWorkerRun(env, String(run.id), { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
-      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: worker.sessionId });
+      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: worker.id });
     }
   });
 
