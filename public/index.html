@@ -724,13 +724,13 @@
       </div>
       <p style="color:var(--muted);margin-bottom:16px">Dodo is an autonomous coding agent. Each session is an isolated workspace with its own files, git repo, and conversation history.</p>
       <dl>
-        <dt>Send / Async</dt><dd>Send waits for the full response (streaming). Async dispatches work in the background — you'll get a push notification when it completes.</dd>
+        <dt>Send</dt><dd>Send starts a prompt and streams the response into the chat as it arrives. The prompt keeps running server-side, so it can survive reconnects and Durable Object eviction.</dd>
         <dt>Fork</dt><dd>Creates a copy of the current session (files + messages) so you can branch experiments without losing the original.</dd>
-        <dt>Abort</dt><dd>Cancels the currently running async prompt.</dd>
+        <dt>Abort</dt><dd>Cancels the currently running prompt.</dd>
         <dt>Workspace Files</dt><dd>The agent's virtual filesystem. It can read, write, search, and edit files autonomously during conversations. Click directories to expand.</dd>
         <dt>Git</dt><dd>Full git support — init, add, commit, branch, push/pull to GitHub/GitLab with configured tokens.</dd>
         <dt>Tasks</dt><dd>A Kanban board. Add tasks, then use the action buttons on each card: <b>Dispatch</b> creates a new session and starts the agent working on it. <b>Done</b> marks it complete. You can also drag cards between columns, select multiple cards for batch dispatch, or delete/cancel tasks. Ctrl/Cmd+click to multi-select.</dd>
-        <dt>Prompts</dt><dd>History of async prompts with their status (queued, running, completed, failed, aborted).</dd>
+        <dt>Prompts</dt><dd>History of prompts with their status (queued, running, completed, failed, aborted).</dd>
         <dt>Cron Jobs</dt><dd>Schedule delayed or recurring prompts that run automatically.</dd>
         <dt>Memory</dt><dd>Persistent key-value store with search. Survives across sessions.</dd>
         <dt>Integrations</dt><dd>Connect external MCP servers (GitHub, Cloudflare, Sentry, etc.) to extend the agent's capabilities.</dd>

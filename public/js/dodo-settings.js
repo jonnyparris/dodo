@@ -45,7 +45,7 @@ async function loadStatus(){
   try{
     const s=await api("/api/status");
     let commit=s.commit||'';
-    if(!commit){try{const v=await(await fetch("/version.json")).json();commit=v.commit||''}catch{}}
+    if(!commit&&!(s.version||'').includes('-dev')){try{const r=await fetch("/version.json");if(r.ok){const v=await r.json();commit=v.commit||''}}catch{}}
     const commitStr=commit?` (${esc(commit.slice(0,7))})`:'';
     const versionLabel=`Dodo v${esc(s.version)}${commitStr}`;
     $("footer-text").innerHTML=`<img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/> ${versionLabel}`;
