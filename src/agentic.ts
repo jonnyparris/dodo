@@ -107,8 +107,16 @@ function buildGitTools(
             .join("; ");
           throw new Error(`Push failed: ${refErrors || "remote rejected the push"}`);
         }
-        const pushed = Object.keys(result.refs ?? {}).join(", ");
-        return { ok: true, refs: pushed || "(no refs)", message: `Successfully pushed to ${remote || "origin"}` };
+        // Detect no-op pushes: ok=true but no refs changed (e.g. pushed main when on a feature branch)
+        const refs = result.refs ?? {};
+        const pushedRefs = Object.keys(refs);
+        if (pushedRefs.length === 0) {
+          throw new Error("Push was a no-op — no refs were pushed. Make sure you are on the correct branch and have committed changes. Use git_branch to verify your current branch, then retry with ref set to your branch name.");
+        }
+        // Check if all refs were already up to date (remote already had these commits)
+        const alreadyUpToDate = Object.values(refs).every((v) => v.ok && !v.error);
+        const pushed = pushedRefs.join(", ");
+        return { ok: true, refs: pushed, message: `Pushed ${pushed} to ${remote || "origin"}` };
       },
     }),
 
