@@ -167,31 +167,17 @@ async function forkSeedSession(env: Env, sourceSessionId: string, title: string,
   return { sessionId: created.id };
 }
 
-async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, branch: string, baseBranch: string, depth: number): Promise<void> {
-  // Checkout base branch first
+async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, _branch: string, baseBranch: string, depth: number): Promise<void> {
+  // Stay on the base branch — we'll push to the remote branch name directly.
+  // isomorphic-git has issues creating local branches when remote tracking
+  // refs with the same name exist. Since each worker is a fork, we just
+  // commit on main and push with ref=branchName which creates the remote
+  // branch from the current HEAD.
   await agentJson(env, sessionId, "/git/checkout", {
     body: JSON.stringify({ branch: baseBranch, dir: repoDir, force: true }),
     headers: { "content-type": "application/json" },
     method: "POST",
   }, depth).catch(() => undefined);
-
-  // Use checkout with both branch and ref to create-and-switch atomically
-  // isomorphic-git's checkout({ branch: "new-branch", ref: "HEAD" }) creates
-  // the branch from HEAD without checking remote tracking refs
-  try {
-    await agentJson(env, sessionId, "/git/checkout", {
-      body: JSON.stringify({ branch, ref: "HEAD", dir: repoDir, force: true }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    }, depth);
-  } catch {
-    // If that fails (branch exists locally), force checkout it
-    await agentJson(env, sessionId, "/git/checkout", {
-      body: JSON.stringify({ branch, dir: repoDir, force: true }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    }, depth);
-  }
 }
 
 function textResult(data: unknown): { content: Array<{ type: "text"; text: string }> } {
