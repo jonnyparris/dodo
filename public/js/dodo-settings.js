@@ -68,15 +68,20 @@ async function loadIntegrations(){
 
 function renderIntegrations(){
   const configMap=new Map(mcpConfigs.map(c=>[c.name.toLowerCase(),c]));
-  const cards=[];
+  const connected=[],suggestions=[];
   mcpCatalog.forEach(cat=>{
     const configured=configMap.get(cat.name.toLowerCase());
-    cards.push(renderIntegCard(cat.name,cat.description,cat.url,configured));
-    if(configured)configMap.delete(cat.name.toLowerCase());
+    if(configured){
+      connected.push(renderIntegCard(cat.name,cat.description,cat.url,configured));
+      configMap.delete(cat.name.toLowerCase());
+    }else{
+      suggestions.push(renderIntegCard(cat.name,cat.description,cat.url,null));
+    }
   });
   configMap.forEach(cfg=>{
-    cards.push(renderIntegCard(cfg.name,cfg.url||"Custom integration",null,cfg));
+    connected.push(renderIntegCard(cfg.name,cfg.url||"Custom integration",null,cfg));
   });
+  const cards=[...connected,...suggestions];
   $("integrations-list").innerHTML=cards.length?cards.join(""):'<div class="empty">No integrations</div>';
 }
 
