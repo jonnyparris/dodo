@@ -179,7 +179,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /** Enable durable fiber recovery for async prompts. */
   override fibers = true;
 
-  private readonly clients = new Set<WritableStreamDefaultWriter<Uint8Array>>();
+  private readonly clients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
   private readonly db: SqlHelper;
   /** Captured token usage from the most recent onChatMessage() call. */
   private _lastUsage: { inputTokens: number; outputTokens: number } | null = null;
@@ -1825,7 +1825,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private openEventStream(request: Request): Response {
     const stream = new TransformStream<Uint8Array>();
     const writer = stream.writable.getWriter();
-    this.clients.add(writer);
+    this.clients.set(writer, Promise.resolve());
     this.setState({ ...this.readSessionDetails() });
 
     void this.writeEvent(writer, { data: this.readSessionDetails(), type: "ready" });
@@ -1855,11 +1855,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private emitEvent(event: SessionEvent): void {
-    // Broadcast to SSE clients
-    for (const writer of [...this.clients]) {
-      void this.writeEvent(writer, event).catch(() => {
-        this.clients.delete(writer);
-      });
+    // Broadcast to SSE clients — chain writes per-writer to avoid concurrent write() calls
+    for (const [writer, pending] of [...this.clients]) {
+      const next = pending
+        .then(() => this.writeEvent(writer, event))
+        .catch(() => { this.clients.delete(writer); });
+      this.clients.set(writer, next);
     }
 
     // Broadcast to WebSocket clients
@@ -2042,7 +2043,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // workspace may already be empty
     }
 
-    for (const writer of [...this.clients]) {
+    for (const [writer] of [...this.clients]) {
       try { void writer.close(); } catch { /* ignore */ }
       this.clients.delete(writer);
     }
