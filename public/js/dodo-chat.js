@@ -8,32 +8,168 @@ function renderMarkdown(text){
   try{return marked.parse(text)}catch{return esc(text)}
 }
 
-// Incremental markdown streaming
+// === Dual-mode streaming renderer ===
+// Phase 1 (instant): append raw text to a text node — zero latency
+// Phase 2 (periodic): full markdown render every ~300ms for rich formatting
 let streamingText="";
-let streamingRenderTimer=null;
-function renderStreamingMarkdown(){
+let _streamRawSpan=null;        // <span> holding the raw unrendered tail
+let _streamRenderedIdx=0;       // how many chars of streamingText have been markdown-rendered
+let _streamMarkdownTimer=null;  // periodic markdown render
+let _streamRafId=null;          // requestAnimationFrame id for scroll
+let _streamScrollSentinel=null; // invisible div at bottom for smooth scroll
+let _streamLastDelta=0;         // timestamp of last delta for idle detection
+
+function _ensureScrollSentinel(){
+  if(_streamScrollSentinel)return;
+  _streamScrollSentinel=document.createElement("div");
+  _streamScrollSentinel.className="stream-scroll-sentinel";
+  _streamScrollSentinel.style.cssText="height:1px;width:1px;flex-shrink:0";
+  $("chat").appendChild(_streamScrollSentinel);
+}
+
+function _smoothScrollToBottom(){
+  if(_streamRafId)return; // already queued
+  _streamRafId=requestAnimationFrame(()=>{
+    _streamRafId=null;
+    if(_streamScrollSentinel){
+      _streamScrollSentinel.scrollIntoView({behavior:"smooth",block:"end"});
+    }else{
+      const chat=$("chat");
+      chat.scrollTo({top:chat.scrollHeight,behavior:"smooth"});
+    }
+  });
+}
+
+function _appendRawDelta(delta){
   if(!streamingEl)return;
-  streamingEl.innerHTML=renderMarkdown(streamingText);
+  if(!_streamRawSpan){
+    _streamRawSpan=document.createElement("span");
+    _streamRawSpan.className="stream-raw-tail";
+    streamingEl.appendChild(_streamRawSpan);
+  }
+  _streamRawSpan.textContent+=delta;
+}
+
+function _doMarkdownRender(){
+  if(!streamingEl||!streamingText)return;
+  // Replace entire content with rendered markdown
+  const rendered=renderMarkdown(streamingText);
+  // Preserve the streaming class/cursor
+  streamingEl.innerHTML=rendered;
   streamingEl.querySelectorAll('pre').forEach(pre=>{pre.style.position='relative'});
-  $("chat").scrollTop=$("chat").scrollHeight;
+  _streamRenderedIdx=streamingText.length;
+  // Re-create raw span for any future deltas
+  _streamRawSpan=document.createElement("span");
+  _streamRawSpan.className="stream-raw-tail";
+  streamingEl.appendChild(_streamRawSpan);
+}
+
+function _scheduleMarkdownRender(){
+  if(_streamMarkdownTimer)return;
+  _streamMarkdownTimer=setTimeout(()=>{
+    _streamMarkdownTimer=null;
+    _doMarkdownRender();
+    _smoothScrollToBottom();
+  },300);
+}
+
+function _streamIdleCheck(){
+  // If no delta for 150ms, do a markdown render (catches pauses mid-stream)
+  if(!streamingEl||!streamingText)return;
+  if(Date.now()-_streamLastDelta>150&&_streamRenderedIdx<streamingText.length){
+    if(_streamMarkdownTimer){clearTimeout(_streamMarkdownTimer);_streamMarkdownTimer=null}
+    _doMarkdownRender();
+    _smoothScrollToBottom();
+  }
+}
+
+function _cleanupStreaming(){
+  if(_streamMarkdownTimer){clearTimeout(_streamMarkdownTimer);_streamMarkdownTimer=null}
+  if(_streamRafId){cancelAnimationFrame(_streamRafId);_streamRafId=null}
+  if(_streamScrollSentinel){_streamScrollSentinel.remove();_streamScrollSentinel=null}
+  _streamRawSpan=null;
+  _streamRenderedIdx=0;
+  _streamLastDelta=0;
+  streamingText="";
 }
 
 // --- SSE ---
+let _streamIdleTimer=null;
 function connectSSE(id){
   if(eventSource)eventSource.close();eventSource=new EventSource(`/session/${id}/events`);
   eventSource.onopen=()=>{$("sse-banner").classList.remove("visible");checkVersionOnReconnect()};
   eventSource.onerror=()=>{if(eventSource.readyState===EventSource.CLOSED){$("sse-banner").classList.add("visible")}else if(eventSource.readyState===EventSource.CONNECTING){$("sse-banner").classList.add("visible")}};
-  eventSource.addEventListener("text_delta",(e)=>{resetSseActivityTimer();hideThinking();const{delta}=JSON.parse(e.data);if(!streamingEl){streamingEl=document.createElement("div");streamingEl.className="msg assistant";streamingEl.textContent="";streamingText="";$("chat").appendChild(streamingEl)}streamingText+=delta;if(!streamingRenderTimer){streamingRenderTimer=setTimeout(()=>{streamingRenderTimer=null;renderStreamingMarkdown()},80)}});
-  eventSource.addEventListener("message",(e)=>{resetSseActivityTimer();hideThinking();const msg=JSON.parse(e.data);if(streamingRenderTimer){clearTimeout(streamingRenderTimer);streamingRenderTimer=null}streamingText="";if(streamingEl){streamingEl.innerHTML=renderMarkdown(msg.content);
-    streamingEl.querySelectorAll('pre').forEach(pre=>{const btn=document.createElement('button');btn.className='copy-code';btn.textContent='Copy';btn.onclick=(ev)=>{ev.stopPropagation();const code=pre.querySelector('code')?.textContent||pre.textContent;navigator.clipboard.writeText(code).then(()=>{btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',1500)})};pre.style.position='relative';pre.appendChild(btn)});
-    const actions=document.createElement("div");actions.className="msg-actions";const copyBtn=document.createElement("button");copyBtn.textContent="Copy";copyBtn.title="Copy message";copyBtn.setAttribute("aria-label","Copy message");copyBtn.onclick=()=>{navigator.clipboard.writeText(msg.content).then(()=>{copyBtn.textContent="Copied!";setTimeout(()=>copyBtn.textContent="Copy",1500)})};actions.appendChild(copyBtn);streamingEl.appendChild(actions);
-    if(msg.tokenInput||msg.tokenOutput){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;streamingEl.appendChild(m)}streamingEl=null}else{renderMessage(msg)}loadFilesDebounced();apiSafe(`/session/${id}`).then(s=>{if(s)updateTokenSummary(s)})});
-  eventSource.addEventListener("state",(e)=>{resetSseActivityTimer();const s=JSON.parse(e.data);setStatusDot(s.status);updateTokenSummary(s);if(s.status!=="running"){setProcessing(false);hideThinking();if(streamingRenderTimer){clearTimeout(streamingRenderTimer);streamingRenderTimer=null}streamingText="";streamingEl=null;loadPrompts()}});
-  eventSource.addEventListener("tool_call",(e)=>{resetSseActivityTimer();hideThinking();if(streamingEl){if(streamingRenderTimer){clearTimeout(streamingRenderTimer);streamingRenderTimer=null}if(streamingText){renderStreamingMarkdown()}streamingText="";streamingEl=null}renderToolCall(JSON.parse(e.data));loadFilesDebounced()});
+
+  eventSource.addEventListener("text_delta",(e)=>{
+    resetSseActivityTimer();hideThinking();
+    const{delta}=JSON.parse(e.data);
+    if(!streamingEl){
+      _ensureScrollSentinel();
+      streamingEl=document.createElement("div");
+      streamingEl.className="msg assistant streaming";
+      streamingText="";_streamRenderedIdx=0;_streamRawSpan=null;
+      $("chat").insertBefore(streamingEl,_streamScrollSentinel);
+    }
+    streamingText+=delta;
+    _streamLastDelta=Date.now();
+    // Phase 1: instant raw text append
+    _appendRawDelta(delta);
+    _smoothScrollToBottom();
+    // Phase 2: schedule periodic markdown render
+    _scheduleMarkdownRender();
+    // Idle check: render markdown if stream pauses
+    if(_streamIdleTimer)clearTimeout(_streamIdleTimer);
+    _streamIdleTimer=setTimeout(_streamIdleCheck,200);
+  });
+
+  eventSource.addEventListener("message",(e)=>{
+    resetSseActivityTimer();hideThinking();
+    const msg=JSON.parse(e.data);
+    if(_streamIdleTimer){clearTimeout(_streamIdleTimer);_streamIdleTimer=null}
+    if(streamingEl){
+      // Final render: full markdown with copy buttons
+      streamingEl.classList.remove("streaming");
+      streamingEl.innerHTML=renderMarkdown(msg.content);
+      streamingEl.querySelectorAll('pre').forEach(pre=>{
+        const btn=document.createElement('button');btn.className='copy-code';btn.textContent='Copy';
+        btn.onclick=(ev)=>{ev.stopPropagation();const code=pre.querySelector('code')?.textContent||pre.textContent;navigator.clipboard.writeText(code).then(()=>{btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',1500)})};
+        pre.style.position='relative';pre.appendChild(btn);
+      });
+      const actions=document.createElement("div");actions.className="msg-actions";
+      const copyBtn=document.createElement("button");copyBtn.textContent="Copy";copyBtn.title="Copy message";copyBtn.setAttribute("aria-label","Copy message");
+      copyBtn.onclick=()=>{navigator.clipboard.writeText(msg.content).then(()=>{copyBtn.textContent="Copied!";setTimeout(()=>copyBtn.textContent="Copy",1500)})};
+      actions.appendChild(copyBtn);streamingEl.appendChild(actions);
+      if(msg.tokenInput||msg.tokenOutput){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;streamingEl.appendChild(m)}
+      _cleanupStreaming();streamingEl=null;
+    }else{renderMessage(msg)}
+    _smoothScrollToBottom();
+    loadFilesDebounced();apiSafe(`/session/${id}`).then(s=>{if(s)updateTokenSummary(s)});
+  });
+
+  eventSource.addEventListener("state",(e)=>{
+    resetSseActivityTimer();const s=JSON.parse(e.data);setStatusDot(s.status);updateTokenSummary(s);
+    if(s.status!=="running"){
+      setProcessing(false);hideThinking();
+      if(streamingEl)streamingEl.classList.remove("streaming");
+      _cleanupStreaming();streamingEl=null;loadPrompts();
+    }
+  });
+
+  eventSource.addEventListener("tool_call",(e)=>{
+    resetSseActivityTimer();hideThinking();
+    if(streamingEl){
+      // Flush pending markdown before tool call
+      if(streamingText&&_streamRenderedIdx<streamingText.length)_doMarkdownRender();
+      streamingEl.classList.remove("streaming");
+      _cleanupStreaming();streamingEl=null;
+    }
+    renderToolCall(JSON.parse(e.data));loadFilesDebounced();
+  });
+
   eventSource.addEventListener("file",()=>loadFilesDebounced());
   eventSource.addEventListener("prompt",()=>loadPrompts());
-  eventSource.addEventListener("execution",(e)=>{const r=JSON.parse(e.data);const el=document.createElement("div");el.className="msg tool_call";el.textContent=r.error?`Error: ${r.error}`:r.result!=null?`Result: ${JSON.stringify(r.result,null,2)}`:'\u2713 Done';$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight});
-  eventSource.addEventListener("error_message",(e)=>{hideThinking();setProcessing(false);const{message}=JSON.parse(e.data);const el=document.createElement("div");el.className="msg error";el.textContent=message||"Something went wrong";$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight});
+  eventSource.addEventListener("execution",(e)=>{const r=JSON.parse(e.data);const el=document.createElement("div");el.className="msg tool_call";el.textContent=r.error?`Error: ${r.error}`:r.result!=null?`Result: ${JSON.stringify(r.result,null,2)}`:'\u2713 Done';$("chat").appendChild(el);_smoothScrollToBottom()});
+  eventSource.addEventListener("error_message",(e)=>{hideThinking();setProcessing(false);const{message}=JSON.parse(e.data);const el=document.createElement("div");el.className="msg error";el.textContent=message||"Something went wrong";$("chat").appendChild(el);_smoothScrollToBottom()});
   eventSource.addEventListener("presence",(e)=>{const data=JSON.parse(e.data);presenceUsers=data.users||[];renderPresence()});
 }
 
@@ -52,7 +188,7 @@ function renderMessage(msg){
   copyBtn.onclick=()=>{const text=msg.role==="assistant"?msg.content:el.textContent;navigator.clipboard.writeText(text).then(()=>{copyBtn.textContent="Copied!";setTimeout(()=>copyBtn.textContent="Copy",1500)})};
   actions.appendChild(copyBtn);el.appendChild(actions);
   if(msg.role==="assistant"&&(msg.tokenInput||msg.tokenOutput)){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;el.appendChild(m)}
-  $("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight
+  $("chat").appendChild(el);_smoothScrollToBottom()
 }
 function renderToolCall(tc){
   const el=document.createElement("div");el.className="msg tool_call";
@@ -69,7 +205,7 @@ function renderToolCall(tc){
     details.appendChild(expandBtn);
   }
   el.appendChild(details);
-  $("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight
+  $("chat").appendChild(el);_smoothScrollToBottom()
 }
 function setStatusDot(status){$("session-status-dot").className=`status-dot ${status==="running"?"running":"idle"}`}
 function updateTokenSummary(state){
