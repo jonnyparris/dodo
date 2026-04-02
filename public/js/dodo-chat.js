@@ -222,7 +222,9 @@ function renderToolCall(tc){
 function setStatusDot(status){$("session-status-dot").className=`status-dot ${status==="running"?"running":"idle"}`}
 function updateTokenSummary(state){
   const ti=state.totalTokenInput??0,to=state.totalTokenOutput??0;
-  $("token-summary").textContent=ti||to?`${(ti/1000).toFixed(1)}k in / ${(to/1000).toFixed(1)}k out`:'';
+  const total=ti+to;
+  const contextStr=total?` · Context: ${Math.round(total/1000)}k / 200k`:'';
+  $("token-summary").textContent=ti||to?`${(ti/1000).toFixed(1)}k in / ${(to/1000).toFixed(1)}k out${contextStr}`:'';
 }
 
 // --- Chat actions ---
