@@ -63,10 +63,16 @@ function applyTheme(theme){
   document.documentElement.setAttribute('data-mode',theme);
   const icon=$('theme-icon');
   if(icon){icon.className=theme==='dark'?'ph ph-sun':'ph ph-moon'}
-  const favSrc=theme==='dark'?'/favicon-dark.svg':'/favicon-light.svg';
+  updateFavicon();
+}
+function updateFavicon(){
+  const theme=getTheme();
+  const suffix=isProcessing?'-thinking':'';
+  const favSrc=theme==='dark'?`/favicon-dark${suffix}.svg`:`/favicon-light${suffix}.svg`;
+  const logoSrc=theme==='dark'?'/favicon-dark.svg':'/favicon-light.svg';
   const fav=$('favicon');
   if(fav)fav.href=favSrc;
-  document.querySelectorAll('.dodo-logo-img').forEach(img=>{img.src=favSrc});
+  document.querySelectorAll('.dodo-logo-img').forEach(img=>{img.src=logoSrc});
 }
 function toggleTheme(){
   const current=getTheme();
@@ -231,6 +237,7 @@ function setProcessing(active){
   isProcessing=active;
   $("send-btn").disabled=active;$("abort-btn").disabled=!active;$("msg-input").disabled=active;
   $("send-btn").innerHTML=active?'<span class="spinner"></span>':'Send';
+  updateFavicon();
   if(active){resetSseActivityTimer()}else{if(sseActivityTimer){clearTimeout(sseActivityTimer);sseActivityTimer=null}sseStallWarned=false}
 }
 function showThinking(){const el=document.createElement("div");el.className="msg thinking";el.id="thinking-indicator";el.innerHTML='Dodo is thinking<span class="thinking-dots"></span>';$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}

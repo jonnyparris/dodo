@@ -8,4 +8,8 @@
   <path d="M21.2 13.5 Q23.5 13 23.2 14.2 Q23 15 21.5 14.5Z" fill="#7B2CF5"/>
   <path d="M12.5 16 Q14.5 14.5 15.8 16 Q16.8 17.3 14.5 17.8 Q12.5 18 12.5 16Z" fill="#D4891A" opacity="0.9"/>
   <path d="M10.5 17 L8.8 15.5 L8.5 16.5 L10 17.5 L8.5 19 L8.8 19.5 L10.5 18Z" fill="#7B2CF5" opacity="0.7"/>
+  <!-- Blinking cursor -->
+  <rect x="13" y="24" width="6" height="1" rx=".5" fill="#7B2CF5" opacity="0.8">
+    <animate attributeName="opacity" values="0.8;0.2;0.8" dur="1.2s" repeatCount="indefinite"/>
+  </rect>
 </svg>
