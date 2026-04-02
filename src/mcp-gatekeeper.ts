@@ -47,14 +47,16 @@ export class HttpMcpGatekeeper implements McpGatekeeper {
   private transport: StreamableHTTPClientTransport | null = null;
   private connected = false;
   private cachedTools: McpToolInfo[] | null = null;
+  private mcpDepth = 0;
 
-  constructor(private config: McpGatekeeperConfig) {
+  constructor(private config: McpGatekeeperConfig, mcpDepth = 0) {
     if (config.type !== "http") {
       throw new Error(`HttpMcpGatekeeper only supports type "http", got "${config.type}"`);
     }
     if (!config.url) {
       throw new Error("HttpMcpGatekeeper requires a url");
     }
+    this.mcpDepth = mcpDepth;
   }
 
   async connect(): Promise<void> {
@@ -62,8 +64,16 @@ export class HttpMcpGatekeeper implements McpGatekeeper {
 
     const url = new URL(this.config.url!);
     const requestInit: RequestInit = {};
+    const headers: Record<string, string> = {};
     if (this.config.headers && Object.keys(this.config.headers).length > 0) {
-      requestInit.headers = { ...this.config.headers };
+      Object.assign(headers, this.config.headers);
+    }
+    // Propagate MCP recursion depth to outbound MCP servers
+    if (this.mcpDepth > 0) {
+      headers["x-dodo-mcp-depth"] = String(this.mcpDepth);
+    }
+    if (Object.keys(headers).length > 0) {
+      requestInit.headers = headers;
     }
 
     this.transport = new StreamableHTTPClientTransport(url, { requestInit });

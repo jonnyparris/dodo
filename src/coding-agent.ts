@@ -185,6 +185,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private _lastUsage: { inputTokens: number; outputTokens: number } | null = null;
   /** Connected MCP gatekeepers, populated by connectMcpServers(). */
   private mcpGatekeepers: McpGatekeeper[] = [];
+  /** MCP recursion depth from incoming request, propagated to outbound MCP calls. */
+  private mcpDepth = 0;
   private readonly presence = new PresenceTracker();
   readonly stateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
@@ -1254,6 +1256,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const sessionId = this.requireSessionId(request);
     const authorEmail = request.headers.get("x-author-email");
     const ownerEmail = request.headers.get("x-owner-email");
+    this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
     this.ensureMetadata(sessionId, ownerEmail);
 
     if (this.readMetadata("active_prompt_id")) {
@@ -1298,6 +1301,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const sessionId = this.requireSessionId(request);
     const authorEmail = request.headers.get("x-author-email");
     const ownerEmail = request.headers.get("x-owner-email");
+    this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
     this.ensureMetadata(sessionId, ownerEmail);
 
     if (this.readMetadata("active_prompt_id")) {
@@ -1490,18 +1494,38 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   // ─── Think chat integration ───
 
   /**
-   * Configure the Think session from request headers (first-time setup).
-   * Copies the user's config into Think.configure() so getModel() can read it.
+   * Configure the Think session from request headers.
+   * On first call, sets up the full config. On subsequent calls, updates
+   * the model/gateway if they've changed (e.g. user changed model in settings).
    */
   private ensureThinkConfig(request: Request): void {
-    if (this.getConfig()) return; // Already configured
+    const incomingModel = request.headers.get("x-dodo-model") ?? this.env.DEFAULT_MODEL;
+    const incomingGateway = request.headers.get("x-dodo-gateway") === "ai-gateway" ? "ai-gateway" as const : "opencode" as const;
+    const existing = this.getConfig();
+
+    if (existing) {
+      // Check if model or gateway changed — if so, reconfigure
+      if (existing.model === incomingModel && existing.activeGateway === incomingGateway) {
+        return; // No change
+      }
+      this.configure({
+        ...existing,
+        model: incomingModel,
+        activeGateway: incomingGateway,
+        opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? existing.opencodeBaseURL,
+        aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? existing.aiGatewayBaseURL,
+      });
+      return;
+    }
+
+    // First-time setup
     const config: DodoConfig = {
       sessionId: this.sessionId(),
       ownerEmail: this.readMetadata("owner_email") ?? "",
       createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
       browserEnabled: this.readMetadata("browser_enabled") === "true",
-      activeGateway: (request.headers.get("x-dodo-gateway") === "ai-gateway" ? "ai-gateway" : "opencode"),
-      model: request.headers.get("x-dodo-model") ?? this.env.DEFAULT_MODEL,
+      activeGateway: incomingGateway,
+      model: incomingModel,
       opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? this.env.OPENCODE_BASE_URL,
       aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? this.env.AI_GATEWAY_BASE_URL,
     };
@@ -1981,7 +2005,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           const gk = new HttpMcpGatekeeper({
             ...config,
             headers,
-          });
+          }, this.mcpDepth);
 
           await gk.connect();
           await gk.listTools(); // Pre-populate cache for synchronous getTools()

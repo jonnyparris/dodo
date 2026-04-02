@@ -10,6 +10,14 @@ export interface McpCatalogEntry {
 
 export const MCP_CATALOG: McpCatalogEntry[] = [
   {
+    id: "dodo-self",
+    name: "Dodo Self",
+    description: "Connect to this Dodo instance's own MCP server for multi-session orchestration.",
+    url: "https://dodo.jonnyparris.workers.dev/mcp",
+    setupGuide: "Add your DODO_MCP_TOKEN as the Authorization Bearer token.",
+    knownHosts: ["dodo.jonnyparris.workers.dev"],
+  },
+  {
     id: "agent-memory",
     name: "Agent Memory",
     description: "Persistent memory across sessions",
@@ -54,12 +62,5 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     setupGuide:
       "Use the remote server at https://mcp.sentry.dev with OAuth, or run locally via npx @sentry/mcp-server",
     knownHosts: ["mcp.sentry.dev"],
-  },
-  {
-    id: "browser",
-    name: "Browser",
-    description: "Web browsing and scraping",
-    url: "Built-in (when enabled)",
-    setupGuide: "Enable browser integration in your Dodo settings",
   },
 ];
