@@ -218,8 +218,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   override getTools(): ToolSet {
     const appConfig = this.getAppConfigFromThink();
+    const ownerEmail = this.readMetadata("owner_email") ?? undefined;
     return buildToolsForThink(this.env, this.workspace, appConfig, {
-      ownerEmail: this.readMetadata("owner_email") ?? undefined,
+      ownerId: this.resolveOwnerId(ownerEmail),
+      ownerEmail,
       stateBackend: this.stateBackend,
       mcpGatekeepers: this.mcpGatekeepers,
     });
@@ -866,12 +868,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async handleExecute(request: Request): Promise<Response> {
     const body = executeCodeSchema.parse(await request.json());
-    this.ensureMetadata(this.requireSessionId(request), request.headers.get("x-owner-email"));
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    this.ensureMetadata(this.requireSessionId(request), ownerEmail);
 
     const execution = await runSandboxedCode({
       code: body.code,
       env: this.env,
       workspace: this.workspace,
+      ownerId: this.resolveOwnerId(ownerEmail),
     });
 
     this.emitEvent({ data: execution, type: "execution" });
@@ -1855,11 +1859,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private emitEvent(event: SessionEvent): void {
-    // Broadcast to SSE clients — chain writes per-writer to avoid concurrent write() calls
+    // Broadcast to SSE clients — chain writes per-writer to prevent
+    // concurrent writer.write() calls which violate the WritableStream
+    // contract and silently disconnect clients.
     for (const [writer, pending] of [...this.clients]) {
       const next = pending
         .then(() => this.writeEvent(writer, event))
-        .catch(() => { this.clients.delete(writer); });
+        .catch(() => {
+          this.clients.delete(writer);
+        });
       this.clients.set(writer, next);
     }
 
@@ -2024,6 +2032,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // Log but don't throw — sync failure shouldn't break prompt completion
       console.error("syncSessionIndex failed:", error instanceof Error ? error.message : error);
     }
+  }
+
+  /**
+   * Compute the UserControl DO ID hex string for a given owner email.
+   * Used to identify the owner in outbound sandbox requests without exposing PII.
+   */
+  private resolveOwnerId(ownerEmail?: string): string | undefined {
+    if (!ownerEmail) return undefined;
+    return this.env.USER_CONTROL.idFromName(ownerEmail).toString();
   }
 
   private async destroyStorage(): Promise<void> {

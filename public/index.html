@@ -570,7 +570,6 @@
         <textarea id="msg-input" rows="1" placeholder="Ask Dodo to build something..." onkeydown="handleInputKeydown(event)" oninput="autoResizeInput(this)" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)" aria-label="Message input"></textarea>
         <div class="input-actions">
           <button class="primary" id="send-btn" onclick="sendMessage()" aria-label="Send message">Send</button>
-          <button id="async-btn" onclick="sendAsync()" aria-label="Send async">Async</button>
         </div>
       </div>
       <div class="footer" id="footer">
