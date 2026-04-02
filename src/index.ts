@@ -527,7 +527,11 @@ app.get("/api/models", async (c) => proxyToSharedIndex(c.env, `/models${new URL(
 
 app.get("/api/status", async (c) => {
   const email = c.get("userEmail");
-  return proxyToUserControl(c.env, email, "/status");
+  const res = await proxyToUserControl(c.env, email, "/status");
+  // Inject commit hash from Worker env — DOs may not receive --var overrides
+  const data = await res.json() as Record<string, unknown>;
+  data.commit = c.env.DODO_COMMIT ?? data.commit ?? "";
+  return Response.json(data);
 });
 
 // ─── Tasks (per-user via UserControl) ───
