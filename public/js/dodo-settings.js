@@ -44,9 +44,11 @@ let _bootCommit=null;
 async function loadStatus(){
   try{
     const s=await api("/api/status");
-    const commitStr=s.commit?` (${esc(s.commit.slice(0,7))})`:'';
+    let commit=s.commit||'';
+    if(!commit){try{const v=await(await fetch("/version.json")).json();commit=v.commit||''}catch{}}
+    const commitStr=commit?` (${esc(commit.slice(0,7))})`:'';
     $("footer-text").innerHTML=`<img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/> Dodo v${esc(s.version)}${commitStr}`;
-    if(!_bootCommit&&s.commit)_bootCommit=s.commit;
+    if(!_bootCommit&&commit)_bootCommit=commit;
   }catch{}
 }
 
