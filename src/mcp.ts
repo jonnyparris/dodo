@@ -168,16 +168,25 @@ async function forkSeedSession(env: Env, sourceSessionId: string, title: string,
 }
 
 async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, branch: string, baseBranch: string, depth: number): Promise<void> {
+  // Ensure we're on the base branch first
   await agentJson(env, sessionId, "/git/checkout", {
     body: JSON.stringify({ branch: baseBranch, dir: repoDir, force: true }),
     headers: { "content-type": "application/json" },
     method: "POST",
   }, depth).catch(() => undefined);
+  // Delete the branch if it already exists (e.g. from a previous failed run or remote tracking)
+  await agentJson(env, sessionId, "/git/branch", {
+    body: JSON.stringify({ dir: repoDir, delete: branch }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }, depth).catch(() => undefined);
+  // Create fresh branch from base
   await agentJson(env, sessionId, "/git/branch", {
     body: JSON.stringify({ dir: repoDir, name: branch }),
     headers: { "content-type": "application/json" },
     method: "POST",
-  }, depth).catch(() => undefined);
+  }, depth);
+  // Checkout the new branch
   await agentJson(env, sessionId, "/git/checkout", {
     body: JSON.stringify({ branch, dir: repoDir, force: true }),
     headers: { "content-type": "application/json" },
