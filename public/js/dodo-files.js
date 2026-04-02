@@ -50,7 +50,7 @@ async function readFile(path){
 }
 
 // --- Config ---
-async function loadConfig(){const cfg=await apiSafe("/api/config");if(!cfg)return;$("cfg-model").value=cfg.model;$("cfg-gateway").value=cfg.activeGateway;const gwUrl=cfg.activeGateway==="opencode"?cfg.opencodeBaseURL:cfg.aiGatewayBaseURL;$("cfg-gateway-url").value=gwUrl||"";$("config-display").innerHTML=`<div class="kv"><span>Model</span><code>${esc(cfg.model)}</code></div><div class="kv"><span>Gateway</span><code>${esc(cfg.activeGateway)}</code></div><div class="kv"><span>Git</span><code>${esc(cfg.gitAuthorName)}</code></div>`}
+async function loadConfig(){const cfg=await apiSafe("/api/config");if(!cfg)return;$("cfg-model").value=cfg.model;$("cfg-gateway").value=cfg.activeGateway;const gwUrl=cfg.activeGateway==="opencode"?cfg.opencodeBaseURL:cfg.aiGatewayBaseURL;$("cfg-gateway-url").value=gwUrl||"";$("config-display").innerHTML=`<div class="kv"><span>Model</span><code>${esc(cfg.model)}</code></div><div class="kv"><span>Gateway</span><code>${esc(cfg.activeGateway)}</code></div><div class="kv"><span>Git Author</span><code>${esc(cfg.gitAuthorName)}</code></div>`}
 async function saveConfig(){const gw=$("cfg-gateway").value;const body={model:$("cfg-model").value,activeGateway:gw};const url=$("cfg-gateway-url").value.trim();if(url){if(gw==="opencode")body.opencodeBaseURL=url;else body.aiGatewayBaseURL=url}const r=await jsonSafe("/api/config",body,"PUT");if(r)toast('Config saved','success');else toast('Failed to save config','error');await loadConfig()}
 
 // --- Allowlist ---
