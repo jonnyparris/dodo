@@ -6,6 +6,7 @@ function humanizeSecretName(name,configs){const m=name.match(/^mcp:([0-9a-f-]+):
 async function loadIdentity(){
   try{
     const{email,isAdmin}=await api("/api/identity");
+    window._userEmail=email;
     $("identity-display").innerHTML=`${esc(email)}${isAdmin?' <span class="tag">admin</span>':''}`;
   }catch{$("identity-display").textContent=""}
 }
@@ -31,7 +32,7 @@ async function changePasskey(){
 async function loadSecrets(){
   try{
     const{keys}=await api("/api/secrets");
-    $("secrets-list").innerHTML=keys.length?keys.map(k=>`<div class="kv"><code>${esc(humanizeSecretName(k,window._mcpConfigs||[]))}</code><button onclick="deleteSecret('${esc(k)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No secrets</div>';
+    $("secrets-list").innerHTML=keys.length?keys.map(k=>`<div class="kv"><code>${esc(humanizeSecretName(k,mcpConfigs))}</code><button onclick="deleteSecret('${esc(k)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No secrets</div>';
   }catch{$("secrets-list").innerHTML='<div class="empty">No secrets</div>'}
 }
 async function setSecret(){
