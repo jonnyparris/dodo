@@ -1,5 +1,7 @@
 // dodo-chat.js — Markdown rendering, SSE, streaming, messages, chat actions, presence
 
+function emailColor(e){let h=0;for(let i=0;i<e.length;i++)h=e.charCodeAt(i)+((h<<5)-h);return "hsl("+(h%360)+",55%,42%)"}
+
 // Markdown rendering for assistant messages
 let _markedConfigured=false;
 function renderMarkdown(text){
@@ -183,7 +185,16 @@ function renderMessage(msg){
       btn.onclick=(e)=>{e.stopPropagation();const code=pre.querySelector('code')?.textContent||pre.textContent;navigator.clipboard.writeText(code).then(()=>{btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',1500)})};
       pre.style.position='relative';pre.appendChild(btn);
     });
-  }else{el.textContent=msg.content}
+  }else{
+    const authorEmail=msg.author||msg.email||(typeof currentUserEmail!=="undefined"?currentUserEmail:null);
+    const label=document.createElement("div");
+    label.style.cssText="font-size:10px;margin-bottom:2px;";
+    if(authorEmail&&typeof currentUserEmail!=="undefined"&&authorEmail!==currentUserEmail){
+      label.style.color=emailColor(authorEmail);label.textContent=authorEmail;
+    }else{label.style.color=emailColor(authorEmail||"you");label.textContent="You"}
+    el.appendChild(label);
+    el.appendChild(document.createTextNode(msg.content));
+  }
   const actions=document.createElement("div");actions.className="msg-actions";
   const copyBtn=document.createElement("button");copyBtn.textContent="Copy";copyBtn.title="Copy message";copyBtn.setAttribute("aria-label","Copy message");
   copyBtn.onclick=()=>{const text=msg.role==="assistant"?msg.content:el.textContent;navigator.clipboard.writeText(text).then(()=>{copyBtn.textContent="Copied!";setTimeout(()=>copyBtn.textContent="Copy",1500)})};
