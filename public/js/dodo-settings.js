@@ -43,7 +43,7 @@ async function loadStatus(){
   try{
     const s=await api("/api/status");
     const commitStr=s.commit?` (${esc(s.commit.slice(0,7))})`:'';
-    $("footer-text").textContent=`Dodo v${esc(s.version)}${commitStr} · ${s.sessionCount} session${s.sessionCount!==1?'s':''}${s.hasPasskey?' · secrets enabled':''}`;
+    $("footer-text").innerHTML=`<img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/> Dodo v${esc(s.version)}${commitStr}`;
   }catch{}
 }
 async function loadModels(){

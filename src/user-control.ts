@@ -88,11 +88,16 @@ export class UserControl implements DurableObject {
       }
     }
 
-    // Internal secret endpoint requires owner email header to match
+    // Internal secret endpoint — the DO ID is the identity proof.
+    // If x-owner-email is provided, validate it matches. Otherwise, use the
+    // stored owner email (enables DO-to-DO calls that only have the DO ID).
     if (url.pathname.startsWith("/internal/secret/")) {
       const stored = this.getOwnerEmail();
-      if (!headerEmail || (stored && stored !== headerEmail)) {
-        return Response.json({ error: "Owner email required and must match" }, { status: 403 });
+      if (headerEmail && stored && stored !== headerEmail) {
+        return Response.json({ error: "Owner email mismatch" }, { status: 403 });
+      }
+      if (!headerEmail && !stored) {
+        return Response.json({ error: "Owner email not established" }, { status: 403 });
       }
     }
 
@@ -385,7 +390,7 @@ export class UserControl implements DurableObject {
 
       if (request.method === "GET" && url.pathname.startsWith("/internal/secret/")) {
         const key = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+        const ownerEmail = request.headers.get("x-owner-email") || this.getOwnerEmail() || "";
         const value = await this.getSecret(key, ownerEmail);
         if (value === null) return Response.json({ error: "Secret not found" }, { status: 404 });
         return Response.json({ value });

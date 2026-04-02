@@ -4,6 +4,7 @@ import { jsonSchema, tool, zodSchema } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken } from "./git";
+import { wrapOutboundWithOwner } from "./executor";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env } from "./types";
@@ -166,7 +167,7 @@ function buildTools(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; ownerEmail?: string; stateBackend?: StateBackend },
+  options?: { authorEmail?: string; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend },
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
@@ -174,12 +175,16 @@ function buildTools(
   const gitTools = buildGitTools(env, workspace, config, options?.ownerEmail);
 
   if (env.LOADER) {
+    const outbound = options?.ownerId && env.OUTBOUND
+      ? wrapOutboundWithOwner(env.OUTBOUND, options.ownerId)
+      : env.OUTBOUND ?? null;
+
     tools.codemode = createExecuteTool({
       tools: workspaceTools,
       state: options?.stateBackend,
       loader: env.LOADER,
       timeout: 30_000,
-      globalOutbound: env.OUTBOUND ?? null,
+      globalOutbound: outbound,
       providers: [
         { name: "git", tools: gitTools },
       ],
@@ -203,7 +208,7 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; ownerEmail?: string; stateBackend?: StateBackend; mcpGatekeepers?: McpGatekeeper[] },
+  options?: { authorEmail?: string; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend; mcpGatekeepers?: McpGatekeeper[] },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
 
