@@ -167,28 +167,22 @@ async function forkSeedSession(env: Env, sourceSessionId: string, title: string,
   return { sessionId: created.id };
 }
 
-async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, branch: string, baseBranch: string, depth: number): Promise<void> {
-  // Ensure we're on the base branch first
-  await agentJson(env, sessionId, "/git/checkout", {
-    body: JSON.stringify({ branch: baseBranch, dir: repoDir, force: true }),
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  }, depth).catch(() => undefined);
-  // Delete the branch if it already exists (e.g. from a previous failed run or remote tracking)
-  await agentJson(env, sessionId, "/git/branch", {
-    body: JSON.stringify({ dir: repoDir, delete: branch }),
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  }, depth).catch(() => undefined);
-  // Create fresh branch from base
-  await agentJson(env, sessionId, "/git/branch", {
-    body: JSON.stringify({ dir: repoDir, name: branch }),
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  }, depth);
-  // Checkout the new branch
-  await agentJson(env, sessionId, "/git/checkout", {
-    body: JSON.stringify({ branch, dir: repoDir, force: true }),
+async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, branch: string, _baseBranch: string, depth: number): Promise<void> {
+  // Use codemode to create and checkout branch atomically via isomorphic-git
+  // This avoids the "branch already exists" issue from remote tracking refs
+  const code = `
+    const git = providers.git;
+    const dir = ${JSON.stringify(repoDir)};
+    const branch = ${JSON.stringify(branch)};
+    // Delete local branch if it exists
+    try { await git.branch({ dir, delete: branch }); } catch {}
+    // Create and checkout in one step using ref (current HEAD)
+    await git.checkout({ dir, branch, force: true });
+    const current = await git.branch({ dir, list: true });
+    return { branch, current };
+  `;
+  await agentJson(env, sessionId, "/execute", {
+    body: JSON.stringify({ code }),
     headers: { "content-type": "application/json" },
     method: "POST",
   }, depth);
