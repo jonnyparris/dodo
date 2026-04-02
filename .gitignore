@@ -3,3 +3,4 @@ node_modules/
 .dev.vars
 coverage/
 dist/
+public/version.json

@@ -26,6 +26,33 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
 - Do not introduce container- or VM-specific assumptions.
 - All Think imports route through `src/think-adapter.ts` — never import `@cloudflare/think` directly elsewhere.
 
+## Git Discipline — Worktrees Required
+
+**Never commit directly to `main`.** Multiple agents may work on this repo concurrently. All changes must go through feature branches.
+
+### Workflow
+
+1. **Create a worktree branch** before making any changes:
+   ```bash
+   git worktree add ../dodo-<short-description> -b <branch-name>
+   ```
+2. **Work in the worktree directory**, not in the main checkout.
+3. **Commit and push** the branch, then open a PR on GitHub.
+4. **Do not merge your own PRs** — let the repo owner review and merge.
+5. **Clean up** the worktree after the PR is merged:
+   ```bash
+   git worktree remove ../dodo-<short-description>
+   git branch -d <branch-name>
+   ```
+
+### Why
+
+Without worktrees, concurrent agents create divergent histories on `main` that require merge commits and conflict resolution. This has already caused confusing commit graphs and near-loss of work.
+
+### Branch Naming
+
+Use descriptive branch names: `fix/sse-serialization`, `feat/per-user-auth`, `docs/update-readme`. Prefix with `fix/`, `feat/`, `docs/`, or `chore/`.
+
 ## File Map
 
 - `src/index.ts` — Worker router (Hono), all HTTP routes, auth middleware, session fork, admin routes
