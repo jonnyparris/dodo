@@ -1,5 +1,7 @@
 // dodo-settings.js — Identity, passkeys, secrets, integrations, session settings, permissions, sharing, browser, approvals, MCP overrides
 
+function humanizeSecretName(name,configs){const m=name.match(/^mcp:([0-9a-f-]+):(.+)$/i);if(m&&configs){const c=configs.find(x=>x.id===m[1]);if(c)return "mcp:"+c.name+":"+m[2]}return name}
+
 // --- Identity ---
 async function loadIdentity(){
   try{
@@ -29,7 +31,7 @@ async function changePasskey(){
 async function loadSecrets(){
   try{
     const{keys}=await api("/api/secrets");
-    $("secrets-list").innerHTML=keys.length?keys.map(k=>`<div class="kv"><code>${esc(k)}</code><button onclick="deleteSecret('${esc(k)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No secrets</div>';
+    $("secrets-list").innerHTML=keys.length?keys.map(k=>`<div class="kv"><code>${esc(humanizeSecretName(k,window._mcpConfigs||[]))}</code><button onclick="deleteSecret('${esc(k)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No secrets</div>';
   }catch{$("secrets-list").innerHTML='<div class="empty">No secrets</div>'}
 }
 async function setSecret(){
