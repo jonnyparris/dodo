@@ -167,25 +167,31 @@ async function forkSeedSession(env: Env, sourceSessionId: string, title: string,
   return { sessionId: created.id };
 }
 
-async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, branch: string, _baseBranch: string, depth: number): Promise<void> {
-  // Use codemode to create and checkout branch atomically via isomorphic-git
-  // This avoids the "branch already exists" issue from remote tracking refs
-  const code = `
-    const git = providers.git;
-    const dir = ${JSON.stringify(repoDir)};
-    const branch = ${JSON.stringify(branch)};
-    // Delete local branch if it exists
-    try { await git.branch({ dir, delete: branch }); } catch {}
-    // Create and checkout in one step using ref (current HEAD)
-    await git.checkout({ dir, branch, force: true });
-    const current = await git.branch({ dir, list: true });
-    return { branch, current };
-  `;
-  await agentJson(env, sessionId, "/execute", {
-    body: JSON.stringify({ code }),
+async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, branch: string, baseBranch: string, depth: number): Promise<void> {
+  // Checkout base branch first
+  await agentJson(env, sessionId, "/git/checkout", {
+    body: JSON.stringify({ branch: baseBranch, dir: repoDir, force: true }),
     headers: { "content-type": "application/json" },
     method: "POST",
-  }, depth);
+  }, depth).catch(() => undefined);
+
+  // Use checkout with both branch and ref to create-and-switch atomically
+  // isomorphic-git's checkout({ branch: "new-branch", ref: "HEAD" }) creates
+  // the branch from HEAD without checking remote tracking refs
+  try {
+    await agentJson(env, sessionId, "/git/checkout", {
+      body: JSON.stringify({ branch, ref: "HEAD", dir: repoDir, force: true }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    }, depth);
+  } catch {
+    // If that fails (branch exists locally), force checkout it
+    await agentJson(env, sessionId, "/git/checkout", {
+      body: JSON.stringify({ branch, dir: repoDir, force: true }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    }, depth);
+  }
 }
 
 function textResult(data: unknown): { content: Array<{ type: "text"; text: string }> } {
