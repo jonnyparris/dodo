@@ -65,14 +65,41 @@ function applyTheme(theme){
   if(icon){icon.className=theme==='dark'?'ph ph-sun':'ph ph-moon'}
   updateFavicon();
 }
+// === Favicon blink during processing ===
+let _faviconBlinkTimer=null;
+let _faviconBlinkOn=true;
+const _faviconCursor={
+  dark:'<rect x="13" y="24" width="6" height="1" rx=".5" fill="#7B2CF5"/>',
+  light:'<rect x="13" y="24" width="6" height="1" rx=".5" fill="#6B21A8"/>'
+};
+function _buildFaviconDataUri(theme,showCursor){
+  const bg=theme==='dark'?'#0D1117':'#f0f0f0';
+  const br=theme==='dark'?'#7B2CF5':'#6B21A8';
+  const eye=bg;
+  const cursor=showCursor?_faviconCursor[theme]:'';
+  const svg=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"><rect width="32" height="32" rx="6" fill="${bg}"/><path d="M4 16 L10 10 L10 12 L6.5 16 L10 20 L10 22 L4 16Z" fill="${br}"/><path d="M28 16 L22 10 L22 12 L25.5 16 L22 20 L22 22 L28 16Z" fill="${br}"/><ellipse cx="16" cy="17" rx="5.5" ry="4.2" fill="#F5A623"/><circle cx="19" cy="13" r="2.8" fill="#F5A623"/><circle cx="20" cy="12.3" r="0.7" fill="${eye}"/><path d="M21.2 13.5 Q23.5 13 23.2 14.2 Q23 15 21.5 14.5Z" fill="${br}"/><path d="M12.5 16 Q14.5 14.5 15.8 16 Q16.8 17.3 14.5 17.8 Q12.5 18 12.5 16Z" fill="#D4891A" opacity="0.9"/><path d="M10.5 17 L8.8 15.5 L8.5 16.5 L10 17.5 L8.5 19 L8.8 19.5 L10.5 18Z" fill="${br}" opacity="0.7"/>${cursor}</svg>`;
+  return 'data:image/svg+xml,'+encodeURIComponent(svg);
+}
+function _startFaviconBlink(){
+  if(_faviconBlinkTimer)return;
+  const fav=$('favicon');
+  if(!fav)return;
+  _faviconBlinkOn=true;
+  const theme=getTheme();
+  fav.href=_buildFaviconDataUri(theme,true);
+  _faviconBlinkTimer=setInterval(()=>{
+    _faviconBlinkOn=!_faviconBlinkOn;
+    fav.href=_buildFaviconDataUri(getTheme(),_faviconBlinkOn);
+  },600);
+}
+function _stopFaviconBlink(){
+  if(_faviconBlinkTimer){clearInterval(_faviconBlinkTimer);_faviconBlinkTimer=null}
+}
 function updateFavicon(){
   const theme=getTheme();
-  const suffix=isProcessing?'-thinking':'';
-  const favSrc=theme==='dark'?`/favicon-dark${suffix}.svg`:`/favicon-light${suffix}.svg`;
   const logoSrc=theme==='dark'?'/favicon-dark.svg':'/favicon-light.svg';
-  const fav=$('favicon');
-  if(fav)fav.href=favSrc;
   document.querySelectorAll('.dodo-logo-img').forEach(img=>{img.src=logoSrc});
+  if(isProcessing){_startFaviconBlink()}else{_stopFaviconBlink();const fav=$('favicon');if(fav)fav.href=logoSrc}
 }
 function toggleTheme(){
   const current=getTheme();
