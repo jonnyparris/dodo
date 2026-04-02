@@ -240,6 +240,6 @@ function setProcessing(active){
   updateFavicon();
   if(active){resetSseActivityTimer()}else{if(sseActivityTimer){clearTimeout(sseActivityTimer);sseActivityTimer=null}sseStallWarned=false}
 }
-function showThinking(){const el=document.createElement("div");el.className="msg thinking";el.id="thinking-indicator";el.innerHTML='Dodo is thinking<span class="thinking-dots"></span>';$("chat").appendChild(el);$("chat").scrollTop=$("chat").scrollHeight}
+function showThinking(){const el=document.createElement("div");el.className="msg thinking";el.id="thinking-indicator";el.innerHTML='Dodo is thinking<span class="thinking-dots"></span>';$("chat").appendChild(el);const chat=$("chat");chat.scrollTo({top:chat.scrollHeight,behavior:"smooth"})}
 function hideThinking(){$("thinking-indicator")?.remove()}
 function useExample(el){if(!currentSession){createSession().then(()=>{$("msg-input").value=el.textContent;autoResizeInput($("msg-input"))});return}$("msg-input").value=el.textContent;autoResizeInput($("msg-input"));$("msg-input").focus()}
