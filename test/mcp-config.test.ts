@@ -182,11 +182,11 @@ describe("MCP Catalog", () => {
 
     // Verify known entries exist
     const ids = catalog.map((c) => c.id);
+    expect(ids).toContain("dodo-self");
     expect(ids).toContain("agent-memory");
     expect(ids).toContain("github");
     expect(ids).toContain("cloudflare-api");
     expect(ids).toContain("sentry");
-    expect(ids).toContain("browser");
 
     // Verify each entry has required fields
     for (const entry of catalog) {

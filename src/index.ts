@@ -202,12 +202,21 @@ export function requirePermission(
 
 // ─── MCP (token auth, no CF Access) ───
 
+const MAX_MCP_DEPTH = 3;
+
 app.all("/mcp", async (c) => {
   const token = c.req.header("Authorization")?.replace("Bearer ", "");
   if (!c.env.DODO_MCP_TOKEN || token !== c.env.DODO_MCP_TOKEN) {
     return c.json({ error: "Invalid or missing MCP token" }, 401);
   }
-  const server = createDodoMcpServer(c.env);
+
+  // Loop protection: reject requests that exceed recursion depth
+  const depth = parseInt(c.req.header("x-dodo-mcp-depth") ?? "0", 10) || 0;
+  if (depth >= MAX_MCP_DEPTH) {
+    return c.json({ error: "MCP recursion depth exceeded" }, 429);
+  }
+
+  const server = createDodoMcpServer(c.env, depth);
   const handler = createMcpHandler(server);
   return handler(c.req.raw, c.env, c.executionCtx);
 });

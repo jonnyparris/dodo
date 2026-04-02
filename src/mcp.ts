@@ -23,11 +23,12 @@ async function sharedIndexFetch(env: Env, path: string, init?: RequestInit): Pro
   return stub.fetch(`https://shared-index${path}`, init);
 }
 
-async function agentFetch(env: Env, sessionId: string, path: string, init?: RequestInit): Promise<Response> {
+async function agentFetch(env: Env, sessionId: string, path: string, init?: RequestInit, depth = 0): Promise<Response> {
   const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
   const headers = new Headers(init?.headers);
   headers.set("x-dodo-session-id", sessionId);
   headers.set("x-owner-email", mcpUserEmail(env));
+  headers.set("x-dodo-mcp-depth", String(depth + 1));
 
   // Inject gateway config for message/prompt routes
   if (path === "/message" || path === "/prompt") {
@@ -51,14 +52,14 @@ function errorResult(data: unknown): { content: Array<{ type: "text"; text: stri
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }], isError: true };
 }
 
-async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: string, opts?: { sessionId?: string; init?: RequestInit }): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: true }> {
+async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: string, opts?: { sessionId?: string; init?: RequestInit; depth?: number }): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: true }> {
   let res: Response;
   if (fetcher === "user") {
     res = await userControlFetch(env, path, opts?.init);
   } else if (fetcher === "shared") {
     res = await sharedIndexFetch(env, path, opts?.init);
   } else {
-    res = await agentFetch(env, opts?.sessionId ?? "", path, opts?.init);
+    res = await agentFetch(env, opts?.sessionId ?? "", path, opts?.init, opts?.depth ?? 0);
   }
   const data = await res.json();
   if (!res.ok) {
@@ -67,8 +68,8 @@ async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: s
   return textResult(data);
 }
 
-export function createDodoMcpServer(env: Env): McpServer {
-  const server = new McpServer({ name: "dodo", version: "0.3.0" });
+export function createDodoMcpServer(env: Env, depth = 0): McpServer {
+  const server = new McpServer({ name: "dodo", version: "0.4.0" });
 
   // --- Session tools ---
 
@@ -94,7 +95,7 @@ export function createDodoMcpServer(env: Env): McpServer {
     if (!checkRes.ok) {
       return errorResult({ error: `Session '${sessionId}' not found. Run list_sessions to see available sessions.` });
     }
-    return jsonFetch(env, "agent", "/", { sessionId });
+    return jsonFetch(env, "agent", "/", { sessionId, depth });
   });
 
   server.tool("delete_session", "Delete a Dodo session and its storage. The session can be restored within 5 minutes using restore_session.", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
@@ -103,11 +104,39 @@ export function createDodoMcpServer(env: Env): McpServer {
     if (!checkRes.ok) {
       return errorResult({ error: `Session '${sessionId}' not found. Run list_sessions to see available sessions.` });
     }
-    const result = await agentFetch(env, sessionId, "/", { method: "DELETE" });
+    const result = await agentFetch(env, sessionId, "/", { method: "DELETE" }, depth);
     // Soft-delete in UserControl (marks as deleted, auto-purges after 5 minutes)
     await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/soft-delete`, { method: "POST" });
     const data = await result.json();
     return textResult({ ...data as object, sessionId, recoverable: true, recoverableUntil: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
+  });
+
+  server.tool("bulk_delete_sessions", "Delete all sessions whose title starts with a given prefix. Skips sessions with running prompts.", {
+    titlePrefix: z.string().min(3).describe("Delete all sessions whose title starts with this prefix"),
+  }, async ({ titlePrefix }) => {
+    const listRes = await userControlFetch(env, "/sessions");
+    const { sessions } = (await listRes.json()) as { sessions: Array<{ id: string; title?: string; status?: string }> };
+    const matching = sessions.filter((s) => s.title?.startsWith(titlePrefix));
+    if (matching.length === 0) {
+      return textResult({ deleted: 0, skipped: [], message: `No sessions found with title prefix "${titlePrefix}"` });
+    }
+
+    let deleted = 0;
+    const skipped: string[] = [];
+    for (const session of matching) {
+      if (session.status === "running") {
+        skipped.push(`${session.id} (running)`);
+        continue;
+      }
+      try {
+        await agentFetch(env, session.id, "/", { method: "DELETE" }, depth);
+        await userControlFetch(env, `/sessions/${encodeURIComponent(session.id)}/soft-delete`, { method: "POST" });
+        deleted++;
+      } catch {
+        skipped.push(`${session.id} (error)`);
+      }
+    }
+    return textResult({ deleted, skipped });
   });
 
   server.tool("restore_session", "Restore a recently deleted session (within 5 minutes of deletion)", { sessionId: z.string().describe("Session ID to restore") }, async ({ sessionId }) => {
@@ -125,14 +154,14 @@ export function createDodoMcpServer(env: Env): McpServer {
     if (!checkRes.ok) {
       return errorResult({ error: `Source session '${sessionId}' not found. Run list_sessions to see available sessions.` });
     }
-    const snapshotRes = await agentFetch(env, sessionId, "/snapshot");
+    const snapshotRes = await agentFetch(env, sessionId, "/snapshot", undefined, depth);
     const snapshot = await snapshotRes.text();
     const storeRes = await userControlFetch(env, "/fork-snapshots", { body: snapshot, headers: { "content-type": "application/json" }, method: "POST" });
     const { id: snapshotId } = (await storeRes.json()) as { id: string };
     const newId = crypto.randomUUID();
     const email = mcpUserEmail(env);
     await userControlFetch(env, "/sessions", { body: JSON.stringify({ id: newId, ownerEmail: email, createdBy: email }), headers: { "content-type": "application/json" }, method: "POST" });
-    await agentFetch(env, newId, `/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`, { method: "POST" });
+    await agentFetch(env, newId, `/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`, { method: "POST" }, depth);
     await userControlFetch(env, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
     return textResult({ sessionId: newId, sourceSessionId: sessionId, forkedAt: new Date().toISOString() });
   });
@@ -143,14 +172,14 @@ export function createDodoMcpServer(env: Env): McpServer {
     sessionId: z.string().describe("Session ID"),
     path: z.string().default("/").describe("Directory path"),
   }, async ({ sessionId, path }) =>
-    jsonFetch(env, "agent", `/files?path=${encodeURIComponent(path)}`, { sessionId }),
+    jsonFetch(env, "agent", `/files?path=${encodeURIComponent(path)}`, { sessionId, depth }),
   );
 
   server.tool("read_file", "Read a file from a session's workspace", {
     sessionId: z.string().describe("Session ID"),
     path: z.string().describe("File path"),
   }, async ({ sessionId, path }) =>
-    jsonFetch(env, "agent", `/file?path=${encodeURIComponent(path)}`, { sessionId }),
+    jsonFetch(env, "agent", `/file?path=${encodeURIComponent(path)}`, { sessionId, depth }),
   );
 
   server.tool("write_file", "Write a file to a session's workspace", {
@@ -160,6 +189,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   }, async ({ sessionId, path, content }) =>
     jsonFetch(env, "agent", `/file?path=${encodeURIComponent(path)}`, {
       sessionId,
+      depth,
       init: { body: JSON.stringify({ content }), headers: { "content-type": "application/json" }, method: "PUT" },
     }),
   );
@@ -171,6 +201,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   }, async ({ sessionId, pattern, query }) =>
     jsonFetch(env, "agent", "/search", {
       sessionId,
+      depth,
       init: { body: JSON.stringify({ pattern, query: query ?? "" }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
@@ -183,6 +214,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   }, async ({ sessionId, code }) =>
     jsonFetch(env, "agent", "/execute", {
       sessionId,
+      depth,
       init: { body: JSON.stringify({ code }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
@@ -195,6 +227,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   }, async ({ sessionId, content }) =>
     jsonFetch(env, "agent", "/message", {
       sessionId,
+      depth,
       init: { body: JSON.stringify({ content }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
@@ -205,6 +238,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   }, async ({ sessionId, content }) =>
     jsonFetch(env, "agent", "/prompt", {
       sessionId,
+      depth,
       init: { body: JSON.stringify({ content }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
@@ -212,19 +246,19 @@ export function createDodoMcpServer(env: Env): McpServer {
   server.tool("abort_prompt", "Abort a running async prompt", {
     sessionId: z.string().describe("Session ID"),
   }, async ({ sessionId }) =>
-    jsonFetch(env, "agent", "/abort", { sessionId, init: { method: "POST", body: "{}", headers: { "content-type": "application/json" } } }),
+    jsonFetch(env, "agent", "/abort", { sessionId, depth, init: { method: "POST", body: "{}", headers: { "content-type": "application/json" } } }),
   );
 
   server.tool("get_messages", "Get message history for a session", {
     sessionId: z.string().describe("Session ID"),
   }, async ({ sessionId }) =>
-    jsonFetch(env, "agent", "/messages", { sessionId }),
+    jsonFetch(env, "agent", "/messages", { sessionId, depth }),
   );
 
   server.tool("get_prompts", "Get prompt history for a session", {
     sessionId: z.string().describe("Session ID"),
   }, async ({ sessionId }) =>
-    jsonFetch(env, "agent", "/prompts", { sessionId }),
+    jsonFetch(env, "agent", "/prompts", { sessionId, depth }),
   );
 
   // --- Git tools ---
@@ -233,7 +267,7 @@ export function createDodoMcpServer(env: Env): McpServer {
     sessionId: z.string().describe("Session ID"),
     dir: z.string().optional().describe("Repo directory path"),
   }, async ({ sessionId, dir }) =>
-    jsonFetch(env, "agent", `/git/status${dir ? `?dir=${encodeURIComponent(dir)}` : ""}`, { sessionId }),
+    jsonFetch(env, "agent", `/git/status${dir ? `?dir=${encodeURIComponent(dir)}` : ""}`, { sessionId, depth }),
   );
 
   server.tool("git_init", "Initialize a git repo in the session workspace", {
@@ -242,6 +276,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   }, async ({ sessionId, dir }) =>
     jsonFetch(env, "agent", "/git/init", {
       sessionId,
+      depth,
       init: { body: JSON.stringify({ dir }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
@@ -253,6 +288,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   }, async ({ sessionId, filepath, dir }) =>
     jsonFetch(env, "agent", "/git/add", {
       sessionId,
+      depth,
       init: { body: JSON.stringify({ filepath, dir }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
@@ -264,6 +300,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   }, async ({ sessionId, message, dir }) =>
     jsonFetch(env, "agent", "/git/commit", {
       sessionId,
+      depth,
       init: { body: JSON.stringify({ message, dir }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
@@ -272,18 +309,18 @@ export function createDodoMcpServer(env: Env): McpServer {
     sessionId: z.string().describe("Session ID"),
     dir: z.string().optional().describe("Repo directory path"),
     depth: z.number().optional().describe("Number of commits to show"),
-  }, async ({ sessionId, dir, depth }) => {
+  }, async ({ sessionId, dir, depth: logDepth }) => {
     const params = new URLSearchParams();
     if (dir) params.set("dir", dir);
-    if (depth) params.set("depth", String(depth));
-    return jsonFetch(env, "agent", `/git/log?${params}`, { sessionId });
+    if (logDepth) params.set("depth", String(logDepth));
+    return jsonFetch(env, "agent", `/git/log?${params}`, { sessionId, depth });
   });
 
   server.tool("git_diff", "Get git diff for a session's repo", {
     sessionId: z.string().describe("Session ID"),
     dir: z.string().optional().describe("Repo directory path"),
   }, async ({ sessionId, dir }) =>
-    jsonFetch(env, "agent", `/git/diff${dir ? `?dir=${encodeURIComponent(dir)}` : ""}`, { sessionId }),
+    jsonFetch(env, "agent", `/git/diff${dir ? `?dir=${encodeURIComponent(dir)}` : ""}`, { sessionId, depth }),
   );
 
   server.tool("git_clone", "Clone a git repo into the session workspace", {
@@ -292,10 +329,11 @@ export function createDodoMcpServer(env: Env): McpServer {
     dir: z.string().optional().describe("Target directory"),
     branch: z.string().optional().describe("Branch to clone"),
     depth: z.number().optional().describe("Clone depth (shallow clone)"),
-  }, async ({ sessionId, url, dir, branch, depth }) =>
+  }, async ({ sessionId, url, dir, branch, depth: cloneDepth }) =>
     jsonFetch(env, "agent", "/git/clone", {
       sessionId,
-      init: { body: JSON.stringify({ url, dir, branch, depth }), headers: { "content-type": "application/json" }, method: "POST" },
+      depth,
+      init: { body: JSON.stringify({ url, dir, branch, depth: cloneDepth }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
 
@@ -308,6 +346,7 @@ export function createDodoMcpServer(env: Env): McpServer {
   }, async ({ sessionId, dir, remote, ref, force }) =>
     jsonFetch(env, "agent", "/git/push", {
       sessionId,
+      depth,
       init: { body: JSON.stringify({ dir, remote, ref, force }), headers: { "content-type": "application/json" }, method: "POST" },
     }),
   );
@@ -343,6 +382,49 @@ export function createDodoMcpServer(env: Env): McpServer {
     jsonFetch(env, "user", "/config", {
       init: { body: JSON.stringify(params), headers: { "content-type": "application/json" }, method: "PUT" },
     }),
+  );
+
+  // --- MCP Config tools ---
+
+  server.tool("add_mcp_config", "Add an MCP integration. Bypasses host allowlist (MCP is trusted).", {
+    name: z.string().describe("Integration name"),
+    url: z.string().url().describe("MCP server URL"),
+    authToken: z.string().optional().describe("Bearer token for Authorization header"),
+    sessionId: z.string().optional().describe("If provided, only enable for this session"),
+  }, async ({ name, url, authToken, sessionId: targetSessionId }) => {
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers["Authorization"] = `Bearer ${authToken}`;
+    }
+
+    // Create the config via UserControl directly (bypasses index.ts host allowlist)
+    const res = await userControlFetch(env, "/mcp-configs", {
+      body: JSON.stringify({ name, type: "http", url, headers: Object.keys(headers).length > 0 ? headers : undefined, enabled: true }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      return errorResult(err);
+    }
+
+    const config = (await res.json()) as { id: string; name: string; url?: string };
+
+    // If sessionId provided, enable only for that session via override
+    if (targetSessionId) {
+      await userControlFetch(env, `/sessions/${encodeURIComponent(targetSessionId)}/mcp-overrides`, {
+        body: JSON.stringify({ mcpConfigId: config.id, enabled: true }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+    }
+
+    return textResult({ ...config, scopedToSession: targetSessionId ?? null });
+  });
+
+  server.tool("list_mcp_configs", "List configured MCP integrations with id, name, url, and enabled status", {}, async () =>
+    jsonFetch(env, "user", "/mcp-configs"),
   );
 
   // --- Task tools (per-user) ---
