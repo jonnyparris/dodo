@@ -152,7 +152,7 @@ function connectSSE(id){
     if(s.status!=="running"){
       setProcessing(false);hideThinking();
       if(streamingEl)streamingEl.classList.remove("streaming");
-      _cleanupStreaming();streamingEl=null;loadPrompts();
+      _cleanupStreaming();streamingEl=null;refreshGit();
     }
   });
 
@@ -168,7 +168,7 @@ function connectSSE(id){
   });
 
   eventSource.addEventListener("file",()=>loadFilesDebounced());
-  eventSource.addEventListener("prompt",()=>loadPrompts());
+  eventSource.addEventListener("prompt",()=>refreshGit());
   eventSource.addEventListener("execution",(e)=>{const r=JSON.parse(e.data);const el=document.createElement("div");el.className="msg tool_call";el.textContent=r.error?`Error: ${r.error}`:r.result!=null?`Result: ${JSON.stringify(r.result,null,2)}`:'\u2713 Done';$("chat").appendChild(el);_smoothScrollToBottom()});
   eventSource.addEventListener("error_message",(e)=>{hideThinking();setProcessing(false);const{message}=JSON.parse(e.data);const el=document.createElement("div");el.className="msg error";el.textContent=message||"Something went wrong";$("chat").appendChild(el);_smoothScrollToBottom()});
   eventSource.addEventListener("presence",(e)=>{const data=JSON.parse(e.data);presenceUsers=data.users||[];renderPresence()});

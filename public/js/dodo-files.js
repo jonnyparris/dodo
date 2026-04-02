@@ -58,11 +58,8 @@ async function loadAllowlist(){const d=await apiSafe("/api/allowlist");if(!d)ret
 async function addHost(){const hostname=$("allowlist-input").value.trim();if(!hostname)return;const r=await jsonSafe("/api/allowlist",{hostname});if(r)toast('Host added','success');$("allowlist-input").value="";await loadAllowlist()}
 async function removeHost(hostname){await apiSafe(`/api/allowlist/${encodeURIComponent(hostname)}`,{method:"DELETE"});await loadAllowlist()}
 
-// --- Prompts ---
-async function loadPrompts(){
-  if(!currentSession)return;
-  try{const{prompts}=await api(`/session/${currentSession}/prompts`);$("prompt-list").innerHTML=prompts.length?prompts.slice(0,10).map(p=>`<div class="kv"><span class="tag">${esc(p.status)}</span><span style="font-size:11px">${esc(p.content.slice(0,40))}</span></div>`).join(""):'<div class="empty">No prompts</div>'}catch{$("prompt-list").innerHTML='<div class="empty">No prompts</div>'}
-}
+// --- Prompts (kept for backward compat — UI section removed) ---
+function loadPrompts(){}
 
 // --- Cron ---
 async function loadCron(){if(!currentSession)return;try{const{jobs}=await api(`/session/${currentSession}/cron`);$("cron-list").innerHTML=jobs.length?jobs.map(j=>`<div class="kv"><span>${esc(j.description)}</span><button onclick="deleteCron('${esc(j.id)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No cron jobs</div>'}catch{$("cron-list").innerHTML='<div class="empty">No cron jobs</div>'}}
@@ -77,7 +74,13 @@ async function saveMemory(){const id=$("mem-id").value;const title=$("mem-title"
 async function deleteMemory(id){await apiSafe(`/api/memory/${encodeURIComponent(id)}`,{method:"DELETE"});await loadMemory()}
 
 // --- Git ---
-async function refreshGit(){if(!currentSession){$("git-status-display").innerHTML="";return}try{const{entries}=await api(`/session/${currentSession}/git/status`);$("git-status-display").innerHTML=entries.length?entries.map(e=>`<div style="font-size:11px;font-family:var(--mono)">${esc(e.status)} ${esc(e.filepath)}</div>`).join(""):'<div class="empty">Clean or no repo</div>'}catch{$("git-status-display").innerHTML='<div class="empty">No repo</div>'}}
+async function refreshGit(){
+  if(!currentSession){$("git-status-display").innerHTML="";$("git-log-display").innerHTML="";return}
+  try{const{entries}=await api(`/session/${currentSession}/git/status`);$("git-status-display").innerHTML=entries.length?entries.map(e=>`<div style="font-size:11px;font-family:var(--mono)">${esc(e.status)} ${esc(e.filepath)}</div>`).join(""):'<div class="empty">Clean or no repo</div>'}catch{$("git-status-display").innerHTML='<div class="empty">No repo</div>'}
+  // Load recent commits
+  try{const{entries}=await api(`/session/${currentSession}/git/log?depth=10`);const el=$("git-log-display");if(!el)return;el.innerHTML=entries&&entries.length?`<details open><summary style="font-size:12px;font-weight:600;cursor:pointer;margin-bottom:4px">Recent commits</summary>${entries.map(e=>{const short=(e.oid||'').slice(0,7);const msg=esc((e.commit?.message||'').split('\n')[0].slice(0,60));const author=esc(e.commit?.author?.name||'');const date=e.commit?.author?.timestamp?new Date(e.commit.author.timestamp*1000).toLocaleDateString('en-GB',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}):'';return`<div style="font-size:11px;font-family:var(--mono);padding:2px 0;display:flex;gap:6px;align-items:baseline"><code style="color:var(--accent);flex-shrink:0">${short}</code><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${msg}</span><span style="color:var(--muted);flex-shrink:0;font-size:10px">${date}</span></div>`}).join('')}</details>`:''
+  }catch{/* no repo or no commits — git-log-display stays empty */}
+}
 async function gitInit(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/git/init`,{});await refreshGit()}
 async function gitAddAll(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/git/add`,{filepath:"."});await refreshGit()}
 async function gitCommitPrompt(){if(!currentSession)return;const message=prompt("Commit message:");if(!message)return;await jsonSafe(`/session/${currentSession}/git/commit`,{message});await refreshGit()}
