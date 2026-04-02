@@ -1259,16 +1259,28 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async exportSnapshot(): Promise<SessionSnapshot | SnapshotV2> {
     const paths = await this.workspace._getAllPaths();
-    const files: Array<{ content: string; path: string }> = [];
+    const files: Array<{ content: string; path: string; encoding?: "base64" }> = [];
 
     for (const path of paths) {
       const stat = await this.workspace.stat(path);
       if (!stat || stat.type !== "file") {
         continue;
       }
-      const content = await this.workspace.readFile(path);
-      if (content !== null) {
-        files.push({ content, path });
+      // Binary files (git internals) must be base64-encoded to survive JSON round-trip
+      const isBinary = path.startsWith("/.git/") || path.includes("/.git/");
+      if (isBinary) {
+        const bytes = await this.workspace.readFileBytes(path);
+        if (bytes !== null) {
+          // Convert Uint8Array to base64
+          const binary = String.fromCharCode(...bytes);
+          const base64 = btoa(binary);
+          files.push({ content: base64, path, encoding: "base64" });
+        }
+      } else {
+        const content = await this.workspace.readFile(path);
+        if (content !== null) {
+          files.push({ content, path });
+        }
       }
     }
 
@@ -1320,7 +1332,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       const v2 = snapshotInput as SnapshotV2;
       if (v2.title) this.writeMetadata("title", v2.title);
       for (const file of v2.files) {
-        await this.workspace.writeFile(normalizePath(file.path), file.content);
+        const normalized = normalizePath(file.path);
+        if ((file as { encoding?: string }).encoding === "base64") {
+          // Decode base64 back to binary
+          const binary = atob(file.content);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          await this.workspace.writeFileBytes(normalized, bytes);
+        } else {
+          await this.workspace.writeFile(normalized, file.content);
+        }
       }
       const thinkSessionId = this.getCurrentSessionId();
       if (thinkSessionId) {
@@ -1349,7 +1372,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
 
     for (const file of snapshot.files) {
-      await this.workspace.writeFile(normalizePath(file.path), file.content);
+      const normalized = normalizePath(file.path);
+      if ((file as { encoding?: string }).encoding === "base64") {
+        const binary = atob(file.content);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        await this.workspace.writeFileBytes(normalized, bytes);
+      } else {
+        await this.workspace.writeFile(normalized, file.content);
+      }
     }
 
     // Import into Think session
