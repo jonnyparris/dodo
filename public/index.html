@@ -456,8 +456,9 @@
       .btn-label{display:none}
       .theme-toggle{font-size:14px !important;padding:4px 6px !important}
 
-      /* Hide token summary on mobile header to save space */
+      /* Hide token summary and footer on mobile to save space */
       #token-summary{display:none}
+      .footer{display:none}
 
       /* File entries bigger touch targets */
       .file-entry{padding:10px 12px;min-height:44px}
@@ -522,6 +523,7 @@
           <button onclick="addHost()">+</button>
         </div>
       </div>
+      <div id="sidebar-version" style="font-size:11px;color:var(--text-inactive);text-align:center;margin-top:16px;padding:8px 0"></div>
     </div>
 
     <div class="resize-handle" id="resize-left" aria-label="Resize left sidebar"></div>
