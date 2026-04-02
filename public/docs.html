@@ -199,7 +199,7 @@
       <tr><td><strong>Send</strong></td><td>Send</td><td>Starts a prompt, returns immediately, and streams output into the open chat over SSE. The input is disabled while the agent works.</td></tr>
       <tr><td><strong>Prompt Recovery</strong></td><td>Automatic</td><td>Prompts are fiber-backed. If the Durable Object is evicted or the page reconnects, Dodo resumes and finishes the prompt instead of starting over.</td></tr>
     </table>
-    <div class="callout"><p>Async prompts are fiber-backed: if the Durable Object is evicted mid-prompt, it replays from a checkpoint on recovery rather than re-running the full LLM call.</p></div>
+    <div class="callout"><p>Prompts are fiber-backed: if the Durable Object is evicted mid-prompt, it replays from a checkpoint on recovery rather than re-running the full LLM call.</p></div>
     <ul>
       <li><strong>Abort</strong> — cancels a running prompt immediately.</li>
       <li><strong>Streaming renderer</strong> — text appears immediately as deltas arrive, then Dodo upgrades it into full markdown a few times per second so long messages stay responsive.</li>
