@@ -90,7 +90,7 @@ function buildGitTools(
     }),
 
     git_push: tool({
-      description: "Push commits to the remote.",
+      description: "Push commits to the remote. Returns a summary with ok/error status per ref. Always check the result — a successful tool call does NOT mean the push succeeded.",
       inputSchema: zodSchema(z.object({
         dir: z.string().optional().describe("Repo directory"),
         remote: z.string().optional().describe("Remote name (default: origin)"),
@@ -99,7 +99,16 @@ function buildGitTools(
       })),
       execute: async ({ dir, remote, ref, force }) => {
         const token = await resolveRemoteToken({ dir, env, git, remote, ownerEmail });
-        return git.push({ dir, force, ref, remote, token });
+        const result = await git.push({ dir, force, ref, remote, token });
+        if (!result.ok) {
+          const refErrors = Object.entries(result.refs ?? {})
+            .filter(([, v]) => !v.ok)
+            .map(([k, v]) => `${k}: ${v.error}`)
+            .join("; ");
+          throw new Error(`Push failed: ${refErrors || "remote rejected the push"}`);
+        }
+        const pushed = Object.keys(result.refs ?? {}).join(", ");
+        return { ok: true, refs: pushed || "(no refs)", message: `Successfully pushed to ${remote || "origin"}` };
       },
     }),
 

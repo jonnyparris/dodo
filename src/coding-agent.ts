@@ -1026,7 +1026,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     try {
       const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote, ownerEmail });
-      return Response.json(await git.push({ dir, force: body.force, ref: body.ref, remote: body.remote, token }));
+      const result = await git.push({ dir, force: body.force, ref: body.ref, remote: body.remote, token });
+      if (!result.ok) {
+        const refErrors = Object.entries(result.refs ?? {})
+          .filter(([, v]) => !v.ok)
+          .map(([k, v]) => `${k}: ${v.error}`)
+          .join("; ");
+        return Response.json({ error: `Push failed: ${refErrors || "remote rejected the push"}`, refs: result.refs }, { status: 422 });
+      }
+      return Response.json(result);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
