@@ -395,9 +395,12 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
         throw new Error("No changed files detected after applying deterministic edits");
       }
 
+      // Stage files — git add needs repo-relative paths, not workspace-absolute
+      const repoPrefix = repo.dir.endsWith("/") ? repo.dir : `${repo.dir}/`;
       for (const file of Array.from(new Set(edits.map((edit) => edit.path)))) {
+        const relPath = file.startsWith(repoPrefix) ? file.slice(repoPrefix.length) : file;
         await agentJson(env, worker.id, "/git/add", {
-          body: JSON.stringify({ dir: repo.dir, filepath: file }),
+          body: JSON.stringify({ dir: repo.dir, filepath: relPath }),
           headers: { "content-type": "application/json" },
           method: "POST",
         }, depth);
