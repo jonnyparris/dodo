@@ -10,9 +10,18 @@ async function loadTasks(){
     const cols={backlog:[],todo:[],in_progress:[],done:[]};
     tasks.forEach(t=>{if(cols[t.status])cols[t.status].push(t);else if(t.status!=="cancelled")(cols.backlog).push(t)});
     selectedTasks.forEach(id=>{if(!tasks.find(t=>t.id===id))selectedTasks.delete(id)});
-    board.innerHTML=`<div class="kanban">${Object.entries(cols).map(([status,items])=>{
-      const colId='kanban-col-'+status;
-      return `<div class="kanban-col" id="${colId}" data-status="${esc(status)}" ondragover="kanbanDragOver(event)" ondragleave="kanbanDragLeave(event)" ondrop="kanbanDrop(event,'${esc(status)}')"><h3>${esc(status.replace('_',' '))}<span class="col-count">${items.length}</span></h3>${items.map(t=>renderTaskCard(t,status)).join("")||'<div class="empty">-</div>'}</div>`}).join("")}</div>`;
+    // Status summary bar (always shown)
+    const statusLabels={backlog:'Backlog',todo:'Todo',in_progress:'In Progress',done:'Done'};
+    const summaryHtml=`<div class="kanban-summary">${Object.entries(cols).map(([s,items])=>`<span class="sum-col">${statusLabels[s]} <span class="sum-count">${items.length}</span></span>`).join('')}</div>`;
+    // Only render columns that have tasks
+    const activeCols=Object.entries(cols).filter(([,items])=>items.length>0);
+    let kanbanHtml='';
+    if(activeCols.length>0){
+      kanbanHtml=`<div class="kanban">${activeCols.map(([status,items])=>{
+        const colId='kanban-col-'+status;
+        return `<div class="kanban-col" id="${colId}" data-status="${esc(status)}" ondragover="kanbanDragOver(event)" ondragleave="kanbanDragLeave(event)" ondrop="kanbanDrop(event,'${esc(status)}')"><h3>${esc(status.replace('_',' '))}<span class="col-count">${items.length}</span></h3>${items.map(t=>renderTaskCard(t,status)).join("")}</div>`}).join("")}</div>`;
+    }
+    board.innerHTML=summaryHtml+kanbanHtml;
     renderBatchBar();
   }catch{$("task-board").innerHTML='<div class="empty">No tasks</div>'}
 }
@@ -20,23 +29,24 @@ async function loadTasks(){
 function renderTaskCard(t,status){
   const sel=selectedTasks.has(t.id)?'selected':'';
   const priClass=t.priority==='high'?'high':t.priority==='low'?'low':'';
-  let actions='';
+  const eid=esc(t.id);
+  let primary='',overflow=[];
   if(status==='backlog'){
-    actions=`<button class="sm back-btn" onclick="moveTask(event,'${esc(t.id)}','todo')" title="Move to Todo">\u2192 Todo</button>`+
-            `<button class="sm del-btn" onclick="deleteTaskUI(event,'${esc(t.id)}')" title="Delete">\u2715</button>`;
+    primary=`<button class="sm back-btn" onclick="moveTask(event,'${eid}','todo')" title="Move to Todo">\u2192 Todo</button>`;
+    overflow.push(`<button onclick="deleteTaskUI(event,'${eid}')">Delete</button>`);
   }else if(status==='todo'){
-    actions=`<button class="sm dispatch" onclick="dispatchTaskUI(event,'${esc(t.id)}')" title="Dispatch to a new session">\u25B6 Dispatch</button>`+
-            `<button class="sm back-btn" onclick="moveTask(event,'${esc(t.id)}','backlog')" title="Back to Backlog">\u2190</button>`+
-            `<button class="sm del-btn" onclick="deleteTaskUI(event,'${esc(t.id)}')" title="Delete">\u2715</button>`;
+    primary=`<button class="sm dispatch" onclick="dispatchTaskUI(event,'${eid}')">Dispatch</button>`;
+    overflow.push(`<button onclick="moveTask(event,'${eid}','backlog')">\u2190 Backlog</button>`);
+    overflow.push(`<button class="del-btn" onclick="deleteTaskUI(event,'${eid}')">Delete</button>`);
   }else if(status==='in_progress'){
-    const sessionBtn=t.sessionId?`<a class="session-link" href="#" onclick="event.stopPropagation();selectSession('${esc(t.sessionId)}')" title="Go to session">\u{1F4BB} session</a>`:'';
-    actions=`<button class="sm done-btn" onclick="moveTask(event,'${esc(t.id)}','done')" title="Mark done">\u2713 Done</button>`+
-            sessionBtn+
-            `<button class="sm del-btn" onclick="cancelTaskUI(event,'${esc(t.id)}')" title="Cancel">\u2715</button>`;
+    primary=`<button class="sm done-btn" onclick="moveTask(event,'${eid}','done')">\u2713 Done</button>`;
+    if(t.sessionId)primary+=`<a class="session-link" href="#" onclick="event.stopPropagation();selectSession('${esc(t.sessionId)}')">\u{1F4BB}</a>`;
+    overflow.push(`<button class="del-btn" onclick="cancelTaskUI(event,'${eid}')">Cancel</button>`);
   }else if(status==='done'){
-    actions=`<button class="sm del-btn" onclick="deleteTaskUI(event,'${esc(t.id)}')" title="Delete">\u2715</button>`;
+    overflow.push(`<button class="del-btn" onclick="deleteTaskUI(event,'${eid}')">Delete</button>`);
   }
-  return `<div class="kanban-card ${sel}" draggable="true" data-task-id="${esc(t.id)}" onclick="toggleSelectTask(event,'${esc(t.id)}')" ondragstart="kanbanDragStart(event,'${esc(t.id)}')" ondragend="kanbanDragEnd(event)"><div class="card-title">${esc(t.title)}</div><div class="card-meta"><span class="priority ${priClass}">${esc(t.priority)}</span>${t.sessionId&&status==='in_progress'?`<a class="session-link" href="#" onclick="event.stopPropagation();selectSession('${esc(t.sessionId)}')">\u{1F517} session</a>`:''}</div><div class="card-actions">${actions}</div></div>`;
+  const overflowHtml=overflow.length?`<span class="overflow-menu"><button class="overflow-btn" onclick="toggleOverflow(event)" title="More">\u22EF</button><span class="overflow-items">${overflow.join('')}</span></span>`:'';
+  return `<div class="kanban-card ${sel}" draggable="true" data-task-id="${eid}" onclick="toggleSelectTask(event,'${eid}')" ondragstart="kanbanDragStart(event,'${eid}')" ondragend="kanbanDragEnd(event)"><div class="card-title">${esc(t.title)}<span class="priority ${priClass}">${esc(t.priority)}</span></div><div class="card-actions">${primary}${overflowHtml}</div></div>`;
 }
 
 function renderBatchBar(){
@@ -136,6 +146,16 @@ async function batchDelete(){
     toast(`${ids.length} task${ids.length>1?'s':''} deleted`,'success');
   });
 }
+
+// --- Overflow menu ---
+function toggleOverflow(e){
+  e.stopPropagation();
+  const menu=e.currentTarget.closest('.overflow-menu');
+  const wasOpen=menu.classList.contains('open');
+  document.querySelectorAll('.overflow-menu.open').forEach(m=>m.classList.remove('open'));
+  if(!wasOpen)menu.classList.add('open');
+}
+document.addEventListener('click',()=>document.querySelectorAll('.overflow-menu.open').forEach(m=>m.classList.remove('open')));
 
 // --- Drag and drop ---
 function kanbanDragStart(e,id){draggedTaskId=id;e.target.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',id)}
