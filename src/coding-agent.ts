@@ -380,8 +380,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const value = output.value;
         const serialized = typeof value === "string" ? value : JSON.stringify(value);
 
-        // Check if this looks like a low-value file (lockfile, minified, sourcemap)
-        const isLowValue = LOW_VALUE_PATTERNS.some((p) => p.test(serialized.slice(0, 500)));
+        // Check if this looks like a low-value file (lockfile, minified, sourcemap).
+        // Test both the tool call args (which contain the file path) and the result
+        // value (which may contain paths in search results or JSON output).
+        const toolResult = part as { toolName?: string; input?: unknown };
+        const argsStr = toolResult.input ? JSON.stringify(toolResult.input) : "";
+        const isLowValue = LOW_VALUE_PATTERNS.some((p) =>
+          p.test(argsStr) || p.test(serialized.slice(0, 500)),
+        );
         let maxChars: number;
         if (isLowValue) {
           maxChars = LOW_VALUE_MAX_CHARS;
@@ -2102,16 +2108,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const history = this.sessions.getHistory(thinkSessionId);
     if (history.length < 6) return; // Too few messages to bother
 
-    // Determine the range to compact: oldest COMPACTION_MESSAGE_FRACTION of messages
-    const compactCount = Math.max(2, Math.floor(history.length * COMPACTION_MESSAGE_FRACTION));
-    const messagesToCompact = history.slice(0, compactCount);
+    // Skip synthetic compaction summary messages — getHistory() injects these with
+    // IDs like "compaction_<uuid>". If we don't filter them out, we'd try to compact
+    // an already-compacted summary, wasting an LLM call and creating orphaned records.
+    const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
+    if (realMessages.length < 6) return;
+
+    // Determine the range to compact: oldest COMPACTION_MESSAGE_FRACTION of real messages
+    const compactCount = Math.max(2, Math.floor(realMessages.length * COMPACTION_MESSAGE_FRACTION));
+    const messagesToCompact = realMessages.slice(0, compactCount);
     const fromMessageId = messagesToCompact[0].id;
     const toMessageId = messagesToCompact[compactCount - 1].id;
 
     // Check if this range is already compacted
     const existingCompactions = this.sessions.getCompactions(thinkSessionId);
     const alreadyCompacted = existingCompactions.some(
-      (c) => c.from_message_id === fromMessageId,
+      (c) => c.from_message_id === fromMessageId || c.to_message_id === toMessageId,
     );
     if (alreadyCompacted) return;
 
