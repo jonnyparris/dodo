@@ -486,6 +486,73 @@ export class UserControl implements DurableObject {
         return Response.json({ completed: state.currentStep === "complete", step: state.currentStep });
       }
 
+      // ─── Browser Rendering Config ───
+
+      if (request.method === "GET" && url.pathname === "/browser-config") {
+        const cfAccountId = this.readUserConfigKey("cf_account_id");
+        const hasApiToken = !!this.db.one("SELECT key FROM encrypted_secrets WHERE key = 'cf_api_token'");
+        const mcpConfig = this.db.one("SELECT id, enabled FROM mcp_configs WHERE id = 'browser-rendering'");
+        return Response.json({
+          cfAccountId: cfAccountId ?? null,
+          hasApiToken,
+          mcpConfigured: !!mcpConfig,
+          mcpEnabled: mcpConfig ? Boolean(Number(mcpConfig.enabled)) : false,
+        });
+      }
+
+      if (request.method === "PUT" && url.pathname === "/browser-config") {
+        const body = z.object({
+          cfAccountId: z.string().min(1),
+          cfApiToken: z.string().min(1),
+          labMode: z.boolean().default(false),
+        }).parse(await request.json());
+        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+
+        // Store account ID in user_config
+        const now = nowEpoch();
+        this.db.exec(
+          "INSERT INTO user_config (key, value, updated_at) VALUES ('cf_account_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+          body.cfAccountId, now,
+        );
+
+        // Store API token as encrypted secret
+        await this.setSecret("cf_api_token", body.cfApiToken, ownerEmail);
+
+        // Auto-create or update the browser-rendering MCP config
+        const mcpUrl = "https://browser.mcp.cloudflare.com/mcp";
+        const existing = this.db.one("SELECT id FROM mcp_configs WHERE id = 'browser-rendering'");
+        if (existing) {
+          this.db.exec(
+            "UPDATE mcp_configs SET url = ?, enabled = 1, updated_at = ? WHERE id = 'browser-rendering'",
+            mcpUrl, now,
+          );
+        } else {
+          this.db.exec(
+            "INSERT INTO mcp_configs (id, name, type, url, headers_json, enabled, created_at, updated_at) VALUES ('browser-rendering', 'Browser Rendering', 'http', ?, '{}', 1, ?, ?)",
+            mcpUrl, now, now,
+          );
+        }
+
+        // Store the auth header as an encrypted MCP secret
+        await this.setSecret("mcp:browser-rendering:Authorization", `Bearer ${body.cfApiToken}`, ownerEmail);
+
+        // Store account ID header for the MCP server
+        await this.setSecret("mcp:browser-rendering:cf-account-id", body.cfAccountId, ownerEmail);
+
+        return Response.json({ configured: true });
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/browser-config") {
+        const now = nowEpoch();
+        // Remove MCP config
+        this.db.exec("DELETE FROM mcp_configs WHERE id = 'browser-rendering'");
+        // Remove secrets
+        this.db.exec("DELETE FROM encrypted_secrets WHERE key IN ('cf_api_token', 'mcp:browser-rendering:Authorization', 'mcp:browser-rendering:cf-account-id')");
+        // Remove config key
+        this.db.exec("DELETE FROM user_config WHERE key = 'cf_account_id'");
+        return Response.json({ deleted: true });
+      }
+
       return new Response("Not Found", { status: 404 });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected request failure";
@@ -665,6 +732,11 @@ export class UserControl implements DurableObject {
   }
 
   // ─── Config ───
+
+  private readUserConfigKey(key: string): string | null {
+    const row = this.db.one("SELECT value FROM user_config WHERE key = ?", key);
+    return row ? String(row.value) : null;
+  }
 
   private readConfig(): AppConfig {
     const rows = this.db.all("SELECT key, value FROM user_config");
