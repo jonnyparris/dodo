@@ -248,8 +248,24 @@ function renderToolCall(tc){
 function setStatusDot(status){$("session-status-dot").className=`status-dot ${status==="running"?"running":"idle"}`}
 function updateTokenSummary(state){
   const ti=state.totalTokenInput??0,to=state.totalTokenOutput??0;
-  const contextStr=ti?` · Context: ${Math.round(ti/1000)}k`:'';
-  $("token-summary").textContent=ti||to?`${(ti/1000).toFixed(1)}k in / ${(to/1000).toFixed(1)}k out${contextStr}`:'';
+  const pct=state.contextUsagePercent??0;
+  const budget=state.contextBudget??0;
+  const el=$("token-summary");
+  if(!ti&&!to){el.textContent='';el.title='';return}
+  // Color code by context usage
+  let color='var(--text-subtle)';
+  if(pct>80)color='#e74c3c';
+  else if(pct>50)color='#e67e22';
+  el.style.color=color;
+  const budgetStr=budget?`${Math.round(budget/1000)}k`:'?';
+  el.textContent=pct>0?`Context: ${pct}% of ${budgetStr} · ${(ti/1000).toFixed(1)}k in / ${(to/1000).toFixed(1)}k out`:`${(ti/1000).toFixed(1)}k in / ${(to/1000).toFixed(1)}k out`;
+  el.title=`Context window: ${state.contextWindow??0} tokens\nBudget (80%): ${budget} tokens\nUsage: ~${pct}%\nModel: ${state.model??'unknown'}`;
+  // Show/hide context warning banner
+  const banner=$("context-warning");
+  if(banner){
+    if(pct>80){banner.style.display="block";banner.textContent=`Context is ${pct}% full. Consider starting a new session for a fresh topic.`}
+    else{banner.style.display="none"}
+  }
 }
 
 // --- Chat actions ---
