@@ -1,6 +1,6 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
-import type { LanguageModel, ToolSet } from "ai";
+import type { LanguageModel, ModelMessage, ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
 import { getUserControlStub } from "./auth";
@@ -28,6 +28,25 @@ import {
 } from "./think-adapter";
 import type { SnapshotV2 } from "./think-adapter";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
+
+/** Context window sizes (in tokens) by model ID prefix. Used for token budget enforcement. */
+const CONTEXT_WINDOW_TOKENS: Record<string, number> = {
+  "anthropic/claude-sonnet-4-6": 200_000,
+  "anthropic/claude-sonnet-4-5": 200_000,
+  "anthropic/claude-haiku-3.5": 200_000,
+  "anthropic/claude-opus-4": 200_000,
+  "openai/gpt-4.1": 1_000_000,
+  "openai/gpt-4.1-mini": 1_000_000,
+  "openai/o3-mini": 200_000,
+  "openai/o4-mini": 200_000,
+  "google/gemini-2.5-pro": 1_000_000,
+  "google/gemini-2.5-flash": 1_000_000,
+  "deepseek/deepseek-chat": 128_000,
+  "deepseek/deepseek-reasoner": 128_000,
+};
+const DEFAULT_CONTEXT_WINDOW = 128_000;
+/** Budget factor — use 80% of context window for messages, leave 20% for response. */
+const CONTEXT_BUDGET_FACTOR = 0.8;
 
 const sendMessageSchema = z.object({ content: z.string().trim().min(1) }).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
@@ -299,8 +318,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    *    turn — mostly from reading large files like index.html.
    * 2. Older assistant messages beyond a threshold get their tool-call
    *    results summarized.
+   * 3. Enforce total token budget — drop oldest messages when the estimated
+   *    token count exceeds 80% of the model's context window.
    */
-  override async assembleContext() {
+  override async assembleContext(): Promise<ModelMessage[]> {
     const messages = await super.assembleContext();
 
     // Max chars per tool result — ~16k chars ≈ ~4k tokens. Generous for file reads,
@@ -341,6 +362,50 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           (part as { output: unknown }).output = { type: "text", value: truncated };
         }
       }
+    }
+
+    // --- Token-budget enforcement ---
+    // Look up context window for current model, compute budget
+    const config = this.getConfig();
+    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
+
+    // Estimate tokens per message: chars / 3.5 is a reasonable heuristic for
+    // English text + code. Walk newest→oldest, accumulating estimated tokens.
+    const estimateTokens = (msg: ModelMessage): number => {
+      const serialized = JSON.stringify(msg);
+      return Math.ceil(serialized.length / 3.5);
+    };
+
+    let totalTokens = 0;
+    let cutoffIndex = 0; // First message to keep
+
+    // Walk from newest to oldest
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msgTokens = estimateTokens(messages[i]);
+      if (totalTokens + msgTokens > tokenBudget) {
+        cutoffIndex = i + 1;
+        break;
+      }
+      totalTokens += msgTokens;
+    }
+
+    if (cutoffIndex > 0 && cutoffIndex < messages.length) {
+      const droppedCount = cutoffIndex;
+      console.warn(
+        `[assembleContext] Token budget exceeded: dropping ${droppedCount} oldest message(s). ` +
+        `Model: ${modelId}, budget: ${tokenBudget} tokens (~${contextWindow} context window × ${CONTEXT_BUDGET_FACTOR}), ` +
+        `estimated total before drop: ${totalTokens + messages.slice(0, cutoffIndex).reduce((acc, m) => acc + estimateTokens(m), 0)} tokens.`
+      );
+
+      // Insert a system note at the start so the model knows context was truncated
+      const truncationNote: ModelMessage = {
+        role: "system" as const,
+        content: `[Earlier messages truncated — context window limit reached. ${droppedCount} message(s) dropped to stay within the ${contextWindow}-token context window.]`,
+      };
+
+      return [truncationNote, ...messages.slice(cutoffIndex)];
     }
 
     return messages;
