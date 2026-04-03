@@ -1,6 +1,6 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
-import type { LanguageModel, ModelMessage, ToolSet } from "ai";
+import { generateText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
 import { getUserControlStub } from "./auth";
@@ -47,6 +47,19 @@ const CONTEXT_WINDOW_TOKENS: Record<string, number> = {
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 /** Budget factor — use 80% of context window for messages, leave 20% for response. */
 const CONTEXT_BUDGET_FACTOR = 0.8;
+
+/**
+ * Compaction settings.
+ * When context usage exceeds COMPACTION_TRIGGER_PERCENT of the budget, older
+ * messages are summarized by an LLM call and stored as a compaction record.
+ * Think's assembleContext() automatically injects the summary in place of
+ * the original messages on subsequent turns.
+ */
+const COMPACTION_TRIGGER_PERCENT = 60;
+/** Fraction of messages to compact (from the oldest end). */
+const COMPACTION_MESSAGE_FRACTION = 0.5;
+/** Model to use for generating compaction summaries — cheap and fast. */
+const COMPACTION_MODEL = "anthropic/claude-haiku-3.5";
 
 const sendMessageSchema = z.object({ content: z.string().trim().min(1) }).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
@@ -149,6 +162,12 @@ const SYSTEM_PROMPT = [
   "- You cannot install system packages or run shell commands directly — use codemode for computation.",
   "- Prefer `git_clone_known` over `git_clone` for built-in repos. It prevents repo URL mistakes.",
   "- When pushing, use `git_push_checked` and specify the branch ref explicitly (e.g. `ref: 'feat/my-branch'`). It verifies the remote branch is actually ahead of the base branch.",
+  "",
+  "## Context management",
+  "",
+  "Every tool result stays in your context window. Be deliberate about what you read — don't read entire large files when `search_files` or reading a specific line range would suffice.",
+  "If the user switches to a completely different topic or codebase area, suggest starting a new session to keep context focused: \"This is a different topic — want me to continue in a fresh session so we don't carry unrelated context?\"",
+  "Avoid reading files you've already read in this conversation unless they may have changed.",
 ].join("\n");
 
 /** Build a LanguageModel from DodoConfig (Think per-session config). */
@@ -190,8 +209,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   initialState: SessionState = {
     activePromptId: null,
     activeStreamCount: 0,
+    contextBudget: 0,
+    contextUsagePercent: 0,
+    contextWindow: 0,
     createdAt: "",
     messageCount: 0,
+    model: "",
     sessionId: "",
     status: "idle",
     totalTokenInput: 0,
@@ -324,11 +347,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   override async assembleContext(): Promise<ModelMessage[]> {
     const messages = await super.assembleContext();
 
-    // Max chars per tool result — ~16k chars ≈ ~4k tokens. Generous for file reads,
-    // tight enough to prevent a single index.html from consuming 100k tokens.
-    const MAX_TOOL_OUTPUT_CHARS = 16_000;
+    // Max chars per tool result — ~8k chars ≈ ~2k tokens. Enough for most
+    // source files, tight enough to prevent context blowout from large reads.
+    const MAX_TOOL_OUTPUT_CHARS = 8_000;
     // Older tool results (beyond this message index from the end) get aggressively truncated
-    const RECENT_MESSAGE_WINDOW = 6;
+    const RECENT_MESSAGE_WINDOW = 4;
+    // Known large/low-value file patterns get extra-aggressive truncation
+    const LOW_VALUE_PATTERNS = [
+      /package-lock\.json/i,
+      /yarn\.lock/i,
+      /pnpm-lock\.yaml/i,
+      /\.min\.(js|css)$/i,
+      /\.map$/i,
+      /\.git\//,
+    ];
+    const LOW_VALUE_MAX_CHARS = 2_000;
 
     const totalMessages = messages.length;
 
@@ -337,7 +370,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       if (msg.role !== "tool") continue;
 
       const isRecent = i >= totalMessages - RECENT_MESSAGE_WINDOW;
-      const maxChars = isRecent ? MAX_TOOL_OUTPUT_CHARS : Math.floor(MAX_TOOL_OUTPUT_CHARS / 4);
 
       for (const part of msg.content) {
         if (part.type !== "tool-result" || part.output === undefined) continue;
@@ -347,6 +379,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         // Serialize the value to measure size
         const value = output.value;
         const serialized = typeof value === "string" ? value : JSON.stringify(value);
+
+        // Check if this looks like a low-value file (lockfile, minified, sourcemap)
+        const isLowValue = LOW_VALUE_PATTERNS.some((p) => p.test(serialized.slice(0, 500)));
+        let maxChars: number;
+        if (isLowValue) {
+          maxChars = LOW_VALUE_MAX_CHARS;
+        } else if (isRecent) {
+          maxChars = MAX_TOOL_OUTPUT_CHARS;
+        } else {
+          maxChars = Math.floor(MAX_TOOL_OUTPUT_CHARS / 4);
+        }
+
         if (serialized.length <= maxChars) continue;
 
         const truncated = truncateToolOutput(serialized, {
@@ -513,6 +557,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
       if (request.method === "GET" && url.pathname === "/messages") {
         return Response.json({ messages: this.listMessages() });
+      }
+
+      if (request.method === "GET" && url.pathname === "/token-usage") {
+        return Response.json(this.getTokenUsageReport());
       }
 
       if (request.method === "GET" && url.pathname === "/prompts") {
@@ -2011,7 +2059,122 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
     }
 
+    // Check if context compaction is needed (fire-and-forget — don't block response)
+    this.maybeCompactContext().catch((err) => {
+      console.warn("[compaction] Background compaction failed:", err instanceof Error ? err.message : err);
+    });
+
     return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
+  }
+
+  /**
+   * Check if context compaction is needed and run it if so.
+   *
+   * Uses Think's built-in compaction system: generates a summary of older
+   * messages via a cheap LLM call (Haiku), then stores it with addCompaction().
+   * On subsequent turns, Think's getHistory() automatically replaces the
+   * compacted message range with the summary.
+   *
+   * Triggers when the last turn's input tokens exceed COMPACTION_TRIGGER_PERCENT
+   * of the context budget.
+   */
+  private async maybeCompactContext(): Promise<void> {
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) return;
+
+    // Check if context usage warrants compaction
+    const config = this.getConfig();
+    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
+
+    const latestAssistant = this.db.one(
+      "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+    );
+    const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
+    if (lastInputTokens === 0) return;
+
+    const usagePercent = Math.round((lastInputTokens / contextBudget) * 100);
+    if (usagePercent < COMPACTION_TRIGGER_PERCENT) return;
+
+    // Check if there are already compactions — avoid compacting on top of compactions
+    // too frequently. Only compact if needsCompaction returns true OR usage is high.
+    const history = this.sessions.getHistory(thinkSessionId);
+    if (history.length < 6) return; // Too few messages to bother
+
+    // Determine the range to compact: oldest COMPACTION_MESSAGE_FRACTION of messages
+    const compactCount = Math.max(2, Math.floor(history.length * COMPACTION_MESSAGE_FRACTION));
+    const messagesToCompact = history.slice(0, compactCount);
+    const fromMessageId = messagesToCompact[0].id;
+    const toMessageId = messagesToCompact[compactCount - 1].id;
+
+    // Check if this range is already compacted
+    const existingCompactions = this.sessions.getCompactions(thinkSessionId);
+    const alreadyCompacted = existingCompactions.some(
+      (c) => c.from_message_id === fromMessageId,
+    );
+    if (alreadyCompacted) return;
+
+    // Build a text representation of the messages to summarize
+    const messageSummaryParts: string[] = [];
+    for (const msg of messagesToCompact) {
+      const textParts = msg.parts
+        ?.filter((p: { type: string }) => p.type === "text")
+        .map((p: { type: string; text?: string }) => (p as { text: string }).text)
+        .join("") ?? "";
+      if (textParts) {
+        messageSummaryParts.push(`[${msg.role}]: ${textParts.slice(0, 2000)}`);
+      }
+    }
+
+    if (messageSummaryParts.length === 0) return;
+
+    const summaryInput = messageSummaryParts.join("\n\n");
+
+    try {
+      // Use a cheap model for the summary generation
+      const appConfig = this.getAppConfigFromThink();
+      const provider = buildProvider(appConfig, this.env);
+      const compactionModel = provider.chatModel(COMPACTION_MODEL);
+
+      const result = await generateText({
+        model: compactionModel,
+        messages: [
+          {
+            role: "system",
+            content: [
+              "Summarize this conversation excerpt concisely. Focus on:",
+              "1. Key decisions made",
+              "2. Files read or modified (with paths)",
+              "3. Problems identified and solutions applied",
+              "4. Important context the assistant will need for future turns",
+              "",
+              "Be factual and specific. Use bullet points. Keep it under 500 words.",
+            ].join("\n"),
+          },
+          {
+            role: "user",
+            content: summaryInput.slice(0, 30_000), // Cap input to avoid blowing Haiku's context
+          },
+        ],
+        maxOutputTokens: 1000,
+      });
+
+      const summary = result.text;
+      if (!summary || summary.length < 20) return; // Summary too short to be useful
+
+      // Store the compaction via Think's API
+      this.sessions.addCompaction(thinkSessionId, summary, fromMessageId, toMessageId);
+      console.log(
+        `[compaction] Compacted ${compactCount} messages (${usagePercent}% usage). Summary: ${summary.length} chars.`,
+      );
+    } catch (error) {
+      // Compaction is best-effort — don't fail the main chat
+      console.warn(
+        "[compaction] Failed to generate summary:",
+        error instanceof Error ? error.message : error,
+      );
+    }
   }
 
   private ensureMetadata(sessionId: string, ownerEmail?: string | null): void {
@@ -2048,17 +2211,104 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const metaTotals = this.db.one("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM message_metadata");
     const totalTokenInput = Number(metaTotals?.total_in ?? 0);
     const totalTokenOutput = Number(metaTotals?.total_out ?? 0);
+
+    // Context window info
+    const config = this.getConfig();
+    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
+    // Use latest assistant turn's input tokens as the best proxy for current context size
+    const latestAssistant = this.db.one(
+      "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+    );
+    const estimatedContext = Number(latestAssistant?.token_input ?? 0);
+    const contextUsagePercent = contextBudget > 0
+      ? Math.round((estimatedContext / contextBudget) * 100)
+      : 0;
+
     return {
       activePromptId,
       activeStreamCount: this.clients.size,
+      contextBudget,
+      contextUsagePercent,
+      contextWindow,
       createdAt,
       messageCount: this.messageCount(),
+      model: modelId,
       ownerEmail,
       sessionId,
       status,
       totalTokenInput,
       totalTokenOutput,
       updatedAt,
+    };
+  }
+
+  /**
+   * Build a token usage report for the current session.
+   * Returns cumulative totals, context window info, and per-message breakdown.
+   */
+  private getTokenUsageReport(): {
+    contextWindow: number;
+    contextBudget: number;
+    estimatedContextTokens: number;
+    contextUsagePercent: number;
+    totalTokenInput: number;
+    totalTokenOutput: number;
+    messageCount: number;
+    model: string;
+    messages: Array<{
+      id: string;
+      role: string;
+      tokenInput: number;
+      tokenOutput: number;
+      createdAt: string;
+    }>;
+  } {
+    const config = this.getConfig();
+    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
+
+    // Get cumulative totals
+    const metaTotals = this.db.one(
+      "SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out, COUNT(*) AS cnt FROM message_metadata",
+    );
+    const totalTokenInput = Number(metaTotals?.total_in ?? 0);
+    const totalTokenOutput = Number(metaTotals?.total_out ?? 0);
+
+    // Estimate current context size from the latest assistant message's input tokens
+    // (this is the most accurate proxy — it's what the LLM actually received last turn)
+    const latestAssistant = this.db.one(
+      "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+    );
+    const estimatedContextTokens = Number(latestAssistant?.token_input ?? 0);
+    const contextUsagePercent = contextBudget > 0
+      ? Math.round((estimatedContextTokens / contextBudget) * 100)
+      : 0;
+
+    // Per-message breakdown
+    const rows = this.db.all(
+      "SELECT message_id, author_email, model, token_input, token_output, created_at FROM message_metadata ORDER BY created_at ASC",
+    );
+    const messages = rows.map((r) => ({
+      id: String(r.message_id),
+      role: r.model ? "assistant" : (r.author_email ? "user" : "unknown"),
+      tokenInput: Number(r.token_input ?? 0),
+      tokenOutput: Number(r.token_output ?? 0),
+      createdAt: epochToIso(r.created_at),
+    }));
+
+    return {
+      contextWindow,
+      contextBudget,
+      estimatedContextTokens,
+      contextUsagePercent,
+      totalTokenInput,
+      totalTokenOutput,
+      messageCount: Number(metaTotals?.cnt ?? 0),
+      model: modelId,
+      messages,
     };
   }
 

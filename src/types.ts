@@ -58,8 +58,12 @@ export interface AccessIdentity {
 export interface SessionState {
   activeStreamCount: number;
   activePromptId?: string | null;
+  contextBudget: number;
+  contextUsagePercent: number;
+  contextWindow: number;
   createdAt: string;
   messageCount: number;
+  model: string;
   ownerEmail?: string;
   sessionId: string;
   status: "idle" | "running" | "deleted";
