@@ -9,7 +9,7 @@ async function loadFiles(path){
   try{
     const{entries}=await api(`/session/${currentSession}/files?path=${encodeURIComponent(path)}`);
     if(path==="/"){$("file-tree").innerHTML=entries.length?renderFileEntries(entries,path):'<div class="empty">Empty workspace</div>'}
-    else{const container=$(`dir-${CSS.escape(path)}`);if(container)container.innerHTML=renderFileEntries(entries,path)}
+    else{const container=document.getElementById(`dir-${path}`);if(container)container.innerHTML=renderFileEntries(entries,path)}
   }catch{if(path==="/")$("file-tree").innerHTML='<div class="empty">Empty workspace</div>'}
 }
 function renderFileEntries(entries,parentPath){
