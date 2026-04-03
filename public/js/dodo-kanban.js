@@ -2,7 +2,6 @@
 
 let selectedTasks=new Set();
 let allTasks=[];
-let draggedTaskId=null;
 
 async function loadTasks(){
   try{
@@ -158,8 +157,8 @@ function toggleOverflow(e){
 document.addEventListener('click',()=>document.querySelectorAll('.overflow-menu.open').forEach(m=>m.classList.remove('open')));
 
 // --- Drag and drop ---
-function kanbanDragStart(e,id){draggedTaskId=id;e.target.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',id)}
-function kanbanDragEnd(e){draggedTaskId=null;e.target.classList.remove('dragging');document.querySelectorAll('.kanban-col').forEach(c=>c.classList.remove('drag-over'))}
+function kanbanDragStart(e,id){e.target.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',id)}
+function kanbanDragEnd(e){e.target.classList.remove('dragging');document.querySelectorAll('.kanban-col').forEach(c=>c.classList.remove('drag-over'))}
 function kanbanDragOver(e){e.preventDefault();e.dataTransfer.dropEffect='move';e.currentTarget.classList.add('drag-over')}
 function kanbanDragLeave(e){e.currentTarget.classList.remove('drag-over')}
 async function kanbanDrop(e,targetStatus){
