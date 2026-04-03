@@ -674,6 +674,21 @@
           </details>
         </div>
         <div class="section">
+          <h2>Browser Rendering</h2>
+          <div id="browser-config-status" style="font-size:12px;margin-bottom:8px"></div>
+          <details style="margin-top:4px" id="browser-config-details">
+            <summary>Configure</summary>
+            <p style="font-size:11px;color:var(--muted);margin:6px 0">Enter your Cloudflare Account ID and an API Token with <strong>Browser Rendering - Edit</strong> permission. Each user's browser sessions bill to their own account.</p>
+            <input id="browser-cf-account" placeholder="Cloudflare Account ID" style="margin-bottom:4px"/>
+            <input id="browser-cf-token" type="password" placeholder="Cloudflare API Token" style="margin-bottom:4px"/>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+              <button onclick="saveBrowserConfig()">Save</button>
+              <button class="sm danger" onclick="deleteBrowserConfig()" id="browser-delete-btn" style="display:none">Remove</button>
+              <a href="https://dash.cloudflare.com/?to=/:account/browser-rendering" target="_blank" style="font-size:11px;color:var(--accent);margin-left:auto">Cloudflare Dashboard</a>
+            </div>
+          </details>
+        </div>
+        <div class="section">
           <h2>Integrations</h2>
           <div id="integrations-list"></div>
           <details style="margin-top:6px">
@@ -840,7 +855,7 @@
   <script>
     // --- Boot ---
     async function boot(){
-      await Promise.all([loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets(),loadIntegrations(),checkOnboarding()]);
+      await Promise.all([loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets(),loadIntegrations(),loadBrowserConfig(),checkOnboarding()]);
       startTaskSync();
       const hashMatch=location.hash.match(/^#session=(.+)$/);
       if(hashMatch){const sid=decodeURIComponent(hashMatch[1]);if(allSessions.some(s=>s.id===sid)){await selectSession(sid);return}}

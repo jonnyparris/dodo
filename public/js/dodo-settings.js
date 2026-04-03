@@ -96,6 +96,51 @@ async function loadModels(){
   }catch{}
 }
 
+// --- Browser Rendering Config ---
+
+async function loadBrowserConfig(){
+  try{
+    const cfg=await api("/api/browser-config");
+    const el=$("browser-config-status");
+    if(cfg.mcpConfigured&&cfg.hasApiToken){
+      el.innerHTML=`<span style="color:var(--accent)">\u2705 Connected</span> &mdash; Account: <code>${esc(cfg.cfAccountId||'?')}</code>`;
+      $("browser-delete-btn").style.display="inline-block";
+      if(cfg.cfAccountId)$("browser-cf-account").value=cfg.cfAccountId;
+    }else{
+      el.innerHTML='<span style="color:var(--muted)">Not configured</span>';
+      $("browser-delete-btn").style.display="none";
+    }
+  }catch{
+    $("browser-config-status").innerHTML='<span style="color:var(--muted)">Not configured</span>';
+  }
+}
+
+async function saveBrowserConfig(){
+  const cfAccountId=$("browser-cf-account").value.trim();
+  const cfApiToken=$("browser-cf-token").value.trim();
+  if(!cfAccountId||!cfApiToken)return toast("Account ID and API Token are required","warning");
+  try{
+    await json("/api/browser-config",{cfAccountId,cfApiToken,labMode:false},"PUT");
+    $("browser-cf-token").value="";
+    $("browser-config-details").open=false;
+    toast("Browser Rendering configured","success");
+    await loadBrowserConfig();
+    await loadIntegrations();
+  }catch(e){toast("Failed: "+(e.message||e),"error")}
+}
+
+async function deleteBrowserConfig(){
+  const ok=await appConfirm("Remove Browser Rendering configuration? This deletes the stored credentials.");
+  if(!ok)return;
+  try{
+    await api("/api/browser-config",{method:"DELETE"});
+    toast("Browser config removed","success");
+    $("browser-cf-account").value="";
+    await loadBrowserConfig();
+    await loadIntegrations();
+  }catch(e){toast("Failed: "+(e.message||e),"error")}
+}
+
 // --- Integrations ---
 let mcpCatalog=[],mcpConfigs=[];
 

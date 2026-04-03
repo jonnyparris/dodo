@@ -859,6 +859,27 @@ app.post("/api/mcp-configs/:id/test", async (c) => {
 
 app.get("/api/mcp-catalog", (c) => c.json(MCP_CATALOG));
 
+// ─── Browser Rendering Config ───
+
+app.get("/api/browser-config", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/browser-config");
+});
+
+app.put("/api/browser-config", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/browser-config", {
+    method: "PUT",
+    body: await c.req.text(),
+    headers: { "content-type": "application/json" },
+  });
+});
+
+app.delete("/api/browser-config", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/browser-config", { method: "DELETE" });
+});
+
 // ─── Passkey / Onboarding ───
 
 app.get("/api/passkey/status", async (c) => {

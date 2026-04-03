@@ -63,4 +63,14 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
       "Use the remote server at https://mcp.sentry.dev with OAuth, or run locally via npx @sentry/mcp-server",
     knownHosts: ["mcp.sentry.dev"],
   },
+  {
+    id: "browser-rendering",
+    name: "Browser Rendering",
+    description:
+      "Automate a headless Chrome browser via CDP — navigate, screenshot, click, fill forms, and run Lighthouse audits. Powered by Cloudflare Browser Rendering.",
+    url: "https://browser.mcp.cloudflare.com/mcp",
+    setupGuide:
+      "Enter your Cloudflare Account ID and an API Token with 'Browser Rendering - Edit' permission. Each user's browser sessions are billed to their own account.",
+    knownHosts: ["browser.mcp.cloudflare.com"],
+  },
 ];
