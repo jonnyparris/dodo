@@ -490,7 +490,7 @@ export class UserControl implements DurableObject {
 
       if (request.method === "GET" && url.pathname === "/browser-config") {
         const cfAccountId = this.readUserConfigKey("cf_account_id");
-        const hasApiToken = !!this.db.one("SELECT key FROM encrypted_secrets WHERE key = 'cf_api_token'");
+        const hasApiToken = !!this.db.one("SELECT key FROM encrypted_secrets WHERE key = 'mcp:browser-rendering:Authorization'");
         const mcpConfig = this.db.one("SELECT id, enabled FROM mcp_configs WHERE id = 'browser-rendering'");
         return Response.json({
           cfAccountId: cfAccountId ?? null,
@@ -514,9 +514,6 @@ export class UserControl implements DurableObject {
           "INSERT INTO user_config (key, value, updated_at) VALUES ('cf_account_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
           body.cfAccountId, now,
         );
-
-        // Store API token as encrypted secret
-        await this.setSecret("cf_api_token", body.cfApiToken, ownerEmail);
 
         // Auto-create or update the browser-rendering MCP config
         // headers_json must list the header names so connectMcpServers resolves them from encrypted_secrets
@@ -549,7 +546,7 @@ export class UserControl implements DurableObject {
         // Remove MCP config
         this.db.exec("DELETE FROM mcp_configs WHERE id = 'browser-rendering'");
         // Remove secrets
-        this.db.exec("DELETE FROM encrypted_secrets WHERE key IN ('cf_api_token', 'mcp:browser-rendering:Authorization', 'mcp:browser-rendering:cf-account-id')");
+        this.db.exec("DELETE FROM encrypted_secrets WHERE key IN ('mcp:browser-rendering:Authorization', 'mcp:browser-rendering:cf-account-id')");
         // Remove config key
         this.db.exec("DELETE FROM user_config WHERE key = 'cf_account_id'");
         return Response.json({ deleted: true });

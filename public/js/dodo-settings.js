@@ -1,6 +1,6 @@
 // dodo-settings.js — Identity, passkeys, secrets, integrations, session settings, permissions, sharing, browser, approvals, MCP overrides
 
-function humanizeSecretName(name,configs){const m=name.match(/^mcp:([0-9a-f-]+):(.+)$/i);if(m&&configs){const c=configs.find(x=>x.id===m[1]);if(c)return "mcp:"+c.name+":"+m[2]}return name}
+function humanizeSecretName(name,configs){const m=name.match(/^mcp:([^:]+):(.+)$/);if(m&&configs){const c=configs.find(x=>x.id===m[1]);if(c)return c.name+" \u2014 "+m[2]}return name}
 
 // --- Identity ---
 async function loadIdentity(){

@@ -192,7 +192,7 @@ function connectSSE(id){
 
 function showQueuedMessage(content,queueId,position){
   const el=document.createElement("div");el.className="msg user queued";el.dataset.queueId=queueId;
-  el.innerHTML=`<div style="opacity:.5">${esc(content)}</div><div style="display:flex;align-items:center;gap:6px;margin-top:4px"><span class="queue-position" style="font-size:10px;color:var(--muted)">#${position} in queue</span><button class="sm" onclick="cancelQueued('${esc(queueId)}',this)" style="font-size:10px;padding:1px 6px">Cancel</button></div>`;
+  el.innerHTML=`<div style="opacity:.6">${esc(content)}</div><div style="display:flex;align-items:center;gap:6px;margin-top:4px"><span class="queue-position" style="font-size:10px;color:var(--text);opacity:.7">#${position} in queue</span><button class="sm" onclick="cancelQueued('${esc(queueId)}',this)" style="font-size:10px;padding:1px 6px">Cancel</button></div>`;
   $("chat").appendChild(el);_smoothScrollToBottom();
 }
 
