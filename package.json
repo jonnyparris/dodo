@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev -c wrangler.dev.jsonc",
-    "deploy": "COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown') && echo \"{\\\"commit\\\":\\\"$COMMIT\\\"}\" > public/version.json && wrangler deploy --var DODO_COMMIT:$COMMIT",
+    "build": "COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown') && echo \"{\\\"commit\\\":\\\"$COMMIT\\\",\\\"builtAt\\\":\\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"}\" > public/version.json",
+    "deploy": "npm run build && wrangler deploy",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
