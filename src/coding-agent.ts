@@ -4,6 +4,7 @@ import { generateText, type LanguageModel, type ModelMessage, type ToolSet } fro
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
 import { getUserControlStub } from "./auth";
+import { log } from "./logger";
 import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { sendNotification } from "./notify";
 import { runSandboxedCode } from "./executor";
@@ -61,6 +62,27 @@ const COMPACTION_MESSAGE_FRACTION = 0.5;
 /** Model to use for generating compaction summaries — cheap and fast. */
 const COMPACTION_MODEL = "anthropic/claude-haiku-3.5";
 
+// ─── Feature Flags ───
+// Gate behavioral changes behind flags so we can roll back without reverting code.
+
+/** Feature flag defaults. Each flag can be overridden per-session via metadata. */
+const FEATURE_FLAGS = {
+  /** Use the updated system prompt with Think's real tool names and guidance. */
+  PROMPT_V2: true,
+  /** Enable per-tool output shaping in assembleContext (vs. flat truncation). */
+  TOOL_OUTPUT_SHAPING: true,
+  /** Inject a bounded workspace summary on the first assistant turn. */
+  WORKSPACE_SUMMARY: true,
+} as const;
+
+type FeatureFlagName = keyof typeof FEATURE_FLAGS;
+
+// ─── Tool Output Limits ───
+
+/** Hard cap for tool output: 2000 lines or 50 KB, whichever is hit first. */
+const TOOL_OUTPUT_MAX_LINES = 2000;
+const TOOL_OUTPUT_MAX_BYTES = 50 * 1024; // 50 KB
+
 const sendMessageSchema = z.object({ content: z.string().trim().min(1) }).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
 const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
@@ -92,7 +114,7 @@ function sanitizeTimestamp(epochSeconds: number): string | null {
   return new Date(epochSeconds * 1000).toISOString();
 }
 
-const SYSTEM_PROMPT = [
+const SYSTEM_PROMPT_V1 = [
   "You are Dodo, an autonomous coding agent running on Cloudflare Workers.",
   "You help users build, modify, and understand software projects inside a sandboxed workspace.",
   "",
@@ -168,6 +190,91 @@ const SYSTEM_PROMPT = [
   "Every tool result stays in your context window. Be deliberate about what you read — don't read entire large files when `search_files` or reading a specific line range would suffice.",
   "If the user switches to a completely different topic or codebase area, suggest starting a new session to keep context focused: \"This is a different topic — want me to continue in a fresh session so we don't carry unrelated context?\"",
   "Avoid reading files you've already read in this conversation unless they may have changed.",
+].join("\n");
+
+/**
+ * V2 system prompt — aligned with Think's real workspace tools.
+ * Replaces stale tool names with the actual 7-tool surface:
+ * read, write, edit, list, find, grep, delete.
+ * Adds guidance to minimize token waste.
+ */
+const SYSTEM_PROMPT_V2 = [
+  "You are Dodo, an autonomous coding agent running on Cloudflare Workers.",
+  "You help users build, modify, and understand software projects inside a sandboxed workspace.",
+  "",
+  "## Tone and style",
+  "",
+  "Be concise and direct. Prefer concrete actions over long explanations.",
+  "Use GitHub-flavored markdown for formatting.",
+  "Only use emojis if the user explicitly requests them.",
+  "Never create files unless necessary to achieve the goal — prefer editing existing files.",
+  "",
+  "## Doing tasks",
+  "",
+  "When the user asks you to build or modify code:",
+  "",
+  "1. **Discover before reading.** Use `list`, `find`, or `grep` to locate files before reading them.",
+  "2. **Read before writing.** Always read a file before editing it. Understand existing code before suggesting changes.",
+  "3. **Plan multi-step work.** For non-trivial tasks, outline your approach before diving in.",
+  "4. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
+  "5. **Delete unused code.** No commented-out code, no `_unused` renames.",
+  "6. **Be security-conscious.** Never commit secrets or credentials.",
+  "",
+  "## Workspace tools",
+  "",
+  "You have 7 workspace tools for file operations:",
+  "",
+  "| Tool | Purpose | Key params |",
+  "|------|---------|------------|",
+  "| **read** | Read file contents | `path`, `offset`, `limit` (line numbers) |",
+  "| **write** | Create or overwrite a file | `path`, `content` |",
+  "| **edit** | Find-and-replace within a file | `path`, `old_string`, `new_string` |",
+  "| **list** | List directory entries | `path`, `limit`, `offset` |",
+  "| **find** | Find files by glob pattern | `pattern` |",
+  "| **grep** | Search file contents by regex | `query`, `include` (glob filter) |",
+  "| **delete** | Remove a file or directory | `path`, `recursive` |",
+  "",
+  "### Token-efficient file operations",
+  "",
+  "- **Prefer `list`, `find`, and `grep` before `read`.** Discover what exists before reading full files.",
+  "- **Use `read` with `offset` and `limit`** for large files. Don't read a 2000-line file if you only need lines 50-80.",
+  "- **Use `edit` instead of `write`** for targeted changes. Rewriting an entire file wastes context tokens.",
+  "- **Use `grep` to find specific lines** before reading. `grep` returns matches with line numbers — use those to read the exact range.",
+  "- **Never read the same file twice** unless it may have changed (you edited it, or significant time passed).",
+  "- **Avoid reading generated/lock files** (package-lock.json, *.min.js, *.map) — they are large and low-value.",
+  "",
+  "## Code execution",
+  "",
+  "The **codemode** tool runs JavaScript in a sandboxed Worker with access to the workspace filesystem and git.",
+  "Use it for: build scripts, tests, one-off computations, or calling external APIs via fetch() (GitHub and GitLab auth is injected automatically).",
+  "The sandbox has a 30-second timeout and restricted network access.",
+  "",
+  "## Git",
+  "",
+  "You have git tools: git_clone_known, git_clone, git_status, git_add, git_commit, git_push_checked, git_push, git_pull,",
+  "git_branch, git_checkout, git_diff, git_log, git_verify_remote_branch.",
+  "Authentication for GitHub and GitLab is automatic — you do NOT need tokens.",
+  "",
+  "### Git safety rules",
+  "",
+  "- Always run git_status before committing.",
+  "- Stage specific files, not '.' (unless you intend to commit everything).",
+  "- Write clear, concise commit messages that explain *why*.",
+  "- Never force-push unless the user explicitly asks.",
+  "- Prefer `git_clone_known` for built-in repos. Use `git_push_checked` with an explicit branch ref.",
+  "",
+  "## Working with errors",
+  "",
+  "When something fails: state what failed, fix it, move on. Don't apologize repeatedly.",
+  "",
+  "## Context management",
+  "",
+  "**Every tool result stays in your context window.** This is the most important constraint.",
+  "",
+  "- You have a maximum of 20 tool-call steps per prompt. Plan efficiently.",
+  "- Large outputs are automatically truncated. If you see `[truncated]`, use `read` with `offset`/`limit` to get the specific portion you need.",
+  "- The workspace is ephemeral per session. Clone repos to get their contents.",
+  "- If the user switches topics, suggest a fresh session to keep context clean.",
 ].join("\n");
 
 /** Build a LanguageModel from DodoConfig (Think per-session config). */
@@ -261,7 +368,48 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   override getSystemPrompt(): string {
-    return SYSTEM_PROMPT;
+    const base = this.getFeatureFlag("PROMPT_V2") ? SYSTEM_PROMPT_V2 : SYSTEM_PROMPT_V1;
+
+    // Phase 1.5: Inject bounded workspace summary on first turn only
+    if (this.getFeatureFlag("WORKSPACE_SUMMARY") && this.messageCount() === 0) {
+      const summary = this.getWorkspaceSummary();
+      if (summary) {
+        return `${base}\n\n## Current workspace\n\n${summary}`;
+      }
+    }
+
+    return base;
+  }
+
+  /**
+   * Build a bounded workspace summary — shallow root listing only.
+   * Returns null if the workspace is empty. Capped at ~40 entries
+   * to prevent bloating the system prompt on large repos.
+   */
+  private getWorkspaceSummary(): string | null {
+    try {
+      // Synchronous readDir not available — use the Think workspace's
+      // internal SQL to get a fast root listing without async.
+      const rows = this.db.all(
+        "SELECT path, type FROM workspace_entries WHERE parent = '/' ORDER BY type DESC, path ASC LIMIT 40",
+      );
+      if (!rows.length) return null;
+
+      const lines = rows.map((r) => {
+        const name = String(r.path).split("/").filter(Boolean).pop() ?? String(r.path);
+        return r.type === "directory" ? `${name}/` : name;
+      });
+      const total = this.db.one("SELECT COUNT(*) as cnt FROM workspace_entries WHERE parent = '/'");
+      const count = Number(total?.cnt ?? lines.length);
+      let result = "```\n" + lines.join("\n") + "\n```";
+      if (count > 40) {
+        result += `\n(${count} entries total, showing first 40)`;
+      }
+      return result;
+    } catch {
+      // workspace_entries table may not exist or be empty — no summary
+      return null;
+    }
   }
 
   override getTools(): ToolSet {
@@ -334,18 +482,29 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return 20;
   }
 
+  /** Read a feature flag, checking per-session metadata override first. */
+  private getFeatureFlag(flag: FeatureFlagName): boolean {
+    const override = this.readMetadata(`flag_${flag}`);
+    if (override !== null) return override === "true";
+    return FEATURE_FLAGS[flag];
+  }
+
   /**
    * Override assembleContext to apply compaction guardrails:
-   * 1. Truncate large tool results (file reads, search results) to prevent
-   *    context window bloat. Workers were burning 200-450k input tokens per
-   *    turn — mostly from reading large files like index.html.
-   * 2. Older assistant messages beyond a threshold get their tool-call
-   *    results summarized.
+   * 1. Per-tool output shaping: apply tool-aware truncation rules to prevent
+   *    context window bloat. Different tools get different response contracts.
+   * 2. Older tool results get aggressively truncated to free budget.
    * 3. Enforce total token budget — drop oldest messages when the estimated
    *    token count exceeds 80% of the model's context window.
+   *
+   * Instrumentation: logs per-turn stats (tool count, output bytes before/after,
+   * estimated tokens) for debugging token waste.
    */
   override async assembleContext(): Promise<ModelMessage[]> {
     const messages = await super.assembleContext();
+
+    // ─── Per-tool output shaping ───
+    const useShaping = this.getFeatureFlag("TOOL_OUTPUT_SHAPING");
 
     // Max chars per tool result — ~8k chars ≈ ~2k tokens. Enough for most
     // source files, tight enough to prevent context blowout from large reads.
@@ -364,6 +523,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const LOW_VALUE_MAX_CHARS = 2_000;
 
     const totalMessages = messages.length;
+    let toolCallCount = 0;
+    let totalOutputBytesBefore = 0;
+    let totalOutputBytesAfter = 0;
+    let truncatedCount = 0;
 
     for (let i = 0; i < totalMessages; i++) {
       const msg = messages[i];
@@ -373,17 +536,51 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
       for (const part of msg.content) {
         if (part.type !== "tool-result" || part.output === undefined) continue;
+        toolCallCount++;
         const output = part.output as { type?: string; value?: unknown };
         if (!output || typeof output !== "object") continue;
+
+        const toolResult = part as { toolName?: string; input?: unknown };
+        const toolName = toolResult.toolName ?? "unknown";
 
         // Serialize the value to measure size
         const value = output.value;
         const serialized = typeof value === "string" ? value : JSON.stringify(value);
+        const originalBytes = serialized.length;
+        totalOutputBytesBefore += originalBytes;
 
-        // Check if this looks like a low-value file (lockfile, minified, sourcemap).
-        // Test both the tool call args (which contain the file path) and the result
-        // value (which may contain paths in search results or JSON output).
-        const toolResult = part as { toolName?: string; input?: unknown };
+        // ─── Per-tool output shaping (Phase 1.2) ───
+        if (useShaping) {
+          // Compact response tools: write, edit, delete, git_add, git_commit
+          // These should return a small status, not file contents.
+          const compactTools = new Set([
+            "write", "edit", "delete",
+            "git_add", "git_commit", "git_init",
+            "git_branch", "git_checkout",
+          ]);
+          if (compactTools.has(toolName) && originalBytes > 1_000) {
+            // These tools shouldn't produce large output — cap at 1KB
+            const capped = truncateToolOutput(serialized, {
+              maxChars: 1_000,
+              strategy: "middle",
+            });
+            if (output.type === "text") {
+              (output as { value: string }).value = capped;
+            } else {
+              (part as { output: unknown }).output = { type: "text", value: capped };
+            }
+            totalOutputBytesAfter += capped.length;
+            if (capped.length < originalBytes) truncatedCount++;
+            continue;
+          }
+
+          // read tool: bounded slice with line numbers — cap per recency
+          // list tool: directory listing — cap to prevent large repo blowout
+          // grep/find tool: search results — cap matches
+          // git_status, git_diff, git_log: structured output — cap
+        }
+
+        // ─── General truncation (existing + improved) ───
         const argsStr = toolResult.input ? JSON.stringify(toolResult.input) : "";
         const isLowValue = LOW_VALUE_PATTERNS.some((p) =>
           p.test(argsStr) || p.test(serialized.slice(0, 500)),
@@ -397,12 +594,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           maxChars = Math.floor(MAX_TOOL_OUTPUT_CHARS / 4);
         }
 
-        if (serialized.length <= maxChars) continue;
+        if (serialized.length <= maxChars) {
+          totalOutputBytesAfter += serialized.length;
+          continue;
+        }
 
         const truncated = truncateToolOutput(serialized, {
           maxChars,
           strategy: "middle",
         });
+        truncatedCount++;
 
         // Preserve the output shape but replace the value with truncated text
         if (output.type === "text") {
@@ -411,27 +612,24 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // Convert JSON output to text with truncation notice
           (part as { output: unknown }).output = { type: "text", value: truncated };
         }
+        totalOutputBytesAfter += truncated.length;
       }
     }
 
-    // --- Token-budget enforcement ---
-    // Look up context window for current model, compute budget
+    // ─── Token-budget enforcement ───
     const config = this.getConfig();
     const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
 
-    // Estimate tokens per message: chars / 3.5 is a reasonable heuristic for
-    // English text + code. Walk newest→oldest, accumulating estimated tokens.
     const estimateTokens = (msg: ModelMessage): number => {
-      const serialized = JSON.stringify(msg);
-      return Math.ceil(serialized.length / 3.5);
+      const s = JSON.stringify(msg);
+      return Math.ceil(s.length / 3.5);
     };
 
     let totalTokens = 0;
-    let cutoffIndex = 0; // First message to keep
+    let cutoffIndex = 0;
 
-    // Walk from newest to oldest
     for (let i = messages.length - 1; i >= 0; i--) {
       const msgTokens = estimateTokens(messages[i]);
       if (totalTokens + msgTokens > tokenBudget) {
@@ -441,15 +639,47 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       totalTokens += msgTokens;
     }
 
+    // ─── Current-turn overshoot check (Phase 1.4) ───
+    // Even after truncation, check if the most recent messages alone exceed budget.
+    // This catches the case where many tool calls in a single turn accumulate.
+    if (messages.length > 0) {
+      const lastMsg = messages[messages.length - 1];
+      const lastMsgTokens = estimateTokens(lastMsg);
+      if (lastMsgTokens > tokenBudget * 0.5) {
+        log("warn", "assembleContext: single message uses >50% of token budget", {
+          sessionId: this.sessionId(),
+          role: lastMsg.role,
+          estimatedTokens: lastMsgTokens,
+          tokenBudget,
+          model: modelId,
+        });
+      }
+    }
+
+    // ─── Instrumentation (Phase 0.1) ───
+    log("info", "assembleContext", {
+      sessionId: this.sessionId(),
+      model: modelId,
+      messageCount: totalMessages,
+      toolCallCount,
+      outputBytesBefore: totalOutputBytesBefore,
+      outputBytesAfter: totalOutputBytesAfter,
+      truncatedToolResults: truncatedCount,
+      estimatedTokens: totalTokens,
+      tokenBudget,
+      contextWindow,
+      dropped: cutoffIndex > 0 ? cutoffIndex : 0,
+    });
+
     if (cutoffIndex > 0 && cutoffIndex < messages.length) {
       const droppedCount = cutoffIndex;
-      console.warn(
-        `[assembleContext] Token budget exceeded: dropping ${droppedCount} oldest message(s). ` +
-        `Model: ${modelId}, budget: ${tokenBudget} tokens (~${contextWindow} context window × ${CONTEXT_BUDGET_FACTOR}), ` +
-        `estimated total before drop: ${totalTokens + messages.slice(0, cutoffIndex).reduce((acc, m) => acc + estimateTokens(m), 0)} tokens.`
-      );
+      log("warn", "assembleContext: dropping oldest messages", {
+        sessionId: this.sessionId(),
+        droppedCount,
+        model: modelId,
+        tokenBudget,
+      });
 
-      // Insert a system note at the start so the model knows context was truncated
       const truncationNote: ModelMessage = {
         role: "system" as const,
         content: `[Earlier messages truncated — context window limit reached. ${droppedCount} message(s) dropped to stay within the ${contextWindow}-token context window.]`,
@@ -1035,6 +1265,19 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
+
+    // Overflow storage for truncated tool outputs — keeps full content
+    // accessible via bounded reads without polluting the workspace or git.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tool_output_overflow (
+        id TEXT PRIMARY KEY,
+        tool_name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        total_lines INTEGER NOT NULL,
+        total_bytes INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
   }
 
   private async handleListFiles(url: URL): Promise<Response> {
@@ -2070,6 +2313,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       console.warn("[compaction] Background compaction failed:", err instanceof Error ? err.message : err);
     });
 
+    // Clean up stale overflow records (fire-and-forget)
+    try { this.cleanupOverflow(); } catch { /* best-effort */ }
+
     return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
   }
 
@@ -2666,11 +2912,53 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return this.env.USER_CONTROL.idFromName(ownerEmail).toString();
   }
 
+  // ─── Tool Output Overflow Storage ───
+
+  /** Store a truncated tool's full output for later bounded retrieval. */
+  private storeOverflow(toolName: string, content: string): string {
+    const id = crypto.randomUUID();
+    const lines = content.split("\n").length;
+    this.db.exec(
+      "INSERT INTO tool_output_overflow (id, tool_name, content, total_lines, total_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      id, toolName, content, lines, content.length, nowEpoch(),
+    );
+    return id;
+  }
+
+  /** Read a slice of an overflow record. Returns null if not found. */
+  readOverflow(id: string, offset = 0, limit = TOOL_OUTPUT_MAX_LINES): { content: string; totalLines: number; totalBytes: number; sliceStart: number; sliceEnd: number } | null {
+    const row = this.db.one("SELECT content, total_lines, total_bytes FROM tool_output_overflow WHERE id = ?", id);
+    if (!row) return null;
+    const full = String(row.content);
+    const lines = full.split("\n");
+    const sliceEnd = Math.min(offset + limit, lines.length);
+    const slice = lines.slice(offset, sliceEnd);
+    return {
+      content: slice.join("\n"),
+      totalLines: Number(row.total_lines),
+      totalBytes: Number(row.total_bytes),
+      sliceStart: offset,
+      sliceEnd,
+    };
+  }
+
+  /** Clean up overflow records older than the given age (seconds). Default: 1 hour. */
+  private cleanupOverflow(maxAgeSeconds = 3600): number {
+    const cutoff = nowEpoch() - maxAgeSeconds;
+    const before = this.db.one("SELECT COUNT(*) as cnt FROM tool_output_overflow WHERE created_at < ?", cutoff);
+    const count = Number(before?.cnt ?? 0);
+    if (count > 0) {
+      this.db.exec("DELETE FROM tool_output_overflow WHERE created_at < ?", cutoff);
+    }
+    return count;
+  }
+
   private async destroyStorage(): Promise<void> {
     this.db.exec("DELETE FROM message_metadata");
     this.db.exec("DELETE FROM prompts");
     this.db.exec("DELETE FROM cron_jobs");
     this.db.exec("DELETE FROM metadata");
+    this.db.exec("DELETE FROM tool_output_overflow");
     // Clean up Think sessions
     const thinkSessionId = this.getCurrentSessionId();
     if (thinkSessionId) {
