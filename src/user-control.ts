@@ -519,17 +519,19 @@ export class UserControl implements DurableObject {
         await this.setSecret("cf_api_token", body.cfApiToken, ownerEmail);
 
         // Auto-create or update the browser-rendering MCP config
+        // headers_json must list the header names so connectMcpServers resolves them from encrypted_secrets
         const mcpUrl = "https://browser.mcp.cloudflare.com/mcp";
+        const headerKeys = JSON.stringify(["Authorization", "cf-account-id"]);
         const existing = this.db.one("SELECT id FROM mcp_configs WHERE id = 'browser-rendering'");
         if (existing) {
           this.db.exec(
-            "UPDATE mcp_configs SET url = ?, enabled = 1, updated_at = ? WHERE id = 'browser-rendering'",
-            mcpUrl, now,
+            "UPDATE mcp_configs SET url = ?, headers_json = ?, enabled = 1, updated_at = ? WHERE id = 'browser-rendering'",
+            mcpUrl, headerKeys, now,
           );
         } else {
           this.db.exec(
-            "INSERT INTO mcp_configs (id, name, type, url, headers_json, enabled, created_at, updated_at) VALUES ('browser-rendering', 'Browser Rendering', 'http', ?, '{}', 1, ?, ?)",
-            mcpUrl, now, now,
+            "INSERT INTO mcp_configs (id, name, type, url, headers_json, enabled, created_at, updated_at) VALUES ('browser-rendering', 'Browser Rendering', 'http', ?, ?, 1, ?, ?)",
+            mcpUrl, headerKeys, now, now,
           );
         }
 

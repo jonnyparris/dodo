@@ -453,6 +453,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       activeStreamCount: this.clients.size,
       messageCount: this.messageCount(),
     } as never);
+
+    // Reconcile orphaned prompt queue — if no prompt is active but the queue
+    // has items, the DO likely evicted between finishPrompt() clearing
+    // active_prompt_id and dequeueAndRunNext() reading the queue.
+    if (!this.readMetadata("active_prompt_id")) {
+      this.dequeueAndRunNext();
+    }
   }
 
   /**
@@ -796,7 +803,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         }
 
         if (this.readMetadata("active_prompt_id")) {
-          connection.send(JSON.stringify({ type: "error", error: "A prompt is already running" }));
+          // Queue the prompt instead of rejecting — WS prompts are async (fire-and-forget)
+          const queueResponse = this.enqueuePrompt(content, entry?.email);
+          const queueBody = await queueResponse.json() as { promptId?: string; position?: number };
+          connection.send(JSON.stringify({ type: "prompt_queued", promptId: queueBody.promptId, position: queueBody.position, queued: true }));
           return;
         }
 
@@ -1502,8 +1512,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
     this.ensureMetadata(sessionId, ownerEmail);
 
+    // handleMessage is synchronous — callers (MCP, external integrations) expect the
+    // assistant response in the HTTP reply. Queuing would lose the response. Keep 409.
     if (this.readMetadata("active_prompt_id")) {
-      return this.enqueuePrompt(input.content, authorEmail);
+      return Response.json({ error: "A prompt is already running" }, { status: 409 });
     }
 
     const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
@@ -1676,6 +1688,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   async runFiberPrompt(payload: { promptId: string; content: string; authorEmail?: string; title: string }): Promise<void> {
     const { promptId, content, authorEmail, title } = payload;
+
+    // Ensure Think config exists — may be absent if this is a dequeued prompt
+    // after DO eviction or if config was lost for any reason.
+    if (!this.getConfig()) {
+      await this.readAppConfig();
+    }
 
     // Check fiber snapshot — if chat already completed, skip to finalization
     const fiberId = this.readPromptFiberId(promptId);
