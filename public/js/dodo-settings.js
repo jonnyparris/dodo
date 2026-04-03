@@ -44,13 +44,25 @@ async function deleteSecret(key){await apiSafe(`/api/secrets/${encodeURIComponen
 // --- Status & models ---
 let _bootCommit=null;
 
+/** Resolve the current deploy's commit hash — tries /api/status first, falls back to /version.json. */
+async function resolveCommit(){
+  try{
+    const s=await api("/api/status");
+    if(s.commit)return{commit:s.commit,version:s.version||''};
+  }catch{}
+  try{
+    const r=await fetch("/version.json",{cache:"no-store"});
+    if(r.ok){const v=await r.json();if(v.commit)return{commit:v.commit,version:''}}
+  }catch{}
+  return{commit:'',version:''};
+}
+
 async function loadStatus(){
   try{
     const s=await api("/api/status");
-    let commit=s.commit||'';
-    if(!commit&&!(s.version||'').includes('-dev')){try{const r=await fetch("/version.json");if(r.ok){const v=await r.json();commit=v.commit||''}}catch{}}
+    const{commit}=await resolveCommit();
     const commitStr=commit?` (${esc(commit.slice(0,7))})`:'';
-    const versionLabel=`Dodo v${esc(s.version)}${commitStr}`;
+    const versionLabel=`Dodo v${esc(s.version||'?')}${commitStr}`;
     $("footer-text").innerHTML=`<img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/> ${versionLabel}`;
     const bv=$("build-version");if(bv)bv.textContent=commit?`build ${esc(commit.slice(0,7))}`:`v${esc(s.version)}`;
     const sv=$("sidebar-version");if(sv)sv.textContent=versionLabel;
@@ -60,11 +72,13 @@ async function loadStatus(){
 
 // Called on SSE reconnect — a deploy restarts the DO, which drops and
 // re-establishes the SSE connection.  One fetch on reconnect, zero polling.
+// Also catches cases where the Worker was redeployed but the SSE didn't drop
+// (e.g. CF Build deploys where the old isolate lingers).
 async function checkVersionOnReconnect(){
   if(!_bootCommit)return;
   try{
-    const s=await api("/api/status");
-    if(s.commit&&s.commit!==_bootCommit)showUpdateBanner(s.commit);
+    const{commit}=await resolveCommit();
+    if(commit&&commit!==_bootCommit)showUpdateBanner(commit);
   }catch{/* transient failure, next reconnect will try again */}
 }
 
