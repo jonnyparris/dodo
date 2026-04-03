@@ -263,7 +263,7 @@ function resetSseActivityTimer(){
 }
 function setProcessing(active){
   isProcessing=active;
-  $("send-btn").disabled=active;$("abort-btn").disabled=!active;$("msg-input").disabled=active;
+  $("send-btn").disabled=false;$("abort-btn").disabled=!active;$("msg-input").disabled=false;
   $("send-btn").innerHTML=active?'<span class="spinner"></span>':'Send';
   updateFavicon();
   if(active){resetSseActivityTimer()}else{if(sseActivityTimer){clearTimeout(sseActivityTimer);sseActivityTimer=null}sseStallWarned=false}
