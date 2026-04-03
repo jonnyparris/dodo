@@ -217,7 +217,7 @@ function renderMessage(msg){
     label.style.cssText="font-size:10px;margin-bottom:2px;";
     if(authorEmail&&window._userEmail&&authorEmail!==window._userEmail){
       label.style.color=emailColor(authorEmail);label.textContent=authorEmail;
-    }else{label.style.color=emailColor(authorEmail||"you");label.textContent="You"}
+    }else{label.style.color="rgba(255,255,255,.75)";label.textContent="You"}
     el.appendChild(label);
     el.appendChild(document.createTextNode(msg.content));
   }
