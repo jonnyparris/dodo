@@ -22,6 +22,7 @@ async function createSession(){const d=await jsonSafe("/session",{});if(!d)retur
 async function selectSession(id){
   currentSession=id;setProcessing(false);history.replaceState(null,"",`#session=${id}`);
   $("chat").innerHTML="";$("onboarding")?.remove();
+  const cw=$("context-warning");if(cw)cw.style.display="none";
   showSkeleton($("chat"),5);
   $("session-id-display").textContent=id.slice(0,8);
   $("session-title-display").textContent=id.slice(0,8);
