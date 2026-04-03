@@ -1085,6 +1085,20 @@ app.get("/session/:id/prompts", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompts");
 });
 
+app.get("/session/:id/prompt-queue", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompt-queue");
+});
+
+app.delete("/session/:id/prompt-queue/:queueId", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/prompt-queue/${encodeURIComponent(c.req.param("queueId"))}`, {
+    method: "DELETE",
+  });
+});
+
 app.get("/session/:id/cron", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;

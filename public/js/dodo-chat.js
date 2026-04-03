@@ -174,6 +174,32 @@ function connectSSE(id){
   eventSource.addEventListener("execution",(e)=>{const r=JSON.parse(e.data);const el=document.createElement("div");el.className="msg tool_call";el.textContent=r.error?`Error: ${r.error}`:r.result!=null?`Result: ${JSON.stringify(r.result,null,2)}`:'\u2713 Done';$("chat").appendChild(el);_smoothScrollToBottom()});
   eventSource.addEventListener("error_message",(e)=>{hideThinking();setProcessing(false);const{message}=JSON.parse(e.data);const el=document.createElement("div");el.className="msg error";el.textContent=message||"Something went wrong";$("chat").appendChild(el);_smoothScrollToBottom()});
   eventSource.addEventListener("presence",(e)=>{const data=JSON.parse(e.data);presenceUsers=data.users||[];renderPresence()});
+
+  eventSource.addEventListener("queue_update",(e)=>{
+    const{queue}=JSON.parse(e.data);
+    // Remove any queued bubbles that are no longer in the queue
+    document.querySelectorAll('.msg.queued').forEach(el=>{
+      const qid=el.dataset.queueId;
+      if(qid&&!queue.find(q=>q.id===qid))el.remove();
+    });
+    // Update positions on remaining
+    queue.forEach(q=>{
+      const el=document.querySelector(`.msg.queued[data-queue-id="${q.id}"]`);
+      if(el){const pos=el.querySelector('.queue-position');if(pos)pos.textContent=`#${q.position} in queue`}
+    });
+  });
+}
+
+function showQueuedMessage(content,queueId,position){
+  const el=document.createElement("div");el.className="msg user queued";el.dataset.queueId=queueId;
+  el.innerHTML=`<div style="opacity:.5">${esc(content)}</div><div style="display:flex;align-items:center;gap:6px;margin-top:4px"><span class="queue-position" style="font-size:10px;color:var(--muted)">#${position} in queue</span><button class="sm" onclick="cancelQueued('${esc(queueId)}',this)" style="font-size:10px;padding:1px 6px">Cancel</button></div>`;
+  $("chat").appendChild(el);_smoothScrollToBottom();
+}
+
+async function cancelQueued(queueId,btn){
+  if(!currentSession)return;
+  await apiSafe(`/session/${currentSession}/prompt-queue/${encodeURIComponent(queueId)}`,{method:"DELETE"});
+  const el=btn.closest('.msg.queued');if(el)el.remove();
 }
 
 function renderMessage(msg){
@@ -227,7 +253,22 @@ function updateTokenSummary(state){
 }
 
 // --- Chat actions ---
-async function sendMessage(){if(isProcessing)return;const content=$("msg-input").value.trim();if(!content)return;if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}$("msg-input").value="";$("msg-input").style.height='auto';setProcessing(true);showThinking();const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});if(!result){setProcessing(false);hideThinking()}}
+async function sendMessage(){
+  const content=$("msg-input").value.trim();if(!content)return;
+  if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}
+  $("msg-input").value="";$("msg-input").style.height='auto';
+  if(isProcessing){
+    // Queue the prompt — show as pending bubble
+    const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});
+    if(result&&result.status==="queued"){
+      showQueuedMessage(content,result.promptId,result.position);
+    }
+    return;
+  }
+  setProcessing(true);showThinking();
+  const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});
+  if(!result){setProcessing(false);hideThinking()}
+}
 async function abortPrompt(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
 async function forkSession(){if(!currentSession)return;const d=await jsonSafe(`/session/${currentSession}/fork`,{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
 async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("presence-bar").innerHTML="";history.replaceState(null,"",location.pathname);await loadSessions();if(window.innerWidth<=900)switchTab('chat')}

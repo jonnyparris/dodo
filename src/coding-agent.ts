@@ -512,6 +512,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return Response.json({ prompts: this.listPrompts() });
       }
 
+      if (request.method === "GET" && url.pathname === "/prompt-queue") {
+        return Response.json(this.readQueueState());
+      }
+
+      if (request.method === "DELETE" && url.pathname.startsWith("/prompt-queue/")) {
+        const queueId = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        this.db.exec("DELETE FROM prompt_queue WHERE id = ?", queueId);
+        this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
+        return Response.json({ deleted: true, id: queueId });
+      }
+
       if (request.method === "GET" && url.pathname === "/cron") {
         return Response.json({ jobs: this.listCronJobs() });
       }
@@ -948,7 +959,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS prompt_queue (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        author_email TEXT,
+        created_at INTEGER NOT NULL,
+        position INTEGER NOT NULL
+      )
+    `);
+
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
   }
 
   private async handleListFiles(url: URL): Promise<Response> {
@@ -1481,7 +1503,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.ensureMetadata(sessionId, ownerEmail);
 
     if (this.readMetadata("active_prompt_id")) {
-      return Response.json({ error: "A prompt is already running" }, { status: 409 });
+      return this.enqueuePrompt(input.content, authorEmail);
     }
 
     const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
@@ -1524,12 +1546,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const ownerEmail = request.headers.get("x-owner-email");
     this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
     this.ensureMetadata(sessionId, ownerEmail);
-
-    if (this.readMetadata("active_prompt_id")) {
-      return Response.json({ error: "A prompt is already running" }, { status: 409 });
-    }
-
     this.ensureThinkConfig(request);
+
+    // If a prompt is already running, queue this one
+    if (this.readMetadata("active_prompt_id")) {
+      return this.enqueuePrompt(input.content, authorEmail);
+    }
 
     const promptId = crypto.randomUUID();
     const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
@@ -1579,6 +1601,70 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.updatePrompt(promptId, patch);
     this.deleteMetadata("active_prompt_id");
     this.writeMetadata("status", "idle");
+
+    // Dequeue next prompt if any
+    this.dequeueAndRunNext();
+  }
+
+  // ─── Prompt queue management ───
+
+  private enqueuePrompt(content: string, authorEmail?: string | null): Response {
+    const id = crypto.randomUUID();
+    const now = nowEpoch();
+    // Position = max existing position + 1
+    const maxRow = this.db.one("SELECT MAX(position) as max_pos FROM prompt_queue");
+    const position = maxRow?.max_pos != null ? Number(maxRow.max_pos) + 1 : 1;
+    this.db.exec(
+      "INSERT INTO prompt_queue (id, content, author_email, created_at, position) VALUES (?, ?, ?, ?, ?)",
+      id, content, authorEmail ?? null, now, position,
+    );
+    this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
+    return Response.json({ status: "queued", promptId: id, position }, { status: 202 });
+  }
+
+  private dequeueAndRunNext(): void {
+    const next = this.db.one("SELECT id, content, author_email FROM prompt_queue ORDER BY position ASC LIMIT 1");
+    if (!next) return;
+
+    const queuedId = String(next.id);
+    const content = String(next.content);
+    const authorEmail = next.author_email ? String(next.author_email) : undefined;
+
+    // Remove from queue
+    this.db.exec("DELETE FROM prompt_queue WHERE id = ?", queuedId);
+    this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
+
+    // Run as a new prompt via fiber
+    const promptId = crypto.randomUUID();
+    const title = this.readMetadata("title") ?? (content.length > 72 ? content.slice(0, 72) + "…" : content);
+
+    this.writeMetadata("active_prompt_id", promptId);
+    this.writeMetadata("status", "running");
+    this.insertPrompt(promptId, content, "queued", authorEmail);
+
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+
+    const fiberId = this.spawnFiber("runFiberPrompt", {
+      promptId,
+      content,
+      authorEmail,
+      title,
+    }, { maxRetries: 3 });
+    this.setPromptFiberId(promptId, fiberId);
+
+    void this.syncSessionIndex({ status: "running", title });
+  }
+
+  private readQueueState(): { queue: Array<{ id: string; content: string; position: number; createdAt: string }> } {
+    const rows = this.db.all("SELECT id, content, position, created_at FROM prompt_queue ORDER BY position ASC");
+    return {
+      queue: rows.map((r) => ({
+        id: String(r.id),
+        content: String(r.content),
+        position: Number(r.position),
+        createdAt: epochToIso(r.created_at),
+      })),
+    };
   }
 
   // ─── Fiber-aware prompt execution ───
