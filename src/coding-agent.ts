@@ -2900,9 +2900,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       ? Math.round((estimatedContext / contextBudget) * 100)
       : 0;
 
+    // Compaction info
+    const thinkSid = this.getCurrentSessionId();
+    const compactionCount = thinkSid ? this.sessions.getCompactions(thinkSid).length : 0;
+
     return {
       activePromptId,
       activeStreamCount: this.clients.size,
+      compactionCount,
       contextBudget,
       contextUsagePercent,
       contextWindow,
