@@ -5,9 +5,7 @@ import type { Env } from "../src/types";
 import { PresenceTracker } from "../src/presence";
 import { AgentConnectionTransport } from "../src/rpc-transport";
 
-const { runAgenticChatMock, streamAgenticChatMock, sendNotificationMock } = vi.hoisted(() => ({
-  runAgenticChatMock: vi.fn(),
-  streamAgenticChatMock: vi.fn(),
+const { sendNotificationMock } = vi.hoisted(() => ({
   sendNotificationMock: vi.fn(),
 }));
 
@@ -16,8 +14,7 @@ vi.mock("../src/executor", () => ({
 }));
 
 vi.mock("../src/agentic", () => ({
-  runAgenticChat: runAgenticChatMock,
-  streamAgenticChat: streamAgenticChatMock,
+  buildProvider: vi.fn().mockReturnValue({ chatModel: vi.fn().mockReturnValue({}) }),
   buildToolsForThink: vi.fn().mockReturnValue({}),
 }));
 
@@ -256,17 +253,7 @@ describe("WebSocket route", () => {
 
   beforeEach(async () => {
     vi.restoreAllMocks();
-    runAgenticChatMock.mockReset();
-    streamAgenticChatMock.mockReset();
     sendNotificationMock.mockReset();
-    streamAgenticChatMock.mockImplementation(async (input: { messages: Array<{ content: string }> }) => {
-      const text = `reply:${input.messages.at(-1)?.content ?? ""}`;
-      return { gateway: "opencode", model: "test", steps: 1, text, tokenInput: 0, tokenOutput: 0, toolCalls: [] };
-    });
-    runAgenticChatMock.mockImplementation(async (input: { messages: Array<{ content: string }> }) => {
-      const text = `reply:${input.messages.at(-1)?.content ?? ""}`;
-      return { gateway: "opencode", model: "test", steps: 1, text, tokenInput: 0, tokenOutput: 0, toolCalls: [] };
-    });
   });
 
   it("returns 426 for non-WebSocket requests to /session/:id/ws", async () => {
@@ -369,13 +356,7 @@ describe("WebSocket reconnection", () => {
 
   beforeEach(async () => {
     vi.restoreAllMocks();
-    runAgenticChatMock.mockReset();
-    streamAgenticChatMock.mockReset();
     sendNotificationMock.mockReset();
-    streamAgenticChatMock.mockImplementation(async (input: { messages: Array<{ content: string }> }) => {
-      const text = `reply:${input.messages.at(-1)?.content ?? ""}`;
-      return { gateway: "opencode", model: "test", steps: 1, text, tokenInput: 0, tokenOutput: 0, toolCalls: [] };
-    });
   });
 
   it("ready message includes totalMessages field", async () => {

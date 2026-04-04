@@ -1029,24 +1029,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return await this.handleGitRemote(request);
       }
 
-      // ─── Approval Queue ───
-
-      if (request.method === "GET" && url.pathname === "/approvals") {
-        return Response.json({ approvals: this.listApprovals() });
-      }
-
-      if (request.method === "POST" && url.pathname.match(/^\/approvals\/[^/]+\/approve$/)) {
-        const approvalId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const resolvedBy = request.headers.get("x-author-email") ?? request.headers.get("x-owner-email") ?? undefined;
-        return Response.json(this.resolveApproval(approvalId, "approved", resolvedBy));
-      }
-
-      if (request.method === "POST" && url.pathname.match(/^\/approvals\/[^/]+\/reject$/)) {
-        const approvalId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const resolvedBy = request.headers.get("x-author-email") ?? request.headers.get("x-owner-email") ?? undefined;
-        return Response.json(this.resolveApproval(approvalId, "rejected", resolvedBy));
-      }
-
       if (request.method === "POST" && url.pathname === "/message") {
         return await this.handleMessage(request);
       }
@@ -1137,7 +1119,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
 
     // Enforce permission: readonly clients cannot perform write actions
-    const writeActions = new Set(["prompt", "message", "abort", "cron-create", "cron-delete", "approval-approve", "approval-reject"]);
+    const writeActions = new Set(["prompt", "message", "abort", "cron-create", "cron-delete"]);
     if (writeActions.has(parsed.type)) {
       const permission = this.getConnectionPermission(connection);
       if (permission === "readonly") {
@@ -1331,18 +1313,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         description TEXT NOT NULL,
         prompt TEXT NOT NULL,
         created_at INTEGER NOT NULL
-      )
-    `);
-
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS approval_queue (
-        id TEXT PRIMARY KEY,
-        tool_name TEXT NOT NULL,
-        tool_args TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        requested_at INTEGER NOT NULL,
-        resolved_at INTEGER,
-        resolved_by TEXT
       )
     `);
 
@@ -2661,53 +2631,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     };
   }
 
-  // ─── Approval Queue ───
-
-  private listApprovals(statusFilter?: string): Array<{
-    id: string;
-    toolName: string;
-    toolArgs: unknown;
-    status: string;
-    requestedAt: string;
-    resolvedAt: string | null;
-    resolvedBy: string | null;
-  }> {
-    const rows = statusFilter
-      ? this.db.all("SELECT id, tool_name, tool_args, status, requested_at, resolved_at, resolved_by FROM approval_queue WHERE status = ? ORDER BY requested_at DESC", statusFilter)
-      : this.db.all("SELECT id, tool_name, tool_args, status, requested_at, resolved_at, resolved_by FROM approval_queue ORDER BY requested_at DESC");
-    return rows.map((row) => ({
-      id: String(row.id),
-      toolName: String(row.tool_name),
-      toolArgs: JSON.parse(String(row.tool_args)),
-      status: String(row.status),
-      requestedAt: epochToIso(row.requested_at),
-      resolvedAt: row.resolved_at === null ? null : epochToIso(row.resolved_at),
-      resolvedBy: row.resolved_by === null ? null : String(row.resolved_by),
-    }));
-  }
-
-  private resolveApproval(id: string, status: "approved" | "rejected", resolvedBy?: string): {
-    id: string;
-    status: string;
-    resolvedAt: string;
-    resolvedBy: string | null;
-  } {
-    const existing = this.db.one("SELECT status FROM approval_queue WHERE id = ?", id);
-    if (!existing) throw new Error(`Approval ${id} not found`);
-    if (String(existing.status) !== "pending") throw new Error(`Approval ${id} already resolved`);
-
-    const now = nowEpoch();
-    this.db.exec(
-      "UPDATE approval_queue SET status = ?, resolved_at = ?, resolved_by = ? WHERE id = ?",
-      status,
-      now,
-      resolvedBy ?? null,
-      id,
-    );
-    this.emitEvent({ data: { id, status, resolvedBy }, type: "approval" });
-    return { id, status, resolvedAt: epochToIso(now), resolvedBy: resolvedBy ?? null };
-  }
-
   private openEventStream(request: Request): Response {
     const stream = new TransformStream<Uint8Array>();
     const writer = stream.writable.getWriter();
@@ -2824,8 +2747,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         configs: Array<McpGatekeeperConfig & { overridden: boolean }>;
       };
 
+      // Gate browser-rendering MCP on the per-session browser_enabled flag.
+      // If browser is disabled for this session, skip the browser-rendering config
+      // even if the MCP config itself is enabled.
+      const browserEnabled = this.readMetadata("browser_enabled") === "true";
+
       // Filter to enabled HTTP configs with URLs
-      const enabled = configs.filter((c) => c.enabled && c.type === "http" && c.url);
+      const enabled = configs.filter((c) => {
+        if (!c.enabled || c.type !== "http" || !c.url) return false;
+        if (c.id === "browser-rendering" && !browserEnabled) return false;
+        return true;
+      });
       if (enabled.length === 0) return;
 
       // Resolve encrypted headers and connect each gatekeeper

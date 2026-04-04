@@ -15,13 +15,13 @@ import { getUserControlStub, isAdmin } from "./auth";
 
 // ─── Shared types ───
 
-export interface RpcUserInfo {
+interface RpcUserInfo {
   email: string;
   displayName?: string;
   isAdmin: boolean;
 }
 
-export interface RpcSessionSummary {
+interface RpcSessionSummary {
   id: string;
   title: string | null;
   status: string;
