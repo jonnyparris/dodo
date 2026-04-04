@@ -83,6 +83,9 @@ type FeatureFlagName = keyof typeof FEATURE_FLAGS;
 const TOOL_OUTPUT_MAX_LINES = 2000;
 const TOOL_OUTPUT_MAX_BYTES = 50 * 1024; // 50 KB
 
+/** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
+const CLEARED_MARKER = "[Old tool result content cleared]";
+
 const sendMessageSchema = z.object({ content: z.string().trim().min(1) }).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
 const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
@@ -444,26 +447,59 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       stopWhen: stepCountIs(this.getMaxSteps()),
       abortSignal: options?.signal,
 
-      // Per-step context shaping: truncate tool results from earlier steps
-      // to prevent the multi-step accumulation problem. Without this, each of
-      // the 20 possible steps sees ALL previous tool results at full size,
-      // causing O(steps² × toolOutputSize) token growth.
-      prepareStep: ({ stepNumber, messages: stepMessages }) => {
-        if (stepNumber <= 1) return {}; // First step — nothing to truncate
+      // ─── Per-step context shaping (OpenCode patterns #2, #3, #4) ───
+      //
+      // Between each step in the multi-step loop:
+      // 1. CLEAR old tool results entirely (not truncate — replace with marker)
+      // 2. Keep only the most recent tool results at full resolution
+      // 3. Detect doom loops (same tool + same args repeated 3+ times)
+      //
+      // This prevents O(steps² × toolOutputSize) token growth by making old
+      // tool results cost ~8 tokens each instead of ~1-4k tokens.
+      prepareStep: ({ stepNumber, steps, messages: stepMessages }) => {
+        if (stepNumber <= 1) return {};
 
-        // Max chars for tool results from non-recent steps
-        const STEP_TOOL_MAX_CHARS = 4_000;
-        // Keep last N messages at full resolution
-        const RECENT_STEP_MSGS = 6;
+        // ─── Pattern 4: Doom loop detection ───
+        // Track recent tool calls and inject a warning if the same tool+args
+        // combo appears 3+ times, catching read→fail→read→fail loops.
+        const DOOM_LOOP_THRESHOLD = 3;
+        let doomWarning: string | null = null;
+        if (steps.length >= DOOM_LOOP_THRESHOLD) {
+          const recentCalls = steps
+            .slice(-DOOM_LOOP_THRESHOLD)
+            .flatMap(s => s.toolCalls ?? [])
+            .map(tc => `${tc.toolName}:${JSON.stringify(tc.input)}`);
+
+          // Check if the last N calls are identical
+          if (recentCalls.length >= DOOM_LOOP_THRESHOLD) {
+            const last = recentCalls[recentCalls.length - 1];
+            const allSame = recentCalls.slice(-DOOM_LOOP_THRESHOLD).every(c => c === last);
+            if (allSame) {
+              const toolName = steps.at(-1)?.toolCalls?.[0]?.toolName ?? "unknown";
+              doomWarning = `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach — use a different tool, different arguments, or explain what's blocking you.]`;
+              log("warn", "doom loop detected", {
+                sessionId: this.sessionId(),
+                toolName,
+                stepNumber,
+                repeats: DOOM_LOOP_THRESHOLD,
+              });
+            }
+          }
+        }
+
+        // ─── Patterns 2+3: Aggressive compaction with [cleared] markers ───
+        // Keep only the most recent PROTECTED_WINDOW messages at full resolution.
+        // Everything older gets its tool results replaced with a zero-token marker.
+        const PROTECTED_WINDOW = 6; // ~3 tool call/result pairs
 
         let mutated = false;
         const shaped: ModelMessage[] = stepMessages.map((msg, idx) => {
           if (msg.role !== "tool") return msg;
 
-          const isRecent = idx >= stepMessages.length - RECENT_STEP_MSGS;
+          const isRecent = idx >= stepMessages.length - PROTECTED_WINDOW;
           if (isRecent) return msg;
 
-          // Truncate older tool results in-place via cast
+          // Replace ALL old tool results with the cleared marker
           for (const part of msg.content) {
             if (part.type !== "tool-result" || part.output === undefined) continue;
             const output = part.output as { type?: string; value?: unknown };
@@ -472,24 +508,30 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             const value = output.value;
             const serialized = typeof value === "string" ? value : JSON.stringify(value);
 
-            if (serialized.length <= STEP_TOOL_MAX_CHARS) continue;
+            // Only clear if the result is non-trivial (>200 chars)
+            // Keep small status results like "Edit applied" as-is
+            if (serialized.length <= 200) continue;
 
-            const truncated = truncateToolOutput(serialized, {
-              maxChars: STEP_TOOL_MAX_CHARS,
-              strategy: "middle",
-            });
-
-            // Mutate in place — the AI SDK creates fresh message arrays per step
+            // Clear entirely — not truncate
             if (output.type === "text") {
-              (output as { value: string }).value = truncated;
+              (output as { value: string }).value = CLEARED_MARKER;
             } else {
-              (part as { output: unknown }).output = { type: "text" as const, value: truncated };
+              (part as { output: unknown }).output = { type: "text" as const, value: CLEARED_MARKER };
             }
             mutated = true;
           }
 
           return msg;
         });
+
+        // Inject doom loop warning as a system message if detected
+        if (doomWarning) {
+          shaped.push({
+            role: "system" as const,
+            content: doomWarning,
+          });
+          mutated = true;
+        }
 
         return mutated ? { messages: shaped } : {};
       },
@@ -647,13 +689,25 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const isLowValue = LOW_VALUE_PATTERNS.some((p) =>
           p.test(argsStr) || p.test(serialized.slice(0, 500)),
         );
+        // Non-recent tool results: clear entirely with marker (Pattern #3)
+        // Recent results: truncate to cap if oversized
+        if (!isRecent && serialized.length > 200) {
+          // Old results → zero-cost marker (~8 tokens vs ~500-2000 tokens)
+          if (output.type === "text") {
+            (output as { value: string }).value = CLEARED_MARKER;
+          } else {
+            (part as { output: unknown }).output = { type: "text", value: CLEARED_MARKER };
+          }
+          totalOutputBytesAfter += CLEARED_MARKER.length;
+          truncatedCount++;
+          continue;
+        }
+
         let maxChars: number;
         if (isLowValue) {
           maxChars = LOW_VALUE_MAX_CHARS;
-        } else if (isRecent) {
-          maxChars = MAX_TOOL_OUTPUT_CHARS;
         } else {
-          maxChars = Math.floor(MAX_TOOL_OUTPUT_CHARS / 4);
+          maxChars = MAX_TOOL_OUTPUT_CHARS;
         }
 
         if (serialized.length <= maxChars) {
@@ -671,7 +725,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         if (output.type === "text") {
           (output as { value: string }).value = truncated;
         } else {
-          // Convert JSON output to text with truncation notice
           (part as { output: unknown }).output = { type: "text", value: truncated };
         }
         totalOutputBytesAfter += truncated.length;

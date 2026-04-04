@@ -1,6 +1,6 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { StateBackend } from "@cloudflare/shell";
-import { jsonSchema, tool, zodSchema } from "ai";
+import { jsonSchema, tool, zodSchema, type Tool as AnyToolType } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
@@ -9,6 +9,127 @@ import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env } from "./types";
+
+// ─── Tool Output Caps (OpenCode Pattern #1) ───
+// Cap tool output AT THE TOOL LEVEL before it enters the AI SDK message history.
+// This is more effective than truncating in assembleContext/prepareStep because
+// the tokens never enter the step-level accumulation in the first place.
+
+/** Per-tool output limits, matching OpenCode's proven values. */
+const TOOL_OUTPUT_CAPS: Record<string, { maxLines?: number; maxBytes?: number; maxEntries?: number }> = {
+  read:   { maxLines: 2000, maxBytes: 50 * 1024 },
+  grep:   { maxEntries: 100 },
+  find:   { maxEntries: 100 },
+  list:   { maxEntries: 100 },
+  // write, edit, delete — already produce small output, no cap needed
+};
+
+/** Compact marker for cleared tool output. */
+const CLEARED_MARKER = "[Old tool result content cleared]";
+
+/**
+ * Wrap a tool set to enforce per-tool output caps.
+ * Each tool's execute function is intercepted: the result is serialized,
+ * checked against its cap, and truncated with an actionable hint if exceeded.
+ */
+function capToolOutputs(tools: Record<string, AnyTool>): Record<string, AnyTool> {
+  const wrapped: Record<string, AnyTool> = {};
+  for (const [name, t] of Object.entries(tools)) {
+    const caps = TOOL_OUTPUT_CAPS[name];
+    if (!caps) {
+      wrapped[name] = t;
+      continue;
+    }
+    // Clone the tool with a wrapped execute
+    const original = t as AnyTool & { execute?: (...args: unknown[]) => unknown };
+    if (!original.execute) {
+      wrapped[name] = t;
+      continue;
+    }
+    const origExecute = original.execute;
+    wrapped[name] = {
+      ...original,
+      execute: async (...args: unknown[]) => {
+        const result = await (origExecute as (...a: unknown[]) => Promise<unknown>)(...args);
+        return capResult(name, result, caps);
+      },
+    } as AnyTool;
+  }
+  return wrapped;
+}
+
+/** Apply output caps to a single tool result. */
+function capResult(
+  toolName: string,
+  result: unknown,
+  caps: { maxLines?: number; maxBytes?: number; maxEntries?: number },
+): unknown {
+  if (result === null || result === undefined) return result;
+
+  // Handle structured results (objects with entries arrays — list, find, grep)
+  if (typeof result === "object" && !Array.isArray(result)) {
+    const obj = result as Record<string, unknown>;
+
+    // Cap entries arrays (list, find, grep return { entries: [...] } or { matches: [...] })
+    if (caps.maxEntries) {
+      for (const key of ["entries", "matches", "files"]) {
+        if (Array.isArray(obj[key]) && (obj[key] as unknown[]).length > caps.maxEntries) {
+          const original = obj[key] as unknown[];
+          const capped = original.slice(0, caps.maxEntries);
+          return {
+            ...obj,
+            [key]: capped,
+            _truncated: `Showing ${caps.maxEntries} of ${original.length} results. Use a more specific pattern to narrow results.`,
+          };
+        }
+      }
+    }
+
+    // Cap text content in read results
+    if (caps.maxLines || caps.maxBytes) {
+      // The read tool returns { content: string, ... } or just a string
+      const content = typeof obj.content === "string" ? obj.content : null;
+      if (content) {
+        const capped = capText(content, caps.maxLines ?? Infinity, caps.maxBytes ?? Infinity);
+        if (capped !== content) {
+          const lines = content.split("\n").length;
+          return {
+            ...obj,
+            content: capped,
+            _truncated: `Output capped. Showing partial content of ${lines} total lines. Use read with offset/limit to view specific sections.`,
+          };
+        }
+      }
+    }
+  }
+
+  // Handle plain string results
+  if (typeof result === "string" && (caps.maxLines || caps.maxBytes)) {
+    const capped = capText(result, caps.maxLines ?? Infinity, caps.maxBytes ?? Infinity);
+    if (capped !== result) {
+      const lines = result.split("\n").length;
+      return capped + `\n\n[Output capped. ${lines} total lines. Use read with offset/limit to view specific sections.]`;
+    }
+  }
+
+  return result;
+}
+
+/** Truncate text by line count and byte size, keeping the head. */
+function capText(text: string, maxLines: number, maxBytes: number): string {
+  const lines = text.split("\n");
+  if (lines.length <= maxLines && text.length <= maxBytes) return text;
+
+  const kept: string[] = [];
+  let bytes = 0;
+  for (let i = 0; i < lines.length && i < maxLines; i++) {
+    const line = lines[i];
+    if (bytes + line.length + 1 > maxBytes) break;
+    kept.push(line);
+    bytes += line.length + 1;
+  }
+  return kept.join("\n");
+}
 
 function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
@@ -330,7 +451,8 @@ function buildTools(
   }
 
   // Workspace tools — available as top-level tools alongside codemode
-  Object.assign(tools, workspaceTools);
+  // Wrap with output caps to prevent large results from entering the message history
+  Object.assign(tools, capToolOutputs(workspaceTools));
 
   // Git tools — always available as top-level tools
   Object.assign(tools, gitTools);
