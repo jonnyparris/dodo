@@ -8,8 +8,7 @@ vi.mock("../src/executor", () => ({
   runSandboxedCode: vi.fn().mockResolvedValue({ logs: [], result: null }),
 }));
 vi.mock("../src/agentic", () => ({
-  runAgenticChat: vi.fn().mockResolvedValue({ gateway: "opencode", model: "test", steps: 0, text: "", toolCalls: [] }),
-  streamAgenticChat: vi.fn().mockResolvedValue({ gateway: "opencode", model: "test", steps: 0, text: "", tokenInput: 0, tokenOutput: 0, toolCalls: [] }),
+  buildProvider: vi.fn().mockReturnValue({ chatModel: vi.fn().mockReturnValue({}) }),
   buildToolsForThink: vi.fn().mockReturnValue({}),
 }));
 vi.mock("../src/notify", () => ({
@@ -187,41 +186,6 @@ describe("Feature Gaps", () => {
       expect(restoredConfig).toBeTruthy();
       expect(restoredConfig!.enabled).toBe(true); // Back to account default
       expect(restoredConfig!.overridden).toBe(false);
-    });
-  });
-
-  // ─── Gap 3: Approval Queue ───
-
-  describe("Gap 3: Approval queue", () => {
-    let sessionId: string;
-
-    beforeAll(async () => {
-      sessionId = await createSession();
-      // Warm up the CodingAgent DO by touching the session
-      for (let i = 0; i < 3; i++) {
-        try {
-          const res = await fetchJson(`/session/${sessionId}`, { headers: { "x-dodo-session-id": sessionId } });
-          if (res.ok) break;
-        } catch {
-          await new Promise(r => setTimeout(r, 10));
-        }
-      }
-    });
-
-    it("list approvals returns empty initially", async () => {
-      const res = await fetchJson(`/session/${sessionId}/approvals`);
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { approvals: unknown[] };
-      expect(body.approvals).toEqual([]);
-    });
-
-    it("approve/reject returns error for nonexistent approval", async () => {
-      const res = await fetchJson(`/session/${sessionId}/approvals/nonexistent/approve`, {
-        method: "POST",
-      });
-      expect(res.status).toBe(400);
-      const body = (await res.json()) as { error: string };
-      expect(body.error).toContain("not found");
     });
   });
 

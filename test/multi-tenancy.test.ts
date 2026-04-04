@@ -4,25 +4,11 @@ import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 
 // Mock modules that depend on unavailable packages in the test runtime
-const { streamAgenticChatMock } = vi.hoisted(() => ({
-  streamAgenticChatMock: vi.fn(),
-}));
-
 vi.mock("../src/executor", () => ({
   runSandboxedCode: vi.fn().mockResolvedValue({ logs: [], result: null }),
 }));
 vi.mock("../src/agentic", () => ({
-  runAgenticChat: vi.fn().mockResolvedValue({ gateway: "opencode", model: "test", steps: 0, text: "", toolCalls: [] }),
-  streamAgenticChat: streamAgenticChatMock.mockImplementation(
-    async (input: { messages: Array<{ content: string; role: string }>; onTextDelta?: (d: string) => void }) => {
-      const lastMessage = input.messages.at(-1)?.content ?? "";
-      const text = `mt:${lastMessage}`;
-      if (input.onTextDelta) {
-        for (const ch of text) input.onTextDelta(ch);
-      }
-      return { gateway: "opencode", model: "test", steps: 1, text, tokenInput: 10, tokenOutput: 5, toolCalls: [] };
-    },
-  ),
+  buildProvider: vi.fn().mockReturnValue({ chatModel: vi.fn().mockReturnValue({}) }),
   buildToolsForThink: vi.fn().mockReturnValue({}),
 }));
 vi.mock("../src/notify", () => ({

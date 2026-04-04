@@ -1,5 +1,3 @@
-export type GatewayType = "opencode" | "ai-gateway";
-
 export interface Env {
   AI_GATEWAY_BASE_URL: string;
   AI_GATEWAY_KEY?: string;
@@ -42,7 +40,7 @@ export interface Env {
 }
 
 export interface AppConfig {
-  activeGateway: GatewayType;
+  activeGateway: "opencode" | "ai-gateway";
   aiGatewayBaseURL: string;
   gitAuthorEmail: string;
   gitAuthorName: string;
@@ -85,7 +83,7 @@ export interface ChatMessageRecord {
 }
 
 export interface UpdateConfigRequest {
-  activeGateway?: GatewayType;
+  activeGateway?: "opencode" | "ai-gateway";
   aiGatewayBaseURL?: string;
   gitAuthorEmail?: string;
   gitAuthorName?: string;

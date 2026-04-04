@@ -447,6 +447,12 @@ const EXPLORE_SYSTEM_PROMPT = [
 /** Max steps for the explore subagent. */
 const EXPLORE_MAX_STEPS = 5;
 
+/** Model for the explore subagent — cheap and fast, search doesn't need heavy reasoning. */
+const EXPLORE_MODEL = "anthropic/claude-haiku-3.5";
+
+/** Timeout for the explore subagent (ms). Prevents indefinite blocking. */
+const EXPLORE_TIMEOUT_MS = 60_000;
+
 /**
  * Build the explore tool — spawns a search-only subagent via generateText().
  *
@@ -488,7 +494,7 @@ function buildExploreTool(
     })),
     execute: async ({ query, scope }: { query: string; scope?: string }) => {
       const provider = buildProvider(config, env);
-      const model = provider.chatModel(config.model);
+      const model = provider.chatModel(EXPLORE_MODEL);
 
       const scopeHint = scope ? `\n\nSearch scope: ${scope}` : "";
       const userMessage = `${query}${scopeHint}`;
@@ -501,6 +507,7 @@ function buildExploreTool(
           tools: readOnlyTools,
           stopWhen: stepCountIs(EXPLORE_MAX_STEPS),
           maxOutputTokens: 2000,
+          abortSignal: AbortSignal.timeout(EXPLORE_TIMEOUT_MS),
         });
 
         const summary = result.text;
@@ -627,10 +634,4 @@ function buildMcpTools(gatekeepers: McpGatekeeper[]): Record<string, AnyTool> {
   return tools;
 }
 
-/**
- * Check if the caller is the session owner (i.e. should have access to memory tools).
- */
-export function isCallerOwner(authorEmail?: string, ownerEmail?: string): boolean {
-  if (!authorEmail || !ownerEmail) return true;
-  return authorEmail === ownerEmail;
-}
+

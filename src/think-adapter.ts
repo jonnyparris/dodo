@@ -10,20 +10,14 @@
 export { Think } from "@cloudflare/think";
 export type {
   ChatMessageOptions,
-  ChatOptions,
   FiberCompleteContext,
-  FiberContext,
-  FiberMethods,
   FiberRecoveryContext,
-  FiberState,
-  Session as ThinkSession,
   StreamCallback,
   StreamableResult,
 } from "@cloudflare/think";
 
 export { createWorkspaceTools } from "@cloudflare/think/tools/workspace";
 export { createExecuteTool } from "@cloudflare/think/tools/execute";
-export type { CreateExecuteToolOptions } from "@cloudflare/think/tools/execute";
 export { truncateToolOutput } from "@cloudflare/think/session";
 
 // ─── Re-exports from AI SDK (used alongside Think) ───

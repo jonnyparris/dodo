@@ -119,14 +119,6 @@ async function readConfig(env: Env, email: string): Promise<AppConfig> {
   return (await response.json()) as AppConfig;
 }
 
-async function verifySessionAccess(env: Env, email: string, sessionId: string): Promise<boolean> {
-  const stub = getUserControlStub(env, email);
-  const response = await stub.fetch(`https://user-control/sessions/${encodeURIComponent(sessionId)}/check`);
-  if (response.ok) return true;
-  if (isAdmin(email, env)) return true;
-  return false;
-}
-
 /**
  * Determine the effective permission level for a user on a session.
  * - Session owner → "admin"
@@ -1293,32 +1285,6 @@ app.put("/session/:id/browser", async (c) => {
   const denied = requirePermission(c, "admin");
   if (denied) return denied;
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser");
-});
-
-// ─── Approval Queue ───
-
-app.get("/session/:id/approvals", async (c) => {
-  const denied = requirePermission(c, "readonly");
-  if (denied) return denied;
-  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/approvals");
-});
-
-app.post("/session/:id/approvals/:approvalId/approve", async (c) => {
-  const denied = requirePermission(c, "write");
-  if (denied) return denied;
-  const email = c.get("userEmail");
-  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/approvals/${encodeURIComponent(c.req.param("approvalId"))}/approve`, {
-    "x-author-email": email,
-  });
-});
-
-app.post("/session/:id/approvals/:approvalId/reject", async (c) => {
-  const denied = requirePermission(c, "write");
-  if (denied) return denied;
-  const email = c.get("userEmail");
-  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/approvals/${encodeURIComponent(c.req.param("approvalId"))}/reject`, {
-    "x-author-email": email,
-  });
 });
 
 app.post("/session/:id/cron", async (c) => {
