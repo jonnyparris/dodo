@@ -175,6 +175,7 @@ const SYSTEM_PROMPT = [
   "- Large outputs are automatically truncated. If you see `[truncated]`, use `read` with `offset`/`limit` to get the specific portion you need.",
   "- The workspace is ephemeral per session. Clone repos to get their contents.",
   "- If the user switches topics, suggest a fresh session to keep context clean.",
+  "- Users can prefix a message with `!!` to exclude it from your context (you won't see it). This is useful for informational commands that don't affect the current task.",
 ].join("\n");
 
 /** Build a LanguageModel from DodoConfig (Think per-session config). */
@@ -236,6 +237,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private readonly db: SqlHelper;
   /** Captured token usage from the most recent onChatMessage() call. */
   private _lastUsage: { inputTokens: number; outputTokens: number } | null = null;
+  /** Overflow recovery flag — prevents infinite retry loops on persistent overflow. */
+  private _overflowRecoveryAttempted = false;
   /** Connected MCP gatekeepers, populated by connectMcpServers(). */
   private mcpGatekeepers: McpGatekeeper[] = [];
   /** MCP recursion depth from incoming request, propagated to outbound MCP calls. */
@@ -489,21 +492,68 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             ? [...messages, ...injections]
             : messages;
 
-          // ─── Single-step LLM call ───
-          const result = streamText({
-            model,
-            system,
-            messages: finalMessages,
-            tools,
-            abortSignal: signal,
-          });
+          // ─── Single-step LLM call with overflow recovery (Tactic 5) ───
+          // Tactic 7: Prompt cache retention — request extended caching for
+          // the system prompt on Anthropic models. The system prompt is identical
+          // across all turns, so caching avoids re-tokenizing it each call.
+          const isAnthropic = modelId.startsWith("anthropic/");
+          const providerOptions = isAnthropic
+            ? { anthropic: { cacheControl: { type: "ephemeral" as const } } }
+            : undefined;
 
-          // Forward all chunks from this iteration to the caller
-          for await (const chunk of result.toUIMessageStream()) {
-            yield chunk;
+          let result;
+          try {
+            result = streamText({
+              model,
+              system,
+              messages: finalMessages,
+              tools,
+              abortSignal: signal,
+              providerOptions,
+            });
+
+            // Forward all chunks from this iteration to the caller
+            for await (const chunk of result.toUIMessageStream()) {
+              yield chunk;
+            }
+          } catch (err) {
+            // ─── Overflow recovery ───
+            // Detect context overflow errors and trigger emergency compaction.
+            // Only attempt once per onChatMessage() invocation to prevent infinite loops.
+            const errMsg = err instanceof Error ? err.message : String(err);
+            const isOverflow = /context.*(length|limit|overflow|window|too long|exceed)/i.test(errMsg)
+              || /max.*token/i.test(errMsg)
+              || /request too large/i.test(errMsg);
+
+            if (isOverflow && !self._overflowRecoveryAttempted) {
+              self._overflowRecoveryAttempted = true;
+              log("warn", "own-loop: context overflow detected, attempting emergency compaction", {
+                sessionId,
+                step,
+                error: errMsg.slice(0, 200),
+              });
+
+              try {
+                await self.maybeCompactContext();
+                // After compaction, continue the loop — assembleContext() on next
+                // iteration will use the compacted context
+                step++;
+                continue;
+              } catch (compactionErr) {
+                log("warn", "own-loop: emergency compaction failed, propagating original error", {
+                  sessionId,
+                  error: compactionErr instanceof Error ? compactionErr.message : String(compactionErr),
+                });
+              }
+            }
+            // Re-throw if not an overflow or recovery failed
+            throw err;
           }
 
           // ─── Post-step bookkeeping ───
+          // Reset overflow recovery flag on successful step
+          self._overflowRecoveryAttempted = false;
+
           const usage = await (result as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
           cumulativeInputTokens += usage?.inputTokens ?? 0;
           cumulativeOutputTokens += usage?.outputTokens ?? 0;
@@ -590,7 +640,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * estimated tokens) for debugging token waste.
    */
   override async assembleContext(): Promise<ModelMessage[]> {
-    const messages = await super.assembleContext();
+    let messages = await super.assembleContext();
+
+    // ─── Selective message exclusion (Tactic 8) ───
+    // Messages prefixed with "!!" are visible in the UI but excluded from
+    // LLM context. Useful for user commands that don't inform the task
+    // (checking git status, previewing files, etc.).
+    messages = messages.filter((msg) => {
+      if (msg.role !== "user") return true;
+      const content = typeof msg.content === "string"
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("")
+          : "";
+      return !content.startsWith("!!");
+    });
 
     // ─── Per-tool output shaping ───
     const useShaping = true; // Per-tool output shaping always enabled
@@ -713,7 +777,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
     }
 
-    // ─── Token-budget enforcement ───
+    // ─── Token-budget enforcement (hybrid tracking) ───
+    // Anchor on provider-reported cumulative input tokens from the agentic loop,
+    // then only estimate the trailing delta (messages added since last LLM call).
+    // This bounds estimation error to 1-3 messages instead of the full history.
     const config = this.getConfig();
     const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
@@ -724,16 +791,51 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return Math.ceil(s.length / 3.5);
     };
 
+    // Hybrid approach: use provider-reported tokens as anchor if available.
+    // _lastUsage.inputTokens is the cumulative input tokens from the current
+    // onChatMessage() run. If available, it's a near-exact count for everything
+    // except the trailing messages added after the last LLM call.
+    const anchorTokens = this._lastUsage?.inputTokens ?? 0;
     let totalTokens = 0;
     let cutoffIndex = 0;
 
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msgTokens = estimateTokens(messages[i]);
-      if (totalTokens + msgTokens > tokenBudget) {
-        cutoffIndex = i + 1;
-        break;
+    if (anchorTokens > 0 && messages.length > 0) {
+      // Find the last assistant message (the anchor point)
+      let anchorIndex = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === "assistant") { anchorIndex = i; break; }
       }
-      totalTokens += msgTokens;
+      if (anchorIndex >= 0) {
+        // Estimate only trailing messages after the anchor
+        let trailingTokens = 0;
+        for (let i = anchorIndex + 1; i < messages.length; i++) {
+          trailingTokens += estimateTokens(messages[i]);
+        }
+        totalTokens = anchorTokens + trailingTokens;
+        // Walk backwards from the anchor to find cutoff if budget exceeded
+        if (totalTokens > tokenBudget) {
+          let budget = tokenBudget - trailingTokens;
+          for (let i = anchorIndex; i >= 0; i--) {
+            const msgTokens = estimateTokens(messages[i]);
+            if (budget - msgTokens < 0) { cutoffIndex = i + 1; break; }
+            budget -= msgTokens;
+          }
+        }
+      } else {
+        // No assistant message yet — fall back to pure estimation
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msgTokens = estimateTokens(messages[i]);
+          if (totalTokens + msgTokens > tokenBudget) { cutoffIndex = i + 1; break; }
+          totalTokens += msgTokens;
+        }
+      }
+    } else {
+      // No provider-reported usage yet — pure estimation (first turn)
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msgTokens = estimateTokens(messages[i]);
+        if (totalTokens + msgTokens > tokenBudget) { cutoffIndex = i + 1; break; }
+        totalTokens += msgTokens;
+      }
     }
 
     // ─── Current-turn overshoot check (Phase 1.4) ───
@@ -2369,10 +2471,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /**
    * Check if context compaction is needed and run it if so.
    *
-   * Uses Think's built-in compaction system: generates a summary of older
-   * messages via a cheap LLM call (Haiku), then stores it with addCompaction().
-   * On subsequent turns, Think's getHistory() automatically replaces the
-   * compacted message range with the summary.
+   * Implements several context management tactics from pi-mono:
+   * - Turn-aware cut points: never splits tool-call/result pairs
+   * - Conversation serialization: [Role]: format with 2K tool result cap
+   * - Structured summary format: rigid template with cumulative file tracking
+   * - Iterative summary updates: updates previous summary instead of regenerating
    *
    * Triggers when the last turn's input tokens exceed COMPACTION_TRIGGER_PERCENT
    * of the context budget.
@@ -2396,19 +2499,33 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const usagePercent = Math.round((lastInputTokens / contextBudget) * 100);
     if (usagePercent < COMPACTION_TRIGGER_PERCENT) return;
 
-    // Check if there are already compactions — avoid compacting on top of compactions
-    // too frequently. Only compact if needsCompaction returns true OR usage is high.
     const history = this.sessions.getHistory(thinkSessionId);
-    if (history.length < 6) return; // Too few messages to bother
+    if (history.length < 6) return;
 
-    // Skip synthetic compaction summary messages — getHistory() injects these with
-    // IDs like "compaction_<uuid>". If we don't filter them out, we'd try to compact
-    // an already-compacted summary, wasting an LLM call and creating orphaned records.
+    // Filter out synthetic compaction summary messages (IDs like "compaction_<uuid>")
     const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
     if (realMessages.length < 6) return;
 
-    // Determine the range to compact: oldest COMPACTION_MESSAGE_FRACTION of real messages
-    const compactCount = Math.max(2, Math.floor(realMessages.length * COMPACTION_MESSAGE_FRACTION));
+    // ─── Turn-aware cut point (Tactic 4) ───
+    // Find the cut point that doesn't split tool-call/result pairs.
+    // A "turn" is: user message → assistant message(s) → tool result(s).
+    // Valid cut points: the boundary BEFORE a user message.
+    const targetCompactCount = Math.max(2, Math.floor(realMessages.length * COMPACTION_MESSAGE_FRACTION));
+    let compactCount = targetCompactCount;
+
+    // Walk forward from the target cut point to find a valid boundary.
+    // A valid boundary is right before a "user" message (never between
+    // an assistant tool-call and its result, or mid-assistant-turn).
+    while (compactCount < realMessages.length - 2) {
+      const nextMsg = realMessages[compactCount];
+      if (nextMsg.role === "user") break; // Valid cut: next message starts a new turn
+      compactCount++; // Skip forward past tool results / mid-turn messages
+    }
+    // If we couldn't find a valid cut point, fall back to the target
+    if (compactCount >= realMessages.length - 2) {
+      compactCount = targetCompactCount;
+    }
+
     const messagesToCompact = realMessages.slice(0, compactCount);
     const fromMessageId = messagesToCompact[0].id;
     const toMessageId = messagesToCompact[compactCount - 1].id;
@@ -2420,61 +2537,207 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     );
     if (alreadyCompacted) return;
 
-    // Build a text representation of the messages to summarize
-    const messageSummaryParts: string[] = [];
-    for (const msg of messagesToCompact) {
-      const textParts = msg.parts
-        ?.filter((p: { type: string }) => p.type === "text")
-        .map((p: { type: string; text?: string }) => (p as { text: string }).text)
-        .join("") ?? "";
-      if (textParts) {
-        messageSummaryParts.push(`[${msg.role}]: ${textParts.slice(0, 2000)}`);
+    // ─── Cumulative file tracking (Tactic 3) ───
+    // Track files read and modified across the messages being compacted.
+    // Also carry forward file lists from previous compactions.
+    const readFiles = new Set<string>();
+    const modifiedFiles = new Set<string>();
+
+    // Carry forward from previous compaction summaries
+    for (const compaction of existingCompactions) {
+      const fileMatch = compaction.summary.match(/<read-files>([\s\S]*?)<\/read-files>/);
+      if (fileMatch) {
+        fileMatch[1].split("\n").map(f => f.trim()).filter(Boolean).forEach(f => readFiles.add(f));
+      }
+      const modMatch = compaction.summary.match(/<modified-files>([\s\S]*?)<\/modified-files>/);
+      if (modMatch) {
+        modMatch[1].split("\n").map(f => f.trim()).filter(Boolean).forEach(f => modifiedFiles.add(f));
       }
     }
 
-    if (messageSummaryParts.length === 0) return;
+    // Extract file operations from messages being compacted
+    for (const msg of messagesToCompact) {
+      if (msg.role !== "assistant") continue;
+      for (const part of msg.parts) {
+        const p = part as { type: string; toolName?: string; args?: Record<string, unknown> };
+        if (p.type !== "tool-invocation" || !p.toolName) continue;
+        const path = (p.args?.path as string) ?? "";
+        if (!path) continue;
+        if (p.toolName === "read") readFiles.add(path);
+        else if (p.toolName === "write") modifiedFiles.add(path);
+        else if (p.toolName === "edit") modifiedFiles.add(path);
+      }
+    }
 
-    const summaryInput = messageSummaryParts.join("\n\n");
+    // Remove modified files from the read set (modified takes precedence)
+    for (const f of modifiedFiles) readFiles.delete(f);
+
+    // ─── Conversation serialization (Tactic 6) ───
+    // Convert messages to flat [Role]: text format with 2K cap on tool results.
+    // This prevents the summarizer from entering "conversation mode".
+    const TOOL_RESULT_CAP = 2_000;
+    const serializedParts: string[] = [];
+    for (const msg of messagesToCompact) {
+      const textContent = msg.parts
+        ?.filter((p: { type: string }) => p.type === "text")
+        .map((p: { type: string; text?: string }) => (p as { text: string }).text)
+        .join("") ?? "";
+
+      if (msg.role === "user" && textContent) {
+        serializedParts.push(`[User]: ${textContent.slice(0, 2_000)}`);
+      } else if (msg.role === "assistant") {
+        // Extract tool calls
+        const toolCalls = msg.parts
+          ?.filter((p: { type: string }) => p.type === "tool-invocation")
+          .map((p: { type: string; toolName?: string; args?: unknown }) => {
+            const tc = p as { toolName: string; args: unknown };
+            return `${tc.toolName}(${JSON.stringify(tc.args ?? {}).slice(0, 500)})`;
+          }) ?? [];
+
+        if (textContent) {
+          serializedParts.push(`[Assistant]: ${textContent.slice(0, 2_000)}`);
+        }
+        if (toolCalls.length > 0) {
+          serializedParts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+        }
+
+        // Extract tool results embedded in assistant parts
+        for (const part of msg.parts ?? []) {
+          const p = part as { type: string; result?: unknown; toolName?: string };
+          if (p.type === "tool-invocation" && p.result !== undefined) {
+            const resultStr = typeof p.result === "string" ? p.result : JSON.stringify(p.result);
+            const capped = resultStr.length > TOOL_RESULT_CAP
+              ? resultStr.slice(0, TOOL_RESULT_CAP) + `\n\n[... ${resultStr.length - TOOL_RESULT_CAP} more chars truncated]`
+              : resultStr;
+            serializedParts.push(`[Tool result (${p.toolName ?? "unknown"})]: ${capped}`);
+          }
+        }
+      }
+    }
+
+    if (serializedParts.length === 0) return;
+
+    const summaryInput = serializedParts.join("\n\n");
+
+    // ─── Iterative summary update (Tactic 2) ───
+    // If there's a previous compaction, use the "update" prompt to preserve
+    // accumulated context. Otherwise use the "create" prompt.
+    const previousSummary = existingCompactions.length > 0
+      ? existingCompactions[existingCompactions.length - 1].summary
+      : null;
+
+    // ─── Structured summary format (Tactic 3) ───
+    const STRUCTURED_SUMMARY_PROMPT = [
+      "Create a structured context checkpoint summary following this EXACT format:",
+      "",
+      "## Goal",
+      "[What the user is trying to accomplish — 1-2 sentences]",
+      "",
+      "## Constraints & Preferences",
+      "- [Requirements mentioned by user]",
+      "",
+      "## Progress",
+      "### Done",
+      "- [x] [Completed tasks with specific file paths]",
+      "### In Progress",
+      "- [ ] [Current work]",
+      "### Blocked",
+      "- [Issues preventing progress, if any]",
+      "",
+      "## Key Decisions",
+      "- **[Decision]**: [Rationale]",
+      "",
+      "## Next Steps",
+      "1. [What should happen next]",
+      "",
+      "## Critical Context",
+      "- [Specific data, error messages, or configurations needed to continue]",
+      "",
+      "PRESERVE exact file paths, function names, error messages, and technical specifics.",
+      "Be factual and concrete. No vague summaries.",
+    ].join("\n");
+
+    const UPDATE_SUMMARY_PROMPT = [
+      "Update the existing structured summary with new information from the conversation.",
+      "",
+      "Rules:",
+      "- PRESERVE all existing information that is still relevant",
+      "- ADD new progress, decisions, and context",
+      "- Move items from 'In Progress' to 'Done' when completed",
+      "- UPDATE 'Next Steps' based on what was accomplished",
+      "- PRESERVE exact file paths, function names, error messages",
+      "- REMOVE items only if they are clearly no longer relevant",
+      "",
+      "Output the COMPLETE updated summary using the same format:",
+      "",
+      "## Goal",
+      "## Constraints & Preferences",
+      "## Progress (Done / In Progress / Blocked)",
+      "## Key Decisions",
+      "## Next Steps",
+      "## Critical Context",
+    ].join("\n");
 
     try {
-      // Use a cheap model for the summary generation
       const appConfig = this.getAppConfigFromThink();
       const provider = buildProvider(appConfig, this.env);
       const compactionModel = provider.chatModel(COMPACTION_MODEL);
+
+      // Build the user message with conversation + optional previous summary
+      const userParts: string[] = [];
+      userParts.push("<conversation>");
+      userParts.push(summaryInput.slice(0, 30_000));
+      userParts.push("</conversation>");
+
+      if (previousSummary) {
+        userParts.push("");
+        userParts.push("<previous-summary>");
+        userParts.push(previousSummary);
+        userParts.push("</previous-summary>");
+      }
+
+      userParts.push("");
+      userParts.push(previousSummary ? UPDATE_SUMMARY_PROMPT : STRUCTURED_SUMMARY_PROMPT);
 
       const result = await generateText({
         model: compactionModel,
         messages: [
           {
             role: "system",
-            content: [
-              "Summarize this conversation excerpt concisely. Focus on:",
-              "1. Key decisions made",
-              "2. Files read or modified (with paths)",
-              "3. Problems identified and solutions applied",
-              "4. Important context the assistant will need for future turns",
-              "",
-              "Be factual and specific. Use bullet points. Keep it under 500 words.",
-            ].join("\n"),
+            content: "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified. Do NOT continue the conversation. ONLY output the structured summary.",
           },
           {
             role: "user",
-            content: summaryInput.slice(0, 30_000), // Cap input to avoid blowing Haiku's context
+            content: userParts.join("\n"),
           },
         ],
-        maxOutputTokens: 1000,
+        maxOutputTokens: 1500,
       });
 
-      const summary = result.text;
-      if (!summary || summary.length < 20) return; // Summary too short to be useful
+      let summary = result.text;
+      if (!summary || summary.length < 20) return;
 
-      // Store the compaction via Think's API
+      // Append cumulative file tracking tags
+      const readFileList = [...readFiles].sort();
+      const modFileList = [...modifiedFiles].sort();
+      if (readFileList.length > 0) {
+        summary += `\n\n<read-files>\n${readFileList.join("\n")}\n</read-files>`;
+      }
+      if (modFileList.length > 0) {
+        summary += `\n\n<modified-files>\n${modFileList.join("\n")}\n</modified-files>`;
+      }
+
       this.sessions.addCompaction(thinkSessionId, summary, fromMessageId, toMessageId);
-      console.log(
-        `[compaction] Compacted ${compactCount} messages (${usagePercent}% usage). Summary: ${summary.length} chars.`,
-      );
+      log("info", "compaction complete", {
+        sessionId: this.sessionId(),
+        compactedMessages: compactCount,
+        usagePercent,
+        summaryChars: summary.length,
+        readFiles: readFileList.length,
+        modifiedFiles: modFileList.length,
+        iterative: !!previousSummary,
+      });
     } catch (error) {
-      // Compaction is best-effort — don't fail the main chat
       console.warn(
         "[compaction] Failed to generate summary:",
         error instanceof Error ? error.message : error,
