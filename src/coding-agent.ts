@@ -649,6 +649,39 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   override async assembleContext(): Promise<ModelMessage[]> {
     let messages = await super.assembleContext();
 
+    // ─── Inject compaction summary if missing ───
+    // Think's getHistory() is supposed to inject the compaction summary as a
+    // system UIMessage, but due to timing issues (stale this.messages, race
+    // conditions) it may not appear in the ModelMessage array after conversion.
+    // As a safety net, read the latest compaction directly from the DB and
+    // inject it if no system message with the summary marker exists.
+    const COMPACTION_MARKER = "[Previous conversation summary]";
+    const hasCompactionSummary = messages.some((msg) => {
+      if (msg.role !== "system") return false;
+      const text = typeof msg.content === "string" ? msg.content : "";
+      return text.startsWith(COMPACTION_MARKER);
+    });
+
+    if (!hasCompactionSummary) {
+      const thinkSessionId = this.getCurrentSessionId();
+      if (thinkSessionId) {
+        const compactions = this.sessions.getCompactions(thinkSessionId);
+        if (compactions.length > 0) {
+          const latest = compactions[compactions.length - 1];
+          const summaryContent = `${COMPACTION_MARKER}\n${latest.summary}`;
+          messages = [
+            { role: "system" as const, content: summaryContent },
+            ...messages,
+          ];
+          log("info", "assembleContext: injected compaction summary (safety net)", {
+            sessionId: this.sessionId(),
+            summaryChars: latest.summary.length,
+            compactionCount: compactions.length,
+          });
+        }
+      }
+    }
+
     // ─── Selective message exclusion (Tactic 8) ───
     // Messages prefixed with "!!" are visible in the UI but excluded from
     // LLM context. Replace content with a minimal placeholder rather than
@@ -801,12 +834,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     };
 
     // ─── Protect compaction summaries from being dropped ───
-    // Think's getHistory() injects compaction summaries as system messages at the
-    // front of the message list. After conversion to ModelMessages, these appear as
-    // system messages whose content starts with "[Previous conversation summary]".
-    // These MUST survive token-budget enforcement — they're the compressed
-    // representation of older messages and are more valuable than any single message.
-    const COMPACTION_MARKER = "[Previous conversation summary]";
+    // The compaction summary (injected above or by Think's getHistory) MUST survive
+    // token-budget enforcement — it's the compressed representation of older messages.
     const minProtectedIndex = messages.findIndex((msg) => {
       if (msg.role !== "system") return false;
       const text = typeof msg.content === "string"
@@ -819,6 +848,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // If a compaction summary exists, the cutoff must not go before it.
     // Set the floor to the index AFTER the compaction summary so it's always included.
     const cutoffFloor = minProtectedIndex >= 0 ? minProtectedIndex : 0;
+
+    // Log compaction detection for debugging
+    if (messages.some(m => m.role === "system")) {
+      log("info", "assembleContext: system messages found", {
+        sessionId: this.sessionId(),
+        totalMessages: messages.length,
+        systemCount: messages.filter(m => m.role === "system").length,
+        minProtectedIndex,
+        systemPreviews: messages
+          .map((m, i) => m.role === "system" ? { i, preview: (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 80) } : null)
+          .filter(Boolean),
+      });
+    }
+
+
 
     // Hybrid approach: use provider-reported tokens as anchor if available.
     // _lastUsage.inputTokens is the cumulative input tokens from the current
