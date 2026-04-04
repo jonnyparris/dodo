@@ -175,7 +175,7 @@ const SYSTEM_PROMPT = [
   "- Large outputs are automatically truncated. If you see `[truncated]`, use `read` with `offset`/`limit` to get the specific portion you need.",
   "- The workspace is ephemeral per session. Clone repos to get their contents.",
   "- If the user switches topics, suggest a fresh session to keep context clean.",
-  "- Users can prefix a message with `!!` to exclude it from your context (you won't see it). This is useful for informational commands that don't affect the current task.",
+  "- Users can prefix a message with `!!` to minimize its context footprint. You'll see `[message excluded by user]` as a placeholder instead of the original content.",
 ].join("\n");
 
 /** Build a LanguageModel from DodoConfig (Think per-session config). */
@@ -379,7 +379,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     // ─── Doom loop detection ───
     const DOOM_LOOP_THRESHOLD = 3;
-    const PROTECTED_WINDOW = 6; // ~3 tool call/result pairs kept at full resolution
 
     // ─── Mid-loop compaction threshold ───
     const MID_LOOP_COMPACTION_THRESHOLD = 0.50; // Compact when >50% of budget used
@@ -493,14 +492,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             : messages;
 
           // ─── Single-step LLM call with overflow recovery (Tactic 5) ───
-          // Tactic 7: Prompt cache retention — request extended caching for
-          // the system prompt on Anthropic models. The system prompt is identical
-          // across all turns, so caching avoids re-tokenizing it each call.
-          const isAnthropic = modelId.startsWith("anthropic/");
-          const providerOptions = isAnthropic
-            ? { anthropic: { cacheControl: { type: "ephemeral" as const } } }
-            : undefined;
-
+          // Note: Prompt cache retention (Tactic 7) requires the native @ai-sdk/anthropic
+          // provider. Dodo uses @ai-sdk/openai-compatible which doesn't support
+          // Anthropic-specific providerOptions. Cache control will be enabled when/if
+          // we switch to the native Anthropic provider.
           let result;
           try {
             result = streamText({
@@ -509,7 +504,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               messages: finalMessages,
               tools,
               abortSignal: signal,
-              providerOptions,
             });
 
             // Forward all chunks from this iteration to the caller
@@ -534,7 +528,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               });
 
               try {
-                await self.maybeCompactContext();
+                await self.maybeCompactContext({ force: true });
                 // After compaction, continue the loop — assembleContext() on next
                 // iteration will use the compacted context
                 step++;
@@ -644,16 +638,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     // ─── Selective message exclusion (Tactic 8) ───
     // Messages prefixed with "!!" are visible in the UI but excluded from
-    // LLM context. Useful for user commands that don't inform the task
-    // (checking git status, previewing files, etc.).
-    messages = messages.filter((msg) => {
-      if (msg.role !== "user") return true;
+    // LLM context. Replace content with a minimal placeholder rather than
+    // filtering entirely — this avoids orphaned assistant responses that
+    // reference a message the model can't see on the current turn.
+    messages = messages.map((msg) => {
+      if (msg.role !== "user") return msg;
       const content = typeof msg.content === "string"
         ? msg.content
         : Array.isArray(msg.content)
           ? msg.content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("")
           : "";
-      return !content.startsWith("!!");
+      if (!content.startsWith("!!")) return msg;
+      return { ...msg, content: "[message excluded by user]" };
     });
 
     // ─── Per-tool output shaping ───
@@ -2480,7 +2476,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * Triggers when the last turn's input tokens exceed COMPACTION_TRIGGER_PERCENT
    * of the context budget.
    */
-  private async maybeCompactContext(): Promise<void> {
+  private async maybeCompactContext(options?: { force?: boolean }): Promise<void> {
     const thinkSessionId = this.getCurrentSessionId();
     if (!thinkSessionId) return;
 
@@ -2490,14 +2486,19 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
 
-    const latestAssistant = this.db.one(
-      "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-    );
-    const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
-    if (lastInputTokens === 0) return;
+    // When force=true (overflow recovery), skip the usage threshold check —
+    // the failed LLM call's tokens may not be in message_metadata yet.
+    let usagePercent = 100; // Default to high for forced compaction
+    if (!options?.force) {
+      const latestAssistant = this.db.one(
+        "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+      );
+      const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
+      if (lastInputTokens === 0) return;
 
-    const usagePercent = Math.round((lastInputTokens / contextBudget) * 100);
-    if (usagePercent < COMPACTION_TRIGGER_PERCENT) return;
+      usagePercent = Math.round((lastInputTokens / contextBudget) * 100);
+      if (usagePercent < COMPACTION_TRIGGER_PERCENT) return;
+    }
 
     const history = this.sessions.getHistory(thinkSessionId);
     if (history.length < 6) return;
@@ -2555,13 +2556,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
     }
 
-    // Extract file operations from messages being compacted
+    // Extract file operations from messages being compacted.
+    // UIMessage tool parts in AI SDK v5 use type "dynamic-tool" (not "tool-invocation"),
+    // field "input" (not "args"), and "output" (not "result").
     for (const msg of messagesToCompact) {
       if (msg.role !== "assistant") continue;
       for (const part of msg.parts) {
-        const p = part as { type: string; toolName?: string; args?: Record<string, unknown> };
-        if (p.type !== "tool-invocation" || !p.toolName) continue;
-        const path = (p.args?.path as string) ?? "";
+        const p = part as { type: string; toolName?: string; input?: Record<string, unknown> };
+        if (p.type !== "dynamic-tool" || !p.toolName) continue;
+        const path = (p.input?.path as string) ?? "";
         if (!path) continue;
         if (p.toolName === "read") readFiles.add(path);
         else if (p.toolName === "write") modifiedFiles.add(path);
@@ -2586,12 +2589,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       if (msg.role === "user" && textContent) {
         serializedParts.push(`[User]: ${textContent.slice(0, 2_000)}`);
       } else if (msg.role === "assistant") {
-        // Extract tool calls
+        // Extract tool calls (AI SDK v5: "dynamic-tool" parts with "input" field)
         const toolCalls = msg.parts
-          ?.filter((p: { type: string }) => p.type === "tool-invocation")
-          .map((p: { type: string; toolName?: string; args?: unknown }) => {
-            const tc = p as { toolName: string; args: unknown };
-            return `${tc.toolName}(${JSON.stringify(tc.args ?? {}).slice(0, 500)})`;
+          ?.filter((p: { type: string }) => p.type === "dynamic-tool")
+          .map((p: { type: string; toolName?: string; input?: unknown }) => {
+            const tc = p as { toolName: string; input: unknown };
+            return `${tc.toolName}(${JSON.stringify(tc.input ?? {}).slice(0, 500)})`;
           }) ?? [];
 
         if (textContent) {
@@ -2602,10 +2605,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         }
 
         // Extract tool results embedded in assistant parts
+        // AI SDK v5: "dynamic-tool" parts with "output" field (state === "output-available")
         for (const part of msg.parts ?? []) {
-          const p = part as { type: string; result?: unknown; toolName?: string };
-          if (p.type === "tool-invocation" && p.result !== undefined) {
-            const resultStr = typeof p.result === "string" ? p.result : JSON.stringify(p.result);
+          const p = part as { type: string; output?: unknown; toolName?: string; state?: string };
+          if (p.type === "dynamic-tool" && p.output !== undefined) {
+            const resultStr = typeof p.output === "string" ? p.output : JSON.stringify(p.output);
             const capped = resultStr.length > TOOL_RESULT_CAP
               ? resultStr.slice(0, TOOL_RESULT_CAP) + `\n\n[... ${resultStr.length - TOOL_RESULT_CAP} more chars truncated]`
               : resultStr;

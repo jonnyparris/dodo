@@ -190,6 +190,20 @@ describe("Token waste reduction", () => {
       expect(typeof state.contextUsagePercent).toBe("number");
     });
 
+    it("context budget is 80% of context window", async () => {
+      const sessionId = await createSession();
+
+      const stateRes = await fetchJson(`/session/${sessionId}`);
+      const state = (await stateRes.json()) as {
+        contextBudget: number;
+        contextWindow: number;
+      };
+
+      // Budget should be 80% of window (CONTEXT_BUDGET_FACTOR = 0.8)
+      const expectedBudget = Math.floor(state.contextWindow * 0.8);
+      expect(state.contextBudget).toBe(expectedBudget);
+    });
+
     it("large file writes don't crash the session", async () => {
       const sessionId = await createSession();
 
@@ -210,6 +224,30 @@ describe("Token waste reduction", () => {
       expect(readRes.status).toBe(200);
       const readBody = (await readRes.json()) as { content: string };
       expect(readBody.content.length).toBe(bigContent.length);
+    });
+
+    it("session survives rapid file operations without context corruption", async () => {
+      const sessionId = await createSession();
+
+      // Write 20 files rapidly to stress the workspace and context tracking
+      const writes = Array.from({ length: 20 }, (_, i) =>
+        fetchJson(`/session/${sessionId}/file?path=/rapid/file${i}.ts`, {
+          body: JSON.stringify({ content: `export const x${i} = ${i};\n`.repeat(50) }),
+          headers: { "content-type": "application/json" },
+          method: "PUT",
+        }),
+      );
+      const results = await Promise.all(writes);
+      for (const r of results) {
+        expect(r.status).toBe(200);
+      }
+
+      // Session state should still be healthy
+      const stateRes = await fetchJson(`/session/${sessionId}`);
+      expect(stateRes.status).toBe(200);
+      const state = (await stateRes.json()) as { status: string; contextWindow: number };
+      expect(state.status).toBe("idle");
+      expect(state.contextWindow).toBeGreaterThan(0);
     });
   });
 });
