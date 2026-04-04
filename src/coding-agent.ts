@@ -787,6 +787,26 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return Math.ceil(s.length / 3.5);
     };
 
+    // ─── Protect compaction summaries from being dropped ───
+    // Think's getHistory() injects compaction summaries as system messages at the
+    // front of the message list. After conversion to ModelMessages, these appear as
+    // system messages whose content starts with "[Previous conversation summary]".
+    // These MUST survive token-budget enforcement — they're the compressed
+    // representation of older messages and are more valuable than any single message.
+    const COMPACTION_MARKER = "[Previous conversation summary]";
+    const minProtectedIndex = messages.findIndex((msg) => {
+      if (msg.role !== "system") return false;
+      const text = typeof msg.content === "string"
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("")
+          : "";
+      return text.startsWith(COMPACTION_MARKER);
+    });
+    // If a compaction summary exists, the cutoff must not go before it.
+    // Set the floor to the index AFTER the compaction summary so it's always included.
+    const cutoffFloor = minProtectedIndex >= 0 ? minProtectedIndex : 0;
+
     // Hybrid approach: use provider-reported tokens as anchor if available.
     // _lastUsage.inputTokens is the cumulative input tokens from the current
     // onChatMessage() run. If available, it's a near-exact count for everything
@@ -813,7 +833,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           let budget = tokenBudget - trailingTokens;
           for (let i = anchorIndex; i >= 0; i--) {
             const msgTokens = estimateTokens(messages[i]);
-            if (budget - msgTokens < 0) { cutoffIndex = i + 1; break; }
+            if (budget - msgTokens < 0) {
+              cutoffIndex = Math.max(i + 1, cutoffFloor);
+              break;
+            }
             budget -= msgTokens;
           }
         }
@@ -821,7 +844,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         // No assistant message yet — fall back to pure estimation
         for (let i = messages.length - 1; i >= 0; i--) {
           const msgTokens = estimateTokens(messages[i]);
-          if (totalTokens + msgTokens > tokenBudget) { cutoffIndex = i + 1; break; }
+          if (totalTokens + msgTokens > tokenBudget) {
+            cutoffIndex = Math.max(i + 1, cutoffFloor);
+            break;
+          }
           totalTokens += msgTokens;
         }
       }
@@ -829,7 +855,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // No provider-reported usage yet — pure estimation (first turn)
       for (let i = messages.length - 1; i >= 0; i--) {
         const msgTokens = estimateTokens(messages[i]);
-        if (totalTokens + msgTokens > tokenBudget) { cutoffIndex = i + 1; break; }
+        if (totalTokens + msgTokens > tokenBudget) {
+          cutoffIndex = Math.max(i + 1, cutoffFloor);
+          break;
+        }
         totalTokens += msgTokens;
       }
     }
@@ -868,19 +897,29 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     if (cutoffIndex > 0 && cutoffIndex < messages.length) {
       const droppedCount = cutoffIndex;
+      const hasCompactionSummary = minProtectedIndex >= 0 && minProtectedIndex < cutoffIndex;
       log("warn", "assembleContext: dropping oldest messages", {
         sessionId: this.sessionId(),
         droppedCount,
+        compactionSummaryProtected: minProtectedIndex >= 0,
         model: modelId,
         tokenBudget,
       });
+
+      // If a compaction summary exists within the dropped range, preserve it
+      // at the front of the returned messages. The summary is the compressed
+      // representation of even older messages — losing it means total amnesia.
+      const preserved: ModelMessage[] = [];
+      if (hasCompactionSummary) {
+        preserved.push(messages[minProtectedIndex]);
+      }
 
       const truncationNote: ModelMessage = {
         role: "system" as const,
         content: `[Earlier messages truncated — context window limit reached. ${droppedCount} message(s) dropped to stay within the ${contextWindow}-token context window.]`,
       };
 
-      return [truncationNote, ...messages.slice(cutoffIndex)];
+      return [...preserved, truncationNote, ...messages.slice(cutoffIndex)];
     }
 
     return messages;
