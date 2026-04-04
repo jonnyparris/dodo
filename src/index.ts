@@ -1065,6 +1065,12 @@ app.delete("/session/:id", async (c) => {
   return result;
 });
 
+app.get("/session/:id/debug/compaction", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/debug/compaction");
+});
+
 app.get("/session/:id/messages", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;
