@@ -15,17 +15,22 @@ import type { AppConfig, Env } from "./types";
 // This is more effective than truncating in assembleContext/prepareStep because
 // the tokens never enter the step-level accumulation in the first place.
 
-/** Per-tool output limits, matching OpenCode's proven values. */
+/**
+ * Per-tool output limits. Applied before results enter the AI SDK message
+ * history — prevents large results from accumulating across multi-step loops.
+ *
+ * Note: Think's tools already have internal caps (read: 2000 lines,
+ * find/grep: 200 results). These are stricter secondary caps that match
+ * OpenCode's proven values. The read tool's internal 2000-line cap makes
+ * an external cap redundant, so only entry-based caps are defined here.
+ */
 const TOOL_OUTPUT_CAPS: Record<string, { maxLines?: number; maxBytes?: number; maxEntries?: number }> = {
-  read:   { maxLines: 2000, maxBytes: 50 * 1024 },
-  grep:   { maxEntries: 100 },
-  find:   { maxEntries: 100 },
-  list:   { maxEntries: 100 },
+  grep:   { maxEntries: 100 },  // Think caps at 200; we cap at 100
+  find:   { maxEntries: 100 },  // Think caps at 200; we cap at 100
+  list:   { maxEntries: 100 },  // Think's list accepts a limit param; we cap the output
+  // read — Think already caps at 2000 lines and 2000 chars/line; no external cap needed
   // write, edit, delete — already produce small output, no cap needed
 };
-
-/** Compact marker for cleared tool output. */
-const CLEARED_MARKER = "[Old tool result content cleared]";
 
 /**
  * Wrap a tool set to enforce per-tool output caps.

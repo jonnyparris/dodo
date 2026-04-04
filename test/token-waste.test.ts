@@ -1,11 +1,12 @@
 /**
- * Regression tests for token waste reduction (Phase 2.1).
+ * Regression tests for token waste reduction.
  *
  * Tests cover:
- * - Feature flag defaults
- * - System prompt V2 content (tool name accuracy)
- * - Tool output overflow storage and retrieval
- * - Overflow cleanup TTL
+ * - Session initialization with system prompt
+ * - Session lifecycle (creation, deletion)
+ * - File operations and search
+ * - Context budget reporting
+ * - Large file handling
  */
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
@@ -63,52 +64,42 @@ describe("Token waste reduction", () => {
     });
   });
 
-  describe("System prompt V2", () => {
-    it("session initializes correctly with V2 prompt and feature flags", async () => {
-      // The V2 prompt and feature flags are compiled into the DO.
-      // If they cause errors, session creation will fail.
+  describe("Session initialization", () => {
+    it("session initializes correctly with system prompt", async () => {
       const sessionId = await createSession();
       expect(sessionId).toBeTruthy();
 
-      // Verify session state is valid — proves the DO initialized
-      // (including schema, feature flags, and system prompt selection)
       const stateRes = await fetchJson(`/session/${sessionId}`);
       expect(stateRes.status).toBe(200);
       const state = (await stateRes.json()) as { status: string; contextWindow: number };
       expect(state.status).toBe("idle");
-      // Context window should be set even before any messages
       expect(state.contextWindow).toBeGreaterThan(0);
     });
   });
 
-  describe("Tool output overflow storage", () => {
-    it("overflow table is created on session init", async () => {
+  describe("Session lifecycle", () => {
+    it("file operations work on initialized session", async () => {
       const sessionId = await createSession();
-      // If the table creation failed, the session wouldn't be usable.
-      // Verify by checking that file operations work (they use the same DO).
       const writeRes = await fetchJson(`/session/${sessionId}/file?path=/test.txt`, {
-        body: JSON.stringify({ content: "overflow test" }),
+        body: JSON.stringify({ content: "lifecycle test" }),
         headers: { "content-type": "application/json" },
         method: "PUT",
       });
       expect(writeRes.status).toBe(200);
     });
 
-    it("session deletion cleans up overflow data", async () => {
+    it("session deletion makes it inaccessible", async () => {
       const sessionId = await createSession();
 
-      // Write a file to ensure the session is fully initialized
       await fetchJson(`/session/${sessionId}/file?path=/test.txt`, {
         body: JSON.stringify({ content: "to be deleted" }),
         headers: { "content-type": "application/json" },
         method: "PUT",
       });
 
-      // Delete the session
       const deleteRes = await fetchJson(`/session/${sessionId}`, { method: "DELETE" });
       expect(deleteRes.status).toBe(200);
 
-      // Session should be inaccessible after deletion (403 from ownership check)
       const afterDelete = await fetchJson(`/session/${sessionId}/files?path=/`);
       expect(afterDelete.status).toBe(403);
     });
