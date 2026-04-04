@@ -1,6 +1,6 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
-import { generateText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
+import { generateText, stepCountIs, streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
 import { getUserControlStub } from "./auth";
@@ -424,19 +424,78 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
-   * Override onChatMessage to capture token usage from the streamText() result.
-   *
-   * Think's chat() only reads toUIMessageStream() which strips usage data.
-   * We wrap the result to attach a background listener on totalUsage that
-   * stores the counts on `this._lastUsage` for runThinkChat() to read.
+   * Override onChatMessage to:
+   * 1. Take full control of the streamText() call (instead of delegating to Think's default)
+   * 2. Inject a `prepareStep` callback that truncates tool results from earlier steps,
+   *    preventing the multi-step token accumulation that caused 1.1M-token sessions
+   * 3. Capture token usage from the streamText() result
    */
   override async onChatMessage(options?: ChatMessageOptions): Promise<StreamableResult> {
     this._lastUsage = null;
-    const result = await super.onChatMessage(options);
 
-    // The AI SDK streamText() result exposes totalUsage as a PromiseLike
-    // that resolves once the stream is fully consumed. Attach a listener
-    // so usage is captured by the time chat() calls onDone().
+    const baseTools = this.getTools();
+    const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
+
+    const result = streamText({
+      model: this.getModel(),
+      system: this.getSystemPrompt(),
+      messages: await this.assembleContext(),
+      tools,
+      stopWhen: stepCountIs(this.getMaxSteps()),
+      abortSignal: options?.signal,
+
+      // Per-step context shaping: truncate tool results from earlier steps
+      // to prevent the multi-step accumulation problem. Without this, each of
+      // the 20 possible steps sees ALL previous tool results at full size,
+      // causing O(steps² × toolOutputSize) token growth.
+      prepareStep: ({ stepNumber, messages: stepMessages }) => {
+        if (stepNumber <= 1) return {}; // First step — nothing to truncate
+
+        // Max chars for tool results from non-recent steps
+        const STEP_TOOL_MAX_CHARS = 4_000;
+        // Keep last N messages at full resolution
+        const RECENT_STEP_MSGS = 6;
+
+        let mutated = false;
+        const shaped: ModelMessage[] = stepMessages.map((msg, idx) => {
+          if (msg.role !== "tool") return msg;
+
+          const isRecent = idx >= stepMessages.length - RECENT_STEP_MSGS;
+          if (isRecent) return msg;
+
+          // Truncate older tool results in-place via cast
+          for (const part of msg.content) {
+            if (part.type !== "tool-result" || part.output === undefined) continue;
+            const output = part.output as { type?: string; value?: unknown };
+            if (!output || typeof output !== "object") continue;
+
+            const value = output.value;
+            const serialized = typeof value === "string" ? value : JSON.stringify(value);
+
+            if (serialized.length <= STEP_TOOL_MAX_CHARS) continue;
+
+            const truncated = truncateToolOutput(serialized, {
+              maxChars: STEP_TOOL_MAX_CHARS,
+              strategy: "middle",
+            });
+
+            // Mutate in place — the AI SDK creates fresh message arrays per step
+            if (output.type === "text") {
+              (output as { value: string }).value = truncated;
+            } else {
+              (part as { output: unknown }).output = { type: "text" as const, value: truncated };
+            }
+            mutated = true;
+          }
+
+          return msg;
+        });
+
+        return mutated ? { messages: shaped } : {};
+      },
+    });
+
+    // Capture token usage from the streamText() result
     const streamResult = result as StreamableResult & {
       totalUsage?: PromiseLike<{ inputTokens?: number; outputTokens?: number }>;
     };
@@ -479,7 +538,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   override getMaxSteps(): number {
-    return 20;
+    // Reduced from 20 to 15: each step accumulates context,
+    // and 20 steps was causing 1M+ token sessions. 15 is still enough
+    // for most tasks while limiting worst-case accumulation.
+    return 15;
   }
 
   /** Read a feature flag, checking per-session metadata override first. */
