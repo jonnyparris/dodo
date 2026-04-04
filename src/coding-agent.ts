@@ -62,27 +62,6 @@ const COMPACTION_MESSAGE_FRACTION = 0.5;
 /** Model to use for generating compaction summaries — cheap and fast. */
 const COMPACTION_MODEL = "anthropic/claude-haiku-3.5";
 
-// ─── Feature Flags ───
-// Gate behavioral changes behind flags so we can roll back without reverting code.
-
-/** Feature flag defaults. Each flag can be overridden per-session via metadata. */
-const FEATURE_FLAGS = {
-  /** Use the updated system prompt with Think's real tool names and guidance. */
-  PROMPT_V2: true,
-  /** Enable per-tool output shaping in assembleContext (vs. flat truncation). */
-  TOOL_OUTPUT_SHAPING: true,
-  /** Inject a bounded workspace summary on the first assistant turn. */
-  WORKSPACE_SUMMARY: true,
-} as const;
-
-type FeatureFlagName = keyof typeof FEATURE_FLAGS;
-
-// ─── Tool Output Limits ───
-
-/** Hard cap for tool output: 2000 lines or 50 KB, whichever is hit first. */
-const TOOL_OUTPUT_MAX_LINES = 2000;
-const TOOL_OUTPUT_MAX_BYTES = 50 * 1024; // 50 KB
-
 /** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
 const CLEARED_MARKER = "[Old tool result content cleared]";
 
@@ -117,91 +96,8 @@ function sanitizeTimestamp(epochSeconds: number): string | null {
   return new Date(epochSeconds * 1000).toISOString();
 }
 
-const SYSTEM_PROMPT_V1 = [
-  "You are Dodo, an autonomous coding agent running on Cloudflare Workers.",
-  "You help users build, modify, and understand software projects inside a sandboxed workspace.",
-  "",
-  "## Tone and style",
-  "",
-  "Be concise and direct. Prefer concrete actions over long explanations.",
-  "Use GitHub-flavored markdown for formatting.",
-  "Only use emojis if the user explicitly requests them.",
-  "Never create files unless necessary to achieve the goal — prefer editing existing files.",
-  "",
-  "## Doing tasks",
-  "",
-  "When the user asks you to build or modify code:",
-  "",
-  "1. **Read before writing.** Always read a file before editing it. Understand existing code before suggesting changes.",
-  "2. **Plan multi-step work.** For non-trivial tasks, outline your approach before diving in. State what you'll do, then do it.",
-  "3. **Stay focused.** Only make changes that are directly requested or clearly necessary. Don't refactor surrounding code, add comments to unchanged lines, or introduce abstractions for one-time operations.",
-  "4. **Delete unused code.** If something is no longer needed, remove it completely. No commented-out code, no `_unused` renames.",
-  "5. **Be security-conscious.** Don't introduce command injection, XSS, SQL injection, or other common vulnerabilities. Never commit secrets or credentials.",
-  "",
-  "## Workspace tools",
-  "",
-  "You have workspace tools for file operations:",
-  "- **read_file** — read a file's contents",
-  "- **write_file** — create or overwrite a file",
-  "- **search_files** — search by glob pattern and content query",
-  "- **replace_in_file** — find and replace within a file",
-  "",
-  "Use these tools for all file operations. Prefer `replace_in_file` for targeted edits over rewriting entire files.",
-  "",
-  "## Code execution",
-  "",
-  "The **codemode** tool runs JavaScript in a sandboxed Worker with access to the workspace filesystem and git.",
-  "Use it for:",
-  "- Running build scripts, tests, or one-off computations",
-  "- Calling external APIs via fetch() (GitHub and GitLab have auth injected automatically)",
-  "- Complex file transformations that are easier to express in code",
-  "",
-  "The sandbox has a 30-second timeout and no access to the network except explicitly allowed hosts.",
-  "",
-  "## Git",
-  "",
-  "You have git tools: git_clone_known, git_clone, git_status, git_add, git_commit, git_push_checked, git_push, git_pull,",
-  "git_branch, git_checkout, git_diff, git_log, git_verify_remote_branch.",
-  "Authentication for GitHub and GitLab is automatic — you do NOT need tokens.",
-  "",
-  "### Git safety rules",
-  "",
-  "- Always run git_status before committing to understand what will be staged.",
-  "- Stage specific files rather than using '.' when possible, to avoid committing unintended changes.",
-  "- Write clear, concise commit messages that explain *why*, not just *what*.",
-  "- Never force-push unless the user explicitly asks.",
-  "- Check git_log to match the repository's commit message style.",
-  "",
-  "## Working with errors",
-  "",
-  "When something fails:",
-  "1. State what failed and why.",
-  "2. Fix it or suggest a fix.",
-  "3. Move on. Don't apologize repeatedly or over-explain.",
-  "",
-  "## Limits",
-  "",
-  "- You have a maximum of 20 tool-call steps per prompt. Plan efficiently — every tool call counts.",
-  "- Large file reads are truncated in context. Use `search_files` to find specific lines before reading. Use `replace_in_file` for edits instead of rewriting entire files with `write_file`.",
-  "- The workspace is ephemeral per session. Clone repos if you need their contents.",
-  "- You cannot install system packages or run shell commands directly — use codemode for computation.",
-  "- Prefer `git_clone_known` over `git_clone` for built-in repos. It prevents repo URL mistakes.",
-  "- When pushing, use `git_push_checked` and specify the branch ref explicitly (e.g. `ref: 'feat/my-branch'`). It verifies the remote branch is actually ahead of the base branch.",
-  "",
-  "## Context management",
-  "",
-  "Every tool result stays in your context window. Be deliberate about what you read — don't read entire large files when `search_files` or reading a specific line range would suffice.",
-  "If the user switches to a completely different topic or codebase area, suggest starting a new session to keep context focused: \"This is a different topic — want me to continue in a fresh session so we don't carry unrelated context?\"",
-  "Avoid reading files you've already read in this conversation unless they may have changed.",
-].join("\n");
-
-/**
- * V2 system prompt — aligned with Think's real workspace tools.
- * Replaces stale tool names with the actual 7-tool surface:
- * read, write, edit, list, find, grep, delete.
- * Adds guidance to minimize token waste.
- */
-const SYSTEM_PROMPT_V2 = [
+/** System prompt aligned with Think's real workspace tools. */
+const SYSTEM_PROMPT = [
   "You are Dodo, an autonomous coding agent running on Cloudflare Workers.",
   "You help users build, modify, and understand software projects inside a sandboxed workspace.",
   "",
@@ -371,10 +267,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   override getSystemPrompt(): string {
-    const base = this.getFeatureFlag("PROMPT_V2") ? SYSTEM_PROMPT_V2 : SYSTEM_PROMPT_V1;
+    const base = SYSTEM_PROMPT;
 
-    // Phase 1.5: Inject bounded workspace summary on first turn only
-    if (this.getFeatureFlag("WORKSPACE_SUMMARY") && this.messageCount() === 0) {
+    // Inject bounded workspace summary on first turn only.
+    // Use this.messages.length <= 1 because Think's chat() persists the
+    // user message before calling onChatMessage() → getSystemPrompt(),
+    // so messageCount() is already 1 on the first turn.
+    if (this.messages.length <= 1) {
       const summary = this.getWorkspaceSummary();
       if (summary) {
         return `${base}\n\n## Current workspace\n\n${summary}`;
@@ -459,21 +358,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       prepareStep: ({ stepNumber, steps, messages: stepMessages }) => {
         if (stepNumber <= 1) return {};
 
-        // ─── Pattern 4: Doom loop detection ───
-        // Track recent tool calls and inject a warning if the same tool+args
-        // combo appears 3+ times, catching read→fail→read→fail loops.
+        // ─── Doom loop detection ───
+        // Check the primary (first) tool call from each of the last 3 steps.
+        // If all 3 are identical tool+args, warn the model to try something else.
         const DOOM_LOOP_THRESHOLD = 3;
         let doomWarning: string | null = null;
         if (steps.length >= DOOM_LOOP_THRESHOLD) {
-          const recentCalls = steps
+          const recentPrimary = steps
             .slice(-DOOM_LOOP_THRESHOLD)
-            .flatMap(s => s.toolCalls ?? [])
+            .map(s => s.toolCalls?.[0])
+            .filter((tc): tc is NonNullable<typeof tc> => tc != null)
             .map(tc => `${tc.toolName}:${JSON.stringify(tc.input)}`);
 
-          // Check if the last N calls are identical
-          if (recentCalls.length >= DOOM_LOOP_THRESHOLD) {
-            const last = recentCalls[recentCalls.length - 1];
-            const allSame = recentCalls.slice(-DOOM_LOOP_THRESHOLD).every(c => c === last);
+          if (recentPrimary.length === DOOM_LOOP_THRESHOLD) {
+            const allSame = recentPrimary.every(c => c === recentPrimary[0]);
             if (allSame) {
               const toolName = steps.at(-1)?.toolCalls?.[0]?.toolName ?? "unknown";
               doomWarning = `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach — use a different tool, different arguments, or explain what's blocking you.]`;
@@ -586,13 +484,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return 15;
   }
 
-  /** Read a feature flag, checking per-session metadata override first. */
-  private getFeatureFlag(flag: FeatureFlagName): boolean {
-    const override = this.readMetadata(`flag_${flag}`);
-    if (override !== null) return override === "true";
-    return FEATURE_FLAGS[flag];
-  }
-
   /**
    * Override assembleContext to apply compaction guardrails:
    * 1. Per-tool output shaping: apply tool-aware truncation rules to prevent
@@ -608,7 +499,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const messages = await super.assembleContext();
 
     // ─── Per-tool output shaping ───
-    const useShaping = this.getFeatureFlag("TOOL_OUTPUT_SHAPING");
+    const useShaping = true; // Per-tool output shaping always enabled
 
     // Max chars per tool result — ~8k chars ≈ ~2k tokens. Enough for most
     // source files, tight enough to prevent context blowout from large reads.
@@ -677,11 +568,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             if (capped.length < originalBytes) truncatedCount++;
             continue;
           }
-
-          // read tool: bounded slice with line numbers — cap per recency
-          // list tool: directory listing — cap to prevent large repo blowout
-          // grep/find tool: search results — cap matches
-          // git_status, git_diff, git_log: structured output — cap
+          // Per-tool shaping for read/list/grep/find is handled at the tool
+          // level in agentic.ts:capToolOutputs, not here.
         }
 
         // ─── General truncation (existing + improved) ───
@@ -908,10 +796,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
       if (request.method === "GET" && url.pathname === "/messages") {
         return Response.json({ messages: this.listMessages() });
-      }
-
-      if (request.method === "GET" && url.pathname === "/token-usage") {
-        return Response.json(this.getTokenUsageReport());
       }
 
       if (request.method === "GET" && url.pathname === "/prompts") {
@@ -1380,19 +1264,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
-
-    // Overflow storage for truncated tool outputs — keeps full content
-    // accessible via bounded reads without polluting the workspace or git.
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS tool_output_overflow (
-        id TEXT PRIMARY KEY,
-        tool_name TEXT NOT NULL,
-        content TEXT NOT NULL,
-        total_lines INTEGER NOT NULL,
-        total_bytes INTEGER NOT NULL,
-        created_at INTEGER NOT NULL
-      )
-    `);
   }
 
   private async handleListFiles(url: URL): Promise<Response> {
@@ -2428,9 +2299,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       console.warn("[compaction] Background compaction failed:", err instanceof Error ? err.message : err);
     });
 
-    // Clean up stale overflow records (fire-and-forget)
-    try { this.cleanupOverflow(); } catch { /* best-effort */ }
-
     return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
   }
 
@@ -2621,70 +2489,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * Build a token usage report for the current session.
    * Returns cumulative totals, context window info, and per-message breakdown.
    */
-  private getTokenUsageReport(): {
-    contextWindow: number;
-    contextBudget: number;
-    estimatedContextTokens: number;
-    contextUsagePercent: number;
-    totalTokenInput: number;
-    totalTokenOutput: number;
-    messageCount: number;
-    model: string;
-    messages: Array<{
-      id: string;
-      role: string;
-      tokenInput: number;
-      tokenOutput: number;
-      createdAt: string;
-    }>;
-  } {
-    const config = this.getConfig();
-    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
-    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
-    const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
-
-    // Get cumulative totals
-    const metaTotals = this.db.one(
-      "SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out, COUNT(*) AS cnt FROM message_metadata",
-    );
-    const totalTokenInput = Number(metaTotals?.total_in ?? 0);
-    const totalTokenOutput = Number(metaTotals?.total_out ?? 0);
-
-    // Estimate current context size from the latest assistant message's input tokens
-    // (this is the most accurate proxy — it's what the LLM actually received last turn)
-    const latestAssistant = this.db.one(
-      "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-    );
-    const estimatedContextTokens = Number(latestAssistant?.token_input ?? 0);
-    const contextUsagePercent = contextBudget > 0
-      ? Math.round((estimatedContextTokens / contextBudget) * 100)
-      : 0;
-
-    // Per-message breakdown
-    const rows = this.db.all(
-      "SELECT message_id, author_email, model, token_input, token_output, created_at FROM message_metadata ORDER BY created_at ASC",
-    );
-    const messages = rows.map((r) => ({
-      id: String(r.message_id),
-      role: r.model ? "assistant" : (r.author_email ? "user" : "unknown"),
-      tokenInput: Number(r.token_input ?? 0),
-      tokenOutput: Number(r.token_output ?? 0),
-      createdAt: epochToIso(r.created_at),
-    }));
-
-    return {
-      contextWindow,
-      contextBudget,
-      estimatedContextTokens,
-      contextUsagePercent,
-      totalTokenInput,
-      totalTokenOutput,
-      messageCount: Number(metaTotals?.cnt ?? 0),
-      model: modelId,
-      messages,
-    };
-  }
-
   private listMessages(): ChatMessageRecord[] {
     return this.listThinkMessages();
   }
@@ -3027,53 +2831,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return this.env.USER_CONTROL.idFromName(ownerEmail).toString();
   }
 
-  // ─── Tool Output Overflow Storage ───
-
-  /** Store a truncated tool's full output for later bounded retrieval. */
-  private storeOverflow(toolName: string, content: string): string {
-    const id = crypto.randomUUID();
-    const lines = content.split("\n").length;
-    this.db.exec(
-      "INSERT INTO tool_output_overflow (id, tool_name, content, total_lines, total_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-      id, toolName, content, lines, content.length, nowEpoch(),
-    );
-    return id;
-  }
-
-  /** Read a slice of an overflow record. Returns null if not found. */
-  readOverflow(id: string, offset = 0, limit = TOOL_OUTPUT_MAX_LINES): { content: string; totalLines: number; totalBytes: number; sliceStart: number; sliceEnd: number } | null {
-    const row = this.db.one("SELECT content, total_lines, total_bytes FROM tool_output_overflow WHERE id = ?", id);
-    if (!row) return null;
-    const full = String(row.content);
-    const lines = full.split("\n");
-    const sliceEnd = Math.min(offset + limit, lines.length);
-    const slice = lines.slice(offset, sliceEnd);
-    return {
-      content: slice.join("\n"),
-      totalLines: Number(row.total_lines),
-      totalBytes: Number(row.total_bytes),
-      sliceStart: offset,
-      sliceEnd,
-    };
-  }
-
-  /** Clean up overflow records older than the given age (seconds). Default: 1 hour. */
-  private cleanupOverflow(maxAgeSeconds = 3600): number {
-    const cutoff = nowEpoch() - maxAgeSeconds;
-    const before = this.db.one("SELECT COUNT(*) as cnt FROM tool_output_overflow WHERE created_at < ?", cutoff);
-    const count = Number(before?.cnt ?? 0);
-    if (count > 0) {
-      this.db.exec("DELETE FROM tool_output_overflow WHERE created_at < ?", cutoff);
-    }
-    return count;
-  }
-
   private async destroyStorage(): Promise<void> {
     this.db.exec("DELETE FROM message_metadata");
     this.db.exec("DELETE FROM prompts");
     this.db.exec("DELETE FROM cron_jobs");
     this.db.exec("DELETE FROM metadata");
-    this.db.exec("DELETE FROM tool_output_overflow");
     // Clean up Think sessions
     const thinkSessionId = this.getCurrentSessionId();
     if (thinkSessionId) {
