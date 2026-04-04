@@ -2646,10 +2646,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   private async maybeCompactContext(options?: { force?: boolean }): Promise<void> {
     const thinkSessionId = this.getCurrentSessionId();
-    if (!thinkSessionId) {
-      console.log("[compaction:exit] no thinkSessionId");
-      return;
-    }
+    if (!thinkSessionId) return;
 
     // Check if context usage warrants compaction
     const config = this.getConfig();
@@ -2669,33 +2666,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
       );
       const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
-      if (lastInputTokens === 0) {
-        console.log("[compaction:exit] lastInputTokens=0");
-        return;
-      }
+      if (lastInputTokens === 0) return;
 
       usagePercent = Math.round((lastInputTokens / contextBudget) * 100);
-      if (usagePercent < COMPACTION_TRIGGER_PERCENT) {
-        console.log(`[compaction:exit] usagePercent=${usagePercent}% < ${COMPACTION_TRIGGER_PERCENT}%`);
-        return;
-      }
-    }
-    if (contextWasTruncated) {
-      console.log("[compaction:trigger] context was truncated by assembleContext — forcing compaction");
+      if (usagePercent < COMPACTION_TRIGGER_PERCENT) return;
     }
 
     const history = this.sessions.getHistory(thinkSessionId);
-    if (history.length < 6) {
-      console.log(`[compaction:exit] history.length=${history.length} < 6`);
-      return;
-    }
+    if (history.length < 6) return;
 
     // Filter out synthetic compaction summary messages (IDs like "compaction_<uuid>")
     const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
-    if (realMessages.length < 6) {
-      console.log(`[compaction:exit] realMessages.length=${realMessages.length} < 6`);
-      return;
-    }
+    if (realMessages.length < 6) return;
 
     // ─── Turn-aware cut point (Tactic 4) ───
     // Find the cut point that doesn't split tool-call/result pairs.
@@ -2726,11 +2708,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const alreadyCompacted = existingCompactions.some(
       (c) => c.from_message_id === fromMessageId || c.to_message_id === toMessageId,
     );
-    if (alreadyCompacted) {
-      console.log(`[compaction:exit] alreadyCompacted from=${fromMessageId} to=${toMessageId}`);
-      return;
-    }
-    console.log(`[compaction:proceed] usagePercent=${usagePercent}%, history=${history.length}, compacting=${compactCount} messages, from=${fromMessageId}, to=${toMessageId}`);
+    if (alreadyCompacted) return;
 
     // ─── Cumulative file tracking (Tactic 3) ───
     // Track files read and modified across the messages being compacted.
@@ -2813,11 +2791,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
     }
 
-    if (serializedParts.length === 0) {
-      console.log("[compaction:exit] serializedParts empty — no text content in messages");
-      return;
-    }
-    console.log(`[compaction:generating] serializedParts=${serializedParts.length}, inputChars=${serializedParts.join("").length}`);
+    if (serializedParts.length === 0) return;
 
     const summaryInput = serializedParts.join("\n\n");
 
@@ -2918,11 +2892,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
 
       let summary = result.text;
-      if (!summary || summary.length < 20) {
-        console.log(`[compaction:exit] summary too short: ${summary?.length ?? 0} chars`);
-        return;
-      }
-      console.log(`[compaction:success] summary=${summary.length} chars, storing...`);
+      if (!summary || summary.length < 20) return;
 
       // Append cumulative file tracking tags
       const readFileList = [...readFiles].sort();
