@@ -467,10 +467,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // ─── Mid-loop compaction ───
           // If context usage is above threshold and we haven't compacted yet this turn,
           // trigger Think's compaction system to summarize older messages.
+          // After compaction, refresh this.messages so the next assembleContext() call
+          // picks up the compacted history (with the summary injected).
           if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered && step >= 3) {
             compactionTriggered = true;
             try {
               await self.maybeCompactContext();
+              // Refresh messages from the database so assembleContext() on the
+              // next iteration sees the compaction summary instead of the raw messages.
+              const thinkSessionId = self.getCurrentSessionId();
+              if (thinkSessionId) {
+                self.messages = self.sessions.getHistory(thinkSessionId);
+              }
               log("info", "own-loop: mid-loop compaction triggered", {
                 sessionId,
                 step,
@@ -529,6 +537,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
               try {
                 await self.maybeCompactContext({ force: true });
+                // Refresh messages so assembleContext() sees the compaction summary.
+                const thinkSid = self.getCurrentSessionId();
+                if (thinkSid) {
+                  self.messages = self.sessions.getHistory(thinkSid);
+                }
                 // After compaction, continue the loop — assembleContext() on next
                 // iteration will use the compacted context
                 step++;
@@ -2495,10 +2508,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
     }
 
-    // Check if context compaction is needed (fire-and-forget — don't block response)
-    this.maybeCompactContext().catch((err) => {
-      console.warn("[compaction] Background compaction failed:", err instanceof Error ? err.message : err);
-    });
+    // Check if context compaction is needed.
+    // Awaited (not fire-and-forget) so the compaction completes before the next
+    // request arrives. Without this, there's a race: the next chat() call may
+    // start before addCompaction() finishes, causing getHistory() to return
+    // the old non-compacted messages and the compaction summary to be invisible.
+    try {
+      await this.maybeCompactContext();
+    } catch (err) {
+      console.warn("[compaction] Post-chat compaction failed:", err instanceof Error ? err.message : err);
+    }
 
     return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
   }
