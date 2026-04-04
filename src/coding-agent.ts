@@ -1,6 +1,6 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
-import { generateText, stepCountIs, streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
+import { generateText, streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
 import { getUserControlStub } from "./auth";
@@ -170,7 +170,7 @@ const SYSTEM_PROMPT = [
   "",
   "**Every tool result stays in your context window.** This is the most important constraint.",
   "",
-  "- You have a maximum of 20 tool-call steps per prompt. Plan efficiently.",
+  "- You have a limited number of tool-call steps per prompt. Plan efficiently — prefer targeted reads over exploring entire directories.",
   "- Large outputs are automatically truncated. If you see `[truncated]`, use `read` with `offset`/`limit` to get the specific portion you need.",
   "- The workspace is ephemeral per session. Clone repos to get their contents.",
   "- If the user switches topics, suggest a fresh session to keep context clean.",
@@ -326,132 +326,225 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
-   * Override onChatMessage to:
-   * 1. Take full control of the streamText() call (instead of delegating to Think's default)
-   * 2. Inject a `prepareStep` callback that truncates tool results from earlier steps,
-   *    preventing the multi-step token accumulation that caused 1.1M-token sessions
-   * 3. Capture token usage from the streamText() result
+   * Override onChatMessage with Dodo's own agentic loop.
+   *
+   * Instead of delegating to AI SDK's internal multi-step loop via
+   * `streamText({ maxSteps: 15 })`, we run a while-loop calling
+   * `streamText({ maxSteps: 1 })` per iteration. This gives us full
+   * control between steps:
+   *
+   * - Reassemble context each iteration (clear old tool results)
+   * - Detect doom loops (same tool+args 3× in a row)
+   * - Enforce token budget thresholds (warn → wrap-up → hard stop)
+   * - Trigger mid-loop compaction when context exceeds threshold
+   * - Abort cleanly on signal
+   *
+   * Returns a custom StreamableResult whose toUIMessageStream() is an
+   * async generator that concatenates chunks from all iterations.
    */
   override async onChatMessage(options?: ChatMessageOptions): Promise<StreamableResult> {
     this._lastUsage = null;
 
     const baseTools = this.getTools();
     const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
+    const model = this.getModel();
+    const system = this.getSystemPrompt();
+    const signal = options?.signal;
+    const maxSteps = this.getMaxSteps();
+    const sessionId = this.sessionId();
 
-    const result = streamText({
-      model: this.getModel(),
-      system: this.getSystemPrompt(),
-      messages: await this.assembleContext(),
-      tools,
-      stopWhen: stepCountIs(this.getMaxSteps()),
-      abortSignal: options?.signal,
+    // ─── Token budget thresholds ───
+    const config = this.getConfig();
+    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
 
-      // ─── Per-step context shaping (OpenCode patterns #2, #3, #4) ───
-      //
-      // Between each step in the multi-step loop:
-      // 1. CLEAR old tool results entirely (not truncate — replace with marker)
-      // 2. Keep only the most recent tool results at full resolution
-      // 3. Detect doom loops (same tool + same args repeated 3+ times)
-      //
-      // This prevents O(steps² × toolOutputSize) token growth by making old
-      // tool results cost ~8 tokens each instead of ~1-4k tokens.
-      prepareStep: ({ stepNumber, steps, messages: stepMessages }) => {
-        if (stepNumber <= 1) return {};
+    // ─── Loop state ───
+    const recentToolCalls: string[] = []; // "toolName:argsJSON" for doom-loop detection
+    let cumulativeInputTokens = 0;
+    let cumulativeOutputTokens = 0;
+    let step = 0;
+    let warnInjected = false;
+    let wrapUpInjected = false;
+    let compactionTriggered = false;
 
-        // ─── Doom loop detection ───
-        // Check the primary (first) tool call from each of the last 3 steps.
-        // If all 3 are identical tool+args, warn the model to try something else.
-        const DOOM_LOOP_THRESHOLD = 3;
-        let doomWarning: string | null = null;
-        if (steps.length >= DOOM_LOOP_THRESHOLD) {
-          const recentPrimary = steps
-            .slice(-DOOM_LOOP_THRESHOLD)
-            .map(s => s.toolCalls?.[0])
-            .filter((tc): tc is NonNullable<typeof tc> => tc != null)
-            .map(tc => `${tc.toolName}:${JSON.stringify(tc.input)}`);
+    // ─── Budget thresholds (% of tokenBudget) ───
+    const WARN_THRESHOLD = 0.70;
+    const WRAP_UP_THRESHOLD = 0.85;
+    const HARD_STOP_THRESHOLD = 0.95;
 
-          if (recentPrimary.length === DOOM_LOOP_THRESHOLD) {
-            const allSame = recentPrimary.every(c => c === recentPrimary[0]);
+    // ─── Doom loop detection ───
+    const DOOM_LOOP_THRESHOLD = 3;
+    const PROTECTED_WINDOW = 6; // ~3 tool call/result pairs kept at full resolution
+
+    // ─── Mid-loop compaction threshold ───
+    const MID_LOOP_COMPACTION_THRESHOLD = 0.50; // Compact when >50% of budget used
+
+    const self = this;
+
+    // Return a custom StreamableResult. Think's chat() calls toUIMessageStream()
+    // and iterates it, forwarding chunks via the StreamCallback.
+    return {
+      async *toUIMessageStream() {
+        while (step < maxSteps) {
+          if (signal?.aborted) break;
+
+          // ─── Assemble fresh context each iteration ───
+          // This replaces the old prepareStep callback — assembleContext()
+          // already clears old tool results and applies token budget enforcement.
+          const messages = await self.assembleContext();
+
+          // ─── Between-step injections ───
+          const injections: ModelMessage[] = [];
+
+          // Doom loop detection: check if the last N tool calls are identical
+          if (recentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
+            const lastN = recentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
+            const allSame = lastN.every(c => c === lastN[0]);
             if (allSame) {
-              const toolName = steps.at(-1)?.toolCalls?.[0]?.toolName ?? "unknown";
-              doomWarning = `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach — use a different tool, different arguments, or explain what's blocking you.]`;
+              const toolName = lastN[0].split(":")[0];
+              injections.push({
+                role: "system" as const,
+                content: `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach — use a different tool, different arguments, or explain what's blocking you.]`,
+              });
               log("warn", "doom loop detected", {
-                sessionId: this.sessionId(),
+                sessionId,
                 toolName,
-                stepNumber,
+                step,
                 repeats: DOOM_LOOP_THRESHOLD,
               });
             }
           }
-        }
 
-        // ─── Patterns 2+3: Aggressive compaction with [cleared] markers ───
-        // Keep only the most recent PROTECTED_WINDOW messages at full resolution.
-        // Everything older gets its tool results replaced with a zero-token marker.
-        const PROTECTED_WINDOW = 6; // ~3 tool call/result pairs
+          // Budget-aware injections
+          const budgetUsage = cumulativeInputTokens / tokenBudget;
 
-        let mutated = false;
-        const shaped: ModelMessage[] = stepMessages.map((msg, idx) => {
-          if (msg.role !== "tool") return msg;
-
-          const isRecent = idx >= stepMessages.length - PROTECTED_WINDOW;
-          if (isRecent) return msg;
-
-          // Replace ALL old tool results with the cleared marker
-          for (const part of msg.content) {
-            if (part.type !== "tool-result" || part.output === undefined) continue;
-            const output = part.output as { type?: string; value?: unknown };
-            if (!output || typeof output !== "object") continue;
-
-            const value = output.value;
-            const serialized = typeof value === "string" ? value : JSON.stringify(value);
-
-            // Only clear if the result is non-trivial (>200 chars)
-            // Keep small status results like "Edit applied" as-is
-            if (serialized.length <= 200) continue;
-
-            // Clear entirely — not truncate
-            if (output.type === "text") {
-              (output as { value: string }).value = CLEARED_MARKER;
-            } else {
-              (part as { output: unknown }).output = { type: "text" as const, value: CLEARED_MARKER };
-            }
-            mutated = true;
+          if (budgetUsage >= HARD_STOP_THRESHOLD) {
+            // Hard stop — yield a wrap-up message and break
+            log("warn", "own-loop: hard stop — budget exhausted", {
+              sessionId,
+              step,
+              cumulativeInputTokens,
+              tokenBudget,
+              usage: `${Math.round(budgetUsage * 100)}%`,
+            });
+            // Inject a forced wrap-up as if the model said it
+            // The model won't see this — we just break the loop
+            break;
           }
 
-          return msg;
-        });
+          if (budgetUsage >= WRAP_UP_THRESHOLD && !wrapUpInjected) {
+            injections.push({
+              role: "system" as const,
+              content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop. Do not read new files or start new tasks. Complete your current thought and wrap up.",
+            });
+            wrapUpInjected = true;
+            log("info", "own-loop: wrap-up injection", {
+              sessionId,
+              step,
+              cumulativeInputTokens,
+              tokenBudget,
+              usage: `${Math.round(budgetUsage * 100)}%`,
+            });
+          } else if (budgetUsage >= WARN_THRESHOLD && !warnInjected) {
+            injections.push({
+              role: "system" as const,
+              content: "[CONTEXT BUDGET WARNING] You are using most of your context budget. Focus on completing the current task. Avoid reading new files unless essential. Prefer targeted edits over full file reads.",
+            });
+            warnInjected = true;
+            log("info", "own-loop: budget warning injection", {
+              sessionId,
+              step,
+              cumulativeInputTokens,
+              tokenBudget,
+              usage: `${Math.round(budgetUsage * 100)}%`,
+            });
+          }
 
-        // Inject doom loop warning as a system message if detected
-        if (doomWarning) {
-          shaped.push({
-            role: "system" as const,
-            content: doomWarning,
+          // ─── Mid-loop compaction ───
+          // If context usage is above threshold and we haven't compacted yet this turn,
+          // trigger Think's compaction system to summarize older messages.
+          if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered && step >= 3) {
+            compactionTriggered = true;
+            try {
+              await self.maybeCompactContext();
+              log("info", "own-loop: mid-loop compaction triggered", {
+                sessionId,
+                step,
+                cumulativeInputTokens,
+                tokenBudget,
+              });
+            } catch (err) {
+              log("warn", "own-loop: mid-loop compaction failed", {
+                sessionId,
+                step,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+
+          // Build final messages with injections appended
+          const finalMessages = injections.length > 0
+            ? [...messages, ...injections]
+            : messages;
+
+          // ─── Single-step LLM call ───
+          const result = streamText({
+            model,
+            system,
+            messages: finalMessages,
+            tools,
+            abortSignal: signal,
           });
-          mutated = true;
+
+          // Forward all chunks from this iteration to the caller
+          for await (const chunk of result.toUIMessageStream()) {
+            yield chunk;
+          }
+
+          // ─── Post-step bookkeeping ───
+          const usage = await (result as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
+          cumulativeInputTokens += usage?.inputTokens ?? 0;
+          cumulativeOutputTokens += usage?.outputTokens ?? 0;
+
+          // Track tool calls for doom loop detection
+          const steps = await (result as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
+          const lastStep = steps?.[steps.length - 1];
+          if (lastStep?.toolCalls?.length) {
+            for (const tc of lastStep.toolCalls) {
+              recentToolCalls.push(`${tc.toolName}:${JSON.stringify(tc.input)}`);
+            }
+            // Keep only the last DOOM_LOOP_THRESHOLD * 2 entries to bound memory
+            if (recentToolCalls.length > DOOM_LOOP_THRESHOLD * 2) {
+              recentToolCalls.splice(0, recentToolCalls.length - DOOM_LOOP_THRESHOLD * 2);
+            }
+          }
+
+          // Check finish reason — if the model didn't make a tool call, it's done
+          const finishReason = await (result as unknown as { finishReason: PromiseLike<string> }).finishReason;
+
+          log("info", "own-loop: step complete", {
+            sessionId,
+            step,
+            finishReason,
+            inputTokens: usage?.inputTokens ?? 0,
+            cumulativeInputTokens,
+            budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
+            toolCalls: lastStep?.toolCalls?.map(tc => tc.toolName) ?? [],
+          });
+
+          if (finishReason !== "tool-calls") break;
+
+          step++;
         }
 
-        return mutated ? { messages: shaped } : {};
+        // ─── Store cumulative usage for runThinkChat to read ───
+        self._lastUsage = {
+          inputTokens: cumulativeInputTokens,
+          outputTokens: cumulativeOutputTokens,
+        };
       },
-    });
-
-    // Capture token usage from the streamText() result
-    const streamResult = result as StreamableResult & {
-      totalUsage?: PromiseLike<{ inputTokens?: number; outputTokens?: number }>;
     };
-    if (streamResult.totalUsage) {
-      streamResult.totalUsage.then(
-        (usage) => {
-          this._lastUsage = {
-            inputTokens: usage.inputTokens ?? 0,
-            outputTokens: usage.outputTokens ?? 0,
-          };
-        },
-        () => { /* ignore errors — usage is best-effort */ },
-      );
-    }
-
-    return result;
   }
 
   /** Build an AppConfig from Think's per-session config, falling back to env defaults. */
@@ -478,9 +571,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   override getMaxSteps(): number {
-    // Reduced from 20 to 15: each step accumulates context,
-    // and 20 steps was causing 1M+ token sessions. 15 is still enough
-    // for most tasks while limiting worst-case accumulation.
+    // Safety net for the own-loop. The loop also respects token budget
+    // thresholds (warn → wrap-up → hard stop) which typically stop
+    // execution before reaching the step limit.
     return 15;
   }
 
