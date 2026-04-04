@@ -1,6 +1,6 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { StateBackend } from "@cloudflare/shell";
-import { jsonSchema, tool, zodSchema, type Tool as AnyToolType } from "ai";
+import { generateText, jsonSchema, stepCountIs, tool, zodSchema, type Tool as AnyToolType } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
@@ -427,6 +427,104 @@ function buildGitTools(
   };
 }
 
+// ─── Explore Subagent (Phase 3) ───
+// Offloads open-ended file search to a worker generateText call with its own
+// context window. Returns a compact summary (~500-1000 tokens) instead of
+// raw file contents (~5000-20000 tokens), saving 5-20× tokens per search.
+
+const EXPLORE_SYSTEM_PROMPT = [
+  "You are a search assistant. Your job is to find files and code relevant to the user's query.",
+  "",
+  "## Rules",
+  "- Use grep, find, list, and read to search the workspace.",
+  "- Be thorough: try multiple search terms if the first doesn't find results.",
+  "- Return a concise summary when done: file paths, relevant line numbers, and key observations.",
+  "- Do NOT return full file contents — only the relevant snippets (max 10 lines per file).",
+  "- If you find too many results, narrow your search with more specific patterns.",
+  "- Focus on answering the user's specific question, not cataloguing everything.",
+].join("\n");
+
+/** Max steps for the explore subagent. */
+const EXPLORE_MAX_STEPS = 5;
+
+/**
+ * Build the explore tool — spawns a search-only subagent via generateText().
+ *
+ * The subagent gets read-only workspace tools (read, list, find, grep) with
+ * output caps applied. It runs up to EXPLORE_MAX_STEPS steps of search,
+ * then returns a compact text summary. The summary enters the main agent's
+ * context (~500-1000 tokens) instead of multiple raw file reads (~5-20k tokens).
+ */
+function buildExploreTool(
+  workspace: Workspace,
+  config: AppConfig,
+  env: Env,
+): AnyTool {
+  // Build read-only workspace tools for the explore subagent
+  const allWsTools = createWorkspaceTools(workspace);
+  const readOnlyTools = capToolOutputs({
+    read: allWsTools.read,
+    list: allWsTools.list,
+    find: allWsTools.find,
+    grep: allWsTools.grep,
+  });
+
+  return tool({
+    description: [
+      "Search the workspace for files and code matching a query.",
+      "Runs an autonomous search agent that uses grep, find, list, and read to explore the codebase,",
+      "then returns a compact summary of findings (file paths, line numbers, key observations).",
+      "Much more token-efficient than reading files directly for open-ended searches.",
+      "Use this when you need to find where something is defined, locate files matching a pattern,",
+      "or understand how a feature is implemented across multiple files.",
+    ].join(" "),
+    inputSchema: zodSchema(z.object({
+      query: z.string().min(1).describe(
+        "What to search for — be specific. E.g. 'Find all files that handle CSS escaping' or 'Where is the database connection pool configured?'",
+      ),
+      scope: z.string().optional().describe(
+        "Optional directory to scope the search to (e.g. 'src/' or 'lib/utils'). Omit to search the entire workspace.",
+      ),
+    })),
+    execute: async ({ query, scope }: { query: string; scope?: string }) => {
+      const provider = buildProvider(config, env);
+      const model = provider.chatModel(config.model);
+
+      const scopeHint = scope ? `\n\nSearch scope: ${scope}` : "";
+      const userMessage = `${query}${scopeHint}`;
+
+      try {
+        const result = await generateText({
+          model,
+          system: EXPLORE_SYSTEM_PROMPT,
+          messages: [{ role: "user" as const, content: userMessage }],
+          tools: readOnlyTools,
+          stopWhen: stepCountIs(EXPLORE_MAX_STEPS),
+          maxOutputTokens: 2000,
+        });
+
+        const summary = result.text;
+        const steps = result.steps.length;
+        const toolCalls = result.steps.flatMap(s =>
+          (s.toolCalls ?? []).map(tc => tc.toolName),
+        );
+
+        // Return structured result for the main agent
+        return [
+          `## Explore results for: ${query}`,
+          scope ? `**Scope:** ${scope}` : "",
+          `**Search steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
+          "",
+          summary || "(No results found)",
+        ].filter(Boolean).join("\n");
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return `Explore failed: ${msg}. Try searching directly with grep or find.`;
+      }
+    },
+  });
+}
+
 function buildTools(
   env: Env,
   workspace: Workspace,
@@ -461,6 +559,9 @@ function buildTools(
 
   // Git tools — always available as top-level tools
   Object.assign(tools, gitTools);
+
+  // Explore tool — search subagent for token-efficient codebase discovery
+  tools.explore = buildExploreTool(workspace, config, env);
 
   return tools;
 }
