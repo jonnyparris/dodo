@@ -60,7 +60,11 @@ const COMPACTION_TRIGGER_PERCENT = 60;
 /** Fraction of messages to compact (from the oldest end). */
 const COMPACTION_MESSAGE_FRACTION = 0.5;
 /** Model to use for generating compaction summaries — cheap and fast. */
-const COMPACTION_MODEL = "anthropic/claude-haiku-3.5";
+// Use the session's own model for compaction. Previously used Haiku for cost
+// savings, but the model ID "anthropic/claude-haiku-3.5" may not route correctly
+// through all gateways. Using the session model guarantees the call succeeds.
+// Cost is bounded by maxOutputTokens: 1500.
+const COMPACTION_MODEL: string | null = null; // null = use session model
 
 /** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
 const CLEARED_MARKER = "[Old tool result content cleared]";
@@ -2879,7 +2883,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     try {
       const appConfig = this.getAppConfigFromThink();
       const provider = buildProvider(appConfig, this.env);
-      const compactionModel = provider.chatModel(COMPACTION_MODEL);
+      const compactionModelId = COMPACTION_MODEL ?? modelId;
+      const compactionModel = provider.chatModel(compactionModelId);
 
       // Build the user message with conversation + optional previous summary
       const userParts: string[] = [];
