@@ -239,6 +239,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private _lastUsage: { inputTokens: number; outputTokens: number } | null = null;
   /** Overflow recovery flag — prevents infinite retry loops on persistent overflow. */
   private _overflowRecoveryAttempted = false;
+  /** Set by assembleContext() when messages are dropped due to token budget. */
+  private _contextTruncated = false;
   /** Connected MCP gatekeepers, populated by connectMcpServers(). */
   private mcpGatekeepers: McpGatekeeper[] = [];
   /** MCP recursion depth from incoming request, propagated to outbound MCP calls. */
@@ -953,6 +955,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     });
 
     if (cutoffIndex > 0 && cutoffIndex < messages.length) {
+      this._contextTruncated = true;
       const droppedCount = cutoffIndex;
       const hasCompactionSummary = minProtectedIndex >= 0 && minProtectedIndex < cutoffIndex;
       log("warn", "assembleContext: dropping oldest messages", {
@@ -1080,6 +1083,65 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         await this.syncSessionIndex({ status: "deleted" });
         await this.destroyStorage();
         return Response.json({ deleted: true, sessionId: sid });
+      }
+
+      // Debug endpoint: run compaction diagnostics without side effects
+      if (request.method === "GET" && url.pathname === "/debug/compaction") {
+        const thinkSid = this.getCurrentSessionId();
+        if (!thinkSid) return Response.json({ error: "no session" });
+
+        const cfg = this.getConfig();
+        const mid = cfg?.model ?? this.env.DEFAULT_MODEL ?? "";
+        const cw = CONTEXT_WINDOW_TOKENS[mid] ?? DEFAULT_CONTEXT_WINDOW;
+        const cb = Math.floor(cw * CONTEXT_BUDGET_FACTOR);
+
+        const latestAssistant = this.db.one(
+          "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+        );
+        const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
+        const usagePct = cb > 0 ? Math.round((lastInputTokens / cb) * 100) : 0;
+
+        const history = this.sessions.getHistory(thinkSid);
+        const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
+        const compactions = this.sessions.getCompactions(thinkSid);
+
+        const targetCompactCount = Math.max(2, Math.floor(realMessages.length * COMPACTION_MESSAGE_FRACTION));
+        const fromId = realMessages.length > 0 ? realMessages[0].id : null;
+        const toId = realMessages.length >= targetCompactCount ? realMessages[targetCompactCount - 1].id : null;
+
+        const alreadyCompacted = fromId && toId ? compactions.some(
+          (c) => c.from_message_id === fromId || c.to_message_id === toId,
+        ) : false;
+
+        // Check serialization: would we get any content?
+        let serializedCount = 0;
+        for (const msg of realMessages.slice(0, targetCompactCount)) {
+          const textContent = msg.parts
+            ?.filter((p: { type: string }) => p.type === "text")
+            .map((p: { type: string; text?: string }) => (p as { text: string }).text)
+            .join("") ?? "";
+          if (textContent) serializedCount++;
+        }
+
+        return Response.json({
+          thinkSessionId: thinkSid,
+          model: mid,
+          contextWindow: cw,
+          contextBudget: cb,
+          lastInputTokens,
+          usagePercent: usagePct,
+          triggerThreshold: COMPACTION_TRIGGER_PERCENT,
+          wouldTrigger: usagePct >= COMPACTION_TRIGGER_PERCENT,
+          historyLength: history.length,
+          realMessageCount: realMessages.length,
+          compactionCount: compactions.length,
+          targetCompactCount,
+          fromId,
+          toId,
+          alreadyCompacted,
+          serializedCount,
+          historyRoles: history.map(m => `${m.role}:${m.id.slice(0, 8)}`),
+        });
       }
 
       if (request.method === "GET" && url.pathname === "/messages") {
@@ -2580,7 +2642,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   private async maybeCompactContext(options?: { force?: boolean }): Promise<void> {
     const thinkSessionId = this.getCurrentSessionId();
-    if (!thinkSessionId) return;
+    if (!thinkSessionId) {
+      console.log("[compaction:exit] no thinkSessionId");
+      return;
+    }
 
     // Check if context usage warrants compaction
     const config = this.getConfig();
@@ -2588,26 +2653,45 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
 
-    // When force=true (overflow recovery), skip the usage threshold check —
-    // the failed LLM call's tokens may not be in message_metadata yet.
-    let usagePercent = 100; // Default to high for forced compaction
-    if (!options?.force) {
+    // When force=true (overflow recovery) or context was truncated by
+    // assembleContext(), skip the usage threshold check. The truncation flag
+    // catches the Catch-22: assembleContext drops old messages → LLM reports
+    // low usage → compaction threshold not met → messages stay dropped forever.
+    const contextWasTruncated = this._contextTruncated;
+    this._contextTruncated = false; // Reset for next turn
+    let usagePercent = 100; // Default to high for forced/truncated compaction
+    if (!options?.force && !contextWasTruncated) {
       const latestAssistant = this.db.one(
         "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
       );
       const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
-      if (lastInputTokens === 0) return;
+      if (lastInputTokens === 0) {
+        console.log("[compaction:exit] lastInputTokens=0");
+        return;
+      }
 
       usagePercent = Math.round((lastInputTokens / contextBudget) * 100);
-      if (usagePercent < COMPACTION_TRIGGER_PERCENT) return;
+      if (usagePercent < COMPACTION_TRIGGER_PERCENT) {
+        console.log(`[compaction:exit] usagePercent=${usagePercent}% < ${COMPACTION_TRIGGER_PERCENT}%`);
+        return;
+      }
+    }
+    if (contextWasTruncated) {
+      console.log("[compaction:trigger] context was truncated by assembleContext — forcing compaction");
     }
 
     const history = this.sessions.getHistory(thinkSessionId);
-    if (history.length < 6) return;
+    if (history.length < 6) {
+      console.log(`[compaction:exit] history.length=${history.length} < 6`);
+      return;
+    }
 
     // Filter out synthetic compaction summary messages (IDs like "compaction_<uuid>")
     const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
-    if (realMessages.length < 6) return;
+    if (realMessages.length < 6) {
+      console.log(`[compaction:exit] realMessages.length=${realMessages.length} < 6`);
+      return;
+    }
 
     // ─── Turn-aware cut point (Tactic 4) ───
     // Find the cut point that doesn't split tool-call/result pairs.
@@ -2638,7 +2722,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const alreadyCompacted = existingCompactions.some(
       (c) => c.from_message_id === fromMessageId || c.to_message_id === toMessageId,
     );
-    if (alreadyCompacted) return;
+    if (alreadyCompacted) {
+      console.log(`[compaction:exit] alreadyCompacted from=${fromMessageId} to=${toMessageId}`);
+      return;
+    }
+    console.log(`[compaction:proceed] usagePercent=${usagePercent}%, history=${history.length}, compacting=${compactCount} messages, from=${fromMessageId}, to=${toMessageId}`);
 
     // ─── Cumulative file tracking (Tactic 3) ───
     // Track files read and modified across the messages being compacted.
@@ -2721,7 +2809,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
     }
 
-    if (serializedParts.length === 0) return;
+    if (serializedParts.length === 0) {
+      console.log("[compaction:exit] serializedParts empty — no text content in messages");
+      return;
+    }
+    console.log(`[compaction:generating] serializedParts=${serializedParts.length}, inputChars=${serializedParts.join("").length}`);
 
     const summaryInput = serializedParts.join("\n\n");
 
@@ -2821,7 +2913,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
 
       let summary = result.text;
-      if (!summary || summary.length < 20) return;
+      if (!summary || summary.length < 20) {
+        console.log(`[compaction:exit] summary too short: ${summary?.length ?? 0} chars`);
+        return;
+      }
+      console.log(`[compaction:success] summary=${summary.length} chars, storing...`);
 
       // Append cumulative file tracking tags
       const readFileList = [...readFiles].sort();
@@ -2845,8 +2941,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
     } catch (error) {
       console.warn(
-        "[compaction] Failed to generate summary:",
-        error instanceof Error ? error.message : error,
+        "[compaction:ERROR] Failed to generate summary:",
+        error instanceof Error ? `${error.message}\n${error.stack}` : error,
       );
     }
   }
