@@ -54,7 +54,7 @@
   "vars": {
     "CF_ACCESS_AUD": "your-cf-access-audience-tag",
     "CF_ACCESS_TEAM_DOMAIN": "https://your-team.cloudflareaccess.com",
-    "DEFAULT_MODEL": "anthropic/claude-sonnet-4-5",
+    "DEFAULT_MODEL": "openai/gpt-5.4",
     "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
     "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1",
     "DODO_VERSION": "0.3.0-dev",
