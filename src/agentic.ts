@@ -28,7 +28,10 @@ const TOOL_OUTPUT_CAPS: Record<string, { maxLines?: number; maxBytes?: number; m
   grep:   { maxEntries: 100 },  // Think caps at 200; we cap at 100
   find:   { maxEntries: 100 },  // Think caps at 200; we cap at 100
   list:   { maxEntries: 100 },  // Think's list accepts a limit param; we cap the output
-  // read — Think already caps at 2000 lines and 2000 chars/line; no external cap needed
+  read:   { maxLines: 200 },    // Force the model to use offset/limit for large files.
+                                // Think caps at 2000 lines but that's ~60k tokens — too
+                                // much for discovery. 200 lines is enough for a preview;
+                                // the truncation hint tells the model to use offset/limit.
   // write, edit, delete — already produce small output, no cap needed
 };
 
