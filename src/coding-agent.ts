@@ -144,8 +144,6 @@ const SYSTEM_PROMPT = [
   "| **write** | Create or overwrite a file | `path`, `content` |",
   "| **edit** | Find-and-replace (unique match) | `path`, `old_string`, `new_string` |",
   "| **replace_all** | Replace ALL occurrences of a string | `path`, `old_string`, `new_string` |",
-  "| **list** | List directory entries | `path`, `limit`, `offset` |",
-  "| **find** | Find files by glob pattern | `pattern` |",
   "| **grep** | Search file contents by regex | `query`, `include` (glob filter) |",
   "| **delete** | Remove a file or directory | `path`, `recursive` |",
   "",
