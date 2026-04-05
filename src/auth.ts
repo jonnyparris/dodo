@@ -3,6 +3,11 @@ import type { AccessIdentity, Env } from "./types";
 
 const DEV_EMAIL = "dev@dodo.local";
 
+/** Resolve the admin email from env, with a hardcoded fallback. */
+export function resolveAdminEmail(env: Env): string {
+  return env.ADMIN_EMAIL ?? "ruskin.constant@gmail.com";
+}
+
 function readAccessToken(request: Request): string | null {
   const headerToken = request.headers.get("Cf-Access-Jwt-Assertion");
   if (headerToken) {
@@ -79,8 +84,7 @@ export async function checkAllowlist(email: string, env: Env): Promise<{ allowed
 /** Check if an email is the admin. */
 export function isAdmin(email: string | null, env: Env): boolean {
   if (!email) return false;
-  const adminEmail = env.ADMIN_EMAIL ?? "ruskin.constant@gmail.com";
-  return email === adminEmail;
+  return email === resolveAdminEmail(env);
 }
 
 // ─── DO Stub Helpers ───

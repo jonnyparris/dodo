@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { resolveAdminEmail } from "./auth";
 import { hashShareToken } from "./share";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
 import type { AllowlistEntry, Env } from "./types";
@@ -487,7 +488,7 @@ export class SharedIndex implements DurableObject {
   }
 
   private seedAdmin(): void {
-    const adminEmail = this.env.ADMIN_EMAIL ?? "ruskin.constant@gmail.com";
+    const adminEmail = resolveAdminEmail(this.env);
     const now = nowEpoch();
     this.db.exec(
       "INSERT OR IGNORE INTO users (email, display_name, role, created_at, last_seen_at) VALUES (?, ?, 'admin', ?, ?)",
@@ -584,15 +585,18 @@ export class SharedIndex implements DurableObject {
       const details = await Promise.all(
         tomlFiles.map(async (f) => {
           const slug = f.name.replace(".toml", "");
-          const id = `anthropic/${slug}`;
           const displayName = slug.split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
           try {
             const tomlRes = await fetch(
               `https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode/models/${encodeURIComponent(f.name)}`,
               { headers: { "User-Agent": "dodo-agent" } },
             );
-            if (!tomlRes.ok) return { id, name: displayName, costInput: null, costOutput: null, contextWindow: null };
+            if (!tomlRes.ok) return { id: slug, name: displayName, costInput: null, costOutput: null, contextWindow: null };
             const toml = await tomlRes.text();
+            // Derive model ID from the provider npm package in the TOML
+            const providerNpm = toml.match(/\[provider\][\s\S]*?npm\s*=\s*"@ai-sdk\/([^"]+)"/)?.[1];
+            const providerPrefix = providerNpm ?? "anthropic"; // fallback for legacy files
+            const id = `${providerPrefix}/${slug}`;
             const nameMatch = toml.match(/^name\s*=\s*"([^"]+)"/m);
             const costInputMatch = toml.match(/\[cost\][\s\S]*?input\s*=\s*([\d.]+)/);
             const costOutputMatch = toml.match(/\[cost\][\s\S]*?output\s*=\s*([\d.]+)/);
@@ -605,7 +609,7 @@ export class SharedIndex implements DurableObject {
               contextWindow: contextMatch ? parseInt(contextMatch[1].replace(/_/g, ""), 10) : null,
             };
           } catch {
-            return { id, name: displayName, costInput: null, costOutput: null, contextWindow: null };
+            return { id: slug, name: displayName, costInput: null, costOutput: null, contextWindow: null };
           }
         }),
       );
@@ -627,7 +631,8 @@ export class SharedIndex implements DurableObject {
     await Promise.all(
       modelIds.map(async (id) => {
         try {
-          const slug = id.replace("anthropic/", "");
+          // Extract slug from "provider/slug" format
+          const slug = id.includes("/") ? id.split("/").slice(1).join("/") : id;
           const res = await fetch(
             `https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode/models/${encodeURIComponent(slug)}.toml`,
             { headers: { "User-Agent": "dodo-agent" } },
@@ -673,7 +678,7 @@ export class SharedIndex implements DurableObject {
   }): Promise<{ id: string; token: string; permission: string; sessionId: string }> {
     const { generateShareToken } = await import("./share");
     const token = generateShareToken();
-    const tokenHash = await hashShareToken(token);
+    const tokenHash = await hashShareToken(token, this.env.COOKIE_SECRET);
     const now = nowEpoch();
     const expiresAt = input.expiresAt ? Math.floor(new Date(input.expiresAt).getTime() / 1000) : null;
 
@@ -723,7 +728,7 @@ export class SharedIndex implements DurableObject {
     permission?: string;
     ownerEmail?: string;
   }> {
-    const tokenHash = await hashShareToken(token);
+    const tokenHash = await hashShareToken(token, this.env.COOKIE_SECRET);
     const row = this.db.one(
       "SELECT session_id, owner_email, permission, expires_at, revoked_at FROM session_shares WHERE id = ?",
       tokenHash,
