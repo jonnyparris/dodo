@@ -2883,17 +2883,34 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         },
       ];
 
-      // Use Workers AI binding (free, fast) or fall back to session model via AI SDK.
+      // Try Workers AI binding (free, fast), fall back to session model via AI SDK.
       let summary: string | undefined;
       if (this.env.AI) {
-        const aiResult = await this.env.AI.run(COMPACTION_MODEL as BaseAiTextGenerationModels, {
-          messages: compactionMessages,
-          max_tokens: 1500,
-        });
-        summary = typeof aiResult === "string"
-          ? aiResult
-          : (aiResult as { response?: string }).response ?? "";
-      } else {
+        try {
+          const aiResult = await this.env.AI.run(COMPACTION_MODEL as BaseAiTextGenerationModels, {
+            messages: compactionMessages,
+            max_tokens: 1500,
+          });
+          summary = typeof aiResult === "string"
+            ? aiResult
+            : (aiResult as { response?: string }).response ?? "";
+          if (summary) {
+            log("info", "compaction: Workers AI summary generated", {
+              sessionId: this.sessionId(),
+              model: COMPACTION_MODEL,
+              summaryChars: summary.length,
+            });
+          }
+        } catch (aiErr) {
+          log("warn", "compaction: Workers AI failed, falling back to session model", {
+            sessionId: this.sessionId(),
+            model: COMPACTION_MODEL,
+            error: aiErr instanceof Error ? aiErr.message : String(aiErr),
+          });
+          summary = undefined; // Fall through to AI SDK path
+        }
+      }
+      if (!summary) {
         const appConfig = this.getAppConfigFromThink();
         const provider = buildProvider(appConfig, this.env);
         const fallbackModel = provider.chatModel(modelId);
