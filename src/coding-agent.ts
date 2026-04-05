@@ -115,7 +115,7 @@ const SYSTEM_PROMPT = [
   "When the user asks you to build or modify code:",
   "",
   "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task. This avoids re-discovering context that was already captured.",
-  "2. **Use `explore` for discovery.** When you need to understand how a feature works, find where something is defined, or locate relevant files — ALWAYS use the `explore` tool first. It runs a search agent in a separate context window and returns a compact summary (~500 tokens) instead of raw file contents (~5-20k tokens). This is critical: reading files directly for discovery will exhaust your context budget before you can make any edits.",
+  "2. **Use `explore` for discovery.** When you need to understand how a feature works, find where something is defined, or locate relevant files — ALWAYS use the `explore` tool first. It runs a search agent in a separate context window and returns a compact summary instead of raw file contents (~5-20k tokens). This is critical: reading files directly for discovery will exhaust your context budget before you can make any edits.",
   "3. **Read only what you need.** After `explore` tells you which files and lines are relevant, use `read` with `offset`/`limit` to fetch only the specific sections you need to edit. Never read entire large files.",
   "4. **Plan, then edit.** For non-trivial tasks, state your plan in one short paragraph, then execute. Don't narrate each step.",
   "5. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
@@ -128,7 +128,7 @@ const SYSTEM_PROMPT = [
   "",
   "| Tool | Purpose | Key params |",
   "|------|---------|------------|",
-  "| **explore** | Search agent for codebase discovery (~500 token result) | `query`, `scope` |",
+  "| **explore** | Search agent for codebase discovery (compact summary) | `query`, `scope` |",
   "| **read** | Read file contents | `path`, `offset`, `limit` (line numbers) |",
   "| **write** | Create or overwrite a file | `path`, `content` |",
   "| **edit** | Find-and-replace (unique match) | `path`, `old_string`, `new_string` |",
@@ -758,6 +758,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
           yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Compacting context and continuing...]\n\n" };
 
+          // Preserve phase 1 totals so _lastUsage reports combined spend
+          const phase1InputTokens = cumulativeInputTokens;
+          const phase1OutputTokens = cumulativeOutputTokens;
+
           // Force compaction to summarize what's been done so far
           try {
             await self.maybeCompactContext({ force: true });
@@ -811,18 +815,47 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                   content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop. Do not read new files or start new tasks. Complete your current thought and wrap up.",
                 });
                 wrapUpInjected = true;
+              } else if (phase2BudgetUsage >= WARN_THRESHOLD && !warnInjected) {
+                phase2Injections.push({
+                  role: "system" as const,
+                  content: "[CONTEXT BUDGET WARNING] You are using most of your context budget. Focus on completing the current task. Avoid reading new files unless essential. Prefer targeted edits over full file reads.",
+                });
+                warnInjected = true;
               }
 
-              // Phase 2 doom loop detection
+              // Phase 2 doom loop detection (two-tier: soft warning then hard break)
               if (p2RecentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
                 const lastN = p2RecentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
                 if (lastN.every(c => c === lastN[0])) {
-                  log("warn", "own-loop: phase2 doom loop — breaking", {
+                  const toolName = lastN[0].split(":")[0];
+                  const DOOM_LOOP_HARD_BREAK = DOOM_LOOP_THRESHOLD + 2;
+
+                  // Hard break after DOOM_LOOP_HARD_BREAK identical calls
+                  if (p2RecentToolCalls.length >= DOOM_LOOP_HARD_BREAK) {
+                    const hardN = p2RecentToolCalls.slice(-DOOM_LOOP_HARD_BREAK);
+                    if (hardN.every(c => c === hardN[0])) {
+                      log("warn", "own-loop: phase2 doom loop hard break", {
+                        sessionId,
+                        step: phase2Step,
+                        toolName,
+                        repeats: DOOM_LOOP_HARD_BREAK,
+                      });
+                      yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Stopped: repeated ${toolName} calls detected]\n\n` };
+                      break;
+                    }
+                  }
+
+                  // Soft warning — give the model a chance to course-correct
+                  phase2Injections.push({
+                    role: "system" as const,
+                    content: `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach — use a different tool, different arguments, or explain what's blocking you.]`,
+                  });
+                  log("warn", "own-loop: phase2 doom loop detected", {
                     sessionId,
                     step: phase2Step,
-                    toolName: lastN[0].split(":")[0],
+                    toolName,
+                    repeats: DOOM_LOOP_THRESHOLD,
                   });
-                  break;
                 }
               }
 
@@ -922,7 +955,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               if (p2FinishReason !== "tool-calls") break;
               phase2Step++;
             }
+
+            // Restore phase 1 totals so _lastUsage reports combined spend
+            cumulativeInputTokens += phase1InputTokens;
+            cumulativeOutputTokens += phase1OutputTokens;
           } catch (err) {
+            // Restore phase 1 totals even on failure
+            cumulativeInputTokens += phase1InputTokens;
+            cumulativeOutputTokens += phase1OutputTokens;
             log("warn", "own-loop: auto-continuation failed", {
               sessionId,
               error: err instanceof Error ? err.message : String(err),
