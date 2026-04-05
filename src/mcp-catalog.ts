@@ -12,9 +12,9 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
   {
     id: "dodo-self",
     name: "Dodo Self",
-    description: "Connect to this Dodo instance's own MCP server for multi-session orchestration.",
-    url: "https://dodo.jonnyparris.workers.dev/mcp",
-    setupGuide: "Add your DODO_MCP_TOKEN as the Authorization Bearer token.",
+    description: "Connect to this Dodo instance's own MCP server for multi-session orchestration. Use /mcp/codemode for coding agents (2 tools, ~1k tokens) or /mcp for orchestrators (40+ tools).",
+    url: "https://dodo.jonnyparris.workers.dev/mcp/codemode",
+    setupGuide: "Add your DODO_MCP_TOKEN as the Authorization Bearer token. The /mcp/codemode endpoint uses code-mode (search + execute) to minimize context usage.",
     knownHosts: ["dodo.jonnyparris.workers.dev"],
   },
   {
