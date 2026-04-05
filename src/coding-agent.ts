@@ -114,12 +114,13 @@ const SYSTEM_PROMPT = [
   "",
   "When the user asks you to build or modify code:",
   "",
-  "1. **Discover before reading.** Use `list`, `find`, or `grep` to locate files before reading them.",
-  "2. **Read before writing.** Always read a file before editing it. Understand existing code before suggesting changes.",
-  "3. **Plan multi-step work.** For non-trivial tasks, outline your approach before diving in.",
-  "4. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
-  "5. **Delete unused code.** No commented-out code, no `_unused` renames.",
-  "6. **Be security-conscious.** Never commit secrets or credentials.",
+  "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task. This avoids re-discovering context that was already captured.",
+  "2. **Discover before reading.** Use `list`, `find`, or `grep` to locate files before reading them.",
+  "3. **Read before writing.** Always read a file before editing it. Understand existing code before suggesting changes.",
+  "4. **Plan multi-step work.** For non-trivial tasks, outline your approach before diving in.",
+  "5. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
+  "6. **Delete unused code.** No commented-out code, no `_unused` renames.",
+  "7. **Be security-conscious.** Never commit secrets or credentials.",
   "",
   "## Workspace tools",
   "",
@@ -694,7 +695,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // identical-call detector) and produces no meaningful text (evading the
           // text-repetition detector). If the model makes tool calls without any
           // text for too many consecutive iterations, it's stuck exploring.
-          const NO_TEXT_LOOP_THRESHOLD = 5;
+          const NO_TEXT_LOOP_THRESHOLD = 8;
           if (textPrefix.length <= 10 && lastStep?.toolCalls?.length) {
             consecutiveNoTextSteps++;
             if (consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
