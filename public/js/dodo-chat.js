@@ -129,6 +129,15 @@ function connectSSE(id){
     resetSseActivityTimer();hideThinking();
     const msg=JSON.parse(e.data);
     if(_streamIdleTimer){clearTimeout(_streamIdleTimer);_streamIdleTimer=null}
+    // Guard: empty assistant response with no preceding stream = silent LLM failure
+    if(msg.role==="assistant"&&!msg.content&&!streamingEl){
+      setProcessing(false);
+      const el=document.createElement("div");el.className="msg error";
+      el.textContent="Empty response from model — the request may have failed silently. Try again or switch models.";
+      $("chat").appendChild(el);_smoothScrollToBottom();
+      loadFilesDebounced();apiSafe(`/session/${id}`).then(s=>{if(s)updateTokenSummary(s)});
+      return;
+    }
     if(streamingEl){
       // Final render: full markdown with copy buttons
       streamingEl.classList.remove("streaming");
@@ -170,7 +179,27 @@ function connectSSE(id){
   });
 
   eventSource.addEventListener("file",()=>loadFilesDebounced());
-  eventSource.addEventListener("prompt",()=>refreshGit());
+  eventSource.addEventListener("prompt",(e)=>{
+    refreshGit();
+    // Check for failed prompts and surface errors the error_message event may have missed
+    try{
+      const prompts=JSON.parse(e.data);
+      if(Array.isArray(prompts)){
+        // Only check the most recent prompt (first in descending order)
+        const latest=prompts[0];
+        if(latest&&latest.status==="failed"&&latest.error){
+          // Only show if there isn't already an error bubble with this text
+          const existing=[...$("chat").querySelectorAll(".msg.error")].some(el=>el.textContent===latest.error);
+          if(!existing){
+            hideThinking();setProcessing(false);
+            const el=document.createElement("div");el.className="msg error";
+            el.textContent=latest.error;
+            $("chat").appendChild(el);_smoothScrollToBottom();
+          }
+        }
+      }
+    }catch{}
+  });
   eventSource.addEventListener("execution",(e)=>{const r=JSON.parse(e.data);const el=document.createElement("div");el.className="msg tool_call";el.textContent=r.error?`Error: ${r.error}`:r.result!=null?`Result: ${JSON.stringify(r.result,null,2)}`:'\u2713 Done';$("chat").appendChild(el);_smoothScrollToBottom()});
   eventSource.addEventListener("error_message",(e)=>{hideThinking();setProcessing(false);const{message}=JSON.parse(e.data);const el=document.createElement("div");el.className="msg error";el.textContent=message||"Something went wrong";$("chat").appendChild(el);_smoothScrollToBottom()});
   eventSource.addEventListener("presence",(e)=>{const data=JSON.parse(e.data);presenceUsers=data.users||[];renderPresence()});

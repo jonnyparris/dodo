@@ -2358,6 +2358,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     try {
       const result = await this.runThinkChat(content, { authorEmail });
 
+      // Guard: treat empty LLM response as a failure
+      if (!result.text && !result.assistantMessageId) {
+        const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
+        this.emitEvent({ data: { message }, type: "error_message" });
+        await this.finishPrompt(promptId, { error: message, status: "failed" });
+        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+        return;
+      }
+
       // Phase 2: Checkpoint immediately after chat completes
       this.stashFiber({
         chatCompleted: true,
