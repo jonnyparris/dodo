@@ -501,7 +501,10 @@
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <h2 style="margin:0">Sessions</h2>
-        <button class="primary" onclick="createSession()" aria-label="Create new session">+ New</button>
+        <div style="display:flex;gap:6px">
+          <button onclick="clearOtherSessions()" aria-label="Delete all other sessions" title="Delete all sessions except the current one">Clear</button>
+          <button class="primary" onclick="createSession()" aria-label="Create new session">+ New</button>
+        </div>
       </div>
       <input id="session-search" class="session-search" placeholder="Search sessions..." oninput="filterSessions(this.value)" aria-label="Search sessions"/>
       <div id="session-list"></div>
