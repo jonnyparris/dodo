@@ -960,6 +960,16 @@ app.get("/api/identity", async (c) => {
   return c.json({ email, isAdmin: isAdmin(email, c.env) });
 });
 
+// ─── User-level SSE (per-user via UserControl) ───
+
+app.get("/api/events", async (c) => {
+  const email = c.get("userEmail");
+  const stub = getUserControlStub(c.env, email);
+  const headers = new Headers();
+  headers.set("x-owner-email", email);
+  return stub.fetch("https://user-control/events", { headers });
+});
+
 // ─── Sessions (per-user via UserControl) ───
 
 app.post("/session", async (c) => {
