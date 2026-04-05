@@ -217,6 +217,8 @@ app.all("/mcp", async (c) => {
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
+
+
 // ─── Bootstrap (one-time, only works when no users exist) ───
 
 app.post("/api/bootstrap", async (c) => {
@@ -1070,6 +1072,8 @@ app.get("/session/:id/debug/compaction", async (c) => {
   if (denied) return denied;
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/debug/compaction");
 });
+
+
 
 app.get("/session/:id/messages", async (c) => {
   const denied = requirePermission(c, "readonly");
