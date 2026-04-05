@@ -405,7 +405,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     // ─── Doom loop detection ───
     const DOOM_LOOP_THRESHOLD = 3;
-    const NO_TEXT_LOOP_THRESHOLD = 8;
+    const NO_TEXT_LOOP_THRESHOLD = 15;
+    const NO_TEXT_GRACE_STEPS = 10; // Skip no-text detection for the first N steps (exploration phase)
 
     // ─── Mid-loop compaction threshold ───
     const MID_LOOP_COMPACTION_THRESHOLD = 0.50; // Compact when >50% of budget used
@@ -715,7 +716,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // text for too many consecutive iterations, it's stuck exploring.
           if (textPrefix.length <= 10 && lastStep?.toolCalls?.length) {
             consecutiveNoTextSteps++;
-            if (consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
+            if (step >= NO_TEXT_GRACE_STEPS && consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
               log("warn", "no-text tool-call loop detected — breaking", {
                 sessionId,
                 step,
@@ -989,11 +990,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 }
               }
 
-              // No-text loop detection
+              // No-text loop detection (grace period applies to continuation phases too)
               if (phTextPrefix.length <= 10 && phLastStep?.toolCalls?.length) {
                 consecutiveNoTextSteps++;
-                if (consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
-                  log("warn", `own-loop: phase ${phase + 1} no-text loop`, { sessionId, step });
+                if (step >= NO_TEXT_GRACE_STEPS && consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
+                  log("warn", `own-loop: phase ${phaseNum} no-text loop`, { sessionId, step });
                   yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Loop detected — summarizing progress so far]\n\n" };
                   exitReason = "no-text-loop";
                   break;
