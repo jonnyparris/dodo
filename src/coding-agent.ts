@@ -369,6 +369,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     // ─── Loop state ───
     const recentToolCalls: string[] = []; // "toolName:argsJSON" for doom-loop detection
+    const recentTextPrefixes: string[] = []; // first ~80 chars of text per iteration for repetition detection
     let cumulativeInputTokens = 0;
     let cumulativeOutputTokens = 0;
     let step = 0;
@@ -528,9 +529,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               abortSignal: signal,
             });
 
-            // Forward all chunks from this iteration to the caller
+            // Forward all chunks from this iteration to the caller.
+            // Capture text emitted this iteration for repetition detection.
+            let iterationText = "";
             for await (const chunk of result.toUIMessageStream()) {
               yield chunk;
+              const c = chunk as { type?: string; delta?: string };
+              if (c.type === "text-delta" && c.delta) {
+                iterationText += c.delta;
+              }
             }
           } catch (err) {
             // ─── Overflow recovery ───
@@ -589,6 +596,31 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             // Keep only the last DOOM_LOOP_THRESHOLD * 2 entries to bound memory
             if (recentToolCalls.length > DOOM_LOOP_THRESHOLD * 2) {
               recentToolCalls.splice(0, recentToolCalls.length - DOOM_LOOP_THRESHOLD * 2);
+            }
+          }
+
+          // ─── Text repetition detection ───
+          // Catches loops where the model emits similar text each iteration
+          // but varies tool arguments (evading the tool-call doom loop detector).
+          // Compare the first ~80 chars of text from each iteration.
+          const textPrefix = iterationText.trim().slice(0, 80);
+          if (textPrefix.length > 10) {
+            recentTextPrefixes.push(textPrefix);
+            if (recentTextPrefixes.length > DOOM_LOOP_THRESHOLD * 2) {
+              recentTextPrefixes.splice(0, recentTextPrefixes.length - DOOM_LOOP_THRESHOLD * 2);
+            }
+            if (recentTextPrefixes.length >= DOOM_LOOP_THRESHOLD) {
+              const lastN = recentTextPrefixes.slice(-DOOM_LOOP_THRESHOLD);
+              const allSame = lastN.every(t => t === lastN[0]);
+              if (allSame) {
+                log("warn", "text repetition loop detected — breaking", {
+                  sessionId,
+                  step,
+                  repeatedText: textPrefix.slice(0, 60),
+                  repeats: DOOM_LOOP_THRESHOLD,
+                });
+                break;
+              }
             }
           }
 
