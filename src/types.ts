@@ -57,6 +57,7 @@ export interface AccessIdentity {
 export interface SessionState {
   activeStreamCount: number;
   activePromptId?: string | null;
+  compactionCount: number;
   contextBudget: number;
   contextUsagePercent: number;
   contextWindow: number;
