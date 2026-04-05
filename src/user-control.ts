@@ -92,6 +92,8 @@ const failureSnapshotCreateSchema = z.object({
 export class UserControl implements DurableObject {
   private readonly env: Env;
   private readonly db: SqlHelper;
+  /** SSE clients for user-level events (session list changes, etc.) */
+  private readonly sseClients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.env = env;
@@ -129,6 +131,12 @@ export class UserControl implements DurableObject {
     }
 
     try {
+      // ─── User-level SSE ───
+
+      if (request.method === "GET" && url.pathname === "/events") {
+        return this.openUserEventStream(request);
+      }
+
       // ─── Config ───
 
       if (request.method === "GET" && url.pathname === "/config") {
@@ -153,13 +161,17 @@ export class UserControl implements DurableObject {
           ownerEmail: z.string().email(),
           createdBy: z.string().email(),
         }).parse(await request.json());
-        return Response.json(this.registerSession(body.id, body.title ?? null, body.ownerEmail, body.createdBy), { status: 201 });
+        const session = this.registerSession(body.id, body.title ?? null, body.ownerEmail, body.createdBy);
+        this.emitUserEvent({ type: "sessions_changed", reason: "created", sessionId: body.id });
+        return Response.json(session, { status: 201 });
       }
 
       if (request.method === "PATCH" && url.pathname.startsWith("/sessions/")) {
         const sessionId = url.pathname.split("/").at(-1) ?? "";
         const body = z.object({ status: z.string().optional(), title: z.string().nullable().optional() }).strict().parse(await request.json());
-        return Response.json(this.touchSession(sessionId, body));
+        const session = this.touchSession(sessionId, body);
+        this.emitUserEvent({ type: "sessions_changed", reason: "updated", sessionId });
+        return Response.json(session);
       }
 
       if (request.method === "GET" && url.pathname.match(/^\/sessions\/[^/]+\/check$/)) {
@@ -172,6 +184,7 @@ export class UserControl implements DurableObject {
       if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/[^/]+$/) && !url.pathname.includes("/mcp-overrides") && !url.pathname.includes("/soft-delete") && !url.pathname.includes("/restore")) {
         const sessionId = url.pathname.split("/").at(-1) ?? "";
         this.db.exec("DELETE FROM sessions WHERE id = ?", sessionId);
+        this.emitUserEvent({ type: "sessions_changed", reason: "deleted", sessionId });
         return Response.json({ deleted: true, sessionId });
       }
 
@@ -182,6 +195,7 @@ export class UserControl implements DurableObject {
         if (!row) return Response.json({ error: `Session '${sessionId}' not found` }, { status: 404 });
         const deleteExpiry = nowEpoch() + 300; // 5 minutes
         this.db.exec("UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?", deleteExpiry, nowEpoch(), sessionId);
+        this.emitUserEvent({ type: "sessions_changed", reason: "deleted", sessionId });
         return Response.json({ deleted: true, sessionId, recoverable: true, recoverableUntil: epochToIso(deleteExpiry) });
       }
 
@@ -198,6 +212,7 @@ export class UserControl implements DurableObject {
           return Response.json({ error: `Recovery window expired. Session '${sessionId}' has been permanently deleted.` }, { status: 410 });
         }
         this.db.exec("UPDATE sessions SET status = 'idle', deleted_at = NULL, updated_at = ? WHERE id = ?", nowEpoch(), sessionId);
+        this.emitUserEvent({ type: "sessions_changed", reason: "restored", sessionId });
         return Response.json(this.getSession(sessionId));
       }
 
@@ -1391,6 +1406,51 @@ export class UserControl implements DurableObject {
       );
     } finally {
       dek.fill(0);
+    }
+  }
+
+  // ─── User-level SSE ───
+
+  private openUserEventStream(request: Request): Response {
+    const stream = new TransformStream<Uint8Array>();
+    const writer = stream.writable.getWriter();
+    this.sseClients.set(writer, Promise.resolve());
+
+    // Send initial ready event with session count
+    void this.writeUserEvent(writer, { type: "ready", sessionCount: this.listSessions().length });
+
+    request.signal.addEventListener(
+      "abort",
+      () => {
+        this.sseClients.delete(writer);
+        try { void writer.close(); } catch { /* stream may already be closed */ }
+      },
+      { once: true },
+    );
+
+    return new Response(stream.readable, {
+      headers: {
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        "content-type": "text/event-stream",
+      },
+    });
+  }
+
+  private async writeUserEvent(writer: WritableStreamDefaultWriter<Uint8Array>, event: Record<string, unknown>): Promise<void> {
+    const eventType = String(event.type ?? "message");
+    const payload = `event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`;
+    await writer.write(new TextEncoder().encode(payload));
+  }
+
+  private emitUserEvent(event: Record<string, unknown>): void {
+    for (const [writer, pending] of [...this.sseClients]) {
+      const next = pending
+        .then(() => this.writeUserEvent(writer, event))
+        .catch(() => {
+          this.sseClients.delete(writer);
+        });
+      this.sseClients.set(writer, next);
     }
   }
 }

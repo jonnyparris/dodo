@@ -1,11 +1,26 @@
 // dodo-sessions.js — Session list, select, filter, onboarding sessions
 
+let userEventSource=null;
+
 async function loadSessions(){
   const el=$("session-list");
   showSkeleton(el,4);
   const d=await apiSafe("/session");if(!d)return;const{sessions}=d;
   allSessions=sessions;
   renderSessionList(sessions);
+}
+
+/** Connect to user-level SSE for real-time session list updates. */
+function connectUserEvents(){
+  if(userEventSource)userEventSource.close();
+  userEventSource=new EventSource("/api/events");
+  userEventSource.addEventListener("sessions_changed",()=>{loadSessions()});
+  userEventSource.onerror=()=>{
+    // Reconnect after a delay if the connection drops
+    if(userEventSource&&userEventSource.readyState===EventSource.CLOSED){
+      setTimeout(connectUserEvents,5000);
+    }
+  };
 }
 function renderSessionList(sessions){
   const el=$("session-list");
