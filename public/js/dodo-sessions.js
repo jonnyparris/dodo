@@ -60,6 +60,19 @@ async function selectSession(id){
   if(window.innerWidth<=900)switchTab('chat');
 }
 
+async function clearOtherSessions(){
+  const others=allSessions.filter(s=>s.id!==currentSession);
+  if(!others.length){toast('No other sessions to delete','info');return}
+  const ok=await appConfirm(`Delete ${others.length} other session${others.length>1?'s':''}? The current session will be kept.`);
+  if(!ok)return;
+  let deleted=0;
+  for(const s of others){
+    try{await apiSafe(`/session/${s.id}`,{method:"DELETE"});deleted++}catch{}
+  }
+  toast(`Deleted ${deleted} session${deleted>1?'s':''}`,'success');
+  await loadSessions();
+}
+
 function renderOnboardingSessions(){
   const container=$('onboarding-sessions');
   const list=$('onboarding-session-list');
