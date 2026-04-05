@@ -762,14 +762,47 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           const phase1InputTokens = cumulativeInputTokens;
           const phase1OutputTokens = cumulativeOutputTokens;
 
-          // Force compaction to summarize what's been done so far
+          // ─── In-memory context truncation ───
+          // Think's compaction requires persisted messages, but during
+          // onChatMessage the assistant response hasn't been persisted yet
+          // (Think does that after the generator completes). So we truncate
+          // the in-memory messages array directly: keep the first message
+          // (user prompt) and the last few tool-call/result pairs, drop
+          // everything in between, and inject a summary of what was dropped.
           try {
-            await self.maybeCompactContext({ force: true });
-            const thinkSid = self.getCurrentSessionId();
-            if (thinkSid) {
-              self.messages = self.sessions.getHistory(thinkSid);
+            const keepRecent = 6; // Keep the last N messages (recent tool results)
+            if (messages.length > keepRecent + 2) {
+              const firstMsg = messages[0]; // Original user message
+              const recentMsgs = messages.slice(-keepRecent);
+
+              // Summarize what was dropped
+              const droppedCount = messages.length - keepRecent - 1;
+              const droppedToolNames = new Set<string>();
+              for (const msg of messages.slice(1, -keepRecent)) {
+                if (typeof msg.content === "object" && Array.isArray(msg.content)) {
+                  for (const part of msg.content) {
+                    if (part && typeof part === "object" && "type" in part) {
+                      if (part.type === "tool-call" && "toolName" in part) {
+                        droppedToolNames.add(String(part.toolName));
+                      }
+                    }
+                  }
+                }
+              }
+
+              const summaryInjection: ModelMessage = {
+                role: "system" as const,
+                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${[...droppedToolNames].join(", ") || "none"}. The task is not yet complete. Continue from where you left off using the remaining context below.]`,
+              };
+
+              messages = [firstMsg, summaryInjection, ...recentMsgs];
+              log("info", "own-loop: in-memory context truncation", {
+                sessionId,
+                originalCount: messages.length + droppedCount,
+                keptCount: messages.length,
+                droppedTools: [...droppedToolNames],
+              });
             }
-            messages = await self.assembleContext();
 
             // Reset budget tracking for the continuation phase
             cumulativeInputTokens = 0;
