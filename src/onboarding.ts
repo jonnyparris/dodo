@@ -9,7 +9,7 @@ export interface OnboardingState {
 
 const STEP_ORDER: OnboardingStep[] = ["welcome", "gateway", "passkey", "secrets", "memory", "integrations", "complete"];
 
-export function getNextStep(current: OnboardingStep, _skip: boolean): OnboardingStep {
+export function getNextStep(current: OnboardingStep, _skip?: boolean): OnboardingStep {
   const idx = STEP_ORDER.indexOf(current);
   if (idx === -1 || idx >= STEP_ORDER.length - 1) return "complete";
   return STEP_ORDER[idx + 1];

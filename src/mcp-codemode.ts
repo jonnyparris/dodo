@@ -1,7 +1,7 @@
 import { getAgentByName } from "agents";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getUserControlStub } from "./auth";
+import { getUserControlStub, resolveAdminEmail } from "./auth";
 import type { Env } from "./types";
 
 // ─── API Catalog ───
@@ -109,7 +109,7 @@ declare const catalog: CatalogEntry[];
 // ─── Helpers ───
 
 function mcpUserEmail(env: Env): string {
-  return env.ADMIN_EMAIL ?? "you@example.com";
+  return resolveAdminEmail(env);
 }
 
 function errorResult(data: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {

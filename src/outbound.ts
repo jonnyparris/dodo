@@ -1,5 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { getSharedIndexStub } from "./auth";
+import { getSharedIndexStub, resolveAdminEmail } from "./auth";
 import { OWNER_ID_HEADER } from "./executor";
 import type { Env } from "./types";
 
@@ -105,7 +105,7 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
 
     // Restricted env var fallback — admin account only
     if (!token && ownerId) {
-      const adminEmail = this.env.ADMIN_EMAIL ?? "you@example.com";
+      const adminEmail = resolveAdminEmail(this.env);
       const adminId = this.env.USER_CONTROL.idFromName(adminEmail).toString();
       if (ownerId === adminId) {
         token = this.envTokenForHost(hostname);

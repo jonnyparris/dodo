@@ -24,10 +24,10 @@ export function generateShareToken(): string {
 }
 
 /** Hash a share token with HMAC-SHA256 for storage. Returns hex string. */
-export async function hashShareToken(token: string): Promise<string> {
+export async function hashShareToken(token: string, secret?: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode("dodo-share-token"),
+    new TextEncoder().encode(secret || "dodo-share-token"),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
