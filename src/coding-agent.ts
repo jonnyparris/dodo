@@ -247,6 +247,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private mcpGatekeepers: McpGatekeeper[] = [];
   /** MCP recursion depth from incoming request, propagated to outbound MCP calls. */
   private mcpDepth = 0;
+  /** AbortController for the currently running fiber prompt. Signalled by handleAbort(). */
+  private _fiberAbortController: AbortController | null = null;
   private readonly presence = new PresenceTracker();
   readonly stateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
@@ -376,6 +378,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     let warnInjected = false;
     let wrapUpInjected = false;
     let compactionTriggered = false;
+    let consecutiveNoTextSteps = 0; // Track iterations where the model produces tool calls but no text
 
     // ─── Budget thresholds (% of tokenBudget) ───
     const WARN_THRESHOLD = 0.70;
@@ -416,11 +419,28 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           const injections: ModelMessage[] = [];
 
           // Doom loop detection: check if the last N tool calls are identical
+          const DOOM_LOOP_HARD_BREAK = DOOM_LOOP_THRESHOLD + 2; // 5 identical calls → hard break
           if (recentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
             const lastN = recentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
             const allSame = lastN.every(c => c === lastN[0]);
             if (allSame) {
               const toolName = lastN[0].split(":")[0];
+
+              // Hard break after DOOM_LOOP_HARD_BREAK identical calls
+              if (recentToolCalls.length >= DOOM_LOOP_HARD_BREAK) {
+                const hardN = recentToolCalls.slice(-DOOM_LOOP_HARD_BREAK);
+                if (hardN.every(c => c === hardN[0])) {
+                  log("warn", "doom loop hard break — identical tool calls", {
+                    sessionId,
+                    toolName,
+                    step,
+                    repeats: DOOM_LOOP_HARD_BREAK,
+                  });
+                  yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Stopped: repeated ${toolName} calls detected]\n\n` };
+                  break;
+                }
+              }
+
               injections.push({
                 role: "system" as const,
                 content: `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach — use a different tool, different arguments, or explain what's blocking you.]`,
@@ -649,6 +669,29 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             }
           }
 
+          // ─── No-text tool-call loop detection ───
+          // Catches loops where the model makes diverse tool calls (evading the
+          // identical-call detector) and produces no meaningful text (evading the
+          // text-repetition detector). If the model makes tool calls without any
+          // text for too many consecutive iterations, it's stuck exploring.
+          const NO_TEXT_LOOP_THRESHOLD = 5;
+          if (textPrefix.length <= 10 && lastStep?.toolCalls?.length) {
+            consecutiveNoTextSteps++;
+            if (consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
+              log("warn", "no-text tool-call loop detected — breaking", {
+                sessionId,
+                step,
+                consecutiveNoTextSteps,
+                recentTools: recentToolCalls.slice(-NO_TEXT_LOOP_THRESHOLD),
+              });
+              // Inject a final message asking the model to summarize
+              yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Loop detected — summarizing progress so far]\n\n" };
+              break;
+            }
+          } else {
+            consecutiveNoTextSteps = 0;
+          }
+
           // Check finish reason — if the model didn't make a tool call, it's done
           const finishReason = await (result as unknown as { finishReason: PromiseLike<string> }).finishReason;
 
@@ -660,6 +703,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             cumulativeInputTokens,
             budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
             toolCalls: lastStep?.toolCalls?.map(tc => tc.toolName) ?? [],
+            consecutiveNoTextSteps,
           });
 
           if (finishReason !== "tool-calls") break;
@@ -1523,6 +1567,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           connection.send(JSON.stringify({ type: "error", error: "No active prompt" }));
           return;
         }
+        // Signal the AbortController to interrupt the running LLM call immediately
+        if (this._fiberAbortController) {
+          this._fiberAbortController.abort();
+          this._fiberAbortController = null;
+        }
         // Cancel via fiber
         const fiberId = this.readPromptFiberId(promptId);
         if (fiberId) {
@@ -2277,6 +2326,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return Response.json({ error: "No active prompt" }, { status: 409 });
     }
 
+    // Signal the AbortController to interrupt the running LLM call immediately
+    if (this._fiberAbortController) {
+      this._fiberAbortController.abort();
+      this._fiberAbortController = null;
+    }
+
     // Cancel via fiber
     const fiberId = this.readPromptFiberId(promptId);
     if (fiberId) {
@@ -2391,8 +2446,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
 
     // Phase 1: Run chat via Think
+    // Create an AbortController so handleAbort() can interrupt the running LLM call
+    this._fiberAbortController = new AbortController();
+    const signal = this._fiberAbortController.signal;
     try {
-      const result = await this.runThinkChat(content, { authorEmail });
+      const result = await this.runThinkChat(content, { authorEmail, signal });
 
       // Guard: treat empty LLM response as a failure
       if (!result.text && !result.assistantMessageId) {
@@ -2421,11 +2479,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         tokenOutput: result.tokenOutput,
       });
     } catch (error) {
+      // Don't report abort-caused errors as failures — the abort handler already
+      // marked the prompt as aborted.
+      if (signal.aborted) return;
       const message = error instanceof Error ? error.message : "Prompt failed";
       this.emitEvent({ data: { message }, type: "error_message" });
       await this.finishPrompt(promptId, { error: message, status: "failed" });
       sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
     } finally {
+      this._fiberAbortController = null;
       await this.syncSessionIndex({ status: "idle", title });
       this.emitEvent({ data: this.listPrompts(), type: "prompt" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
