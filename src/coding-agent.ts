@@ -776,28 +776,51 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
           try {
             // ─── In-memory context truncation ───
-            const keepRecent = 6;
+            // Keep more recent messages (12) so the model retains context
+            // from the current phase. Also extract text output from dropped
+            // messages to preserve the model's findings and plan.
+            const keepRecent = 12;
             if (messages.length > keepRecent + 2) {
               const firstMsg = messages[0];
               const recentMsgs = messages.slice(-keepRecent);
+              const droppedMsgs = messages.slice(1, -keepRecent);
 
-              const droppedCount = messages.length - keepRecent - 1;
+              const droppedCount = droppedMsgs.length;
               const droppedToolNames = new Set<string>();
-              for (const msg of messages.slice(1, -keepRecent)) {
+              const assistantTexts: string[] = [];
+
+              for (const msg of droppedMsgs) {
                 if (typeof msg.content === "object" && Array.isArray(msg.content)) {
                   for (const part of msg.content) {
                     if (part && typeof part === "object" && "type" in part) {
                       if (part.type === "tool-call" && "toolName" in part) {
                         droppedToolNames.add(String(part.toolName));
                       }
+                      // Extract the model's text output (findings, plans, decisions)
+                      if (part.type === "text" && "text" in part && typeof part.text === "string") {
+                        const text = part.text.trim();
+                        if (text.length > 20) assistantTexts.push(text);
+                      }
                     }
                   }
                 }
+                // Also handle string content (system/user messages with findings)
+                if (msg.role === "assistant" && typeof msg.content === "string") {
+                  const text = msg.content.trim();
+                  if (text.length > 20) assistantTexts.push(text);
+                }
               }
+
+              // Build a summary that preserves the model's key findings
+              const toolsSummary = [...droppedToolNames].join(", ") || "none";
+              // Keep the last ~1000 chars of assistant text as a digest of findings
+              const findingsDigest = assistantTexts.length > 0
+                ? "\n\nKey findings from previous phases:\n" + assistantTexts.join("\n").slice(-1500)
+                : "";
 
               const summaryInjection: ModelMessage = {
                 role: "system" as const,
-                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${[...droppedToolNames].join(", ") || "none"}. The task is not yet complete. Continue from where you left off using the remaining context below.]`,
+                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${toolsSummary}. The task is not yet complete. Do NOT re-explore files you already found — use the findings below and the recent context to continue making edits.${findingsDigest}]`,
               };
 
               messages = [firstMsg, summaryInjection, ...recentMsgs];
@@ -806,6 +829,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 originalCount: messages.length + droppedCount,
                 keptCount: messages.length,
                 droppedTools: [...droppedToolNames],
+                findingsLength: findingsDigest.length,
               });
             }
 
@@ -820,10 +844,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             recentTextPrefixes.length = 0;
             exitReason = "natural";
 
-            // Inject continuation prompt
+            // Inject continuation prompt — directive to avoid re-exploration
             const continuationInjection: ModelMessage = {
               role: "user" as const,
-              content: "[auto-continue] Your previous turn was cut short by context limits. The conversation has been compacted. Continue where you left off — review the summary above and proceed with the task.",
+              content: "[auto-continue] Your previous turn was cut short by context limits. The conversation has been compacted. Do NOT re-explore the codebase — your findings are preserved in the summary above. Start making edits immediately using the file paths and line numbers from the summary and recent context.",
             };
             messages = [...messages, continuationInjection];
 
