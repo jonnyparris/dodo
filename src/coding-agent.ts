@@ -60,11 +60,10 @@ const COMPACTION_TRIGGER_PERCENT = 60;
 /** Fraction of messages to compact (from the oldest end). */
 const COMPACTION_MESSAGE_FRACTION = 0.5;
 /** Model to use for generating compaction summaries — cheap and fast. */
-// Use the session's own model for compaction. Previously used Haiku for cost
-// savings, but the model ID "anthropic/claude-haiku-3.5" may not route correctly
-// through all gateways. Using the session model guarantees the call succeeds.
-// Cost is bounded by maxOutputTokens: 1500.
-const COMPACTION_MODEL: string | null = null; // null = use session model
+// Use Workers AI Kimi K2.5 for compaction. Cheap (free tier on Workers AI),
+// fast, and large enough context for summarization. Routed through the AI Gateway
+// with the /workers-ai/v1 OpenAI-compatible endpoint.
+const COMPACTION_MODEL = "@cf/moonshotai/kimi-k2.5";
 
 /** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
 const CLEARED_MARKER = "[Old tool result content cleared]";
@@ -2855,11 +2854,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     ].join("\n");
 
     try {
-      const appConfig = this.getAppConfigFromThink();
-      const provider = buildProvider(appConfig, this.env);
-      const compactionModelId = COMPACTION_MODEL ?? modelId;
-      const compactionModel = provider.chatModel(compactionModelId);
-
+      // Build a Workers AI provider for compaction. The AI Gateway provides an
+      // OpenAI-compatible endpoint at {base}/workers-ai/v1 that accepts @cf/ model IDs.
       // Build the user message with conversation + optional previous summary
       const userParts: string[] = [];
       userParts.push("<conversation>");
@@ -2876,22 +2872,38 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       userParts.push("");
       userParts.push(previousSummary ? UPDATE_SUMMARY_PROMPT : STRUCTURED_SUMMARY_PROMPT);
 
-      const result = await generateText({
-        model: compactionModel,
-        messages: [
-          {
-            role: "system",
-            content: "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified. Do NOT continue the conversation. ONLY output the structured summary.",
-          },
-          {
-            role: "user",
-            content: userParts.join("\n"),
-          },
-        ],
-        maxOutputTokens: 1500,
-      });
+      const compactionMessages: Array<{ role: "system" | "user"; content: string }> = [
+        {
+          role: "system",
+          content: "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified. Do NOT continue the conversation. ONLY output the structured summary.",
+        },
+        {
+          role: "user",
+          content: userParts.join("\n"),
+        },
+      ];
 
-      let summary = result.text;
+      // Use Workers AI binding (free, fast) or fall back to session model via AI SDK.
+      let summary: string | undefined;
+      if (this.env.AI) {
+        const aiResult = await this.env.AI.run(COMPACTION_MODEL as BaseAiTextGenerationModels, {
+          messages: compactionMessages,
+          max_tokens: 1500,
+        });
+        summary = typeof aiResult === "string"
+          ? aiResult
+          : (aiResult as { response?: string }).response ?? "";
+      } else {
+        const appConfig = this.getAppConfigFromThink();
+        const provider = buildProvider(appConfig, this.env);
+        const fallbackModel = provider.chatModel(modelId);
+        const result = await generateText({
+          model: fallbackModel,
+          messages: compactionMessages,
+          maxOutputTokens: 1500,
+        });
+        summary = result.text;
+      }
       if (!summary || summary.length < 20) return;
 
       // Append cumulative file tracking tags
