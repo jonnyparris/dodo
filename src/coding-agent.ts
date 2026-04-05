@@ -765,14 +765,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           const shouldAutoContinue = (exitReason === "step-limit" || exitReason === "budget-limit");
           if (!shouldAutoContinue || signal?.aborted) break;
 
-          log("info", `own-loop: auto-continuation phase ${phase}/${MAX_CONTINUATION_PHASES}`, {
+          const phaseNum = phase + 1; // phase 1 = original, phase 2+ = continuations
+          log("info", `own-loop: auto-continuation phase ${phaseNum}`, {
             sessionId,
             step,
             exitReason,
             budgetUsage: `${Math.round((totalInputTokens / tokenBudget) * 100)}%`,
           });
 
-          yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Compacting context and continuing... (phase ${phase + 1})]\n\n` };
+          yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Compacting context and continuing... (phase ${phaseNum})]\n\n` };
 
           try {
             // ─── In-memory context truncation ───
@@ -787,6 +788,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
               const droppedCount = droppedMsgs.length;
               const droppedToolNames = new Set<string>();
+              const discoveredFiles = new Set<string>();
               const assistantTexts: string[] = [];
 
               for (const msg of droppedMsgs) {
@@ -795,6 +797,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                     if (part && typeof part === "object" && "type" in part) {
                       if (part.type === "tool-call" && "toolName" in part) {
                         droppedToolNames.add(String(part.toolName));
+                        // Extract file paths from tool-call arguments
+                        if ("input" in part && part.input && typeof part.input === "object") {
+                          const input = part.input as Record<string, unknown>;
+                          if (typeof input.path === "string" && input.path.length > 1) {
+                            discoveredFiles.add(input.path);
+                          }
+                        }
                       }
                       // Extract the model's text output (findings, plans, decisions)
                       if (part.type === "text" && "text" in part && typeof part.text === "string") {
@@ -804,31 +813,29 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                     }
                   }
                 }
-                // Also handle string content (system/user messages with findings)
-                if (msg.role === "assistant" && typeof msg.content === "string") {
-                  const text = msg.content.trim();
-                  if (text.length > 20) assistantTexts.push(text);
-                }
               }
 
               // Build a summary that preserves the model's key findings
               const toolsSummary = [...droppedToolNames].join(", ") || "none";
-              // Keep the last ~1000 chars of assistant text as a digest of findings
+              const filesList = discoveredFiles.size > 0
+                ? "\n\nFiles discovered in previous phases:\n" + [...discoveredFiles].join("\n")
+                : "";
               const findingsDigest = assistantTexts.length > 0
                 ? "\n\nKey findings from previous phases:\n" + assistantTexts.join("\n").slice(-1500)
                 : "";
 
               const summaryInjection: ModelMessage = {
                 role: "system" as const,
-                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${toolsSummary}. The task is not yet complete. Do NOT re-explore files you already found — use the findings below and the recent context to continue making edits.${findingsDigest}]`,
+                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${toolsSummary}. The task is not yet complete. Do NOT re-explore files you already found — use the file paths and findings below to continue making edits.${filesList}${findingsDigest}]`,
               };
 
               messages = [firstMsg, summaryInjection, ...recentMsgs];
-              log("info", `own-loop: phase ${phase + 1} context truncation`, {
+              log("info", `own-loop: phase ${phaseNum} context truncation`, {
                 sessionId,
                 originalCount: messages.length + droppedCount,
                 keptCount: messages.length,
                 droppedTools: [...droppedToolNames],
+                discoveredFiles: discoveredFiles.size,
                 findingsLength: findingsDigest.length,
               });
             }
