@@ -397,6 +397,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // and iterates it, forwarding chunks via the StreamCallback.
     return {
       async *toUIMessageStream() {
+        // ─── Assemble context once at the start ───
+        // Think's chat() persists the assistant message only AFTER this entire
+        // generator completes. So this.messages (and thus assembleContext()) is
+        // stale during the loop — it only has messages up to the user message,
+        // not any tool calls/results from previous iterations.
+        //
+        // We assemble once, then accumulate response messages (assistant + tool
+        // results) from each streamText() call so the model sees its own
+        // previous tool results on subsequent iterations.
+        let messages = await self.assembleContext();
+
         while (step < maxSteps) {
           if (signal?.aborted) break;
 
@@ -409,11 +420,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           if (step > 0) {
             yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
           }
-
-          // ─── Assemble fresh context each iteration ───
-          // This replaces the old prepareStep callback — assembleContext()
-          // already clears old tool results and applies token budget enforcement.
-          const messages = await self.assembleContext();
 
           // ─── Between-step injections ───
           const injections: ModelMessage[] = [];
@@ -502,18 +508,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // ─── Mid-loop compaction ───
           // If context usage is above threshold and we haven't compacted yet this turn,
           // trigger Think's compaction system to summarize older messages.
-          // After compaction, refresh this.messages so the next assembleContext() call
+          // After compaction, re-assemble the local messages array so it
           // picks up the compacted history (with the summary injected).
           if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered && step >= 3) {
             compactionTriggered = true;
             try {
               await self.maybeCompactContext();
-              // Refresh messages from the database so assembleContext() on the
-              // next iteration sees the compaction summary instead of the raw messages.
+              // Refresh messages from storage and re-assemble with compaction summary.
               const thinkSessionId = self.getCurrentSessionId();
               if (thinkSessionId) {
                 self.messages = self.sessions.getHistory(thinkSessionId);
               }
+              messages = await self.assembleContext();
               log("info", "own-loop: mid-loop compaction triggered", {
                 sessionId,
                 step,
@@ -603,13 +609,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
               try {
                 await self.maybeCompactContext({ force: true });
-                // Refresh messages so assembleContext() sees the compaction summary.
+                // Refresh messages from storage so we get the compaction summary.
                 const thinkSid = self.getCurrentSessionId();
                 if (thinkSid) {
                   self.messages = self.sessions.getHistory(thinkSid);
                 }
-                // After compaction, continue the loop — assembleContext() on next
-                // iteration will use the compacted context
+                // Re-assemble context after compaction to pick up the summary.
+                // This replaces the stale accumulated messages with freshly
+                // compacted ones.
+                messages = await self.assembleContext();
                 step++;
                 continue;
               } catch (compactionErr) {
@@ -630,6 +638,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           const usage = await (result as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
           cumulativeInputTokens += usage?.inputTokens ?? 0;
           cumulativeOutputTokens += usage?.outputTokens ?? 0;
+
+          // ─── Accumulate response messages for the next iteration ───
+          // streamText() returns response messages (assistant + tool results)
+          // that must be appended to the messages array so the model sees its
+          // own tool call results on subsequent iterations. Without this, each
+          // iteration would only see the original user message (because
+          // this.messages is not updated until Think's chat() finishes).
+          const response = await (result as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
+          if (response?.messages?.length) {
+            messages = [...messages, ...response.messages];
+          }
 
           // Track tool calls for doom loop detection
           const steps = await (result as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
