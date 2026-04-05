@@ -520,6 +520,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // Anthropic-specific providerOptions. Cache control will be enabled when/if
           // we switch to the native Anthropic provider.
           let result;
+          // Declared outside try so post-step bookkeeping can access them
+          let iterationText = "";
+          let chunkCount = 0;
+          let hasErrorChunk = false;
+          let errorText = "";
           try {
             result = streamText({
               model,
@@ -531,10 +536,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
             // Forward all chunks from this iteration to the caller.
             // Capture text emitted this iteration for repetition detection.
-            let iterationText = "";
-            let chunkCount = 0;
-            let hasErrorChunk = false;
-            let errorText = "";
             for await (const chunk of result.toUIMessageStream()) {
               yield chunk;
               chunkCount++;
