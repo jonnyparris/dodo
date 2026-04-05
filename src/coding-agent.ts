@@ -60,10 +60,9 @@ const COMPACTION_TRIGGER_PERCENT = 60;
 /** Fraction of messages to compact (from the oldest end). */
 const COMPACTION_MESSAGE_FRACTION = 0.5;
 /** Model to use for generating compaction summaries — cheap and fast. */
-// Use Workers AI Kimi K2.5 for compaction. Cheap (free tier on Workers AI),
-// fast, and large enough context for summarization. Routed through the AI Gateway
-// with the /workers-ai/v1 OpenAI-compatible endpoint.
-const COMPACTION_MODEL = "@cf/moonshotai/kimi-k2.5";
+// Use GPT-4.1-nano for compaction — cheapest model on the OpenCode gateway
+// ($0.10/M input, 30x cheaper than Sonnet). Falls back to session model if unavailable.
+const COMPACTION_MODEL = "openai/gpt-4.1-nano";
 
 /** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
 const CLEARED_MARKER = "[Old tool result content cleared]";
