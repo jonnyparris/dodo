@@ -124,10 +124,11 @@ const SYSTEM_PROMPT = [
   "",
   "## Workspace tools",
   "",
-  "You have 8 workspace tools for file operations:",
+  "You have workspace tools for file operations:",
   "",
   "| Tool | Purpose | Key params |",
   "|------|---------|------------|",
+  "| **explore** | Search agent for codebase discovery (~500 token result) | `query`, `scope` |",
   "| **read** | Read file contents | `path`, `offset`, `limit` (line numbers) |",
   "| **write** | Create or overwrite a file | `path`, `content` |",
   "| **edit** | Find-and-replace (unique match) | `path`, `old_string`, `new_string` |",
@@ -382,6 +383,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     let wrapUpInjected = false;
     let compactionTriggered = false;
     let consecutiveNoTextSteps = 0; // Track iterations where the model produces tool calls but no text
+    let exitReason: "natural" | "step-limit" | "budget-limit" | "doom-loop" | "no-text-loop" | "text-loop" | "abort" = "natural";
 
     // ─── Budget thresholds (% of tokenBudget) ───
     const WARN_THRESHOLD = 0.70;
@@ -390,6 +392,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     // ─── Doom loop detection ───
     const DOOM_LOOP_THRESHOLD = 3;
+    const NO_TEXT_LOOP_THRESHOLD = 8;
 
     // ─── Mid-loop compaction threshold ───
     const MID_LOOP_COMPACTION_THRESHOLD = 0.50; // Compact when >50% of budget used
@@ -412,7 +415,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         let messages = await self.assembleContext();
 
         while (step < maxSteps) {
-          if (signal?.aborted) break;
+          if (signal?.aborted) { exitReason = "abort"; break; }
 
           // ─── Newline separator between iterations ───
           // After a tool call, the model starts a new text response. Without
@@ -446,6 +449,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                     repeats: DOOM_LOOP_HARD_BREAK,
                   });
                   yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Stopped: repeated ${toolName} calls detected]\n\n` };
+                  exitReason = "doom-loop";
                   break;
                 }
               }
@@ -475,8 +479,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               tokenBudget,
               usage: `${Math.round(budgetUsage * 100)}%`,
             });
-            // Inject a forced wrap-up as if the model said it
-            // The model won't see this — we just break the loop
+            exitReason = "budget-limit";
             break;
           }
 
@@ -686,6 +689,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                   repeatedText: textPrefix.slice(0, 60),
                   repeats: DOOM_LOOP_THRESHOLD,
                 });
+                exitReason = "text-loop";
                 break;
               }
             }
@@ -696,7 +700,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // identical-call detector) and produces no meaningful text (evading the
           // text-repetition detector). If the model makes tool calls without any
           // text for too many consecutive iterations, it's stuck exploring.
-          const NO_TEXT_LOOP_THRESHOLD = 8;
           if (textPrefix.length <= 10 && lastStep?.toolCalls?.length) {
             consecutiveNoTextSteps++;
             if (consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
@@ -708,6 +711,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               });
               // Inject a final message asking the model to summarize
               yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Loop detected — summarizing progress so far]\n\n" };
+              exitReason = "no-text-loop";
               break;
             }
           } else {
@@ -733,22 +737,23 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           step++;
         }
 
-        // ─── Auto-continuation ───
-        // If we exited because we hit maxSteps or budget limits while the model
-        // was still making tool calls, compact and continue automatically instead
-        // of forcing the user to say "continue".
-        const budgetUsageAtExit = cumulativeInputTokens / tokenBudget;
-        const hitStepLimit = step >= maxSteps;
-        const hitBudgetLimit = budgetUsageAtExit >= HARD_STOP_THRESHOLD;
-        const wasStillWorking = hitStepLimit || hitBudgetLimit;
+        // Tag step-limit exit (while condition failed)
+        if (step >= maxSteps && exitReason === "natural") {
+          exitReason = "step-limit";
+        }
 
-        if (wasStillWorking && !signal?.aborted) {
+        // ─── Auto-continuation ───
+        // Only trigger when the loop ended due to resource limits (step or budget),
+        // NOT when it ended due to loop detection (doom loop, text repetition,
+        // no-text loop) — those indicate the model is stuck, not productive.
+        const shouldAutoContinue = (exitReason === "step-limit" || exitReason === "budget-limit");
+
+        if (shouldAutoContinue && !signal?.aborted) {
           log("info", "own-loop: auto-continuation triggered", {
             sessionId,
             step,
-            hitStepLimit,
-            hitBudgetLimit,
-            budgetUsage: `${Math.round(budgetUsageAtExit * 100)}%`,
+            exitReason,
+            budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
           });
 
           yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Compacting context and continuing...]\n\n" };
@@ -775,14 +780,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             // Inject a continuation prompt so the model knows to keep going
             const continuationInjection: ModelMessage = {
               role: "user" as const,
-              content: [{ type: "text" as const, text: "[auto-continue] Your previous turn was cut short by context limits. The conversation has been compacted. Continue where you left off — review the summary above and proceed with the task." }],
+              content: "[auto-continue] Your previous turn was cut short by context limits. The conversation has been compacted. Continue where you left off — review the summary above and proceed with the task.",
             };
             messages = [...messages, continuationInjection];
 
-            // Run a second phase with the remaining step budget
-            const remainingSteps = maxSteps;
+            // Run a second phase with a full step budget (context was compacted)
+            const phase2MaxSteps = maxSteps;
             let phase2Step = 0;
-            while (phase2Step < remainingSteps) {
+            const p2RecentToolCalls: string[] = [];
+            const p2RecentTextPrefixes: string[] = [];
+            let p2ConsecutiveNoTextSteps = 0;
+
+            while (phase2Step < phase2MaxSteps) {
               if (signal?.aborted) break;
 
               if (phase2Step > 0) {
@@ -799,9 +808,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               if (phase2BudgetUsage >= WRAP_UP_THRESHOLD && !wrapUpInjected) {
                 phase2Injections.push({
                   role: "system" as const,
-                  content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop.",
+                  content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop. Do not read new files or start new tasks. Complete your current thought and wrap up.",
                 });
                 wrapUpInjected = true;
+              }
+
+              // Phase 2 doom loop detection
+              if (p2RecentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
+                const lastN = p2RecentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
+                if (lastN.every(c => c === lastN[0])) {
+                  log("warn", "own-loop: phase2 doom loop — breaking", {
+                    sessionId,
+                    step: phase2Step,
+                    toolName: lastN[0].split(":")[0],
+                  });
+                  break;
+                }
               }
 
               const finalMessages = phase2Injections.length > 0
@@ -847,6 +869,46 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 messages = [...messages, ...p2Response.messages];
               }
 
+              // Track tool calls for phase 2 loop detection
+              const p2Steps = await (p2Result as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
+              const p2LastStep = p2Steps?.[p2Steps.length - 1];
+              if (p2LastStep?.toolCalls?.length) {
+                for (const tc of p2LastStep.toolCalls) {
+                  p2RecentToolCalls.push(`${tc.toolName}:${JSON.stringify(tc.input)}`);
+                }
+                if (p2RecentToolCalls.length > DOOM_LOOP_THRESHOLD * 2) {
+                  p2RecentToolCalls.splice(0, p2RecentToolCalls.length - DOOM_LOOP_THRESHOLD * 2);
+                }
+              }
+
+              // Phase 2 text repetition detection
+              const p2TextPrefix = p2Text.trim().slice(0, 80);
+              if (p2TextPrefix.length > 10) {
+                p2RecentTextPrefixes.push(p2TextPrefix);
+                if (p2RecentTextPrefixes.length > DOOM_LOOP_THRESHOLD * 2) {
+                  p2RecentTextPrefixes.splice(0, p2RecentTextPrefixes.length - DOOM_LOOP_THRESHOLD * 2);
+                }
+                if (p2RecentTextPrefixes.length >= DOOM_LOOP_THRESHOLD) {
+                  const lastN = p2RecentTextPrefixes.slice(-DOOM_LOOP_THRESHOLD);
+                  if (lastN.every(t => t === lastN[0])) {
+                    log("warn", "own-loop: phase2 text repetition loop — breaking", { sessionId, step: phase2Step });
+                    break;
+                  }
+                }
+              }
+
+              // Phase 2 no-text loop detection
+              if (p2TextPrefix.length <= 10 && p2LastStep?.toolCalls?.length) {
+                p2ConsecutiveNoTextSteps++;
+                if (p2ConsecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
+                  log("warn", "own-loop: phase2 no-text loop — breaking", { sessionId, step: phase2Step });
+                  yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Loop detected — summarizing progress so far]\n\n" };
+                  break;
+                }
+              } else {
+                p2ConsecutiveNoTextSteps = 0;
+              }
+
               const p2FinishReason = await (p2Result as unknown as { finishReason: PromiseLike<string> }).finishReason;
 
               log("info", "own-loop: phase2 step complete", {
@@ -854,6 +916,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 step: phase2Step,
                 finishReason: p2FinishReason,
                 budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
+                toolCalls: p2LastStep?.toolCalls?.map(tc => tc.toolName) ?? [],
               });
 
               if (p2FinishReason !== "tool-calls") break;
