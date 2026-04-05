@@ -2897,6 +2897,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           maxOutputTokens: 2048,
         });
         summary = result.text;
+        if (summary) {
+          log("info", "compaction: summary generated", {
+            sessionId: this.sessionId(),
+            model: COMPACTION_MODEL,
+            summaryChars: summary.length,
+          });
+        }
       } catch (compactionErr) {
         compactionModelUsed = modelId;
         log("warn", "compaction: primary model failed, falling back to session model", {
@@ -2925,7 +2932,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         summary += `\n\n<modified-files>\n${modFileList.join("\n")}\n</modified-files>`;
       }
 
-      // Tag summary with model used (visible via debug endpoint / model quoting)
+      // Tag summary with model used (for diagnostics via debug endpoint)
       summary += `\n\n<!-- compaction-model: ${compactionModelUsed} -->`;
 
       this.sessions.addCompaction(thinkSessionId, summary, fromMessageId, toMessageId);
@@ -2933,8 +2940,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         sessionId: this.sessionId(),
         compactedMessages: compactCount,
         usagePercent,
-        model: compactionModelUsed,
         summaryChars: summary.length,
+        model: compactionModelUsed,
         readFiles: readFileList.length,
         modifiedFiles: modFileList.length,
         iterative: !!previousSummary,
