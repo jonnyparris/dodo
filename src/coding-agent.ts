@@ -115,9 +115,9 @@ const SYSTEM_PROMPT = [
   "When the user asks you to build or modify code:",
   "",
   "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task. This avoids re-discovering context that was already captured.",
-  "2. **Discover before reading.** Use `list`, `find`, or `grep` to locate files before reading them.",
-  "3. **Read before writing.** Always read a file before editing it. Understand existing code before suggesting changes.",
-  "4. **Plan multi-step work.** For non-trivial tasks, outline your approach before diving in.",
+  "2. **Use `explore` for discovery.** When you need to understand how a feature works, find where something is defined, or locate relevant files — ALWAYS use the `explore` tool first. It runs a search agent in a separate context window and returns a compact summary (~500 tokens) instead of raw file contents (~5-20k tokens). This is critical: reading files directly for discovery will exhaust your context budget before you can make any edits.",
+  "3. **Read only what you need.** After `explore` tells you which files and lines are relevant, use `read` with `offset`/`limit` to fetch only the specific sections you need to edit. Never read entire large files.",
+  "4. **Plan, then edit.** For non-trivial tasks, state your plan in one short paragraph, then execute. Don't narrate each step.",
   "5. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
   "6. **Delete unused code.** No commented-out code, no `_unused` renames.",
   "7. **Be security-conscious.** Never commit secrets or credentials.",
@@ -137,15 +137,16 @@ const SYSTEM_PROMPT = [
   "| **grep** | Search file contents by regex | `query`, `include` (glob filter) |",
   "| **delete** | Remove a file or directory | `path`, `recursive` |",
   "",
-  "### Token-efficient file operations",
+  "### Token budget",
   "",
-  "- **Use `explore` for open-ended search.** When you need to find where something is defined, locate files matching a pattern, or understand how a feature is implemented, use the `explore` tool. It runs an autonomous search agent in a separate context window and returns a compact summary — much cheaper than reading files directly.",
-  "- **Use direct tools for targeted operations.** If you already know the file path or need to make edits, use `read`, `edit`, `grep` etc. directly. `explore` is for discovery, not for files you already know about.",
-  "- **Use `read` with `offset` and `limit`** for large files. Don't read a 2000-line file if you only need lines 50-80.",
-  "- **Use `edit` instead of `write`** for targeted changes. Rewriting an entire file wastes context tokens.",
-  "- **Use `grep` to find specific lines** before reading. `grep` returns matches with line numbers — use those to read the exact range.",
-  "- **Never read the same file twice** unless it may have changed (you edited it, or significant time passed).",
-  "- **Avoid reading generated/lock files** (package-lock.json, *.min.js, *.map) — they are large and low-value.",
+  "Your context window is shared across all tool calls in a single prompt. Every file you read, every tool result — it all accumulates. If you exhaust the budget on reading, you won't have room to edit.",
+  "",
+  "- **`explore` first, `read` second.** Use `explore` for any question about the codebase (where is X defined? how does Y work?). Use `read` only for the specific lines you need to edit.",
+  "- **Use `read` with `offset` and `limit`.** Don't read a 2000-line file if you only need lines 50-80.",
+  "- **Use `edit` instead of `write`** for targeted changes. Rewriting an entire file wastes context.",
+  "- **Use `grep` to find specific lines** before reading. It returns line numbers — use those to read the exact range.",
+  "- **Never read the same file twice** unless it changed.",
+  "- **Avoid generated/lock files** (package-lock.json, *.min.js, *.map).",
   "",
   "## Code execution",
   "",
@@ -730,6 +731,141 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           if (finishReason !== "tool-calls") break;
 
           step++;
+        }
+
+        // ─── Auto-continuation ───
+        // If we exited because we hit maxSteps or budget limits while the model
+        // was still making tool calls, compact and continue automatically instead
+        // of forcing the user to say "continue".
+        const budgetUsageAtExit = cumulativeInputTokens / tokenBudget;
+        const hitStepLimit = step >= maxSteps;
+        const hitBudgetLimit = budgetUsageAtExit >= HARD_STOP_THRESHOLD;
+        const wasStillWorking = hitStepLimit || hitBudgetLimit;
+
+        if (wasStillWorking && !signal?.aborted) {
+          log("info", "own-loop: auto-continuation triggered", {
+            sessionId,
+            step,
+            hitStepLimit,
+            hitBudgetLimit,
+            budgetUsage: `${Math.round(budgetUsageAtExit * 100)}%`,
+          });
+
+          yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Compacting context and continuing...]\n\n" };
+
+          // Force compaction to summarize what's been done so far
+          try {
+            await self.maybeCompactContext({ force: true });
+            const thinkSid = self.getCurrentSessionId();
+            if (thinkSid) {
+              self.messages = self.sessions.getHistory(thinkSid);
+            }
+            messages = await self.assembleContext();
+
+            // Reset budget tracking for the continuation phase
+            cumulativeInputTokens = 0;
+            cumulativeOutputTokens = 0;
+            warnInjected = false;
+            wrapUpInjected = false;
+            compactionTriggered = false;
+            consecutiveNoTextSteps = 0;
+            recentToolCalls.length = 0;
+            recentTextPrefixes.length = 0;
+
+            // Inject a continuation prompt so the model knows to keep going
+            const continuationInjection: ModelMessage = {
+              role: "user" as const,
+              content: [{ type: "text" as const, text: "[auto-continue] Your previous turn was cut short by context limits. The conversation has been compacted. Continue where you left off — review the summary above and proceed with the task." }],
+            };
+            messages = [...messages, continuationInjection];
+
+            // Run a second phase with the remaining step budget
+            const remainingSteps = maxSteps;
+            let phase2Step = 0;
+            while (phase2Step < remainingSteps) {
+              if (signal?.aborted) break;
+
+              if (phase2Step > 0) {
+                yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
+              }
+
+              const phase2Injections: ModelMessage[] = [];
+              const phase2BudgetUsage = cumulativeInputTokens / tokenBudget;
+
+              if (phase2BudgetUsage >= HARD_STOP_THRESHOLD) {
+                log("warn", "own-loop: phase2 hard stop", { sessionId, step: phase2Step });
+                break;
+              }
+              if (phase2BudgetUsage >= WRAP_UP_THRESHOLD && !wrapUpInjected) {
+                phase2Injections.push({
+                  role: "system" as const,
+                  content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop.",
+                });
+                wrapUpInjected = true;
+              }
+
+              const finalMessages = phase2Injections.length > 0
+                ? [...messages, ...phase2Injections]
+                : messages;
+
+              let p2Result;
+              let p2Text = "";
+              try {
+                p2Result = streamText({
+                  model,
+                  system,
+                  messages: finalMessages,
+                  tools,
+                  abortSignal: signal,
+                });
+
+                for await (const chunk of p2Result.toUIMessageStream()) {
+                  yield chunk;
+                  const c = chunk as { type?: string; delta?: string };
+                  if (c.type === "text-delta" && c.delta) {
+                    p2Text += c.delta;
+                  }
+                }
+              } catch (err) {
+                const errMsg = err instanceof Error ? err.message : String(err);
+                const isOverflow = /context.*(length|limit|overflow|window|too long|exceed)/i.test(errMsg)
+                  || /max.*token/i.test(errMsg)
+                  || /request too large/i.test(errMsg);
+                if (isOverflow) {
+                  log("warn", "own-loop: phase2 overflow — stopping", { sessionId });
+                  break;
+                }
+                throw err;
+              }
+
+              const p2Usage = await (p2Result as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
+              cumulativeInputTokens += p2Usage?.inputTokens ?? 0;
+              cumulativeOutputTokens += p2Usage?.outputTokens ?? 0;
+
+              const p2Response = await (p2Result as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
+              if (p2Response?.messages?.length) {
+                messages = [...messages, ...p2Response.messages];
+              }
+
+              const p2FinishReason = await (p2Result as unknown as { finishReason: PromiseLike<string> }).finishReason;
+
+              log("info", "own-loop: phase2 step complete", {
+                sessionId,
+                step: phase2Step,
+                finishReason: p2FinishReason,
+                budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
+              });
+
+              if (p2FinishReason !== "tool-calls") break;
+              phase2Step++;
+            }
+          } catch (err) {
+            log("warn", "own-loop: auto-continuation failed", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Auto-continuation failed — send 'continue' to resume manually]\n\n" };
+          }
         }
 
         // ─── Store cumulative usage for runThinkChat to read ───
