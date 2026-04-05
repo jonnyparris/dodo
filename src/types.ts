@@ -1,4 +1,5 @@
 export interface Env {
+  AI?: Ai;
   AI_GATEWAY_BASE_URL: string;
   AI_GATEWAY_KEY?: string;
   ALLOW_UNAUTHENTICATED_DEV?: string;
