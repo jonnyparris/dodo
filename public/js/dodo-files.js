@@ -76,10 +76,50 @@ async function deleteMemory(id){await apiSafe(`/api/memory/${encodeURIComponent(
 // --- Git ---
 async function refreshGit(){
   if(!currentSession){$("git-status-display").innerHTML="";$("git-log-display").innerHTML="";return}
-  try{const{entries}=await api(`/session/${currentSession}/git/status`);$("git-status-display").innerHTML=entries.length?entries.map(e=>`<div style="font-size:11px;font-family:var(--mono)">${esc(e.status)} ${esc(e.filepath)}</div>`).join(""):'<div class="empty">Clean or no repo</div>'}catch{$("git-status-display").innerHTML='<div class="empty">No repo</div>'}
+  try{
+    const{entries}=await api(`/session/${currentSession}/git/status`);
+    // Filter out false "untracked" files: after clone, isomorphic-git's statusMatrix
+    // may report all files as "new, untracked" (HEAD=0, workdir=2, stage=0) due to
+    // a workspace filesystem adapter issue. If ALL entries are "new, untracked",
+    // it's almost certainly a false positive — show as clean instead.
+    const meaningful=entries.filter(e=>e.status!=="new, untracked");
+    const allUntracked=entries.length>0&&meaningful.length===0;
+    const display=allUntracked?[]:entries;
+    const el=$("git-status-display");
+    // Make scrollable when the file list is long
+    el.style.maxHeight=display.length>10?"200px":"";
+    el.style.overflowY=display.length>10?"auto":"";
+    el.innerHTML=display.length?display.map(e=>`<div style="font-size:11px;font-family:var(--mono)">${esc(e.status)} ${esc(e.filepath)}</div>`).join(""):'<div class="empty">Clean or no repo</div>'
+  }catch{$("git-status-display").innerHTML='<div class="empty">No repo</div>'}
   // Load recent commits
-  try{const{entries}=await api(`/session/${currentSession}/git/log?depth=10`);const el=$("git-log-display");if(!el)return;el.innerHTML=entries&&entries.length?`<details open><summary style="font-size:12px;font-weight:600;cursor:pointer;margin-bottom:4px">Recent commits</summary>${entries.map(e=>{const short=(e.oid||'').slice(0,7);const msg=esc((e.commit?.message||'').split('\n')[0].slice(0,60));const author=esc(e.commit?.author?.name||'');const date=e.commit?.author?.timestamp?new Date(e.commit.author.timestamp*1000).toLocaleDateString('en-GB',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}):'';return`<div style="font-size:11px;font-family:var(--mono);padding:2px 0;display:flex;gap:6px;align-items:baseline"><code style="color:var(--accent);flex-shrink:0">${short}</code><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${msg}</span><span style="color:var(--muted);flex-shrink:0;font-size:10px">${date}</span></div>`}).join('')}</details>`:''
+  try{
+    const{entries}=await api(`/session/${currentSession}/git/log?depth=10`);
+    const el=$("git-log-display");if(!el)return;
+    // Resolve the remote URL to build commit links (fire-and-forget, cached)
+    if(!_gitRemoteUrlCache&&entries&&entries.length){
+      jsonSafe(`/session/${currentSession}/git/remote`,{list:true}).then(r=>{
+        if(Array.isArray(r)){const origin=r.find(x=>x.remote==='origin');if(origin)_gitRemoteUrlCache=origin.url;refreshGitLog(entries)}
+      }).catch(()=>{})
+    }
+    refreshGitLog(entries);
   }catch{/* no repo or no commits — git-log-display stays empty */}
+}
+let _gitRemoteUrlCache='';
+function refreshGitLog(entries){
+  const el=$("git-log-display");if(!el)return;
+  const commitBaseUrl=_gitCommitUrl(_gitRemoteUrlCache);
+  el.innerHTML=entries&&entries.length?`<details open><summary style="font-size:12px;font-weight:600;cursor:pointer;margin-bottom:4px">Recent commits</summary>${entries.map(e=>{const short=(e.oid||'').slice(0,7);const fullOid=e.oid||'';const msg=esc((e.commit?.message||'').split('\n')[0].slice(0,60));const date=e.commit?.author?.timestamp?new Date(e.commit.author.timestamp*1000).toLocaleDateString('en-GB',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}):'';const commitUrl=commitBaseUrl?commitBaseUrl+fullOid:'';const oidHtml=commitUrl?`<a href="${esc(commitUrl)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;flex-shrink:0" title="Open commit">${short}</a>`:`<code style="color:var(--accent);flex-shrink:0">${short}</code>`;return`<div style="font-size:11px;font-family:var(--mono);padding:2px 0;display:flex;gap:6px;align-items:baseline">${oidHtml}<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${msg}</span><span style="color:var(--muted);flex-shrink:0;font-size:10px">${date}</span></div>`}).join('')}</details>`:''
+}
+// Convert a git remote URL to a commit URL base (e.g. https://github.com/owner/repo/commit/)
+function _gitCommitUrl(remoteUrl){
+  if(!remoteUrl)return'';
+  // HTTPS: https://github.com/owner/repo.git or https://github.com/owner/repo
+  let m=remoteUrl.match(/https?:\/\/(github\.com|gitlab\.com|gitlab\.[^/]+)\/(.+?)(?:\.git)?$/);
+  if(m)return`https://${m[1]}/${m[2]}/commit/`;
+  // SSH: git@github.com:owner/repo.git
+  m=remoteUrl.match(/git@(github\.com|gitlab\.com|gitlab\.[^:]+):(.+?)(?:\.git)?$/);
+  if(m)return`https://${m[1]}/${m[2]}/commit/`;
+  return'';
 }
 async function gitInit(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/git/init`,{});await refreshGit()}
 async function gitAddAll(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/git/add`,{filepath:"."});await refreshGit()}

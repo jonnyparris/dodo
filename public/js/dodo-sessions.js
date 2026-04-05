@@ -20,7 +20,7 @@ function filterSessions(query){
 }
 async function createSession(){const d=await jsonSafe("/session",{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
 async function selectSession(id){
-  currentSession=id;setProcessing(false);history.replaceState(null,"",`#session=${id}`);
+  currentSession=id;setProcessing(false);_gitRemoteUrlCache='';history.replaceState(null,"",`#session=${id}`);
   $("chat").innerHTML="";$("onboarding")?.remove();
   const cw=$("context-warning");if(cw)cw.style.display="none";
   showSkeleton($("chat"),5);
