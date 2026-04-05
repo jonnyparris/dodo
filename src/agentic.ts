@@ -564,6 +564,28 @@ function buildTools(
   // Wrap with output caps to prevent large results from entering the message history
   Object.assign(tools, capToolOutputs(workspaceTools));
 
+  // Replace-all tool — complements the edit tool for bulk string replacements.
+  // The edit tool requires a unique old_string match (fails on duplicates).
+  // This tool replaces ALL occurrences, which is useful for renaming variables,
+  // fixing repeated patterns in minified files, or updating imports.
+  tools.replace_all = tool({
+    description: "Replace ALL occurrences of a string in a file. Unlike edit (which requires a unique match), this replaces every occurrence. Use for renaming variables, updating repeated patterns, or fixing minified files where the same substring appears multiple times.",
+    inputSchema: z.object({
+      path: z.string().describe("Absolute path to the file"),
+      old_string: z.string().min(1).describe("Exact text to find (all occurrences will be replaced)"),
+      new_string: z.string().describe("Replacement text"),
+    }),
+    execute: async ({ path, old_string, new_string }: { path: string; old_string: string; new_string: string }) => {
+      const content = await workspace.readFile(path);
+      if (content === null) return { error: `File not found: ${path}` };
+      if (!content.includes(old_string)) return { error: "old_string not found in file. Read the file first to verify the exact text." };
+      const count = content.split(old_string).length - 1;
+      const newContent = content.replaceAll(old_string, new_string);
+      await workspace.writeFile(path, newContent);
+      return { path, replacements: count, old_string, new_string };
+    },
+  });
+
   // Git tools — always available as top-level tools
   Object.assign(tools, gitTools);
 
