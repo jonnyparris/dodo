@@ -396,6 +396,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         while (step < maxSteps) {
           if (signal?.aborted) break;
 
+          // ─── Newline separator between iterations ───
+          // After a tool call, the model starts a new text response. Without
+          // a separator, the new text gets concatenated directly to the previous
+          // text, creating an unreadable wall of text (e.g. "Let me explore...Let me explore...").
+          // Yield a synthetic text-delta chunk so the separator flows through
+          // Think's callback and gets appended to fullText and the SSE stream.
+          if (step > 0) {
+            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
+          }
+
           // ─── Assemble fresh context each iteration ───
           // This replaces the old prepareStep callback — assembleContext()
           // already clears old tool results and applies token budget enforcement.
