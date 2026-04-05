@@ -560,9 +560,13 @@ function buildTools(
     });
   }
 
-  // Workspace tools — available as top-level tools alongside codemode
-  // Wrap with output caps to prevent large results from entering the message history
-  Object.assign(tools, capToolOutputs(workspaceTools));
+  // Workspace tools — available as top-level tools alongside codemode.
+  // `list` and `find` are excluded from the top-level set to prevent the
+  // model from using them for open-ended discovery (which fills the context
+  // window with raw file listings). They remain available inside the
+  // `explore` subagent where they run in a separate context window.
+  const { list: _list, find: _find, ...topLevelWsTools } = workspaceTools;
+  Object.assign(tools, capToolOutputs(topLevelWsTools));
 
   // Replace-all tool — complements the edit tool for bulk string replacements.
   // The edit tool requires a unique old_string match (fails on duplicates).
