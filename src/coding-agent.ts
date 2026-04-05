@@ -532,12 +532,36 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             // Forward all chunks from this iteration to the caller.
             // Capture text emitted this iteration for repetition detection.
             let iterationText = "";
+            let chunkCount = 0;
+            let hasErrorChunk = false;
+            let errorText = "";
             for await (const chunk of result.toUIMessageStream()) {
               yield chunk;
-              const c = chunk as { type?: string; delta?: string };
+              chunkCount++;
+              const c = chunk as { type?: string; delta?: string; errorText?: string; error?: string };
               if (c.type === "text-delta" && c.delta) {
                 iterationText += c.delta;
+              } else if (c.type === "error") {
+                hasErrorChunk = true;
+                errorText = c.errorText ?? c.error ?? "unknown";
               }
+            }
+
+            // Log diagnostic info when the stream produced no content
+            if (!iterationText && chunkCount === 0) {
+              log("warn", "own-loop: LLM stream produced zero chunks", {
+                sessionId,
+                step,
+                model: modelId,
+              });
+            } else if (hasErrorChunk) {
+              log("warn", "own-loop: LLM stream contained error chunk", {
+                sessionId,
+                step,
+                model: modelId,
+                errorText: errorText.slice(0, 500),
+                chunkCount,
+              });
             }
           } catch (err) {
             // ─── Overflow recovery ───
@@ -2174,6 +2198,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     try {
       const result = await this.runThinkChat(input.content, { authorEmail: authorEmail ?? undefined });
 
+      // Guard: treat empty LLM response as a failure (same as runFiberPrompt)
+      if (!result.text && !result.assistantMessageId) {
+        const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
+        this.writeMetadata("status", "idle");
+        await this.syncSessionIndex({ status: "idle", title });
+        this.emitEvent({ data: { message }, type: "error_message" });
+        this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+        return Response.json({ error: message, sessionId }, { status: 502 });
+      }
+
       const config = this.getConfig();
       const assistantRecord = uiMessageToChatRecord(
         { id: result.assistantMessageId, role: "assistant", parts: [{ type: "text", text: result.text }] },
@@ -2606,6 +2641,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Track assistant response metadata
     let assistantMessageId = "";
     let fullText = "";
+    let streamError: string | null = null;
 
     const callback: StreamCallback = {
       onEvent: (json: string) => {
@@ -2621,6 +2657,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               data: { code: chunk.args ?? "", result: chunk.toolCallId },
               type: "tool_call",
             });
+          } else if (chunk.type === "error") {
+            // AI SDK emits { type: "error", errorText: "..." } when the gateway
+            // returns an error. Think's applyChunkToParts silently drops these.
+            // Capture so we can throw after the stream ends.
+            streamError = chunk.errorText ?? chunk.error ?? "Unknown LLM error";
+            console.error("[runThinkChat] stream error chunk:", streamError);
           }
           // Token usage is captured via onChatMessage() override — see _lastUsage.
         } catch {
@@ -2642,10 +2684,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       },
       onError: (error: string) => {
         console.error("Think chat error:", error);
+        streamError = error;
       },
     };
 
     await this.chat(userMsg, callback, { signal: options?.signal });
+
+    // If the stream contained an error chunk that Think silently dropped,
+    // throw it so the caller (runFiberPrompt) can surface it properly.
+    if (streamError && !fullText) {
+      throw new Error(streamError);
+    }
 
     // Get config for provider info
     const config = this.getConfig();
