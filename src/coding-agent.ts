@@ -407,6 +407,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const DOOM_LOOP_THRESHOLD = 3;
     const NO_TEXT_LOOP_THRESHOLD = 15;
     const NO_TEXT_GRACE_STEPS = 10; // Skip no-text detection for the first N steps (exploration phase)
+    // OpenAI/Google/DeepSeek models work silently (tool calls without text narration).
+    // The no-text detector is only useful for Anthropic models where silence means stuck.
+    const noTextDetectionEnabled = modelId.startsWith("anthropic/");
 
     // ─── Mid-loop compaction threshold ───
     const MID_LOOP_COMPACTION_THRESHOLD = 0.50; // Compact when >50% of budget used
@@ -714,7 +717,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // identical-call detector) and produces no meaningful text (evading the
           // text-repetition detector). If the model makes tool calls without any
           // text for too many consecutive iterations, it's stuck exploring.
-          if (textPrefix.length <= 10 && lastStep?.toolCalls?.length) {
+          if (noTextDetectionEnabled && textPrefix.length <= 10 && lastStep?.toolCalls?.length) {
             consecutiveNoTextSteps++;
             if (step >= NO_TEXT_GRACE_STEPS && consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
               log("warn", "no-text tool-call loop detected — breaking", {
@@ -990,8 +993,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 }
               }
 
-              // No-text loop detection (grace period applies to continuation phases too)
-              if (phTextPrefix.length <= 10 && phLastStep?.toolCalls?.length) {
+              // No-text loop detection (only for Anthropic; OpenAI/Google work silently)
+              if (noTextDetectionEnabled && phTextPrefix.length <= 10 && phLastStep?.toolCalls?.length) {
                 consecutiveNoTextSteps++;
                 if (step >= NO_TEXT_GRACE_STEPS && consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
                   log("warn", `own-loop: phase ${phaseNum} no-text loop`, { sessionId, step });
