@@ -60,9 +60,9 @@ const COMPACTION_TRIGGER_PERCENT = 60;
 /** Fraction of messages to compact (from the oldest end). */
 const COMPACTION_MESSAGE_FRACTION = 0.5;
 /** Model to use for generating compaction summaries — cheap and fast. */
-// Use GPT-4.1-nano for compaction — cheapest model on the OpenCode gateway
-// ($0.10/M input, 30x cheaper than Sonnet). Falls back to session model if unavailable.
-const COMPACTION_MODEL = "openai/gpt-4.1-nano";
+// Use Haiku 4.5 for compaction — fast, cheap ($1/M input, 3x cheaper than Sonnet),
+// and good at structured summarization. Falls back to session model if unavailable.
+const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
 
 /** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
 const CLEARED_MARKER = "[Old tool result content cleared]";
