@@ -114,10 +114,21 @@ const SYSTEM_PROMPT = [
   "",
   "When the user asks you to build or modify code:",
   "",
-  "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task. This avoids re-discovering context that was already captured.",
-  "2. **Use `explore` for discovery.** When you need to understand how a feature works, find where something is defined, or locate relevant files — ALWAYS use the `explore` tool first. It runs a search agent in a separate context window and returns a compact summary instead of raw file contents (~5-20k tokens). This is critical: reading files directly for discovery will exhaust your context budget before you can make any edits.",
-  "3. **Read only what you need.** After `explore` tells you which files and lines are relevant, use `read` with `offset`/`limit` to fetch only the specific sections you need to edit. Never read entire large files.",
-  "4. **Plan, then edit.** For non-trivial tasks, state your plan in one short paragraph, then execute. Don't narrate each step.",
+  "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task.",
+  "2. **Use `explore` for ALL codebase discovery.** CRITICAL: when you need to find where something is defined, understand how a feature works, or locate relevant files — you MUST use the `explore` tool. Do NOT use `read`, `list`, `find`, or `grep` for open-ended exploration. `explore` runs a search agent in a separate context window and returns a compact summary. Using direct tools for discovery will exhaust your context budget before you can make any edits.",
+  "",
+  "   Examples of when to use `explore`:",
+  "   - 'Where is the config schema defined?' → `explore`",
+  "   - 'How does the settings UI work?' → `explore`",
+  "   - 'Find all files related to git author' → `explore`",
+  "",
+  "   Examples of when to use direct tools:",
+  "   - You already know the file and line numbers → `read` with offset/limit",
+  "   - You need to make an edit → `edit`",
+  "   - You need to search for a specific string → `grep`",
+  "",
+  "3. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
+  "4. **Plan, then edit.** State your plan in one short paragraph, then execute. Don't narrate each step.",
   "5. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
   "6. **Delete unused code.** No commented-out code, no `_unused` renames.",
   "7. **Be security-conscious.** Never commit secrets or credentials.",
@@ -177,7 +188,7 @@ const SYSTEM_PROMPT = [
   "",
   "**Every tool result stays in your context window.** This is the most important constraint.",
   "",
-  "- You have a limited number of tool-call steps per prompt. Plan efficiently — prefer targeted reads over exploring entire directories.",
+  "- Your context budget is limited. Plan efficiently — use `explore` for discovery, then targeted reads for edits.",
   "- Large outputs are automatically truncated. If you see `[truncated]`, use `read` with `offset`/`limit` to get the specific portion you need.",
   "- The workspace is ephemeral per session. Clone repos to get their contents.",
   "- If the user switches topics, suggest a fresh session to keep context clean.",
@@ -1037,10 +1048,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   override getMaxSteps(): number {
-    // Safety net for the own-loop. The loop also respects token budget
-    // thresholds (warn → wrap-up → hard stop) which typically stop
-    // execution before reaching the step limit.
-    return 15;
+    // High safety net — the token budget thresholds (warn at 70%,
+    // wrap-up at 85%, hard stop at 95%) are the real limiting factor.
+    // This just prevents truly runaway loops if budget tracking fails.
+    return 200;
   }
 
   /**
