@@ -130,8 +130,9 @@ const SYSTEM_PROMPT = [
   "3. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
   "4. **Plan, then edit.** State your plan in one short paragraph, then execute. Don't narrate each step.",
   "5. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
-  "6. **Delete unused code.** No commented-out code, no `_unused` renames.",
-  "7. **Be security-conscious.** Never commit secrets or credentials.",
+  "6. **Commit completed work only.** When you commit, each commit should represent a coherent, working chunk of functionality. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
+  "7. **Delete unused code.** No commented-out code, no `_unused` renames.",
+  "8. **Be security-conscious.** Never commit secrets or credentials.",
   "",
   "## Workspace tools",
   "",
@@ -751,40 +752,35 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           exitReason = "step-limit";
         }
 
-        // ─── Auto-continuation ───
-        // Only trigger when the loop ended due to resource limits (step or budget),
-        // NOT when it ended due to loop detection (doom loop, text repetition,
-        // no-text loop) — those indicate the model is stuck, not productive.
-        const shouldAutoContinue = (exitReason === "step-limit" || exitReason === "budget-limit");
+        // ─── Multi-phase auto-continuation ───
+        // When the loop ends due to resource limits (step or budget), truncate
+        // context in-memory and start a new phase. Repeats up to MAX_PHASES
+        // times. Does NOT trigger on loop detection exits (doom loop, text
+        // repetition, no-text loop) — those indicate the model is stuck.
+        const MAX_CONTINUATION_PHASES = 5;
+        let totalInputTokens = cumulativeInputTokens;
+        let totalOutputTokens = cumulativeOutputTokens;
 
-        if (shouldAutoContinue && !signal?.aborted) {
-          log("info", "own-loop: auto-continuation triggered", {
+        for (let phase = 1; phase <= MAX_CONTINUATION_PHASES; phase++) {
+          const shouldAutoContinue = (exitReason === "step-limit" || exitReason === "budget-limit");
+          if (!shouldAutoContinue || signal?.aborted) break;
+
+          log("info", `own-loop: auto-continuation phase ${phase}/${MAX_CONTINUATION_PHASES}`, {
             sessionId,
             step,
             exitReason,
-            budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
+            budgetUsage: `${Math.round((totalInputTokens / tokenBudget) * 100)}%`,
           });
 
-          yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Compacting context and continuing...]\n\n" };
+          yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Compacting context and continuing... (phase ${phase + 1})]\n\n` };
 
-          // Preserve phase 1 totals so _lastUsage reports combined spend
-          const phase1InputTokens = cumulativeInputTokens;
-          const phase1OutputTokens = cumulativeOutputTokens;
-
-          // ─── In-memory context truncation ───
-          // Think's compaction requires persisted messages, but during
-          // onChatMessage the assistant response hasn't been persisted yet
-          // (Think does that after the generator completes). So we truncate
-          // the in-memory messages array directly: keep the first message
-          // (user prompt) and the last few tool-call/result pairs, drop
-          // everything in between, and inject a summary of what was dropped.
           try {
-            const keepRecent = 6; // Keep the last N messages (recent tool results)
+            // ─── In-memory context truncation ───
+            const keepRecent = 6;
             if (messages.length > keepRecent + 2) {
-              const firstMsg = messages[0]; // Original user message
+              const firstMsg = messages[0];
               const recentMsgs = messages.slice(-keepRecent);
 
-              // Summarize what was dropped
               const droppedCount = messages.length - keepRecent - 1;
               const droppedToolNames = new Set<string>();
               for (const msg of messages.slice(1, -keepRecent)) {
@@ -805,7 +801,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               };
 
               messages = [firstMsg, summaryInjection, ...recentMsgs];
-              log("info", "own-loop: in-memory context truncation", {
+              log("info", `own-loop: phase ${phase + 1} context truncation`, {
                 sessionId,
                 originalCount: messages.length + droppedCount,
                 keptCount: messages.length,
@@ -813,7 +809,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               });
             }
 
-            // Reset budget tracking for the continuation phase
+            // Reset budget tracking for the new phase
             cumulativeInputTokens = 0;
             cumulativeOutputTokens = 0;
             warnInjected = false;
@@ -822,93 +818,78 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             consecutiveNoTextSteps = 0;
             recentToolCalls.length = 0;
             recentTextPrefixes.length = 0;
+            exitReason = "natural";
 
-            // Inject a continuation prompt so the model knows to keep going
+            // Inject continuation prompt
             const continuationInjection: ModelMessage = {
               role: "user" as const,
               content: "[auto-continue] Your previous turn was cut short by context limits. The conversation has been compacted. Continue where you left off — review the summary above and proceed with the task.",
             };
             messages = [...messages, continuationInjection];
 
-            // Run a second phase with a full step budget (context was compacted)
-            const phase2MaxSteps = maxSteps;
-            let phase2Step = 0;
-            const p2RecentToolCalls: string[] = [];
-            const p2RecentTextPrefixes: string[] = [];
-            let p2ConsecutiveNoTextSteps = 0;
+            // Run the next phase
+            step = 0;
+            while (step < maxSteps) {
+              if (signal?.aborted) { exitReason = "abort"; break; }
 
-            while (phase2Step < phase2MaxSteps) {
-              if (signal?.aborted) break;
-
-              if (phase2Step > 0) {
+              if (step > 0) {
                 yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
               }
 
-              const phase2Injections: ModelMessage[] = [];
-              const phase2BudgetUsage = cumulativeInputTokens / tokenBudget;
+              const phaseInjections: ModelMessage[] = [];
+              const phaseBudgetUsage = cumulativeInputTokens / tokenBudget;
 
-              if (phase2BudgetUsage >= HARD_STOP_THRESHOLD) {
-                log("warn", "own-loop: phase2 hard stop", { sessionId, step: phase2Step });
+              if (phaseBudgetUsage >= HARD_STOP_THRESHOLD) {
+                log("warn", `own-loop: phase ${phase + 1} hard stop`, { sessionId, step });
+                exitReason = "budget-limit";
                 break;
               }
-              if (phase2BudgetUsage >= WRAP_UP_THRESHOLD && !wrapUpInjected) {
-                phase2Injections.push({
+              if (phaseBudgetUsage >= WRAP_UP_THRESHOLD && !wrapUpInjected) {
+                phaseInjections.push({
                   role: "system" as const,
                   content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop. Do not read new files or start new tasks. Complete your current thought and wrap up.",
                 });
                 wrapUpInjected = true;
-              } else if (phase2BudgetUsage >= WARN_THRESHOLD && !warnInjected) {
-                phase2Injections.push({
+              } else if (phaseBudgetUsage >= WARN_THRESHOLD && !warnInjected) {
+                phaseInjections.push({
                   role: "system" as const,
                   content: "[CONTEXT BUDGET WARNING] You are using most of your context budget. Focus on completing the current task. Avoid reading new files unless essential. Prefer targeted edits over full file reads.",
                 });
                 warnInjected = true;
               }
 
-              // Phase 2 doom loop detection (two-tier: soft warning then hard break)
-              if (p2RecentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
-                const lastN = p2RecentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
+              // Doom loop detection (two-tier: soft warning then hard break)
+              if (recentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
+                const lastN = recentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
                 if (lastN.every(c => c === lastN[0])) {
                   const toolName = lastN[0].split(":")[0];
                   const DOOM_LOOP_HARD_BREAK = DOOM_LOOP_THRESHOLD + 2;
 
-                  // Hard break after DOOM_LOOP_HARD_BREAK identical calls
-                  if (p2RecentToolCalls.length >= DOOM_LOOP_HARD_BREAK) {
-                    const hardN = p2RecentToolCalls.slice(-DOOM_LOOP_HARD_BREAK);
+                  if (recentToolCalls.length >= DOOM_LOOP_HARD_BREAK) {
+                    const hardN = recentToolCalls.slice(-DOOM_LOOP_HARD_BREAK);
                     if (hardN.every(c => c === hardN[0])) {
-                      log("warn", "own-loop: phase2 doom loop hard break", {
-                        sessionId,
-                        step: phase2Step,
-                        toolName,
-                        repeats: DOOM_LOOP_HARD_BREAK,
-                      });
+                      log("warn", `own-loop: phase ${phase + 1} doom loop hard break`, { sessionId, step, toolName });
                       yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Stopped: repeated ${toolName} calls detected]\n\n` };
+                      exitReason = "doom-loop";
                       break;
                     }
                   }
 
-                  // Soft warning — give the model a chance to course-correct
-                  phase2Injections.push({
+                  phaseInjections.push({
                     role: "system" as const,
-                    content: `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach — use a different tool, different arguments, or explain what's blocking you.]`,
-                  });
-                  log("warn", "own-loop: phase2 doom loop detected", {
-                    sessionId,
-                    step: phase2Step,
-                    toolName,
-                    repeats: DOOM_LOOP_THRESHOLD,
+                    content: `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach.]`,
                   });
                 }
               }
 
-              const finalMessages = phase2Injections.length > 0
-                ? [...messages, ...phase2Injections]
+              const finalMessages = phaseInjections.length > 0
+                ? [...messages, ...phaseInjections]
                 : messages;
 
-              let p2Result;
-              let p2Text = "";
+              let phResult;
+              let phText = "";
               try {
-                p2Result = streamText({
+                phResult = streamText({
                   model,
                   system,
                   messages: finalMessages,
@@ -916,11 +897,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                   abortSignal: signal,
                 });
 
-                for await (const chunk of p2Result.toUIMessageStream()) {
+                for await (const chunk of phResult.toUIMessageStream()) {
                   yield chunk;
                   const c = chunk as { type?: string; delta?: string };
                   if (c.type === "text-delta" && c.delta) {
-                    p2Text += c.delta;
+                    phText += c.delta;
                   }
                 }
               } catch (err) {
@@ -929,89 +910,101 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                   || /max.*token/i.test(errMsg)
                   || /request too large/i.test(errMsg);
                 if (isOverflow) {
-                  log("warn", "own-loop: phase2 overflow — stopping", { sessionId });
+                  log("warn", `own-loop: phase ${phase + 1} overflow — stopping`, { sessionId });
+                  exitReason = "budget-limit";
                   break;
                 }
                 throw err;
               }
 
-              const p2Usage = await (p2Result as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
-              cumulativeInputTokens += p2Usage?.inputTokens ?? 0;
-              cumulativeOutputTokens += p2Usage?.outputTokens ?? 0;
+              const phUsage = await (phResult as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
+              cumulativeInputTokens += phUsage?.inputTokens ?? 0;
+              cumulativeOutputTokens += phUsage?.outputTokens ?? 0;
 
-              const p2Response = await (p2Result as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
-              if (p2Response?.messages?.length) {
-                messages = [...messages, ...p2Response.messages];
+              const phResponse = await (phResult as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
+              if (phResponse?.messages?.length) {
+                messages = [...messages, ...phResponse.messages];
               }
 
-              // Track tool calls for phase 2 loop detection
-              const p2Steps = await (p2Result as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
-              const p2LastStep = p2Steps?.[p2Steps.length - 1];
-              if (p2LastStep?.toolCalls?.length) {
-                for (const tc of p2LastStep.toolCalls) {
-                  p2RecentToolCalls.push(`${tc.toolName}:${JSON.stringify(tc.input)}`);
+              // Track tool calls for loop detection
+              const phSteps = await (phResult as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
+              const phLastStep = phSteps?.[phSteps.length - 1];
+              if (phLastStep?.toolCalls?.length) {
+                for (const tc of phLastStep.toolCalls) {
+                  recentToolCalls.push(`${tc.toolName}:${JSON.stringify(tc.input)}`);
                 }
-                if (p2RecentToolCalls.length > DOOM_LOOP_THRESHOLD * 2) {
-                  p2RecentToolCalls.splice(0, p2RecentToolCalls.length - DOOM_LOOP_THRESHOLD * 2);
+                if (recentToolCalls.length > DOOM_LOOP_THRESHOLD * 2) {
+                  recentToolCalls.splice(0, recentToolCalls.length - DOOM_LOOP_THRESHOLD * 2);
                 }
               }
 
-              // Phase 2 text repetition detection
-              const p2TextPrefix = p2Text.trim().slice(0, 80);
-              if (p2TextPrefix.length > 10) {
-                p2RecentTextPrefixes.push(p2TextPrefix);
-                if (p2RecentTextPrefixes.length > DOOM_LOOP_THRESHOLD * 2) {
-                  p2RecentTextPrefixes.splice(0, p2RecentTextPrefixes.length - DOOM_LOOP_THRESHOLD * 2);
+              // Text repetition detection
+              const phTextPrefix = phText.trim().slice(0, 80);
+              if (phTextPrefix.length > 10) {
+                recentTextPrefixes.push(phTextPrefix);
+                if (recentTextPrefixes.length > DOOM_LOOP_THRESHOLD * 2) {
+                  recentTextPrefixes.splice(0, recentTextPrefixes.length - DOOM_LOOP_THRESHOLD * 2);
                 }
-                if (p2RecentTextPrefixes.length >= DOOM_LOOP_THRESHOLD) {
-                  const lastN = p2RecentTextPrefixes.slice(-DOOM_LOOP_THRESHOLD);
+                if (recentTextPrefixes.length >= DOOM_LOOP_THRESHOLD) {
+                  const lastN = recentTextPrefixes.slice(-DOOM_LOOP_THRESHOLD);
                   if (lastN.every(t => t === lastN[0])) {
-                    log("warn", "own-loop: phase2 text repetition loop — breaking", { sessionId, step: phase2Step });
+                    log("warn", `own-loop: phase ${phase + 1} text repetition loop`, { sessionId, step });
+                    exitReason = "text-loop";
                     break;
                   }
                 }
               }
 
-              // Phase 2 no-text loop detection
-              if (p2TextPrefix.length <= 10 && p2LastStep?.toolCalls?.length) {
-                p2ConsecutiveNoTextSteps++;
-                if (p2ConsecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
-                  log("warn", "own-loop: phase2 no-text loop — breaking", { sessionId, step: phase2Step });
+              // No-text loop detection
+              if (phTextPrefix.length <= 10 && phLastStep?.toolCalls?.length) {
+                consecutiveNoTextSteps++;
+                if (consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
+                  log("warn", `own-loop: phase ${phase + 1} no-text loop`, { sessionId, step });
                   yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Loop detected — summarizing progress so far]\n\n" };
+                  exitReason = "no-text-loop";
                   break;
                 }
               } else {
-                p2ConsecutiveNoTextSteps = 0;
+                consecutiveNoTextSteps = 0;
               }
 
-              const p2FinishReason = await (p2Result as unknown as { finishReason: PromiseLike<string> }).finishReason;
+              const phFinishReason = await (phResult as unknown as { finishReason: PromiseLike<string> }).finishReason;
 
-              log("info", "own-loop: phase2 step complete", {
+              log("info", `own-loop: phase ${phase + 1} step complete`, {
                 sessionId,
-                step: phase2Step,
-                finishReason: p2FinishReason,
+                step,
+                finishReason: phFinishReason,
                 budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
-                toolCalls: p2LastStep?.toolCalls?.map(tc => tc.toolName) ?? [],
+                toolCalls: phLastStep?.toolCalls?.map(tc => tc.toolName) ?? [],
               });
 
-              if (p2FinishReason !== "tool-calls") break;
-              phase2Step++;
+              if (phFinishReason !== "tool-calls") break;
+              step++;
             }
 
-            // Restore phase 1 totals so _lastUsage reports combined spend
-            cumulativeInputTokens += phase1InputTokens;
-            cumulativeOutputTokens += phase1OutputTokens;
+            // Tag step-limit exit
+            if (step >= maxSteps && exitReason === "natural") {
+              exitReason = "step-limit";
+            }
+
+            // Accumulate phase tokens into total
+            totalInputTokens += cumulativeInputTokens;
+            totalOutputTokens += cumulativeOutputTokens;
           } catch (err) {
-            // Restore phase 1 totals even on failure
-            cumulativeInputTokens += phase1InputTokens;
-            cumulativeOutputTokens += phase1OutputTokens;
-            log("warn", "own-loop: auto-continuation failed", {
+            totalInputTokens += cumulativeInputTokens;
+            totalOutputTokens += cumulativeOutputTokens;
+            log("warn", `own-loop: auto-continuation phase ${phase} failed`, {
               sessionId,
               error: err instanceof Error ? err.message : String(err),
             });
             yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Auto-continuation failed — send 'continue' to resume manually]\n\n" };
+            break;
           }
         }
+
+        // Use totals across all phases for _lastUsage
+        cumulativeInputTokens = totalInputTokens;
+        cumulativeOutputTokens = totalOutputTokens;
 
         // ─── Store cumulative usage for runThinkChat to read ───
         self._lastUsage = {
