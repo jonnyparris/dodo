@@ -450,8 +450,20 @@ const EXPLORE_SYSTEM_PROMPT = [
 /** Max steps for the explore subagent. */
 const EXPLORE_MAX_STEPS = 5;
 
-/** Model for the explore subagent — cheap and fast, search doesn't need heavy reasoning. */
-const EXPLORE_MODEL = "anthropic/claude-haiku-3.5";
+/** Cheap model for the explore subagent, keyed by provider prefix.
+ *  Falls back to the main model if no match (still works, just costs more). */
+const EXPLORE_MODELS: Record<string, string> = {
+  "anthropic/": "anthropic/claude-haiku-4-5",
+  "openai/": "openai/gpt-4.1-mini",
+  "google/": "google/gemini-2.5-flash",
+  "deepseek/": "deepseek/deepseek-chat",
+};
+function getExploreModel(mainModel: string): string {
+  for (const [prefix, model] of Object.entries(EXPLORE_MODELS)) {
+    if (mainModel.startsWith(prefix)) return model;
+  }
+  return mainModel; // fallback: use the main model itself
+}
 
 /** Timeout for the explore subagent (ms). Prevents indefinite blocking. */
 const EXPLORE_TIMEOUT_MS = 60_000;
@@ -497,7 +509,8 @@ function buildExploreTool(
     })),
     execute: async ({ query, scope }: { query: string; scope?: string }) => {
       const provider = buildProvider(config, env);
-      const model = provider.chatModel(EXPLORE_MODEL);
+      const exploreModelId = getExploreModel(config.model);
+      const model = provider.chatModel(exploreModelId);
 
       const scopeHint = scope ? `\n\nSearch scope: ${scope}` : "";
       const userMessage = `${query}${scopeHint}`;
@@ -529,7 +542,7 @@ function buildExploreTool(
         ].filter(Boolean).join("\n");
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        return `Explore failed: ${msg}. Try searching directly with grep or find.`;
+        return `Explore failed: model: ${exploreModelId}. ${msg}. Try searching directly with grep.`;
       }
     },
   });
