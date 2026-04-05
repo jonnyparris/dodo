@@ -133,7 +133,7 @@ const SYSTEM_PROMPT = [
   "3. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
   "4. **Plan, then edit.** State your plan in one short paragraph, then execute. Don't narrate each step.",
   "5. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
-  "6. **Commit completed work only.** When you commit, each commit should represent a coherent, working chunk of functionality. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
+  "6. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
   "7. **Delete unused code.** No commented-out code, no `_unused` renames.",
   "8. **Be security-conscious.** Never commit secrets or credentials.",
   "",
@@ -202,8 +202,8 @@ function buildProviderFromConfig(config: DodoConfig, env: Env): LanguageModel {
   const appConfig: AppConfig = {
     activeGateway: config.activeGateway,
     aiGatewayBaseURL: config.aiGatewayBaseURL,
-    gitAuthorEmail: env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
-    gitAuthorName: env.GIT_AUTHOR_NAME ?? "Dodo",
+    gitAuthorEmail: config.gitAuthorEmail,
+    gitAuthorName: config.gitAuthorName,
     model: config.model,
     opencodeBaseURL: config.opencodeBaseURL,
   };
@@ -236,6 +236,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   initialState: SessionState = {
     activePromptId: null,
     activeStreamCount: 0,
+    compactionCount: 0,
     contextBudget: 0,
     contextUsagePercent: 0,
     contextWindow: 0,
@@ -612,6 +613,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 errorText: errorText.slice(0, 500),
                 chunkCount,
               });
+              if (!iterationText && errorText) {
+                throw new Error(errorText);
+              }
             }
           } catch (err) {
             // ─── Overflow recovery ───
@@ -1060,8 +1064,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return {
         activeGateway: config.activeGateway,
         aiGatewayBaseURL: config.aiGatewayBaseURL,
-        gitAuthorEmail: this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
-        gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
+        gitAuthorEmail: config.gitAuthorEmail,
+        gitAuthorName: config.gitAuthorName,
         model: config.model,
         opencodeBaseURL: config.opencodeBaseURL,
       };
@@ -1286,11 +1290,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // token-budget enforcement — it's the compressed representation of older messages.
     const minProtectedIndex = messages.findIndex((msg) => {
       if (msg.role !== "system") return false;
-      const text = typeof msg.content === "string"
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("")
-          : "";
+      const text = typeof msg.content === "string" ? msg.content : "";
       return text.startsWith(COMPACTION_MARKER);
     });
     // If a compaction summary exists, the cutoff must not go before it.
@@ -2578,6 +2578,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     await this.syncSessionIndex({ status: "running", title });
 
     this.ensureThinkConfig(request);
+    await this.readAppConfig();
     try {
       const result = await this.runThinkChat(input.content, { authorEmail: authorEmail ?? undefined });
 
@@ -2760,11 +2761,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   async runFiberPrompt(payload: { promptId: string; content: string; authorEmail?: string; title: string }): Promise<void> {
     const { promptId, content, authorEmail, title } = payload;
 
-    // Ensure Think config exists — may be absent if this is a dequeued prompt
-    // after DO eviction or if config was lost for any reason.
-    if (!this.getConfig()) {
-      await this.readAppConfig();
-    }
+    // Refresh Think config from the latest account config before each prompt run.
+    await this.readAppConfig();
 
     // Check fiber snapshot — if chat already completed, skip to finalization
     const fiberId = this.readPromptFiberId(promptId);
@@ -2937,6 +2935,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
       browserEnabled: this.readMetadata("browser_enabled") === "true",
       activeGateway: incomingGateway,
+      gitAuthorEmail: this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
+      gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
       model: incomingModel,
       opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? this.env.OPENCODE_BASE_URL,
       aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? this.env.AI_GATEWAY_BASE_URL,
@@ -3784,20 +3784,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const response = await stub.fetch("https://user-control/config");
     const appConfig = (await response.json()) as AppConfig;
 
-    // Ensure Think config is populated
-    if (!this.getConfig()) {
-      const dodoConfig: DodoConfig = {
-        sessionId: this.sessionId(),
-        ownerEmail,
-        createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
-        browserEnabled: this.readMetadata("browser_enabled") === "true",
-        activeGateway: appConfig.activeGateway,
-        model: appConfig.model,
-        opencodeBaseURL: appConfig.opencodeBaseURL,
-        aiGatewayBaseURL: appConfig.aiGatewayBaseURL,
-      };
-      this.configure(dodoConfig);
-    }
+    const existing = this.getConfig();
+    const dodoConfig: DodoConfig = {
+      sessionId: this.sessionId(),
+      ownerEmail,
+      createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
+      browserEnabled: this.readMetadata("browser_enabled") === "true",
+      activeGateway: existing?.activeGateway ?? appConfig.activeGateway,
+      gitAuthorEmail: appConfig.gitAuthorEmail,
+      gitAuthorName: appConfig.gitAuthorName,
+      model: existing?.model ?? appConfig.model,
+      opencodeBaseURL: existing?.opencodeBaseURL ?? appConfig.opencodeBaseURL,
+      aiGatewayBaseURL: existing?.aiGatewayBaseURL ?? appConfig.aiGatewayBaseURL,
+    };
+    this.configure(dodoConfig);
 
     return appConfig;
   }

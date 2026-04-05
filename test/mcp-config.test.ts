@@ -7,10 +7,7 @@ import type { Env } from "../src/types";
 vi.mock("../src/executor", () => ({
   runSandboxedCode: vi.fn().mockResolvedValue({ logs: [], result: null }),
 }));
-vi.mock("../src/agentic", () => ({
-  buildProvider: vi.fn().mockReturnValue({ chatModel: vi.fn().mockReturnValue({}) }),
-  buildToolsForThink: vi.fn().mockReturnValue({}),
-}));
+vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/notify", () => ({
   sendNotification: vi.fn(),
 }));
@@ -172,12 +169,12 @@ describe("MCP Config CRUD", () => {
 });
 
 describe("MCP Catalog", () => {
-  it("returns catalog with 5 entries", async () => {
+  it("returns catalog with 6 entries", async () => {
     const res = await fetchJson("/api/mcp-catalog");
     expect(res.status).toBe(200);
     const catalog = (await res.json()) as Array<{ id: string; name: string; description: string; url: string; setupGuide: string }>;
     expect(Array.isArray(catalog)).toBe(true);
-    expect(catalog.length).toBe(5);
+    expect(catalog.length).toBe(6);
 
     // Verify known entries exist
     const ids = catalog.map((c) => c.id);
@@ -186,6 +183,7 @@ describe("MCP Catalog", () => {
     expect(ids).toContain("github");
     expect(ids).toContain("cloudflare-api");
     expect(ids).toContain("sentry");
+    expect(ids).toContain("browser-rendering");
 
     // Verify each entry has required fields
     for (const entry of catalog) {

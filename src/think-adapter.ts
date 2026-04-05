@@ -33,6 +33,8 @@ export interface DodoConfig {
   createdAt: string;
   browserEnabled: boolean;
   activeGateway: "opencode" | "ai-gateway";
+  gitAuthorEmail: string;
+  gitAuthorName: string;
   model: string;
   opencodeBaseURL: string;
   aiGatewayBaseURL: string;
