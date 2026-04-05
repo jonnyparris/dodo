@@ -8,6 +8,7 @@ import { CodingAgent } from "./coding-agent";
 import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
+import { createDodoCodeModeMcpServer } from "./mcp-codemode";
 import { MCP_CATALOG } from "./mcp-catalog";
 import { AllowlistOutbound } from "./outbound";
 import { RateLimiter } from "./rate-limit";
@@ -213,6 +214,24 @@ app.all("/mcp", async (c) => {
   return handler(c.req.raw, c.env, c.executionCtx);
 });
 
+// Code-mode MCP: 2 tools (search + execute) instead of 40+.
+// Use this endpoint for MCP connections from coding agents to minimize context usage.
+app.all("/mcp/codemode", async (c) => {
+  const token = c.req.header("Authorization")?.replace("Bearer ", "");
+  if (!c.env.DODO_MCP_TOKEN || token !== c.env.DODO_MCP_TOKEN) {
+    return c.json({ error: "Invalid or missing MCP token" }, 401);
+  }
+
+  const depth = parseInt(c.req.header("x-dodo-mcp-depth") ?? "0", 10) || 0;
+  if (depth >= MAX_MCP_DEPTH) {
+    return c.json({ error: "MCP recursion depth exceeded" }, 429);
+  }
+
+  const server = createDodoCodeModeMcpServer(c.env, depth);
+  const handler = createMcpHandler(server);
+  return handler(c.req.raw, c.env, c.executionCtx);
+});
+
 // ─── Health (no auth) ───
 
 app.get("/health", (c) => c.json({ status: "ok" }));
@@ -311,7 +330,7 @@ app.post("/api/errors", async (c) => {
 
 app.use("*", async (c, next) => {
   const path = new URL(c.req.raw.url).pathname;
-  if (path === "/health" || path === "/api/bootstrap" || path === "/api/errors" || path === "/mcp" || path.startsWith("/shared/")) return next();
+  if (path === "/health" || path === "/api/bootstrap" || path === "/api/errors" || path === "/mcp" || path.startsWith("/mcp/") || path.startsWith("/shared/")) return next();
 
   let identity: AccessIdentity;
   try {

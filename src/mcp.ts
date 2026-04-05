@@ -818,6 +818,17 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     jsonFetch(env, "user", "/mcp-configs"),
   );
 
+  server.tool("remove_mcp_config", "Remove an MCP integration by id", {
+    id: z.string().describe("MCP config id to remove"),
+  }, async ({ id }) => {
+    const res = await userControlFetch(env, `/mcp-configs/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!res.ok) {
+      const err = await res.json();
+      return errorResult(err);
+    }
+    return textResult({ removed: id });
+  });
+
   // --- Task tools (per-user) ---
 
   server.tool("list_tasks", "List all tasks in the Dodo backlog", {
