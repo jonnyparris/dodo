@@ -32,7 +32,7 @@ function renderWizardStep(step){
       body.innerHTML=`<img src="${_fav}" alt="Dodo" class="dodo-logo md dodo-logo-img" style="margin-bottom:12px"/><h3>Welcome to Dodo</h3><p>Dodo is a self-hostable platform for dispatching long-running autonomous coding agents on Cloudflare Workers. Let's get you set up in a few quick steps.</p><p style="font-size:12px">You can skip any step and configure it later from the sidebar.</p><div class="wizard-actions"><button class="primary" onclick="advanceWizard('welcome',false)">Continue</button></div>`;
       break;
     case "gateway":
-      body.innerHTML=`<h3>AI Provider</h3><p>Dodo needs an AI provider to work. Choose a gateway and configure your API credentials.</p><div style="max-width:360px;margin:0 auto;text-align:left"><label style="font-size:11px;color:var(--muted)">Gateway</label><select id="wiz-gateway" style="margin-bottom:8px" onchange="wizGatewayChanged()"><option value="ai-gateway">AI Gateway (Cloudflare)</option><option value="opencode">OpenCode Gateway</option></select><div id="wiz-gateway-fields"><label style="font-size:11px;color:var(--muted)">AI Gateway Base URL</label><input id="wiz-gw-url" placeholder="https://gateway.ai.cloudflare.com/v1/YOUR_ACCOUNT/YOUR_GATEWAY" style="margin-bottom:8px"/><label style="font-size:11px;color:var(--muted)">Model ID</label><input id="wiz-gw-model" placeholder="anthropic/claude-sonnet-4-5" value="anthropic/claude-sonnet-4-5" style="margin-bottom:8px"/></div></div><p style="font-size:11px;color:var(--muted)">You must bring your own AI provider. <a href="https://developers.cloudflare.com/ai-gateway/" target="_blank" style="color:var(--accent)">Set up an AI Gateway</a> or use any OpenAI-compatible endpoint.</p><div class="wizard-actions"><button class="primary" onclick="wizardSaveGateway()">Save &amp; Continue</button></div>`;
+      body.innerHTML=`<h3>AI Provider</h3><p>Dodo needs an AI provider to work. Choose a gateway and configure your API credentials.</p><div style="max-width:360px;margin:0 auto;text-align:left"><label style="font-size:11px;color:var(--muted)">Gateway</label><select id="wiz-gateway" style="margin-bottom:8px" onchange="wizGatewayChanged()"><option value="ai-gateway">AI Gateway (Cloudflare)</option><option value="opencode">OpenCode Gateway</option></select><div id="wiz-gateway-fields"><label style="font-size:11px;color:var(--muted)">AI Gateway Base URL</label><input id="wiz-gw-url" placeholder="https://gateway.ai.cloudflare.com/v1/YOUR_ACCOUNT/YOUR_GATEWAY" style="margin-bottom:8px"/><label style="font-size:11px;color:var(--muted)">Model ID</label><input id="wiz-gw-model" placeholder="openai/gpt-5.4" value="openai/gpt-5.4" style="margin-bottom:8px"/></div></div><p style="font-size:11px;color:var(--muted)">You must bring your own AI provider. <a href="https://developers.cloudflare.com/ai-gateway/" target="_blank" style="color:var(--accent)">Set up an AI Gateway</a> or use any OpenAI-compatible endpoint.</p><div class="wizard-actions"><button class="primary" onclick="wizardSaveGateway()">Save &amp; Continue</button></div>`;
       break;
     case "passkey":
       body.innerHTML=`<h3>Set a Passkey</h3><p>A passkey protects your secrets (API tokens, etc.) with envelope encryption. You can skip this and set one later.</p><input type="password" id="wiz-passkey" placeholder="Passkey (min 4 characters)" style="max-width:320px;margin:0 auto;display:block"/><div class="wizard-actions"><button class="primary" onclick="wizardSetPasskey()">Set Passkey</button><button onclick="advanceWizard('passkey',true)">Skip</button></div>`;
@@ -74,16 +74,16 @@ function wizGatewayChanged(){
   const fields=$("wiz-gateway-fields");
   if(!fields)return;
   if(gw==="opencode"){
-    fields.innerHTML=`<label style="font-size:11px;color:var(--muted)">OpenCode Base URL</label><input id="wiz-gw-url" placeholder="https://your-opencode-gateway.com/compat" style="margin-bottom:8px"/><label style="font-size:11px;color:var(--muted)">Model ID</label><input id="wiz-gw-model" placeholder="anthropic/claude-sonnet-4-5" value="anthropic/claude-sonnet-4-5" style="margin-bottom:8px"/>`;
+    fields.innerHTML=`<label style="font-size:11px;color:var(--muted)">OpenCode Base URL</label><input id="wiz-gw-url" placeholder="https://your-opencode-gateway.com/compat" style="margin-bottom:8px"/><label style="font-size:11px;color:var(--muted)">Model ID</label><input id="wiz-gw-model" placeholder="openai/gpt-5.4" value="openai/gpt-5.4" style="margin-bottom:8px"/>`;
   }else{
-    fields.innerHTML=`<label style="font-size:11px;color:var(--muted)">AI Gateway Base URL</label><input id="wiz-gw-url" placeholder="https://gateway.ai.cloudflare.com/v1/YOUR_ACCOUNT/YOUR_GATEWAY" style="margin-bottom:8px"/><label style="font-size:11px;color:var(--muted)">Model ID</label><input id="wiz-gw-model" placeholder="anthropic/claude-sonnet-4-5" value="anthropic/claude-sonnet-4-5" style="margin-bottom:8px"/>`;
+    fields.innerHTML=`<label style="font-size:11px;color:var(--muted)">AI Gateway Base URL</label><input id="wiz-gw-url" placeholder="https://gateway.ai.cloudflare.com/v1/YOUR_ACCOUNT/YOUR_GATEWAY" style="margin-bottom:8px"/><label style="font-size:11px;color:var(--muted)">Model ID</label><input id="wiz-gw-model" placeholder="openai/gpt-5.4" value="openai/gpt-5.4" style="margin-bottom:8px"/>`;
   }
 }
 
 async function wizardSaveGateway(){
   const gw=$("wiz-gateway")?.value||"ai-gateway";
   const url=$("wiz-gw-url")?.value?.trim();
-  const model=$("wiz-gw-model")?.value?.trim()||"anthropic/claude-sonnet-4-5";
+  const model=$("wiz-gw-model")?.value?.trim()||"openai/gpt-5.4";
   if(!url){toast('Gateway URL is required','error');return}
   try{
     const body={activeGateway:gw,model};
