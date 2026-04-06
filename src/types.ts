@@ -1,9 +1,14 @@
+import type { CodingAgent } from "./coding-agent";
+import type { SharedIndex } from "./shared-index";
+import type { UserControl } from "./user-control";
+
 export interface Env {
   AI?: Ai;
   AI_GATEWAY_BASE_URL: string;
   AI_GATEWAY_KEY?: string;
   ALLOW_UNAUTHENTICATED_DEV?: string;
   ASSETS?: Fetcher;
+  BROWSER?: Fetcher;
   CF_ACCESS_AUD: string;
   CF_ACCESS_TEAM_DOMAIN: string;
   DEFAULT_MODEL: string;
@@ -17,13 +22,10 @@ export interface Env {
   OUTBOUND?: Fetcher;
   WORKSPACE_BUCKET?: R2Bucket;
 
-  // Browser rendering binding
-  BROWSER?: unknown;
-
   // Durable Object bindings
-  CODING_AGENT: DurableObjectNamespace;
-  USER_CONTROL: DurableObjectNamespace;
-  SHARED_INDEX: DurableObjectNamespace;
+  CODING_AGENT: DurableObjectNamespace<CodingAgent>;
+  USER_CONTROL: DurableObjectNamespace<UserControl>;
+  SHARED_INDEX: DurableObjectNamespace<SharedIndex>;
 
   // Secrets (wrangler secret)
   SECRETS_MASTER_KEY?: string;

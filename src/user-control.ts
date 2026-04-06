@@ -1,3 +1,4 @@
+import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import {
   bytesToBase64,
@@ -89,17 +90,18 @@ const failureSnapshotCreateSchema = z.object({
  * key envelope (envelope encryption), encrypted secrets,
  * MCP configs, and fork snapshots.
  */
-export class UserControl implements DurableObject {
-  private readonly env: Env;
+export class UserControl extends DurableObject<Env> {
   private readonly db: SqlHelper;
   /** SSE clients for user-level events (session list changes, etc.) */
   private readonly sseClients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
 
-  constructor(state: DurableObjectState, env: Env) {
-    this.env = env;
-    this.db = new SqlHelper(state.storage.sql);
-    this.initializeSchema();
-    this.seedDefaults();
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.db = new SqlHelper(ctx.storage.sql);
+    ctx.blockConcurrencyWhile(async () => {
+      this.initializeSchema();
+      this.seedDefaults();
+    });
   }
 
   async fetch(request: Request): Promise<Response> {

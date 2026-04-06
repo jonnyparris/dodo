@@ -1,3 +1,4 @@
+import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { resolveAdminEmail } from "./auth";
 import { hashShareToken } from "./share";
@@ -8,7 +9,20 @@ function normalizeHostname(hostname: string): string {
   return hostname.trim().toLowerCase();
 }
 
-const FALLBACK_MODELS=[{id:"openai/gpt-5.4",name:"GPT-5.4",provider:"OpenAI",costInput:2,costOutput:8,contextWindow:1000000},{id:"openai/gpt-4.1",name:"GPT-4.1",provider:"OpenAI",costInput:2,costOutput:8,contextWindow:1000000},{id:"openai/gpt-4.1-mini",name:"GPT-4.1 Mini",provider:"OpenAI",costInput:0.4,costOutput:1.6,contextWindow:1000000},{id:"anthropic/claude-sonnet-4-6",name:"Claude Sonnet 4.6",provider:"Anthropic",costInput:3,costOutput:15,contextWindow:200000},{id:"anthropic/claude-opus-4-6",name:"Claude Opus 4.6",provider:"Anthropic",costInput:15,costOutput:75,contextWindow:200000},{id:"anthropic/claude-haiku-4-5",name:"Claude Haiku 4.5",provider:"Anthropic",costInput:0.8,costOutput:4,contextWindow:200000},{id:"openai/o3-mini",name:"o3-mini",provider:"OpenAI",costInput:1.1,costOutput:4.4,contextWindow:200000},{id:"openai/o4-mini",name:"o4-mini",provider:"OpenAI",costInput:1.1,costOutput:4.4,contextWindow:200000},{id:"google/gemini-2.5-pro",name:"Gemini 2.5 Pro",provider:"Google",costInput:1.25,costOutput:10,contextWindow:1000000},{id:"google/gemini-2.5-flash",name:"Gemini 2.5 Flash",provider:"Google",costInput:0.15,costOutput:0.6,contextWindow:1000000},{id:"deepseek/deepseek-chat",name:"DeepSeek Chat",provider:"DeepSeek",costInput:0.27,costOutput:1.1,contextWindow:128000},{id:"deepseek/deepseek-reasoner",name:"DeepSeek Reasoner",provider:"DeepSeek",costInput:0.55,costOutput:2.19,contextWindow:128000}];
+const FALLBACK_MODELS = [
+  { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_000_000 },
+  { id: "openai/gpt-4.1", name: "GPT-4.1", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_000_000 },
+  { id: "openai/gpt-4.1-mini", name: "GPT-4.1 Mini", provider: "OpenAI", costInput: 0.4, costOutput: 1.6, contextWindow: 1_000_000 },
+  { id: "anthropic/claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "Anthropic", costInput: 3, costOutput: 15, contextWindow: 200_000 },
+  { id: "anthropic/claude-opus-4-6", name: "Claude Opus 4.6", provider: "Anthropic", costInput: 15, costOutput: 75, contextWindow: 200_000 },
+  { id: "anthropic/claude-haiku-4-5", name: "Claude Haiku 4.5", provider: "Anthropic", costInput: 0.8, costOutput: 4, contextWindow: 200_000 },
+  { id: "openai/o3-mini", name: "o3-mini", provider: "OpenAI", costInput: 1.1, costOutput: 4.4, contextWindow: 200_000 },
+  { id: "openai/o4-mini", name: "o4-mini", provider: "OpenAI", costInput: 1.1, costOutput: 4.4, contextWindow: 200_000 },
+  { id: "google/gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "Google", costInput: 1.25, costOutput: 10, contextWindow: 1_000_000 },
+  { id: "google/gemini-2.5-flash", name: "Gemini 2.5 Flash", provider: "Google", costInput: 0.15, costOutput: 0.6, contextWindow: 1_000_000 },
+  { id: "deepseek/deepseek-chat", name: "DeepSeek Chat", provider: "DeepSeek", costInput: 0.27, costOutput: 1.1, contextWindow: 128_000 },
+  { id: "deepseek/deepseek-reasoner", name: "DeepSeek Reasoner", provider: "DeepSeek", costInput: 0.55, costOutput: 2.19, contextWindow: 128_000 },
+];
 
 /**
  * SharedIndex DO — global singleton (`idFromName("global")`).
@@ -16,15 +30,16 @@ const FALLBACK_MODELS=[{id:"openai/gpt-5.4",name:"GPT-5.4",provider:"OpenAI",cos
  * Owns cross-user state: user allowlist/registry, host allowlist,
  * models cache, and (Phase 2) session shares/permissions.
  */
-export class SharedIndex implements DurableObject {
+export class SharedIndex extends DurableObject<Env> {
   private readonly db: SqlHelper;
-  private readonly env: Env;
 
-  constructor(state: DurableObjectState, env: Env) {
-    this.env = env;
-    this.db = new SqlHelper(state.storage.sql);
-    this.initializeSchema();
-    this.seedAdmin();
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.db = new SqlHelper(ctx.storage.sql);
+    ctx.blockConcurrencyWhile(async () => {
+      this.initializeSchema();
+      this.seedAdmin();
+    });
   }
 
   async fetch(request: Request): Promise<Response> {

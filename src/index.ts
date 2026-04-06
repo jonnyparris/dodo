@@ -19,13 +19,17 @@ import { UserControl } from "./user-control";
 import type { AccessIdentity, AppConfig, Env } from "./types";
 
 // ─── Per-isolate rate limiters ───
+// Intentionally module-level mutable state. Rate limiters are approximate
+// (per-isolate, not global) — sufficient for abuse prevention without
+// requiring a DO round-trip. The requestCount counter is also per-isolate;
+// it drives periodic cleanup of expired sliding windows and carries no
+// cross-request semantics.
 
 const promptLimiter = new RateLimiter();
 const shareLimiter = new RateLimiter();
 const messageLimiter = new RateLimiter();
 const errorLimiter = new RateLimiter();
 
-// Cleanup expired windows on every 100th request (setInterval not allowed at global scope)
 let requestCount = 0;
 function maybeCleanupRateLimiters() {
   if (++requestCount % 100 === 0) {
