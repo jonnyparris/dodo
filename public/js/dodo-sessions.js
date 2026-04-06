@@ -2,12 +2,15 @@
 
 let userEventSource=null;
 
+let _sessionsLoaded=false;
 async function loadSessions(){
   const el=$("session-list");
-  showSkeleton(el,4);
+  // Only show skeleton on first load — SSE refreshes should be seamless
+  if(!_sessionsLoaded)showSkeleton(el,4);
   const d=await apiSafe("/session");if(!d)return;const{sessions}=d;
   allSessions=sessions;
   renderSessionList(sessions);
+  _sessionsLoaded=true;
 }
 
 /** Connect to user-level SSE for real-time session list updates. */
@@ -22,10 +25,48 @@ function connectUserEvents(){
     }
   };
 }
+function _sessionItemHtml(s){
+  return `<div class="session-item ${currentSession===s.id?'active':''}" data-sid="${esc(s.id)}" onclick="selectSession('${esc(s.id)}')" role="button" tabindex="0" onkeydown="if(event.key==='Enter')selectSession('${esc(s.id)}')"><div class="session-title">${esc(s.title||s.id.slice(0,8))}</div><div class="session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`
+}
 function renderSessionList(sessions){
   const el=$("session-list");
   if(!sessions.length){el.innerHTML='<div class="empty">No sessions yet</div>';return}
-  el.innerHTML=sessions.map(s=>`<div class="session-item ${currentSession===s.id?'active':''}" onclick="selectSession('${esc(s.id)}')" role="button" tabindex="0" onkeydown="if(event.key==='Enter')selectSession('${esc(s.id)}')"><div class="session-title">${esc(s.title||s.id.slice(0,8))}</div><div class="session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`).join("")
+  // Targeted update: patch existing items instead of replacing the entire list.
+  // This prevents flicker on SSE-triggered refreshes.
+  const existingItems=el.querySelectorAll(".session-item[data-sid]");
+  if(existingItems.length>0){
+    const sessionMap=new Map(sessions.map(s=>[s.id,s]));
+    const existingIds=new Set();
+    // Update existing items in place
+    existingItems.forEach(item=>{
+      const sid=item.getAttribute("data-sid");
+      existingIds.add(sid);
+      const s=sessionMap.get(sid);
+      if(!s){item.remove();return}
+      // Update active state
+      item.classList.toggle("active",currentSession===sid);
+      // Update title and meta
+      const titleEl=item.querySelector(".session-title");
+      const metaEl=item.querySelector(".session-meta");
+      const newTitle=s.title||sid.slice(0,8);
+      const newMeta=`${s.status} \u00b7 ${new Date(s.updatedAt).toLocaleString()}`;
+      if(titleEl&&titleEl.textContent!==newTitle)titleEl.textContent=newTitle;
+      if(metaEl&&metaEl.textContent!==newMeta)metaEl.textContent=newMeta;
+    });
+    // Prepend new sessions that don't exist in the DOM yet
+    sessions.forEach((s,i)=>{
+      if(!existingIds.has(s.id)){
+        const tmp=document.createElement("div");
+        tmp.innerHTML=_sessionItemHtml(s);
+        const node=tmp.firstElementChild;
+        const ref=el.children[i];
+        if(ref)el.insertBefore(node,ref);else el.appendChild(node);
+      }
+    });
+  }else{
+    // Cold render — no existing items
+    el.innerHTML=sessions.map(s=>_sessionItemHtml(s)).join("");
+  }
 }
 function filterSessions(query){
   if(!query){renderSessionList(allSessions);return}
