@@ -12,10 +12,7 @@ import type { Env } from "../src/types";
 vi.mock("../src/executor", () => ({
   runSandboxedCode: vi.fn().mockResolvedValue({ logs: [], result: null }),
 }));
-vi.mock("../src/agentic", () => ({
-  buildToolsForThink: vi.fn().mockReturnValue({}),
-  buildProvider: vi.fn().mockReturnValue({ chatModel: vi.fn().mockReturnValue({}) }),
-}));
+vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/notify", () => ({ sendNotification: vi.fn() }));
 
 import worker from "../src/index";
