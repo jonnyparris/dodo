@@ -17,6 +17,7 @@ async function loadSessions(){
 function connectUserEvents(){
   if(userEventSource)userEventSource.close();
   userEventSource=new EventSource("/api/events");
+  userEventSource.onopen=()=>{checkVersionOnReconnect()};
   userEventSource.addEventListener("sessions_changed",()=>{loadSessions()});
   userEventSource.onerror=()=>{
     // Reconnect after a delay if the connection drops
