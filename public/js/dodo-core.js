@@ -263,11 +263,17 @@ function resetSseActivityTimer(){
 }
 function setProcessing(active){
   isProcessing=active;
-  $("send-btn").disabled=false;$("abort-btn").disabled=!active;$("msg-input").disabled=false;
-  $("send-btn").innerHTML=active?'<span class="spinner"></span>':'Send';
+  const btn=$("send-btn");
+  btn.disabled=false;$("abort-btn").disabled=!active;$("msg-input").disabled=false;
+  if(active){
+    btn.className='aborting';btn.innerHTML='<i class="ph ph-stop-circle"></i>';btn.setAttribute('aria-label','Abort prompt');btn.title='Abort prompt';
+  }else{
+    btn.className='sending';btn.innerHTML='<i class="ph ph-paper-plane-right"></i>';btn.setAttribute('aria-label','Send message');btn.title='Send message';
+  }
   updateFavicon();
   if(active){resetSseActivityTimer()}else{if(sseActivityTimer){clearTimeout(sseActivityTimer);sseActivityTimer=null}sseStallWarned=false}
 }
+function handleSendBtn(){if(isProcessing){abortPrompt()}else{sendMessage()}}
 function showThinking(){const el=document.createElement("div");el.className="msg thinking";el.id="thinking-indicator";el.innerHTML='Dodo is thinking<span class="thinking-dots"></span>';$("chat").appendChild(el);const chat=$("chat");chat.scrollTo({top:chat.scrollHeight,behavior:"smooth"})}
 function hideThinking(){$("thinking-indicator")?.remove()}
 function useExample(el){if(!currentSession){createSession().then(()=>{$("msg-input").value=el.textContent;autoResizeInput($("msg-input"))});return}$("msg-input").value=el.textContent;autoResizeInput($("msg-input"));$("msg-input").focus()}
