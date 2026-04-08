@@ -73,7 +73,14 @@ const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
 /** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
 const CLEARED_MARKER = "[Old tool result content cleared]";
 
-const sendMessageSchema = z.object({ content: z.string().trim().min(1) }).strict();
+const imageAttachmentSchema = z.object({
+  data: z.string().min(1),       // base64-encoded image data (no data: prefix)
+  mediaType: z.string().regex(/^image\/(png|jpeg|gif|webp)$/),
+});
+const sendMessageSchema = z.object({
+  content: z.string().trim().min(1),
+  images: z.array(imageAttachmentSchema).max(5).optional(),
+});
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
 const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
 const gitCloneSchema = z.object({ branch: z.string().optional(), depth: z.number().int().nonnegative().optional(), dir: z.string().optional(), singleBranch: z.boolean().optional(), url: z.string().url() }).strict();
@@ -2601,7 +2608,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.ensureThinkConfig(request);
     await this.readAppConfig();
     try {
-      const result = await this.runThinkChat(input.content, { authorEmail: authorEmail ?? undefined });
+      const result = await this.runThinkChat(input.content, { authorEmail: authorEmail ?? undefined, images: input.images });
 
       // Guard: treat empty LLM response as a failure (same as runFiberPrompt)
       if (!result.text && !result.assistantMessageId) {
@@ -2667,6 +2674,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const fiberId = this.spawnFiber("runFiberPrompt", {
       promptId,
       content: input.content,
+      images: input.images,
       authorEmail: authorEmail ?? undefined,
       title,
     }, { maxRetries: 3 });
@@ -2779,8 +2787,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * if the DO is evicted mid-chat, recovery replays from the top and
    * skips already-completed work.
    */
-  async runFiberPrompt(payload: { promptId: string; content: string; authorEmail?: string; title: string }): Promise<void> {
-    const { promptId, content, authorEmail, title } = payload;
+  async runFiberPrompt(payload: { promptId: string; content: string; images?: Array<{ data: string; mediaType: string }>; authorEmail?: string; title: string }): Promise<void> {
+    const { promptId, content, images, authorEmail, title } = payload;
 
     // Refresh Think config from the latest account config before each prompt run.
     await this.readAppConfig();
@@ -2802,7 +2810,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this._fiberAbortController = new AbortController();
     const signal = this._fiberAbortController.signal;
     try {
-      const result = await this.runThinkChat(content, { authorEmail, signal });
+      const result = await this.runThinkChat(content, { authorEmail, signal, images });
 
       // Guard: treat empty LLM response as a failure
       if (!result.text && !result.assistantMessageId) {
@@ -3025,17 +3033,31 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   private async runThinkChat(
     userContent: string,
-    options?: { authorEmail?: string; signal?: AbortSignal },
+    options?: { authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string }> },
   ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string }> {
     // Connect MCP servers before Think calls getTools()
     await this.connectMcpServers();
 
     // Insert user message metadata
     const userMsgId = crypto.randomUUID();
+    const parts: UIMessage["parts"] = [{ type: "text", text: userContent }];
+    if (options?.images?.length) {
+      for (const img of options.images) {
+        // Pass raw base64 in the url field — the AI SDK's downloadAssets step
+        // tries new URL(data) which throws for raw base64 (not a valid URL),
+        // so it skips the download. convertToLanguageModelV3DataContent then
+        // handles the raw string as inline base64 data.
+        (parts as Array<{ type: string; mediaType: string; url: string }>).push({
+          type: "file",
+          mediaType: img.mediaType,
+          url: img.data,
+        });
+      }
+    }
     const userMsg: UIMessage = {
       id: userMsgId,
       role: "user",
-      parts: [{ type: "text", text: userContent }],
+      parts,
     };
 
     this.insertMessageMetadata({

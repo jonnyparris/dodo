@@ -357,6 +357,15 @@
     .presence-avatar[title]:hover::after{content:attr(title);position:absolute;bottom:-26px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--panel);padding:3px 8px;border-radius:4px;font-size:10px;white-space:nowrap;z-index:10}
     .typing-indicator{align-self:flex-start;color:var(--muted);font-size:11px;font-style:italic;padding:4px 14px}
 
+    /* === Image attachments === */
+    .image-preview-bar{display:flex;gap:6px;padding:6px 12px;flex-wrap:wrap;align-items:center}
+    .image-preview-bar:empty{display:none}
+    .image-preview-item{position:relative;display:inline-block}
+    .image-preview-item img{height:48px;max-width:80px;border-radius:var(--radius);object-fit:cover;border:1px solid var(--line)}
+    .image-preview-item .remove-btn{position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;background:var(--text);color:var(--base);border:none;font-size:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1}
+    .msg-attachment{margin-top:6px}
+    .msg-attachment img{max-width:300px;max-height:200px;border-radius:var(--radius);cursor:pointer;border:1px solid var(--line)}
+
     /* === Session header actions — wrap on small screens === */
     .header-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
     .btn-icon{display:none}
@@ -603,9 +612,12 @@
       </div>
       <button class="scroll-bottom-btn" id="scroll-bottom-btn" onclick="scrollChatToBottom()" title="Scroll to bottom">&darr;</button>
       <div id="typing-indicator" class="typing-indicator" style="display:none"></div>
+      <div id="image-preview-bar" class="image-preview-bar"></div>
       <div class="input-bar">
-        <textarea id="msg-input" rows="1" placeholder="Ask Dodo to build something..." onkeydown="handleInputKeydown(event)" oninput="autoResizeInput(this);sendTypingStart()" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)" aria-label="Message input"></textarea>
+        <textarea id="msg-input" rows="1" placeholder="Ask Dodo to build something..." onkeydown="handleInputKeydown(event)" oninput="autoResizeInput(this);sendTypingStart()" onpaste="handleImagePaste(event)" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)" aria-label="Message input"></textarea>
         <div class="input-actions">
+          <input type="file" id="image-file-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple style="display:none" onchange="handleFileSelect(this)"/>
+          <button class="ghost" onclick="$('image-file-input').click()" title="Attach image" aria-label="Attach image"><i class="ph ph-paperclip"></i></button>
           <button class="sending" id="send-btn" onclick="handleSendBtn()" aria-label="Send message"><i class="ph ph-paper-plane-right"></i></button>
         </div>
       </div>

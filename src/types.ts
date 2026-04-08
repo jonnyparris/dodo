@@ -74,6 +74,7 @@ export interface SessionState {
 }
 
 export interface ChatMessageRecord {
+  attachments?: Array<{ mediaType: string; url: string }>;
   authorEmail?: string | null;
   content: string;
   createdAt: string;

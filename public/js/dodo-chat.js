@@ -249,6 +249,11 @@ function renderMessage(msg){
     }else{label.style.color="rgba(255,255,255,.75)";label.textContent="You"}
     el.appendChild(label);
     el.appendChild(document.createTextNode(msg.content));
+    if(msg.attachments&&msg.attachments.length){
+      const imgWrap=document.createElement("div");imgWrap.className="msg-attachment";
+      msg.attachments.forEach(a=>{const img=document.createElement("img");img.src=a.url;img.alt="attachment";img.loading="lazy";img.onclick=()=>window.open(a.url,"_blank");imgWrap.appendChild(img)});
+      el.appendChild(imgWrap);
+    }
   }
   const actions=document.createElement("div");actions.className="msg-actions";
   const copyBtn=document.createElement("button");copyBtn.textContent="Copy";copyBtn.title="Copy message";copyBtn.setAttribute("aria-label","Copy message");
@@ -299,12 +304,16 @@ function updateTokenSummary(state){
 
 // --- Chat actions ---
 async function sendMessage(){
-  const content=$("msg-input").value.trim();if(!content)return;
+  const content=$("msg-input").value.trim();
+  const images=getPendingImages();
+  if(!content&&!images)return;
+  if(!content)return toast("Add a text message with your images","warning");
   sendTypingStop();
   if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}
-  $("msg-input").value="";$("msg-input").style.height='auto';
+  $("msg-input").value="";$("msg-input").style.height='auto';clearPendingImages();
+  const payload=images?{content,images}:{content};
   if(isProcessing){
-    // Queue the prompt — show as pending bubble
+    // Queue the prompt — show as pending bubble (images not supported in queue)
     const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});
     if(result&&result.status==="queued"){
       showQueuedMessage(content,result.promptId,result.position);
@@ -312,7 +321,7 @@ async function sendMessage(){
     return;
   }
   setProcessing(true);showThinking();
-  const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});
+  const result=await jsonSafe(`/session/${currentSession}/prompt`,payload);
   if(!result){setProcessing(false);hideThinking()}
 }
 async function abortPrompt(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
@@ -387,4 +396,63 @@ function sendTypingStop(){
   if(wsConnection&&wsConnection.readyState===WebSocket.OPEN){
     wsConnection.send(JSON.stringify({type:"typing",isTyping:false}));
   }
+}
+
+// --- Image attachments ---
+const _pendingImages=[];
+const MAX_IMAGE_SIZE=10*1024*1024; // 10MB
+const MAX_IMAGES=5;
+
+function handleImagePaste(event){
+  const items=event.clipboardData?.items;
+  if(!items)return;
+  for(const item of items){
+    if(item.type.startsWith("image/")){
+      event.preventDefault();
+      const file=item.getAsFile();
+      if(file)addImageFile(file);
+      return;
+    }
+  }
+}
+
+function handleFileSelect(input){
+  for(const file of input.files){
+    if(file.type.startsWith("image/"))addImageFile(file);
+  }
+  input.value="";
+}
+
+function addImageFile(file){
+  if(_pendingImages.length>=MAX_IMAGES)return toast(`Maximum ${MAX_IMAGES} images per message`,"warning");
+  if(file.size>MAX_IMAGE_SIZE)return toast("Image too large (max 10MB)","warning");
+  const reader=new FileReader();
+  reader.onload=()=>{
+    const dataUrl=reader.result;
+    const base64=dataUrl.split(",")[1];
+    const mediaType=file.type;
+    _pendingImages.push({data:base64,mediaType,dataUrl});
+    renderImagePreviews();
+  };
+  reader.readAsDataURL(file);
+}
+
+function removeImage(idx){
+  _pendingImages.splice(idx,1);
+  renderImagePreviews();
+}
+
+function renderImagePreviews(){
+  const bar=$("image-preview-bar");
+  bar.innerHTML=_pendingImages.map((img,i)=>`<div class="image-preview-item"><img src="${img.dataUrl}" alt="attachment"/><button class="remove-btn" onclick="removeImage(${i})">&times;</button></div>`).join("");
+}
+
+function getPendingImages(){
+  if(!_pendingImages.length)return undefined;
+  return _pendingImages.map(({data,mediaType})=>({data,mediaType}));
+}
+
+function clearPendingImages(){
+  _pendingImages.length=0;
+  renderImagePreviews();
 }

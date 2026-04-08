@@ -98,14 +98,25 @@ export function uiMessageToChatRecord(
 ): ChatMessageRecord {
   // Extract text content from parts
   let content = "";
+  const attachments: Array<{ mediaType: string; url: string }> = [];
   if (msg.parts) {
     content = msg.parts
       .filter((p): p is { type: "text"; text: string } => p.type === "text")
       .map((p) => p.text)
       .join("");
+    for (const p of msg.parts) {
+      if (p.type === "file" && (p as { mediaType?: string }).mediaType?.startsWith("image/")) {
+        const mediaType = (p as { mediaType: string }).mediaType;
+        const rawUrl = (p as { url: string }).url;
+        // Ensure the URL is a data URL for frontend rendering — the stored value
+        // may be raw base64 (for AI SDK compatibility) or already a data URL.
+        const url = rawUrl.startsWith("data:") ? rawUrl : `data:${mediaType};base64,${rawUrl}`;
+        attachments.push({ mediaType, url });
+      }
+    }
   }
 
-  return {
+  const record: ChatMessageRecord = {
     id: msg.id,
     role: msg.role as ChatMessageRecord["role"],
     content,
@@ -118,4 +129,6 @@ export function uiMessageToChatRecord(
     tokenInput: meta.tokenInput ?? 0,
     tokenOutput: meta.tokenOutput ?? 0,
   };
+  if (attachments.length > 0) record.attachments = attachments;
+  return record;
 }
