@@ -24,6 +24,13 @@ const FALLBACK_MODELS = [
   { id: "deepseek/deepseek-reasoner", name: "DeepSeek Reasoner", provider: "DeepSeek", costInput: 0.55, costOutput: 2.19, contextWindow: 128_000 },
 ];
 
+/** Workers AI models available via AI Gateway's OpenAI-compatible endpoint. */
+const WORKERS_AI_MODELS = [
+  { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B A4B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 256_000 },
+  { id: "@cf/meta/llama-4-scout-17b-16e-instruct", name: "Llama 4 Scout 17B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 131_072 },
+  { id: "@cf/qwen/qwen2.5-coder-32b-instruct", name: "Qwen 2.5 Coder 32B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 32_768 },
+];
+
 /**
  * SharedIndex DO — global singleton (`idFromName("global")`).
  *
@@ -139,7 +146,10 @@ export class SharedIndex extends DurableObject<Env> {
         if (refresh) {
           this.db.exec("DELETE FROM models_cache");
         }
-        return Response.json({ models: await this.getModels() });
+        const models = await this.getModels();
+        const ids = new Set(models.map((m) => m.id));
+        const extras = WORKERS_AI_MODELS.filter((m) => !ids.has(m.id));
+        return Response.json({ models: [...models, ...extras] });
       }
 
       // ─── Session shares ───

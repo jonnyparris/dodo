@@ -362,7 +362,8 @@ function renderPresence(){
 
 function renderTypingIndicator(){
   const el=$("typing-indicator");
-  const names=typingUsers.filter(u=>u.isTyping).map(u=>u.displayName||u.email);
+  const me=window._userEmail;
+  const names=typingUsers.filter(u=>u.isTyping&&u.email!==me).map(u=>u.displayName||u.email);
   if(!names.length){el.style.display="none";return}
   el.style.display="block";
   el.textContent=names.length===1?`${names[0]} is typing...`:`${names.join(", ")} are typing...`;

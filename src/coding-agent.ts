@@ -47,6 +47,9 @@ const CONTEXT_WINDOW_TOKENS: Record<string, number> = {
   "google/gemini-2.5-flash": 1_000_000,
   "deepseek/deepseek-chat": 128_000,
   "deepseek/deepseek-reasoner": 128_000,
+  "@cf/google/gemma-4-26b-a4b-it": 256_000,
+  "@cf/meta/llama-4-scout-17b-16e-instruct": 131_072,
+  "@cf/qwen/qwen2.5-coder-32b-instruct": 32_768,
 };
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 /** Budget factor — use 80% of context window for messages, leave 20% for response. */
