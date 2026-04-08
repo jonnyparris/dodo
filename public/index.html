@@ -866,11 +866,13 @@
   <script>
     // --- Boot ---
     async function boot(){
-      await Promise.all([loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets(),loadIntegrations(),loadBrowserConfig(),checkOnboarding()]);
+      const isSharedSession=location.hash.match(/^#session=(.+)$/);
+      const bootTasks=[loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets(),loadIntegrations(),loadBrowserConfig()];
+      if(!isSharedSession)bootTasks.push(checkOnboarding());
+      await Promise.all(bootTasks);
       startTaskSync();
       connectUserEvents();
-      const hashMatch=location.hash.match(/^#session=(.+)$/);
-      if(hashMatch){const sid=decodeURIComponent(hashMatch[1]);await selectSession(sid);return}
+      if(isSharedSession){const sid=decodeURIComponent(isSharedSession[1]);await selectSession(sid);return}
       renderOnboardingSessions();
     }
 
