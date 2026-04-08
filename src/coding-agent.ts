@@ -74,13 +74,13 @@ const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
 const CLEARED_MARKER = "[Old tool result content cleared]";
 
 const imageAttachmentSchema = z.object({
-  data: z.string().min(1),       // base64-encoded image data (no data: prefix)
+  data: z.string().min(1).max(15_000_000).regex(/^[A-Za-z0-9+/]+=*$/, "Invalid base64"),
   mediaType: z.string().regex(/^image\/(png|jpeg|gif|webp)$/),
-});
+}).strict();
 const sendMessageSchema = z.object({
   content: z.string().trim().min(1),
   images: z.array(imageAttachmentSchema).max(5).optional(),
-});
+}).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
 const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
 const gitCloneSchema = z.object({ branch: z.string().optional(), depth: z.number().int().nonnegative().optional(), dir: z.string().optional(), singleBranch: z.boolean().optional(), url: z.string().url() }).strict();

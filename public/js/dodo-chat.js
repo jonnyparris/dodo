@@ -251,7 +251,11 @@ function renderMessage(msg){
     el.appendChild(document.createTextNode(msg.content));
     if(msg.attachments&&msg.attachments.length){
       const imgWrap=document.createElement("div");imgWrap.className="msg-attachment";
-      msg.attachments.forEach(a=>{const img=document.createElement("img");img.src=a.url;img.alt="attachment";img.loading="lazy";img.onclick=()=>window.open(a.url,"_blank");imgWrap.appendChild(img)});
+      msg.attachments.forEach(a=>{
+        if(!a.url.startsWith("data:image/"))return;
+        const img=document.createElement("img");img.src=a.url;img.alt="attachment";img.loading="lazy";
+        imgWrap.appendChild(img);
+      });
       el.appendChild(imgWrap);
     }
   }
@@ -402,12 +406,13 @@ function sendTypingStop(){
 const _pendingImages=[];
 const MAX_IMAGE_SIZE=10*1024*1024; // 10MB
 const MAX_IMAGES=5;
+const ALLOWED_IMAGE_TYPES=new Set(["image/png","image/jpeg","image/gif","image/webp"]);
 
 function handleImagePaste(event){
   const items=event.clipboardData?.items;
   if(!items)return;
   for(const item of items){
-    if(item.type.startsWith("image/")){
+    if(ALLOWED_IMAGE_TYPES.has(item.type)){
       event.preventDefault();
       const file=item.getAsFile();
       if(file)addImageFile(file);
@@ -418,7 +423,8 @@ function handleImagePaste(event){
 
 function handleFileSelect(input){
   for(const file of input.files){
-    if(file.type.startsWith("image/"))addImageFile(file);
+    if(ALLOWED_IMAGE_TYPES.has(file.type))addImageFile(file);
+    else toast(`${file.type} not supported. Use PNG, JPEG, GIF, or WebP.`,"warning");
   }
   input.value="";
 }
@@ -444,7 +450,14 @@ function removeImage(idx){
 
 function renderImagePreviews(){
   const bar=$("image-preview-bar");
-  bar.innerHTML=_pendingImages.map((img,i)=>`<div class="image-preview-item"><img src="${img.dataUrl}" alt="attachment"/><button class="remove-btn" onclick="removeImage(${i})">&times;</button></div>`).join("");
+  bar.innerHTML="";
+  _pendingImages.forEach((img,i)=>{
+    const wrap=document.createElement("div");wrap.className="image-preview-item";
+    const imgEl=document.createElement("img");imgEl.src=img.dataUrl;imgEl.alt="attachment";
+    const btn=document.createElement("button");btn.className="remove-btn";btn.textContent="\u00d7";
+    btn.onclick=()=>removeImage(i);
+    wrap.appendChild(imgEl);wrap.appendChild(btn);bar.appendChild(wrap);
+  });
 }
 
 function getPendingImages(){

@@ -84,4 +84,32 @@ describe("uiMessageToChatRecord — multimodal", () => {
     expect(record.tokenOutput).toBe(50);
     expect(record.attachments).toHaveLength(1);
   });
+
+  it("normalizes raw base64 to data URL for frontend rendering", () => {
+    const msg: UIMessage = {
+      id: "msg-raw",
+      role: "user",
+      parts: [
+        { type: "text", text: "Check this" },
+        { type: "file", mediaType: "image/png", url: "iVBORw0KGgoAAAAN" } as UIMessage["parts"][number],
+      ],
+    };
+    const record = uiMessageToChatRecord(msg);
+    expect(record.attachments).toHaveLength(1);
+    expect(record.attachments![0].url).toBe("data:image/png;base64,iVBORw0KGgoAAAAN");
+  });
+
+  it("preserves existing data URLs without double-prefixing", () => {
+    const msg: UIMessage = {
+      id: "msg-existing-data-url",
+      role: "user",
+      parts: [
+        { type: "text", text: "Check" },
+        { type: "file", mediaType: "image/jpeg", url: "data:image/jpeg;base64,/9j/4AAQ" } as UIMessage["parts"][number],
+      ],
+    };
+    const record = uiMessageToChatRecord(msg);
+    expect(record.attachments).toHaveLength(1);
+    expect(record.attachments![0].url).toBe("data:image/jpeg;base64,/9j/4AAQ");
+  });
 });
