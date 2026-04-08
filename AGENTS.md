@@ -61,9 +61,8 @@ Use descriptive branch names: `fix/sse-serialization`, `feat/per-user-auth`, `do
 - `src/agentic.ts` — LLM provider construction (buildProvider), tool composition (buildToolsForThink), git tools
 - `src/user-control.ts` — per-user DO (config, sessions, memory, tasks, key envelope, encrypted secrets, fork snapshots)
 - `src/shared-index.ts` — global singleton DO (user allowlist, host allowlist, models cache, session shares/permissions)
-- `src/app-control.ts` — legacy global DO (kept for migration, being phased out)
 - `src/executor.ts` — DynamicWorkerExecutor wrapper for sandboxed code execution (direct API route)
-- `src/git.ts` — isomorphic-git helpers via @cloudflare/shell, multi-host token injection (GitHub + GitLab)
+- `src/git.ts` — git helpers via @cloudflare/shell, multi-host token injection (GitHub + GitLab)
 - `src/mcp.ts` — MCP server exposing all Dodo capabilities as tools
 - `src/crypto.ts` — hybrid envelope encryption (PBKDF2 + HKDF + AES-GCM) for per-user secrets
 - `src/auth.ts` — Cloudflare Access JWT verification, user allowlist check, admin guard
@@ -71,10 +70,23 @@ Use descriptive branch names: `fix/sse-serialization`, `feat/per-user-auth`, `do
 - `src/outbound.ts` — AllowlistOutbound WorkerEntrypoint for gated sandbox fetch
 - `src/presence.ts` — WebSocket presence tracking
 - `src/sql-helpers.ts` — lightweight SQLite query helpers
+- `src/health-check.ts` — health endpoint handler
+- `src/logger.ts` — structured logging helpers
+- `src/mcp-catalog.ts` — curated catalog of recommended MCP servers
+- `src/mcp-codemode.ts` — code-mode MCP endpoint (2 tools, minimal context)
+- `src/mcp-gatekeeper.ts` — MCP server auth and rate limiting
+- `src/notify.ts` — push notifications via ntfy.sh
+- `src/onboarding.ts` — guided passkey and secrets setup
+- `src/rate-limit.ts` — per-user rate limiting
+- `src/repos.ts` — known repository registry for orchestration
+- `src/rpc-api.ts` — JSON-RPC API surface
+- `src/rpc-transport.ts` — JSON-RPC transport layer
+- `src/share.ts` — session sharing (tokens, permissions, cookies)
 - `src/types.ts` — shared TypeScript types
 - `test/dodo.test.ts` — integration tests via vitest-pool-workers
 - `public/index.html` — three-panel web UI (mobile-responsive)
 - `public/docs.html` — architecture documentation page
+- `public/howto.html` — task-oriented how-to guides
 
 ## Architecture
 
@@ -86,13 +98,12 @@ Worker (Hono router + CF Access auth)
 |   +-- user_config, sessions, memory_entries, tasks, key_envelope, encrypted_secrets, fork_snapshots
 +-- CodingAgent DO (one per session, extends Think<Env, DodoConfig>)
 |   +-- Think tables: assistant_sessions, assistant_messages, _think_config, cf_agents_fibers
-|   +-- Dodo tables: metadata, message_metadata, prompts, cron_jobs, approval_queue
+|   +-- Dodo tables: metadata, message_metadata, prompts, cron_jobs
 |   +-- Workspace (@cloudflare/shell, SQLite + optional R2 spill)
 |   +-- createExecuteTool (codemode with workspace + git providers, gated outbound)
 |   +-- One Think session per DO — single-session invariant
 |   +-- Durable fibers — async prompts survive DO eviction
 +-- AllowlistOutbound (WorkerEntrypoint, self-referencing service binding)
-+-- AppControl DO (legacy, migration target)
 ```
 
 ## Key Invariants

@@ -5,7 +5,10 @@ const DEV_EMAIL = "dev@dodo.local";
 
 /** Resolve the admin email from env, with a hardcoded fallback. */
 export function resolveAdminEmail(env: Env): string {
-  return env.ADMIN_EMAIL ?? "you@example.com";
+  if (!env.ADMIN_EMAIL) {
+    throw new Error("ADMIN_EMAIL environment variable is required. Set it in wrangler.jsonc vars or .dev.vars.");
+  }
+  return env.ADMIN_EMAIL;
 }
 
 function readAccessToken(request: Request): string | null {

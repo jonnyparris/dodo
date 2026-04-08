@@ -10,7 +10,7 @@
  * - Whether compaction was triggered (inferred from context % dropping)
  *
  * Run: npx tsx bench/b5-compaction.ts <DODO_BASE_URL>
- * Example: npx tsx bench/b5-compaction.ts https://dodo.jonnyparris.workers.dev
+ * Example: npx tsx bench/b5-compaction.ts https://your-dodo.workers.dev
  *
  * Requires DODO_SESSION_TOKEN env var or CF Access cookie for auth.
  */
@@ -342,7 +342,11 @@ async function runBenchmark(baseUrl: string): Promise<void> {
 }
 
 // Entry point
-const baseUrl = process.argv[2] || "https://dodo.jonnyparris.workers.dev";
+const baseUrl = process.argv[2];
+if (!baseUrl) {
+  console.error("Usage: npx tsx bench/b5-compaction.ts <DODO_BASE_URL>");
+  process.exit(1);
+}
 runBenchmark(baseUrl).catch((err) => {
   console.error("Benchmark failed:", err);
   process.exit(1);

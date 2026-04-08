@@ -92,9 +92,10 @@
 
     <h2 id="schedule-task">Schedule a Recurring Task</h2>
     <h3>Run prompts on a cron schedule</h3>
-    <p>Open the <strong>Cron</strong> tab to create a scheduled task. Enter a cron expression and the prompt you want Dodo to run automatically.</p>
+    <p>Open the <strong>Cron</strong> tab to create a scheduled task. Choose a scheduling type — <strong>delayed</strong> (one-shot after N seconds), <strong>scheduled</strong> (one-shot at a specific datetime), <strong>cron</strong> (recurring cron expression), or <strong>interval</strong> (recurring every N seconds) — then enter the prompt you want Dodo to run.</p>
     <p>Use this for repeated work like test runs, dependency checks, or status reports. Keep the prompt focused and action-oriented.</p>
-    <pre><code>Cron: 0 * * * *
+    <pre><code>Type: cron
+Cron: 0 * * * *
 Prompt: Run the test suite, summarize failures, and open a task if anything regressed.
 </code></pre>
     <p>After saving, Dodo will dispatch the prompt on schedule. Review the resulting sessions to inspect logs, diffs, and outputs.</p>
@@ -134,7 +135,7 @@ Token: optional-secret-token
     <h3>Store information that survives session deletion</h3>
     <p>Dodo includes a persistent memory store for long-lived notes, decisions, and small pieces of structured data. Memory survives even if you delete the session that wrote it.</p>
     <p>Write key-value pairs you want to reuse later, such as deployment notes, repository conventions, or customer-specific details. Search works across all saved entries.</p>
-    <pre><code>memory_write({ key: "repos/dodo/default-branch", value: "main" })
+    <pre><code>memory_write({ title: "dodo default branch", content: "main" })
 memory_search({ query: "default branch for dodo" })
 </code></pre>
     <p>Use memory for durable context, not large source files. Keep entries short, searchable, and specific enough to help future sessions.</p>

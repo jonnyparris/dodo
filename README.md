@@ -18,17 +18,30 @@ Dodo is a turnkey coding agent backend and UI. Each session gets its own Durable
 - **Durable fibers** -- async prompts survive DO eviction via replay-from-checkpoint recovery
 - **Workspace** -- file CRUD, search, in-file replace via `@cloudflare/shell` (SQLite + optional R2 spill)
 - **Code execution** -- sandboxed JS via `createExecuteTool()` with workspace + git providers
-- **Git** -- init, clone, add, commit, branch, checkout, pull, push, diff, remote (isomorphic-git)
+- **Git** -- init, clone, add, commit, branch, checkout, pull, push, diff, remote (via `@cloudflare/shell`)
 - **Git auth** -- automatic token injection for GitHub/GitLab via per-user encrypted secrets or env fallback
-- **Cron** -- schedule delayed, cron, or interval tasks that run prompts
+- **Cron** -- schedule delayed, scheduled (datetime), cron, or interval tasks that run prompts
 - **Session forking** -- snapshot files + messages into a new session (v1 and v2 format)
 - **Config** -- per-session model config via Think.configure(), switchable LLM gateway
 - **Allowlist** -- manage outbound hostnames the sandbox can access
 - **Memory** -- per-user key-value memory store with text search
 - **Tasks** -- per-user Kanban backlog with auto-dispatch to sessions
 - **Secrets** -- encrypted per-user secret storage (envelope encryption with passkey + server key)
-- **MCP** -- Model Context Protocol server exposing all tools (sessions, files, git, memory, tasks)
+- **Prompt queue** -- async prompts backed by durable fibers with abort and recovery
+- **Orchestration** -- dispatch repo tasks to worker sessions, verify branches, track run state
+- **Browser rendering** -- optional browser tools via Cloudflare Browser Rendering
+- **RPC** -- JSON-RPC transport for programmatic access
+- **Session restore** -- soft-deleted sessions recoverable within 5 minutes
+- **Batch dispatch** -- dispatch up to 10 tasks in parallel from the Kanban board
+- **Known repos / seed sessions** -- pre-clone repos once, fork for each new task
+- **MCP** -- Model Context Protocol server exposing 46 tools (sessions, files, git, memory, tasks, orchestration)
+- **MCP catalog** -- curated list of recommended MCP servers with one-click setup
+- **MCP codemode** -- `/mcp/codemode` endpoint for coding agents (2 tools, ~1k tokens context)
 - **MCP configs** -- per-user MCP server configurations with encrypted header secrets
+- **Health checks** -- `/health` endpoint for uptime monitoring
+- **Onboarding** -- guided passkey + secrets setup for new users
+- **Rate limiting** -- per-user rate limits on LLM calls
+- **Account delegation** -- admin can act on behalf of other users
 - **Notifications** -- push notifications via ntfy.sh on completion/failure
 - **SSE** -- real-time event stream per session for text deltas, messages, state, files, prompts, execution
 - **WebSocket** -- presence tracking, typing indicators, and session events broadcast to all connected clients
@@ -54,6 +67,7 @@ npm run deploy
 | `OPENCODE_GATEWAY_TOKEN` | Auth token for the OpenCode gateway |
 | `AI_GATEWAY_KEY` | Auth key for the AI Gateway fallback |
 | `SECRETS_MASTER_KEY` | 32-byte hex key for server-side envelope encryption |
+| `COOKIE_SECRET` | Secret for session sharing cookie signatures |
 | `DODO_MCP_TOKEN` | Bearer token for MCP endpoint auth |
 
 Per-user secrets (GitHub token, GitLab token, ntfy topic, gateway token) are stored encrypted in each user's UserControl DO after passkey onboarding.
@@ -70,13 +84,12 @@ Worker (Hono router + CF Access auth)
 |   +-- fork_snapshots, mcp_configs
 +-- CodingAgent DO (one per session, extends Think<Env, DodoConfig>)
 |   +-- Think-managed: assistant_sessions, assistant_messages, _think_config, cf_agents_fibers
-|   +-- Dodo-owned: metadata, message_metadata, prompts, cron_jobs, approval_queue
+|   +-- Dodo-owned: metadata, message_metadata, prompts, cron_jobs
 |   +-- Workspace (@cloudflare/shell, SQLite + optional R2 spill)
 |   +-- createExecuteTool (@cloudflare/think/tools/execute, gated outbound)
 |   +-- One Think session per DO (single-session invariant)
 |   +-- Durable fibers for async prompt recovery
 +-- AllowlistOutbound (WorkerEntrypoint, gated sandbox fetch)
-+-- AppControl DO (legacy, kept for migration)
 ```
 
 ### Key design decisions

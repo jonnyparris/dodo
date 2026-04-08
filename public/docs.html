@@ -69,7 +69,7 @@
 
     <!-- ─── Architecture ─── -->
     <h2 id="architecture">Architecture</h2>
-    <p>Every Dodo deployment runs as a Cloudflare Worker with two types of Durable Objects: one per user (state, config, tasks) and one per session (code, chat, git).</p>
+    <p>Every Dodo deployment runs as a Cloudflare Worker with three types of Durable Objects: a global SharedIndex (user allowlist, permissions, models cache), one UserControl per user (state, config, tasks, secrets), and one CodingAgent per session (code, chat, git).</p>
     <div class="diagram">
       <svg viewBox="0 0 720 340" width="100%" style="max-width:720px">
         <rect x="10" y="10" width="700" height="60" rx="12" fill="#e8f5e9" stroke="#0a7c66" stroke-width="1.5"/>
@@ -149,8 +149,8 @@
 
     <!-- ─── Sessions ─── -->
     <h2 id="session-lifecycle">Session Lifecycle</h2>
-    <p>Sessions can be <strong>soft-deleted</strong> via <code>DELETE /session/:id</code> and recovered within 5 minutes using <code>POST /session/:id/restore</code>. After 5 minutes, deleted sessions are permanently purged.</p>
-    <p>Use <code>POST /api/sessions/:id/fork</code> to copy a session's files, git history, and conversation into a new session.</p>
+    <p>Sessions can be <strong>soft-deleted</strong> via <code>DELETE /session/:id</code> and recovered within 5 minutes using <code>restore_session</code> (MCP tool). After 5 minutes, deleted sessions are permanently purged.</p>
+    <p>Use <code>POST /session/:id/fork</code> to copy a session's files, git history, and conversation into a new session.</p>
 
     <h2 id="sessions">Sessions</h2>
     <p>Each session is an isolated workspace with its own files, git repo, message history, and token budget. Sessions run in separate Durable Objects, so they never interfere with each other.</p>
@@ -192,7 +192,7 @@
       <li><strong>Create</strong> — starts with an empty workspace. Clone a repo or let the agent build from scratch.</li>
       <li><strong>Fork</strong> — copies all files and the full message history into a new session. Branch an experiment without losing the original.</li>
       <li><strong>Rename</strong> — click the session title in the header bar to rename it.</li>
-      <li><strong>Delete</strong> — permanently removes the session and all its data.</li>
+      <li><strong>Delete</strong> — soft-deletes the session. Recoverable within 5 minutes via <code>restore_session</code>.</li>
     </ul>
 
     <!-- ─── Chat ─── -->
@@ -223,7 +223,7 @@
 
     <!-- ─── Git ─── -->
     <h2 id="git">Git</h2>
-    <p>Full git support via isomorphic-git, running inside the Durable Object. The agent can clone repos, make commits, push and pull — all without a local machine.</p>
+    <p>Full git support via <code>@cloudflare/shell</code>, running inside the Durable Object. The agent can clone repos, make commits, push and pull — all without a local machine.</p>
     <table>
       <tr><th>Operation</th><th>Details</th></tr>
       <tr><td>Clone</td><td>Shallow by default (depth 1). Supports GitHub and GitLab. Tokens are injected from your secrets.</td></tr>
@@ -350,11 +350,13 @@
     <h2 id="cron">Cron Jobs</h2>
     <p>Schedule prompts that run automatically. Each cron job sends a prompt to its session after a delay.</p>
     <table>
-      <tr><th>Field</th><th>Description</th></tr>
-      <tr><td>Description</td><td>A label for the job (shown in the list).</td></tr>
-      <tr><td>Prompt</td><td>The message sent to the agent when the job fires.</td></tr>
-      <tr><td>Delay (seconds)</td><td>How long to wait before firing.</td></tr>
+      <tr><th>Type</th><th>Field</th><th>Description</th></tr>
+      <tr><td><strong>delayed</strong></td><td><code>delayInSeconds</code></td><td>Fire once after a delay (in seconds).</td></tr>
+      <tr><td><strong>scheduled</strong></td><td><code>date</code></td><td>Fire once at a specific ISO 8601 datetime.</td></tr>
+      <tr><td><strong>cron</strong></td><td><code>cron</code></td><td>Recurring schedule using a cron expression (e.g. <code>0 * * * *</code>).</td></tr>
+      <tr><td><strong>interval</strong></td><td><code>intervalSeconds</code></td><td>Fire repeatedly at a fixed interval (in seconds).</td></tr>
     </table>
+    <p>All types require a <code>description</code> (label) and <code>prompt</code> (message sent to the agent when the job fires).</p>
     <div class="callout"><p>Cron jobs run via the Agents SDK scheduler inside the Durable Object. They persist across DO evictions.</p></div>
 
     <!-- ─── Integrations ─── -->
@@ -399,7 +401,7 @@
       <tr><td><strong>Sharing</strong></td><td>Create share links with read-only or read-write access. Revoke links at any time.</td></tr>
       <tr><td><strong>Permissions</strong></td><td>Grant other users direct access by email address. Choose read-only or read-write.</td></tr>
       <tr><td><strong>Browser Tools</strong></td><td>Toggle browser capabilities for the session (when available).</td></tr>
-      <tr><td><strong>Approvals</strong></td><td>Review and approve/reject pending tool calls that require human authorization.</td></tr>
+
       <tr><td><strong>MCP Overrides</strong></td><td>Enable or disable integrations for this session only. Reset to follow the global config.</td></tr>
     </table>
 
@@ -443,7 +445,8 @@
       <tr><td>*</td><td><code>/api/secrets</code></td><td>Encrypted secrets CRUD</td></tr>
       <tr><td>*</td><td><code>/api/mcp-configs</code></td><td>Integration (MCP server) CRUD</td></tr>
       <tr><td>*</td><td><code>/api/passkey</code></td><td>Init, change passkey</td></tr>
-      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth)</td></tr>
+      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth) — 46 tools for orchestration</td></tr>
+      <tr><td>ALL</td><td><code>/mcp/codemode</code></td><td>Code-mode MCP endpoint — 2 tools (<code>search</code> + <code>execute</code>), ~1k tokens context. Ideal for coding agents.</td></tr>
     </table>
 
     <h3>Session endpoints</h3>
@@ -467,7 +470,7 @@
       <tr><td>*</td><td><code>/session/:id/cron</code></td><td>Cron job CRUD</td></tr>
       <tr><td>*</td><td><code>/session/:id/share</code></td><td>Create/revoke share links</td></tr>
       <tr><td>*</td><td><code>/session/:id/permissions</code></td><td>Grant/revoke user access</td></tr>
-      <tr><td>*</td><td><code>/session/:id/approvals</code></td><td>Approve/reject pending tool calls</td></tr>
+
       <tr><td>*</td><td><code>/session/:id/mcp-configs</code></td><td>Per-session MCP overrides</td></tr>
       <tr><td>GET/PUT</td><td><code>/session/:id/browser</code></td><td>Toggle browser tools</td></tr>
       <tr><td>GET</td><td><code>/session/:id/ws</code></td><td>WebSocket (presence, typing indicators)</td></tr>
@@ -496,24 +499,78 @@
       <li>Set it as a Worker secret: <code>wrangler versions secret put DODO_MCP_TOKEN</code></li>
     </ol>
 
-    <h3>Available MCP tools</h3>
+    <h3>Available MCP tools (46)</h3>
+
+    <h4>Sessions</h4>
     <table>
       <tr><th>Tool</th><th>Description</th></tr>
       <tr><td><code>list_sessions</code></td><td>List all sessions</td></tr>
       <tr><td><code>create_session</code></td><td>Create a new session</td></tr>
       <tr><td><code>get_session</code></td><td>Get session state</td></tr>
-      <tr><td><code>delete_session</code></td><td>Delete a session</td></tr>
-      <tr><td><code>fork_session</code></td><td>Fork a session</td></tr>
-      <tr><td><code>send_message</code></td><td>Send a synchronous message</td></tr>
-      <tr><td><code>send_prompt</code></td><td>Dispatch an async prompt</td></tr>
+      <tr><td><code>delete_session</code></td><td>Soft-delete a session (recoverable within 5 min)</td></tr>
+      <tr><td><code>bulk_delete_sessions</code></td><td>Delete sessions by title prefix</td></tr>
+      <tr><td><code>restore_session</code></td><td>Restore a recently deleted session</td></tr>
+      <tr><td><code>fork_session</code></td><td>Fork a session (copy files + messages)</td></tr>
+    </table>
+
+    <h4>Chat</h4>
+    <table>
+      <tr><th>Tool</th><th>Description</th></tr>
+      <tr><td><code>send_message</code></td><td>Synchronous message (waits for response)</td></tr>
+      <tr><td><code>send_prompt</code></td><td>Async prompt (returns immediately, runs in background)</td></tr>
       <tr><td><code>abort_prompt</code></td><td>Abort a running prompt</td></tr>
-      <tr><td><code>list_files</code> / <code>read_file</code> / <code>write_file</code></td><td>Workspace file operations</td></tr>
-      <tr><td><code>search_files</code></td><td>Glob + content search</td></tr>
+      <tr><td><code>get_messages</code></td><td>Get message history</td></tr>
+      <tr><td><code>get_prompts</code></td><td>Get prompt history</td></tr>
+    </table>
+
+    <h4>Workspace</h4>
+    <table>
+      <tr><th>Tool</th><th>Description</th></tr>
+      <tr><td><code>list_files</code></td><td>List files in a directory</td></tr>
+      <tr><td><code>read_file</code></td><td>Read a file</td></tr>
+      <tr><td><code>write_file</code></td><td>Write a file</td></tr>
+      <tr><td><code>search_files</code></td><td>Glob pattern + content search</td></tr>
       <tr><td><code>execute_code</code></td><td>Sandboxed JavaScript execution</td></tr>
-      <tr><td><code>git_*</code></td><td>Git operations (init, clone, add, commit, status, log, diff, push, pull)</td></tr>
+    </table>
+
+    <h4>Git</h4>
+    <table>
+      <tr><th>Tool</th><th>Description</th></tr>
+      <tr><td><code>git_init</code></td><td>Initialize a git repo</td></tr>
+      <tr><td><code>git_clone</code></td><td>Clone a repo into the workspace</td></tr>
+      <tr><td><code>git_status</code></td><td>Working tree status</td></tr>
+      <tr><td><code>git_add</code></td><td>Stage files</td></tr>
+      <tr><td><code>git_commit</code></td><td>Commit staged changes</td></tr>
+      <tr><td><code>git_log</code></td><td>Commit log</td></tr>
+      <tr><td><code>git_diff</code></td><td>Diff working tree</td></tr>
+      <tr><td><code>git_push</code></td><td>Push to remote</td></tr>
+    </table>
+
+    <h4>Orchestration</h4>
+    <table>
+      <tr><th>Tool</th><th>Description</th></tr>
+      <tr><td><code>list_known_repos</code></td><td>List built-in repositories</td></tr>
+      <tr><td><code>get_or_create_seed_session</code></td><td>Get or create a seed session for a known repo</td></tr>
+      <tr><td><code>fork_seed_session</code></td><td>Fork a seed session into a worker session</td></tr>
+      <tr><td><code>run_repo_edits</code></td><td>Deterministic edit pipeline: fork, branch, edit, commit, push, verify</td></tr>
+      <tr><td><code>dispatch_repo_prompt</code></td><td>Dispatch a prompt-based task to a worker session</td></tr>
+      <tr><td><code>verify_branch</code></td><td>Verify a pushed branch is ahead of base</td></tr>
+      <tr><td><code>verify_worker_run</code></td><td>Wait for prompt completion and verify the branch</td></tr>
+      <tr><td><code>list_worker_runs</code></td><td>List tracked worker runs</td></tr>
+      <tr><td><code>get_worker_run</code></td><td>Get a worker run by id</td></tr>
+      <tr><td><code>get_failure_snapshot</code></td><td>Get failure details for a failed run</td></tr>
+    </table>
+
+    <h4>Tasks, Memory, Config, Integrations</h4>
+    <table>
+      <tr><th>Tool</th><th>Description</th></tr>
       <tr><td><code>list_tasks</code> / <code>create_task</code> / <code>update_task</code> / <code>delete_task</code></td><td>Task board CRUD</td></tr>
-      <tr><td><code>memory_search</code> / <code>memory_write</code></td><td>Memory store operations</td></tr>
+      <tr><td><code>memory_search</code></td><td>Search persistent memory</td></tr>
+      <tr><td><code>memory_write</code></td><td>Write a memory entry (<code>title</code> + <code>content</code>)</td></tr>
       <tr><td><code>get_config</code> / <code>update_config</code></td><td>Read and change LLM config</td></tr>
+      <tr><td><code>add_mcp_config</code></td><td>Add an MCP integration</td></tr>
+      <tr><td><code>list_mcp_configs</code></td><td>List MCP integrations</td></tr>
+      <tr><td><code>remove_mcp_config</code></td><td>Remove an MCP integration</td></tr>
     </table>
     <p style="margin-top:32px"><a href="/howto" style="color:var(--accent)">How-To Guides &rarr;</a></p>
   </main>
