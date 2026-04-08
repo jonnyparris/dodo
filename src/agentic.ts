@@ -553,7 +553,7 @@ function buildTools(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; browserEnabled?: boolean; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend },
+  options?: { authorEmail?: string; browserEnabled?: boolean; isAdminUser?: boolean; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend },
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
@@ -614,8 +614,11 @@ function buildTools(
   tools.explore = buildExploreTool(workspace, config, env);
 
   // Browser tool — headless Chrome via the BROWSER binding.
-  // Gated on the BROWSER binding existing AND the session having browser enabled.
-  if (env.BROWSER && options?.browserEnabled) {
+  // Gated on: BROWSER binding exists, session has browser enabled, AND the session
+  // owner is admin. Non-admin users get browser via the MCP path (which bills to
+  // their own Cloudflare account), not the native binding (which bills to the
+  // instance owner's account).
+  if (env.BROWSER && options?.browserEnabled && options?.isAdminUser) {
     tools.browser_navigate = tool({
       description:
         "Navigate to a URL in a headless browser and return the rendered page text. " +
@@ -665,7 +668,7 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; browserEnabled?: boolean; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend; mcpGatekeepers?: McpGatekeeper[] },
+  options?: { authorEmail?: string; browserEnabled?: boolean; isAdminUser?: boolean; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend; mcpGatekeepers?: McpGatekeeper[] },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
 

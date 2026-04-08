@@ -3,7 +3,7 @@ import { type Connection, type ConnectionContext, type WSMessage } from "agents"
 import { generateText, streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
-import { getUserControlStub } from "./auth";
+import { getUserControlStub, isAdmin } from "./auth";
 import { log } from "./logger";
 import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { sendNotification } from "./notify";
@@ -353,6 +353,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
     return buildToolsForThink(this.env, this.workspace, appConfig, {
       browserEnabled: this.readMetadata("browser_enabled") === "true",
+      isAdminUser: isAdmin(ownerEmail ?? null, this.env),
       ownerId: this.resolveOwnerId(ownerEmail),
       ownerEmail,
       stateBackend: this.stateBackend,

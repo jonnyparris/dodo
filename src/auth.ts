@@ -90,6 +90,17 @@ export function isAdmin(email: string | null, env: Env): boolean {
   return email === resolveAdminEmail(env);
 }
 
+/** Check if a user has browser access enabled (admin-controlled flag in SharedIndex). */
+export async function checkBrowserEnabled(email: string, env: Env): Promise<boolean> {
+  // Admin always has browser access
+  if (isAdmin(email, env)) return true;
+  const stub = getSharedIndexStub(env);
+  const response = await stub.fetch(`https://shared-index/users/${encodeURIComponent(email)}/browser`);
+  if (!response.ok) return false;
+  const data = (await response.json()) as { browserEnabled: boolean };
+  return data.browserEnabled;
+}
+
 // ─── DO Stub Helpers ───
 
 export function getSharedIndexStub(env: Env): DurableObjectStub {

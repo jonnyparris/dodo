@@ -3,7 +3,7 @@ import { createMcpHandler } from "agents/mcp";
 import { newRpcResponse } from "@hono/capnweb";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { AuthError, checkAllowlist, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, verifyAccess } from "./auth";
+import { AuthError, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
 import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
@@ -1334,6 +1334,14 @@ app.get("/session/:id/browser", async (c) => {
 app.put("/session/:id/browser", async (c) => {
   const denied = requirePermission(c, "admin");
   if (denied) return denied;
+  // Non-admin users must have browser_enabled set by admin before they can toggle browser on sessions.
+  const email = c.get("userEmail");
+  if (!isAdmin(email, c.env)) {
+    const allowed = await checkBrowserEnabled(email, c.env);
+    if (!allowed) {
+      return c.json({ error: "Browser access not enabled for your account. Ask your admin to enable it." }, 403);
+    }
+  }
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser");
 });
 

@@ -172,6 +172,14 @@ describe("Per-session browser toggle", () => {
         await new Promise(r => setTimeout(r, 10));
       }
     }
+    // Ensure the dev user exists in SharedIndex, then enable browser for them.
+    // Non-admin users must have this flag set before they can toggle browser on sessions.
+    await fetchSharedIndex("/users", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "dev@dodo.local", role: "user" }),
+    });
+    await fetchSharedIndex("/users/dev%40dodo.local/browser", { method: "POST" });
   });
 
   it("browser defaults to disabled for new sessions", async () => {
@@ -221,5 +229,23 @@ describe("Per-session browser toggle", () => {
     expect(disableRes.status).toBe(200);
     const body = (await disableRes.json()) as { browserEnabled: boolean };
     expect(body.browserEnabled).toBe(false);
+  });
+
+  it("returns 403 when user-level browser is not enabled", async () => {
+    // Disable browser for the dev user to test the gate
+    await fetchSharedIndex("/users/dev%40dodo.local/browser", { method: "DELETE" });
+
+    const sessionId = await createSession();
+    const res = await fetchJson(`/session/${sessionId}/browser`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("Browser access not enabled");
+
+    // Re-enable for other tests (cleanup)
+    await fetchSharedIndex("/users/dev%40dodo.local/browser", { method: "POST" });
   });
 });
