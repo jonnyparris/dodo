@@ -47,15 +47,6 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     ],
   },
   {
-    id: "sentry",
-    name: "Sentry",
-    description: "Error tracking and monitoring",
-    url: "https://github.com/getsentry/sentry-mcp",
-    setupGuide:
-      "Use the remote server at https://mcp.sentry.dev with OAuth, or run locally via npx @sentry/mcp-server",
-    knownHosts: ["mcp.sentry.dev"],
-  },
-  {
     id: "browser-rendering",
     name: "Browser Rendering",
     description:

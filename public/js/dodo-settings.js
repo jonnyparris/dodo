@@ -178,8 +178,10 @@ function renderIntegrations(){
     // Browser Rendering has its own dedicated settings section — skip it here
     if(cat.id==="browser-rendering")return;
     const catHostname=cat.url?getHostname(cat.url):null;
+    const catHosts=new Set(cat.knownHosts||[]);
+    if(catHostname)catHosts.add(catHostname);
     const configured=configMap.get(cat.name.toLowerCase())
-      ||[...configMap.values()].find(c=>catHostname&&c.url&&getHostname(c.url)===catHostname);
+      ||[...configMap.values()].find(c=>c.url&&catHosts.has(getHostname(c.url)));
     if(configured){
       connected.push(renderIntegCard(cat.name,cat.description,cat.url,configured));
       configMap.delete(configured.name.toLowerCase());
