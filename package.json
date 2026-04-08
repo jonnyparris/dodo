@@ -44,14 +44,14 @@
       "AI_GATEWAY_KEY": {
         "description": "Auth key for the [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/). Only needed if using AI Gateway."
       },
+      "ADMIN_EMAIL": {
+        "description": "**Required.** Your email address. You'll be the admin user, auto-added to the allowlist on first request."
+      },
       "CF_ACCESS_AUD": {
-        "description": "Your [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/validating-json/) application audience tag."
+        "description": "Optional — your [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/validating-json/) application audience tag. Only needed for multi-user deployments with Access authentication."
       },
       "CF_ACCESS_TEAM_DOMAIN": {
-        "description": "Your Cloudflare Access team domain (e.g. `https://your-team.cloudflareaccess.com`)."
-      },
-      "ADMIN_EMAIL": {
-        "description": "Email address of the admin user. This user bypasses the allowlist and can manage other users."
+        "description": "Optional — your Cloudflare Access team domain (e.g. `https://your-team.cloudflareaccess.com`). Only needed for multi-user deployments with Access authentication."
       }
     }
   },

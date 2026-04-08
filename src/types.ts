@@ -8,8 +8,8 @@ export interface Env {
   ALLOW_UNAUTHENTICATED_DEV?: string;
   ASSETS?: Fetcher;
   BROWSER?: Fetcher;
-  CF_ACCESS_AUD: string;
-  CF_ACCESS_TEAM_DOMAIN: string;
+  CF_ACCESS_AUD?: string;
+  CF_ACCESS_TEAM_DOMAIN?: string;
   DEFAULT_MODEL: string;
   DODO_MCP_TOKEN?: string;
   DODO_COMMIT?: string;

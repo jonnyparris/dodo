@@ -504,6 +504,7 @@ export class SharedIndex extends DurableObject<Env> {
 
   private seedAdmin(): void {
     const adminEmail = resolveAdminEmail(this.env);
+    if (!adminEmail) return; // No admin configured — skip seeding
     const now = nowEpoch();
     this.db.exec(
       "INSERT OR IGNORE INTO users (email, display_name, role, created_at, last_seen_at) VALUES (?, ?, 'admin', ?, ?)",

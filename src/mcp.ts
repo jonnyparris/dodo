@@ -8,7 +8,9 @@ import type { Env } from "./types";
 // MCP uses the admin email for all operations since MCP is token-authenticated
 // (no CF Access identity available). In Phase 2, MCP can pass user context.
 function mcpUserEmail(env: Env): string {
-  return resolveAdminEmail(env);
+  const email = resolveAdminEmail(env);
+  if (!email) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
+  return email;
 }
 
 async function userControlFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {

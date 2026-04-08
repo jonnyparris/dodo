@@ -109,7 +109,9 @@ declare const catalog: CatalogEntry[];
 // ─── Helpers ───
 
 function mcpUserEmail(env: Env): string {
-  return resolveAdminEmail(env);
+  const email = resolveAdminEmail(env);
+  if (!email) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
+  return email;
 }
 
 function errorResult(data: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {

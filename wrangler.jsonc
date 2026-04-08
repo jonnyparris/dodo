@@ -52,16 +52,13 @@
   "assets": {
     "directory": "./public"
   },
+  "secrets": {
+    "required": ["ADMIN_EMAIL"]
+  },
   "vars": {
-    // Set these to your Cloudflare Access application's audience tag and team domain.
-    // See: https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/validating-json/
-    "CF_ACCESS_AUD": "your-cf-access-audience-tag",
-    "CF_ACCESS_TEAM_DOMAIN": "https://your-team.cloudflareaccess.com",
-    // Set this to any model your LLM gateway supports (e.g. "anthropic/claude-sonnet-4", "openai/gpt-4o")
     "DEFAULT_MODEL": "anthropic/claude-sonnet-4",
     "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
     "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1",
-    "DODO_VERSION": "0.4.0",
-    "ADMIN_EMAIL": "you@example.com"
+    "DODO_VERSION": "0.4.0"
   }
 }

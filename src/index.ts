@@ -342,7 +342,7 @@ app.use("*", async (c, next) => {
   } catch (error) {
     if (error instanceof AuthError) {
       log("warn", "Auth failure", { source: "unknown", error: error.message });
-      return c.json({ error: error.message }, error.status as 401 | 403);
+      return c.json({ error: error.message }, error.status as 401 | 403 | 500);
     }
     log("warn", "Auth failure", { source: "unknown", error: "Authentication failed" });
     return c.json({ error: "Authentication failed" }, 403);

@@ -5,8 +5,8 @@
 </p>
 
 <p align="center">
-  Self-hostable coding agent platform on Cloudflare Workers.<br/>
-  Deploy your own, connect any LLM, and dispatch autonomous sessions from a browser or MCP client.
+  Coding agent platform on Cloudflare Workers.<br/>
+  Deploy to your Cloudflare account, connect any LLM, and dispatch autonomous sessions from a browser or MCP client.
 </p>
 
 <p align="center">
@@ -17,17 +17,17 @@
 
 ## What is Dodo?
 
-Dodo gives you a turnkey coding agent you own and control. Each session runs in its own [Durable Object](https://developers.cloudflare.com/durable-objects/) with persistent files, git, a chat loop backed by [`@cloudflare/think`](https://www.npmjs.com/package/@cloudflare/think), and sandboxed code execution. You bring the LLM — Dodo handles the rest.
+Dodo is a coding agent platform built on Cloudflare Workers. Each session runs in its own [Durable Object](https://developers.cloudflare.com/durable-objects/) with persistent files, git, a chat loop backed by [`@cloudflare/think`](https://www.npmjs.com/package/@cloudflare/think), and sandboxed code execution. You bring the LLM — Dodo handles the rest.
 
-**Why self-host?** Your code stays on your infrastructure. You pick the model. You control costs. No vendor lock-in, no data leaving your account.
+It deploys to your Cloudflare account. You pick the model, you control costs, and your data stays in your account.
 
 ## Quick start
 
 ### One-click deploy
 
-Click the **Deploy to Cloudflare** button above. Cloudflare will fork the repo, provision resources (Durable Objects, R2, Workers AI, Browser Rendering), and deploy. You'll be prompted for secrets during setup — see [Secrets](#secrets) for what each one does.
+Click the **Deploy to Cloudflare** button above. Cloudflare will fork the repo, provision resources (Durable Objects, R2, Workers AI, Browser Rendering), and deploy. You'll be prompted for secrets during setup — the only required one is `ADMIN_EMAIL`. See [Secrets](#secrets) for the full list.
 
-After deploy, set up [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) to protect your Worker, then visit the URL to start using Dodo.
+After deploy, visit the URL — you'll be logged in as the admin.
 
 ### Manual deploy
 
@@ -36,14 +36,16 @@ git clone https://github.com/jonnyparris/dodo.git
 cd dodo
 npm install
 
-# 1. Edit wrangler.jsonc — set ADMIN_EMAIL, CF_ACCESS_AUD, CF_ACCESS_TEAM_DOMAIN
-# 2. Set secrets:
+# Set the one required secret — your email:
+wrangler secret put ADMIN_EMAIL
+
+# Optional but recommended:
 wrangler secret put SECRETS_MASTER_KEY      # openssl rand -hex 32
 wrangler secret put COOKIE_SECRET           # openssl rand -hex 32
 wrangler secret put DODO_MCP_TOKEN          # openssl rand -base64url 32
 wrangler secret put OPENCODE_GATEWAY_TOKEN  # your LLM gateway token
 
-# 3. Deploy
+# Deploy
 npm run deploy
 ```
 
@@ -60,8 +62,8 @@ The dev server uses `wrangler.dev.jsonc` with `ALLOW_UNAUTHENTICATED_DEV=true` t
 ## Prerequisites
 
 - A [Cloudflare account](https://dash.cloudflare.com/sign-up) (Workers Paid plan for Durable Objects)
-- A [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) application protecting your Worker
 - An LLM gateway token — either [OpenCode](https://opencode.cloudflare.dev) or [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/)
+- Optional: [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) for multi-user deployments (see [Authentication](#authentication))
 
 ## Features
 
@@ -78,7 +80,7 @@ The dev server uses `wrangler.dev.jsonc` with `ALLOW_UNAUTHENTICATED_DEV=true` t
 | **MCP** | 46-tool server at `/mcp` for orchestration; 2-tool code-mode at `/mcp/codemode` for agents |
 | **Orchestration** | Seed sessions, deterministic edit pipelines, worker dispatch with branch verification |
 | **Browser** | Headless Chrome via native binding (admin) or user-supplied credentials (MCP). Navigate pages, read docs, scrape data. |
-| **Security** | CF Access auth, user allowlist, envelope-encrypted secrets, gated sandbox networking |
+| **Security** | Optional CF Access auth, user allowlist, envelope-encrypted secrets, gated sandbox networking |
 | **UI** | Three-panel responsive web app with real-time streaming, presence, and dark mode |
 
 ## Connecting your LLM
@@ -123,18 +125,37 @@ Set via `wrangler secret put <NAME>` or through the Deploy to Cloudflare flow.
 
 | Secret | Required | Purpose |
 |--------|----------|---------|
-| `SECRETS_MASTER_KEY` | Yes | 32-byte hex key for envelope encryption of per-user secrets |
-| `COOKIE_SECRET` | Yes | Signs session-sharing cookies |
-| `DODO_MCP_TOKEN` | Yes | Bearer token for `/mcp` and `/mcp/codemode` |
+| `ADMIN_EMAIL` | **Yes** | Your email address. Auto-added to the allowlist on first request. |
+| `SECRETS_MASTER_KEY` | Recommended | 32-byte hex key for envelope encryption of per-user secrets |
+| `COOKIE_SECRET` | Recommended | Signs session-sharing cookies |
+| `DODO_MCP_TOKEN` | Recommended | Bearer token for `/mcp` and `/mcp/codemode` |
 | `OPENCODE_GATEWAY_TOKEN` | If using OpenCode | Auth token for the OpenCode gateway |
 | `AI_GATEWAY_KEY` | If using AI Gateway | Auth key for the AI Gateway |
+| `CF_ACCESS_AUD` | If using Access | Cloudflare Access application audience tag |
+| `CF_ACCESS_TEAM_DOMAIN` | If using Access | Cloudflare Access team domain URL |
 
 Per-user secrets (GitHub token, GitLab token, ntfy topic) are stored encrypted in each user's Durable Object after passkey onboarding — not as environment variables.
+
+## Authentication
+
+Dodo supports two modes:
+
+**Single-user (default).** Set `ADMIN_EMAIL` and you're done. Every request is authenticated as the admin. No login page, no external auth provider. Good for personal deployments.
+
+**Multi-user with Cloudflare Access.** Put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) in front of your Worker, then set `CF_ACCESS_AUD` and `CF_ACCESS_TEAM_DOMAIN` as secrets. Dodo validates the Access JWT on every request and identifies users by email. Add users to the allowlist from the admin panel.
+
+```bash
+# Enable Access auth:
+wrangler secret put CF_ACCESS_AUD             # your Access app audience tag
+wrangler secret put CF_ACCESS_TEAM_DOMAIN     # e.g. https://your-team.cloudflareaccess.com
+```
+
+When Access secrets are set, Dodo enforces JWT validation. When they're absent, it runs in single-user mode.
 
 ## Architecture
 
 ```
-Worker (Hono router + CF Access auth)
+Worker (Hono router + optional CF Access auth)
 ├── SharedIndex DO (global singleton)
 │   └── users, host allowlist, models cache, session shares/permissions
 ├── UserControl DO (one per user)

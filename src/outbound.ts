@@ -106,9 +106,11 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     // Restricted env var fallback — admin account only
     if (!token && ownerId) {
       const adminEmail = resolveAdminEmail(this.env);
-      const adminId = this.env.USER_CONTROL.idFromName(adminEmail).toString();
-      if (ownerId === adminId) {
-        token = this.envTokenForHost(hostname);
+      if (adminEmail) {
+        const adminId = this.env.USER_CONTROL.idFromName(adminEmail).toString();
+        if (ownerId === adminId) {
+          token = this.envTokenForHost(hostname);
+        }
       }
     }
 

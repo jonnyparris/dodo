@@ -2,13 +2,22 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { AccessIdentity, Env } from "./types";
 
 const DEV_EMAIL = "dev@dodo.local";
+const PLACEHOLDER_VALUES = new Set(["your-cf-access-audience-tag", "https://your-team.cloudflareaccess.com", ""]);
 
-/** Resolve the admin email from env, with a hardcoded fallback. */
-export function resolveAdminEmail(env: Env): string {
-  if (!env.ADMIN_EMAIL) {
-    throw new Error("ADMIN_EMAIL environment variable is required. Set it in wrangler.jsonc vars or .dev.vars.");
-  }
+/** Resolve the admin email from env. Returns undefined when not configured. */
+export function resolveAdminEmail(env: Env): string | undefined {
+  if (!env.ADMIN_EMAIL || env.ADMIN_EMAIL === "you@example.com") return undefined;
   return env.ADMIN_EMAIL;
+}
+
+/** Check whether Cloudflare Access JWT validation is configured. */
+export function isAccessConfigured(env: Env): boolean {
+  return !!(
+    env.CF_ACCESS_AUD &&
+    env.CF_ACCESS_TEAM_DOMAIN &&
+    !PLACEHOLDER_VALUES.has(env.CF_ACCESS_AUD) &&
+    !PLACEHOLDER_VALUES.has(env.CF_ACCESS_TEAM_DOMAIN)
+  );
 }
 
 function readAccessToken(request: Request): string | null {
@@ -49,6 +58,16 @@ export function isDevMode(env: Env): boolean {
 export async function verifyAccess(request: Request, env: Env): Promise<AccessIdentity> {
   if (isDevMode(env)) {
     return { email: DEV_EMAIL, source: "dev" };
+  }
+
+  // When Access is not configured, trust the email header (if Access is in
+  // front at the network level) or fall back to the admin email.
+  if (!isAccessConfigured(env)) {
+    const headerEmail = request.headers.get("Cf-Access-Authenticated-User-Email");
+    if (headerEmail) return { email: headerEmail, source: "access" };
+    const admin = resolveAdminEmail(env);
+    if (admin) return { email: admin, source: "dev" };
+    throw new AuthError("ADMIN_EMAIL is not configured. Set it with: wrangler secret put ADMIN_EMAIL", 500);
   }
 
   const token = readAccessToken(request);

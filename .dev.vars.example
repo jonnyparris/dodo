@@ -1,4 +1,10 @@
-# Required secrets — the Deploy to Cloudflare flow will prompt you for these.
+# ─── Required ───
+
+# Admin user email — this is the only secret you must set.
+# This user is auto-added to the allowlist on first request and can manage other users.
+ADMIN_EMAIL=
+
+# ─── Recommended ───
 
 # 32-byte hex key for server-side envelope encryption of per-user secrets.
 # Generate with: openssl rand -hex 32
@@ -12,8 +18,18 @@ COOKIE_SECRET=
 # Generate with: openssl rand -base64url 32
 DODO_MCP_TOKEN=
 
-# Auth token for the OpenCode LLM gateway (optional — only if using OpenCode gateway).
+# ─── Optional: LLM gateway ───
+
+# Auth token for the OpenCode LLM gateway (only if using OpenCode gateway).
 OPENCODE_GATEWAY_TOKEN=
 
-# Auth key for the Cloudflare AI Gateway (optional — only if using AI Gateway).
+# Auth key for the Cloudflare AI Gateway (only if using AI Gateway).
 AI_GATEWAY_KEY=
+
+# ─── Optional: Cloudflare Access ───
+# Set these to enable Cloudflare Access authentication.
+# Without Access, Dodo runs in single-user mode using ADMIN_EMAIL.
+# See: https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/validating-json/
+
+# CF_ACCESS_AUD=
+# CF_ACCESS_TEAM_DOMAIN=
