@@ -870,7 +870,7 @@
       startTaskSync();
       connectUserEvents();
       const hashMatch=location.hash.match(/^#session=(.+)$/);
-      if(hashMatch){const sid=decodeURIComponent(hashMatch[1]);if(allSessions.some(s=>s.id===sid)){await selectSession(sid);return}}
+      if(hashMatch){const sid=decodeURIComponent(hashMatch[1]);await selectSession(sid);return}
       renderOnboardingSessions();
     }
 

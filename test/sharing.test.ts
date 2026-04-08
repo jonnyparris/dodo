@@ -97,18 +97,17 @@ describe("Sharing & Permissions", () => {
       expect(share!.sessionId).toBe(sessionId);
     });
 
-    it("verify share token returns valid with correct sessionId + permission", async () => {
-      // Verify through the SharedIndex DO directly via the /shared/:token route
+    it("verify share token redirects to session with correct sessionId", async () => {
+      // The /shared/:token route mints a cookie and redirects to the app
       const res = await fetchJson(`/shared/${shareToken}`);
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { sessionId: string; permission: string };
-      expect(body.sessionId).toBe(sessionId);
-      expect(body.permission).toBe("readonly");
+      expect(res.status).toBe(302);
+      const location = res.headers.get("location");
+      expect(location).toBe(`/#session=${sessionId}`);
     });
 
-    it("verify sets a signed cookie", async () => {
+    it("verify sets a signed cookie on redirect", async () => {
       const res = await fetchJson(`/shared/${shareToken}`);
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(302);
       const setCookie = res.headers.get("set-cookie");
       expect(setCookie).toBeTruthy();
       expect(setCookie).toContain("dodo_share=");

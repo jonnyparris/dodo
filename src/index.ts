@@ -294,11 +294,13 @@ app.get("/shared/:token", async (c) => {
   });
 
   const signed = await signCookie(payload, cookieSecret);
-  return c.json(
-    { sessionId: result.sessionId, permission: result.permission },
-    200,
-    { "Set-Cookie": `dodo_share=${signed}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400` },
-  );
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: `/#session=${encodeURIComponent(result.sessionId)}`,
+      "Set-Cookie": `dodo_share=${signed}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400`,
+    },
+  });
 });
 
 // ─── Error ingestion (no auth — errors can happen before/during auth) ───
