@@ -620,14 +620,9 @@ function buildTools(
   // AND the session owner is admin. Non-admin users get browser via the MCP
   // path (which bills to their own Cloudflare account).
   if (env.BROWSER && env.LOADER && options?.browserEnabled && options?.isAdminUser) {
-    const outbound = options?.ownerId && env.OUTBOUND
-      ? wrapOutboundWithOwner(env.OUTBOUND, options.ownerId)
-      : env.OUTBOUND ?? null;
-
     const browserTools = createBrowserTools({
       browser: env.BROWSER,
       loader: env.LOADER,
-      outbound,
       timeout: 30_000,
     });
     Object.assign(tools, browserTools);

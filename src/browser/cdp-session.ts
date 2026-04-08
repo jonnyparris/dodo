@@ -1,11 +1,5 @@
-interface PendingCommand {
-  resolve: (result: unknown) => void;
-  reject: (error: Error) => void;
-  timeoutId: ReturnType<typeof setTimeout>;
-  method: string;
-  sessionId?: string;
-  startedAt: number;
-}
+import puppeteer from "@cloudflare/puppeteer";
+import type { Browser, CDPSession as PuppeteerCDPSession } from "@cloudflare/puppeteer";
 
 interface DebugEntry {
   at: string;
@@ -22,84 +16,73 @@ export interface CdpAttachOptions {
   timeoutMs?: number;
 }
 
-const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_DEBUG_ENTRIES = 400;
 
 /**
- * A CDP session over an open WebSocket. Manages command correlation,
- * timeouts, target sessions, and a debug event ring buffer.
+ * A CDP session backed by @cloudflare/puppeteer.
+ *
+ * The Browser Rendering binding doesn't expose raw CDP WebSocket access,
+ * so we use Puppeteer to launch the browser and then use its CDPSession
+ * to proxy raw CDP commands. This gives us full CDP access (screenshots,
+ * DOM, network, etc.) while working within the binding's constraints.
  *
  * Used host-side (not in the sandbox) — the sandbox calls into this
- * via DynamicWorkerExecutor's ToolDispatcher RPC.
+ * via DynamicWorkerExecutor's provider RPC.
  */
 export class CdpSession {
-  #socket: WebSocket;
-  #nextId = 1;
-  #pending = new Map<number, PendingCommand>();
+  #browser: Browser;
+  #cdpSession: PuppeteerCDPSession;
   #debugLog: DebugEntry[] = [];
-  #defaultTimeoutMs: number;
+  /** Map of sessionId → CDPSession for attached targets */
+  #targetSessions = new Map<string, PuppeteerCDPSession>();
 
-  constructor(socket: WebSocket, defaultTimeoutMs = DEFAULT_TIMEOUT_MS) {
-    this.#socket = socket;
-    this.#defaultTimeoutMs = defaultTimeoutMs;
-
-    socket.addEventListener("message", (event) => this.#handleMessage(event));
-    socket.addEventListener("error", () => {
-      this.#rejectAll(new Error("CDP socket error"));
-    });
-    socket.addEventListener("close", () => {
-      this.#rejectAll(new Error("CDP connection closed"));
-    });
+  constructor(browser: Browser, cdpSession: PuppeteerCDPSession) {
+    this.#browser = browser;
+    this.#cdpSession = cdpSession;
   }
 
-  send(
+  async send(
     method: string,
     params?: unknown,
     options: CdpSendOptions = {},
   ): Promise<unknown> {
-    const id = this.#nextId++;
-    const timeoutMs = options.timeoutMs ?? this.#defaultTimeoutMs;
-    const sessionId =
-      typeof options.sessionId === "string" && options.sessionId.length > 0
-        ? options.sessionId
-        : undefined;
+    const sessionId = typeof options.sessionId === "string" && options.sessionId.length > 0
+      ? options.sessionId
+      : undefined;
 
-    const domain = typeof method === "string" ? method.split(".")[0] : "";
-    if (!sessionId && domain && !["Browser", "Target"].includes(domain)) {
-      this.#recordDebug("warning", {
-        id,
-        method,
-        reason: "target-scoped method sent without sessionId",
-      });
+    this.#recordDebug("send", { method, sessionId });
+
+    try {
+      // Use the target-specific session if a sessionId is provided
+      const session = sessionId
+        ? this.#targetSessions.get(sessionId) ?? this.#cdpSession
+        : this.#cdpSession;
+
+      const result = await session.send(method as any, params as any);
+      this.#recordDebug("receive", { method, sessionId, success: true });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.#recordDebug("error", { method, sessionId, error: message });
+      throw new Error(`CDP error: ${message} for ${method}`);
     }
-
-    const result = new Promise<unknown>((resolve, reject) => {
-      const startedAt = performance.now();
-      const timeoutId = setTimeout(() => {
-        this.#pending.delete(id);
-        reject(new Error(`CDP command timed out after ${timeoutMs}ms: ${method}`));
-      }, timeoutMs);
-      this.#pending.set(id, { resolve, reject, timeoutId, method, sessionId, startedAt });
-    });
-
-    this.#recordDebug("send", { id, method, sessionId, timeoutMs });
-    this.#socket.send(JSON.stringify({ id, method, params, sessionId }));
-    return result;
   }
 
   async attachToTarget(
     targetId: string,
-    options: CdpAttachOptions = {},
+    _options: CdpAttachOptions = {},
   ): Promise<string> {
     if (typeof targetId !== "string" || !targetId) {
       throw new Error("attachToTarget requires a targetId");
     }
 
-    const result = (await this.send(
-      "Target.attachToTarget",
-      { targetId, flatten: true },
-      { timeoutMs: options.timeoutMs },
-    )) as { sessionId?: string };
+    this.#recordDebug("attach-request", { targetId });
+
+    // Use the browser-level CDP session to attach to the target
+    const result = await this.#cdpSession.send("Target.attachToTarget" as any, {
+      targetId,
+      flatten: true,
+    } as any) as { sessionId?: string };
 
     const sessionId = result?.sessionId ?? "";
     if (!sessionId) {
@@ -107,6 +90,12 @@ export class CdpSession {
         `Target.attachToTarget did not return a sessionId for target ${targetId}`,
       );
     }
+
+    // Create a new CDPSession for this target using Puppeteer's internal API
+    // The flattened session mode means commands with the sessionId go through
+    // the same connection. We track the sessionId and use the browser-level
+    // session with manual sessionId routing.
+    this.#targetSessions.set(sessionId, this.#cdpSession);
 
     this.#recordDebug("attach", { targetId, sessionId });
     return sessionId;
@@ -121,63 +110,12 @@ export class CdpSession {
     this.#debugLog = [];
   }
 
-  close(): void {
-    this.#rejectAll(new Error("CDP session closed"));
+  async close(): Promise<void> {
     try {
-      this.#socket.close(1000, "Done");
+      await this.#browser.close();
     } catch {
-      // socket may already be closed
+      // browser may already be closed
     }
-  }
-
-  #rejectAll(error: Error): void {
-    for (const [id, pending] of this.#pending.entries()) {
-      clearTimeout(pending.timeoutId);
-      this.#pending.delete(id);
-      pending.reject(error);
-    }
-  }
-
-  #handleMessage(event: MessageEvent): void {
-    if (typeof event.data !== "string") {
-      return;
-    }
-
-    let payload: Record<string, unknown>;
-    try {
-      payload = JSON.parse(event.data) as Record<string, unknown>;
-    } catch {
-      return;
-    }
-
-    this.#recordDebug("receive", {
-      id: payload.id,
-      method: payload.method,
-      sessionId: payload.sessionId,
-      hasError: !!payload.error,
-    });
-
-    if (typeof payload.id !== "number") {
-      return;
-    }
-
-    const pending = this.#pending.get(payload.id);
-    if (!pending) {
-      return;
-    }
-
-    clearTimeout(pending.timeoutId);
-    this.#pending.delete(payload.id);
-
-    if (payload.error) {
-      const err = payload.error as { code?: unknown; message?: string };
-      const code = err.code ?? "unknown";
-      const message = err.message ?? "CDP error";
-      pending.reject(new Error(`CDP error ${code}: ${message} for ${pending.method}`));
-      return;
-    }
-
-    pending.resolve(payload.result);
   }
 
   #recordDebug(type: string, data: Record<string, unknown>): void {
@@ -189,25 +127,16 @@ export class CdpSession {
 }
 
 /**
- * Connect to a browser via the Browser Rendering binding (Fetcher).
- * Establishes a CDP WebSocket through the binding's fetch interface.
+ * Connect to a browser via the Browser Rendering binding using Puppeteer.
+ * Launches a browser, opens a page, and creates a CDP session for raw
+ * protocol access. The caller gets full CDP command access while Puppeteer
+ * handles the connection protocol with the Browser Rendering binding.
  */
 export async function connectBrowser(
-  browser: Fetcher,
-  timeoutMs?: number,
+  browserBinding: Fetcher,
 ): Promise<CdpSession> {
-  const response = await browser.fetch("http://localhost", {
-    headers: { Upgrade: "websocket" },
-  });
-
-  const ws = response.webSocket;
-  if (!ws) {
-    throw new Error(
-      "Browser Rendering binding did not return a WebSocket. " +
-        "Ensure the 'browser' binding is configured in wrangler.jsonc.",
-    );
-  }
-
-  ws.accept();
-  return new CdpSession(ws, timeoutMs);
+  const browser = await puppeteer.launch(browserBinding);
+  const page = await browser.newPage();
+  const cdpSession = await page.createCDPSession();
+  return new CdpSession(browser, cdpSession);
 }

@@ -13,8 +13,6 @@ export interface BrowserToolsOptions {
   browser: Fetcher;
   /** Worker loader binding for DynamicWorkerExecutor */
   loader: WorkerLoader;
-  /** Optional outbound fetcher for gated network access from sandbox */
-  outbound?: Fetcher | null;
   /** Execution timeout in ms (default: 30000) */
   timeout?: number;
 }
@@ -51,6 +49,9 @@ async () => {
 
 const EXECUTE_DESCRIPTION = `Execute CDP commands against a live browser session using JavaScript code.
 
+A fresh browser with one blank page is launched per call. The CDP session is already
+attached to that page — you can send page-scoped commands directly without attaching.
+
 Available in your code:
 
 declare const cdp: {
@@ -70,14 +71,23 @@ Write an async arrow function in JavaScript. Do NOT use TypeScript syntax.
 Common patterns:
 // Navigate and screenshot
 async () => {
-  const targets = await cdp.send("Target.getTargets");
-  const page = targets.targetInfos.find(t => t.type === "page");
-  const sid = await cdp.attachToTarget(page.targetId);
-  await cdp.send("Page.enable", {}, { sessionId: sid });
-  await cdp.send("Page.navigate", { url: "https://example.com" }, { sessionId: sid });
+  await cdp.send("Page.enable");
+  await cdp.send("Page.navigate", { url: "https://example.com" });
   await new Promise(r => setTimeout(r, 3000));
-  const { data } = await cdp.send("Page.captureScreenshot", { format: "png" }, { sessionId: sid });
+  const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
   return { screenshot: data, format: "png", encoding: "base64" };
+}
+
+// Get page text content
+async () => {
+  await cdp.send("Page.enable");
+  await cdp.send("Page.navigate", { url: "https://example.com" });
+  await new Promise(r => setTimeout(r, 2000));
+  const { result } = await cdp.send("Runtime.evaluate", {
+    expression: "document.body.innerText",
+    returnByValue: true
+  });
+  return result.value;
 }
 
 // Get browser version
@@ -98,9 +108,11 @@ function formatError(error: unknown): string {
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function createBrowserTools(options: BrowserToolsOptions): Record<string, any> {
+  // No globalOutbound — the sandbox doesn't need network access.
+  // All CDP traffic goes through host-side providers (cdp.send etc.),
+  // not through the sandbox's fetch.
   const executor = new DynamicWorkerExecutor({
     loader: options.loader,
-    globalOutbound: options.outbound ?? null,
     timeout: options.timeout ?? 30_000,
   });
 
@@ -136,7 +148,7 @@ export function createBrowserTools(options: BrowserToolsOptions): Record<string,
       execute: async ({ code }: { code: string }) => {
         let session: CdpSession | undefined;
         try {
-          session = await connectBrowser(options.browser, options.timeout);
+          session = await connectBrowser(options.browser);
 
           const providers: ResolvedProvider[] = [
             {
@@ -169,7 +181,7 @@ export function createBrowserTools(options: BrowserToolsOptions): Record<string,
         } catch (error) {
           return { error: formatError(error) };
         } finally {
-          session?.close();
+          await session?.close();
         }
       },
     }),
