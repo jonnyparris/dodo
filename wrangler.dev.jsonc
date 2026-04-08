@@ -39,9 +39,6 @@
   "r2_buckets": [
     { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" }
   ],
-  "ai": {
-    "binding": "AI"
-  },
   "browser": {
     "binding": "BROWSER"
   },

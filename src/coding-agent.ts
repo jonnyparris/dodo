@@ -182,6 +182,12 @@ const SYSTEM_PROMPT = [
   "- Never force-push unless the user explicitly asks.",
   "- Prefer `git_clone_known` for built-in repos. Use `git_push_checked` with an explicit branch ref.",
   "",
+  "## Browser",
+  "",
+  "If browser tools are enabled for this session, you have `browser_navigate` to fetch rendered page content.",
+  "Use it to read documentation, check deployed sites, or scrape data from JavaScript-heavy pages.",
+  "The tool returns visible text (not HTML) to save tokens.",
+  "",
   "## Working with errors",
   "",
   "When something fails: state what failed, fix it, move on. Don't apologize repeatedly.",
@@ -346,6 +352,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const appConfig = this.getAppConfigFromThink();
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
     return buildToolsForThink(this.env, this.workspace, appConfig, {
+      browserEnabled: this.readMetadata("browser_enabled") === "true",
       ownerId: this.resolveOwnerId(ownerEmail),
       ownerEmail,
       stateBackend: this.stateBackend,

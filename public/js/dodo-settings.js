@@ -1,4 +1,4 @@
-// dodo-settings.js — Identity, passkeys, secrets, integrations, session settings, permissions, sharing, browser, approvals, MCP overrides
+// dodo-settings.js — Identity, passkeys, secrets, integrations, session settings, permissions, sharing, browser, MCP overrides
 
 function humanizeSecretName(name,configs){const m=name.match(/^mcp:([^:]+):(.+)$/);if(m&&configs){const c=configs.find(x=>x.id===m[1]);if(c)return c.name+" \u2014 "+m[2]}return name}
 
@@ -240,7 +240,7 @@ async function deleteIntegration(id){
 function showSessionSettings(){
   if(!currentSession)return toast("Select a session first","warning");
   $("settings-overlay").style.display="flex";
-  loadSharesList();loadPermissionsList();loadBrowserStatus();loadApprovals();loadSessionMcpConfigs();
+  loadSharesList();loadPermissionsList();loadBrowserStatus();loadSessionMcpConfigs();
 }
 function hideSessionSettings(){$("settings-overlay").style.display="none"}
 
@@ -321,27 +321,6 @@ async function toggleBrowser(){
     $("browser-toggle").checked=!enabled;
     toast("Failed: "+(e.message||e),"error");
   }
-}
-
-async function loadApprovals(){
-  if(!currentSession)return;
-  try{
-    const{approvals}=await api(`/session/${currentSession}/approvals`);
-    const pending=(approvals||[]).filter(a=>a.status==="pending");
-    $("approvals-list").innerHTML=pending.length?pending.map(a=>`<div class="approval-card"><div><strong>${esc(a.toolName||a.action||"Action")}</strong></div><div style="color:var(--muted)">${esc(a.description||JSON.stringify(a.args||{}).slice(0,100))}</div><div class="approval-actions"><button class="sm primary" onclick="approveAction('${esc(a.id)}')">Approve</button><button class="sm danger" onclick="rejectAction('${esc(a.id)}')">Reject</button></div></div>`).join(""):'<div class="empty">No pending approvals</div>';
-  }catch{$("approvals-list").innerHTML='<div class="empty">No approvals</div>'}
-}
-
-async function approveAction(approvalId){
-  if(!currentSession)return;
-  await jsonSafe(`/session/${currentSession}/approvals/${encodeURIComponent(approvalId)}/approve`,{});
-  await loadApprovals();
-}
-
-async function rejectAction(approvalId){
-  if(!currentSession)return;
-  await jsonSafe(`/session/${currentSession}/approvals/${encodeURIComponent(approvalId)}/reject`,{});
-  await loadApprovals();
 }
 
 // --- Session MCP Config Overrides ---

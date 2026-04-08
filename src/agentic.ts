@@ -3,6 +3,7 @@ import type { StateBackend } from "@cloudflare/shell";
 import { generateText, jsonSchema, stepCountIs, tool, zodSchema, type Tool as AnyToolType } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
+import puppeteer from "@cloudflare/puppeteer";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { wrapOutboundWithOwner } from "./executor";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
@@ -552,7 +553,7 @@ function buildTools(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend },
+  options?: { authorEmail?: string; browserEnabled?: boolean; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend },
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
@@ -612,6 +613,47 @@ function buildTools(
   // Explore tool — search subagent for token-efficient codebase discovery
   tools.explore = buildExploreTool(workspace, config, env);
 
+  // Browser tool — headless Chrome via the BROWSER binding.
+  // Gated on the BROWSER binding existing AND the session having browser enabled.
+  if (env.BROWSER && options?.browserEnabled) {
+    tools.browser_navigate = tool({
+      description:
+        "Navigate to a URL in a headless browser and return the rendered page text. " +
+        "Use this to read documentation, check deployed sites, or scrape data from JavaScript-heavy pages. " +
+        "Returns the visible text content after JavaScript execution (not raw HTML).",
+      inputSchema: z.object({
+        url: z.string().url().describe("URL to navigate to"),
+        waitUntil: z
+          .enum(["load", "domcontentloaded", "networkidle0", "networkidle2"])
+          .optional()
+          .default("networkidle2")
+          .describe("When to consider navigation complete. Use networkidle0 for JS-heavy SPAs."),
+      }),
+      execute: async ({ url, waitUntil }: { url: string; waitUntil?: string }) => {
+        let browser;
+        try {
+          browser = await puppeteer.launch(env.BROWSER!);
+          const page = await browser.newPage();
+          await page.goto(url, {
+            waitUntil: (waitUntil ?? "networkidle2") as "load" | "domcontentloaded" | "networkidle0" | "networkidle2",
+            timeout: 15_000,
+          });
+          const title = await page.title();
+          // Extract visible text — much more token-efficient than raw HTML.
+          // page.evaluate runs in the browser context where `document` exists.
+          // eslint-disable-next-line no-undef
+          const text = await page.evaluate("document.body.innerText") as string;
+          const truncated = text.length > 50_000 ? text.slice(0, 50_000) + "\n\n[Truncated — page text exceeds 50k characters]" : text;
+          return { url, title, text: truncated };
+        } catch (err) {
+          return { error: `Browser navigation failed: ${err instanceof Error ? err.message : String(err)}` };
+        } finally {
+          if (browser) await browser.close().catch(() => {});
+        }
+      },
+    });
+  }
+
   return tools;
 }
 
@@ -623,7 +665,7 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend; mcpGatekeepers?: McpGatekeeper[] },
+  options?: { authorEmail?: string; browserEnabled?: boolean; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend; mcpGatekeepers?: McpGatekeeper[] },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
 
