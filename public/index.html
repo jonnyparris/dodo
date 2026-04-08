@@ -604,7 +604,7 @@
       <button class="scroll-bottom-btn" id="scroll-bottom-btn" onclick="scrollChatToBottom()" title="Scroll to bottom">&darr;</button>
       <div id="typing-indicator" class="typing-indicator" style="display:none"></div>
       <div class="input-bar">
-        <textarea id="msg-input" rows="1" placeholder="Ask Dodo to build something..." onkeydown="handleInputKeydown(event)" oninput="autoResizeInput(this)" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)" aria-label="Message input"></textarea>
+        <textarea id="msg-input" rows="1" placeholder="Ask Dodo to build something..." onkeydown="handleInputKeydown(event)" oninput="autoResizeInput(this);sendTypingStart()" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)" aria-label="Message input"></textarea>
         <div class="input-actions">
           <button class="sending" id="send-btn" onclick="handleSendBtn()" aria-label="Send message"><i class="ph ph-paper-plane-right"></i></button>
         </div>

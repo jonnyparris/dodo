@@ -1853,14 +1853,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       case "typing": {
         const isTyping = Boolean(parsed.isTyping);
         this.presence.setTyping(connection.id, isTyping);
-        const entry = this.presence.get(connection.id);
-        if (entry) {
-          this.broadcastToWebSockets(JSON.stringify({
-            type: "typing",
-            email: entry.email,
-            isTyping,
-          }), connection.id);
-        }
+        this.broadcastTyping();
         break;
       }
 
@@ -1989,6 +1982,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const payload = JSON.stringify({
       type: "presence",
       users: this.presence.getAll(),
+    });
+    this.broadcastToWebSockets(payload);
+  }
+
+  /** Broadcast current typing users to all WebSocket clients. */
+  private broadcastTyping(): void {
+    const payload = JSON.stringify({
+      type: "typing",
+      users: this.presence.getAll().filter((u) => u.isTyping),
     });
     this.broadcastToWebSockets(payload);
   }

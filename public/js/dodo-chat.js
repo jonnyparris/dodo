@@ -300,6 +300,7 @@ function updateTokenSummary(state){
 // --- Chat actions ---
 async function sendMessage(){
   const content=$("msg-input").value.trim();if(!content)return;
+  sendTypingStop();
   if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}
   $("msg-input").value="";$("msg-input").style.height='auto';
   if(isProcessing){
@@ -365,4 +366,24 @@ function renderTypingIndicator(){
   if(!names.length){el.style.display="none";return}
   el.style.display="block";
   el.textContent=names.length===1?`${names[0]} is typing...`:`${names.join(", ")} are typing...`;
+}
+
+// --- Typing notifications (outbound) ---
+let _typingSent=false,_typingTimer=null;
+function sendTypingStart(){
+  if(!wsConnection||wsConnection.readyState!==WebSocket.OPEN)return;
+  if(!_typingSent){
+    wsConnection.send(JSON.stringify({type:"typing",isTyping:true}));
+    _typingSent=true;
+  }
+  if(_typingTimer)clearTimeout(_typingTimer);
+  _typingTimer=setTimeout(()=>{sendTypingStop()},3000);
+}
+function sendTypingStop(){
+  if(_typingTimer){clearTimeout(_typingTimer);_typingTimer=null}
+  if(!_typingSent)return;
+  _typingSent=false;
+  if(wsConnection&&wsConnection.readyState===WebSocket.OPEN){
+    wsConnection.send(JSON.stringify({type:"typing",isTyping:false}));
+  }
 }
