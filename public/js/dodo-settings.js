@@ -32,8 +32,10 @@ async function changePasskey(){
 async function loadSecrets(){
   try{
     const{keys}=await api("/api/secrets");
+    secretKeys=keys||[];
     $("secrets-list").innerHTML=keys.length?keys.map(k=>`<div class="kv"><code>${esc(humanizeSecretName(k,mcpConfigs))}</code><button onclick="deleteSecret('${esc(k)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No secrets</div>';
-  }catch{$("secrets-list").innerHTML='<div class="empty">No secrets</div>'}
+    if(mcpCatalog.length)renderIntegrations();
+  }catch{secretKeys=[];$("secrets-list").innerHTML='<div class="empty">No secrets</div>'}
 }
 async function setSecret(){
   const key=$("secret-key").value,value=$("secret-value").value;if(!key||!value)return;
@@ -156,7 +158,7 @@ async function deleteBrowserConfig(){
 }
 
 // --- Integrations ---
-let mcpCatalog=[],mcpConfigs=[];
+let mcpCatalog=[],mcpConfigs=[],secretKeys=[];
 
 async function loadIntegrations(){
   try{
@@ -171,7 +173,10 @@ function renderIntegrations(){
   const configMap=new Map(mcpConfigs.map(c=>[c.name.toLowerCase(),c]));
   const getHostname=url=>{try{return new URL(url).hostname;}catch{return null;}};
   const connected=[],suggestions=[];
+  const hasGithubToken=secretKeys.includes("github_token");
   mcpCatalog.forEach(cat=>{
+    // Browser Rendering has its own dedicated settings section — skip it here
+    if(cat.id==="browser-rendering")return;
     const catHostname=cat.url?getHostname(cat.url):null;
     const configured=configMap.get(cat.name.toLowerCase())
       ||[...configMap.values()].find(c=>catHostname&&c.url&&getHostname(c.url)===catHostname);
@@ -179,6 +184,8 @@ function renderIntegrations(){
       connected.push(renderIntegCard(cat.name,cat.description,cat.url,configured));
       configMap.delete(configured.name.toLowerCase());
     }else{
+      // Hide GitHub suggestion when a github_token secret covers git operations
+      if(cat.id==="github"&&hasGithubToken)return;
       suggestions.push(renderIntegCard(cat.name,cat.description,cat.url,null));
     }
   });
