@@ -690,10 +690,11 @@
         </div>
         <div class="section">
           <h2>Browser Rendering</h2>
+          <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Browser tools let the agent navigate web pages, read documentation, and scrape data. An admin must enable browser access for your account before you can use it. Admin sessions use the platform's built-in browser; other users supply their own Cloudflare credentials below.</p>
           <div id="browser-config-status" style="font-size:12px;margin-bottom:8px"></div>
           <details style="margin-top:4px" id="browser-config-details">
-            <summary>Configure</summary>
-            <p style="font-size:11px;color:var(--muted);margin:6px 0">Enter your Cloudflare Account ID and an API Token with <strong>Browser Rendering - Edit</strong> permission. Each user's browser sessions bill to their own account.</p>
+            <summary>Configure your own credentials</summary>
+            <p style="font-size:11px;color:var(--muted);margin:6px 0">Enter your Cloudflare Account ID and an API Token with <strong>Browser Rendering - Edit</strong> permission. Browser sessions bill to your account.</p>
             <input id="browser-cf-account" placeholder="Cloudflare Account ID" style="margin-bottom:4px"/>
             <input id="browser-cf-token" type="password" placeholder="Cloudflare API Token" style="margin-bottom:4px"/>
             <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
@@ -776,7 +777,7 @@
         <dt>Cron Jobs</dt><dd>Schedule delayed or recurring prompts that run automatically.</dd>
         <dt>Memory</dt><dd>Persistent key-value store with search. Survives across sessions.</dd>
         <dt>Integrations</dt><dd>Connect external MCP servers (GitHub, Cloudflare, Sentry, etc.) to extend the agent's capabilities.</dd>
-        <dt>Session Settings</dt><dd>Manage sharing, permissions, browser tools, and per-session MCP overrides.</dd>
+        <dt>Session Settings</dt><dd>Manage sharing, permissions, browser tools (requires admin approval), and per-session MCP overrides.</dd>
         <dt>Config</dt><dd>Switch LLM models and gateways. The model dropdown is populated from the available models on the OpenCode gateway.</dd>
         <dt>Allowlist</dt><dd>Hosts that sandboxed code execution is allowed to reach. Unlisted hosts are blocked.</dd>
       </dl>
@@ -830,6 +831,7 @@
           </label>
           <span style="font-size:12px" id="browser-status">Loading...</span>
         </div>
+        <p style="font-size:11px;color:var(--muted);margin-top:4px">An admin must enable browser access for your account first. Configure credentials under Browser Rendering in the sidebar, or use the built-in browser (admin only).</p>
       </div>
 
       <!-- Session MCP Overrides -->

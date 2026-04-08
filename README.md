@@ -77,6 +77,7 @@ The dev server uses `wrangler.dev.jsonc` with `ALLOW_UNAUTHENTICATED_DEV=true` t
 | **Memory** | Per-user key-value store with text search, persistent across sessions |
 | **MCP** | 46-tool server at `/mcp` for orchestration; 2-tool code-mode at `/mcp/codemode` for agents |
 | **Orchestration** | Seed sessions, deterministic edit pipelines, worker dispatch with branch verification |
+| **Browser** | Headless Chrome via native binding (admin) or user-supplied credentials (MCP). Navigate pages, read docs, scrape data. |
 | **Security** | CF Access auth, user allowlist, envelope-encrypted secrets, gated sandbox networking |
 | **UI** | Three-panel responsive web app with real-time streaming, presence, and dark mode |
 

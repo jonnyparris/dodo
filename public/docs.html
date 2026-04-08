@@ -400,7 +400,7 @@
       <tr><th>Section</th><th>What it does</th></tr>
       <tr><td><strong>Sharing</strong></td><td>Create share links with read-only or read-write access. Revoke links at any time.</td></tr>
       <tr><td><strong>Permissions</strong></td><td>Grant other users direct access by email address. Choose read-only or read-write.</td></tr>
-      <tr><td><strong>Browser Tools</strong></td><td>Toggle browser capabilities for the session (when available).</td></tr>
+      <tr><td><strong>Browser Tools</strong></td><td>Toggle browser capabilities for this session. Requires an admin to enable browser access for your account first. Admin sessions use the platform's built-in browser binding; other users connect via their own Cloudflare Browser Rendering credentials (configured in the sidebar).</td></tr>
 
       <tr><td><strong>MCP Overrides</strong></td><td>Enable or disable integrations for this session only. Reset to follow the global config.</td></tr>
     </table>
@@ -475,6 +475,33 @@
       <tr><td>GET/PUT</td><td><code>/session/:id/browser</code></td><td>Toggle browser tools</td></tr>
       <tr><td>GET</td><td><code>/session/:id/ws</code></td><td>WebSocket (presence, typing indicators)</td></tr>
     </table>
+
+    <!-- ─── Browser Rendering ─── -->
+    <h2 id="browser">Browser Rendering</h2>
+    <p>Browser tools let the agent navigate web pages, read documentation, and scrape content. There are two paths, with different billing targets:</p>
+
+    <table>
+      <tr><th>Path</th><th>Who gets it</th><th>Bills to</th><th>How to enable</th></tr>
+      <tr>
+        <td><strong>Native binding</strong> (<code>browser_navigate</code> tool)</td>
+        <td>Admin only</td>
+        <td>The Dodo instance owner's Cloudflare account</td>
+        <td>Automatic when the <code>BROWSER</code> binding is configured in wrangler.jsonc and browser is enabled on the session.</td>
+      </tr>
+      <tr>
+        <td><strong>MCP server</strong> (Browser Rendering MCP)</td>
+        <td>Any user with browser access enabled</td>
+        <td>The user's own Cloudflare account</td>
+        <td>User provides their Account ID and API Token in the sidebar under Browser Rendering. An admin must first enable browser access for the user via <code>POST /api/admin/users/:email/browser</code>.</td>
+      </tr>
+    </table>
+
+    <h3>Access control</h3>
+    <ol>
+      <li><strong>Admin enables browser for a user</strong> — <code>POST /api/admin/users/:email/browser</code>. Without this, the user cannot toggle browser on any session.</li>
+      <li><strong>User configures credentials</strong> (non-admin only) — <code>PUT /api/browser-config</code> with their own <code>cfAccountId</code> and <code>cfApiToken</code>. This creates an MCP connection to Cloudflare's Browser Rendering service, billed to the user's account.</li>
+      <li><strong>User enables browser per session</strong> — <code>PUT /session/:id/browser</code> with <code>{"enabled": true}</code>. The agent's tool set then includes browser capabilities.</li>
+    </ol>
 
     <!-- ─── MCP Client ─── -->
     <h2 id="mcp-client">Connecting via MCP</h2>
