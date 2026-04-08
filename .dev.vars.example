@@ -1,0 +1,19 @@
+# Required secrets — the Deploy to Cloudflare flow will prompt you for these.
+
+# 32-byte hex key for server-side envelope encryption of per-user secrets.
+# Generate with: openssl rand -hex 32
+SECRETS_MASTER_KEY=
+
+# Secret for signing session-sharing cookies.
+# Generate with: openssl rand -hex 32
+COOKIE_SECRET=
+
+# Bearer token for the MCP endpoint (/mcp and /mcp/codemode).
+# Generate with: openssl rand -base64url 32
+DODO_MCP_TOKEN=
+
+# Auth token for the OpenCode LLM gateway (optional — only if using OpenCode gateway).
+OPENCODE_GATEWAY_TOKEN=
+
+# Auth key for the Cloudflare AI Gateway (optional — only if using AI Gateway).
+AI_GATEWAY_KEY=

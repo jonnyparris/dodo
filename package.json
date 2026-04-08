@@ -26,6 +26,34 @@
     "jose": "^6.1.3",
     "zod": "^4.1.11"
   },
+  "cloudflare": {
+    "bindings": {
+      "SECRETS_MASTER_KEY": {
+        "description": "32-byte hex key for encrypting per-user secrets. Generate with `openssl rand -hex 32`."
+      },
+      "COOKIE_SECRET": {
+        "description": "Secret for signing session-sharing cookies. Generate with `openssl rand -hex 32`."
+      },
+      "DODO_MCP_TOKEN": {
+        "description": "Bearer token for the MCP endpoint (`/mcp` and `/mcp/codemode`). Generate with `openssl rand -base64url 32`."
+      },
+      "OPENCODE_GATEWAY_TOKEN": {
+        "description": "Auth token for the [OpenCode LLM gateway](https://opencode.cloudflare.dev). Only needed if using the OpenCode gateway."
+      },
+      "AI_GATEWAY_KEY": {
+        "description": "Auth key for the [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/). Only needed if using AI Gateway."
+      },
+      "CF_ACCESS_AUD": {
+        "description": "Your [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/validating-json/) application audience tag."
+      },
+      "CF_ACCESS_TEAM_DOMAIN": {
+        "description": "Your Cloudflare Access team domain (e.g. `https://your-team.cloudflareaccess.com`)."
+      },
+      "ADMIN_EMAIL": {
+        "description": "Email address of the admin user. This user bypasses the allowlist and can manage other users."
+      }
+    }
+  },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.13.5",
     "@cloudflare/workers-types": "^4.20260207.0",
