@@ -35,6 +35,17 @@ async function loadSecrets(){
     secretKeys=keys||[];
     $("secrets-list").innerHTML=keys.length?keys.map(k=>`<div class="kv"><code>${esc(humanizeSecretName(k,mcpConfigs))}</code><button onclick="deleteSecret('${esc(k)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No secrets</div>';
     if(mcpCatalog.length)renderIntegrations();
+    // Hide dropdown options for secrets that already exist; hide form entirely if all are set
+    const sel=$("secret-key");
+    const form=$("secret-add-form");
+    if(sel&&form){
+      const set=new Set(keys.filter(k=>!k.startsWith("mcp:")));
+      let available=0;
+      for(const opt of sel.options){opt.disabled=set.has(opt.value);if(!opt.disabled)available++}
+      if(!available)form.style.display="none";
+      // Select the first available option
+      for(const opt of sel.options){if(!opt.disabled){sel.value=opt.value;break}}
+    }
   }catch{secretKeys=[];$("secrets-list").innerHTML='<div class="empty">No secrets</div>'}
 }
 async function setSecret(){
