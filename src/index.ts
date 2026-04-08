@@ -391,6 +391,13 @@ app.get("/docs", async (c) => {
   return new Response("Docs not available", { status: 404 });
 });
 
+app.get("/howto", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/howto.html", c.req.url), c.req.raw));
+  }
+  return new Response("How-to guides not available", { status: 404 });
+});
+
 // ─── Admin routes (admin only) ───
 
 const adminGuard = async (c: { get: (key: string) => unknown; env: Env; json: (data: unknown, status?: number) => Response }, next: () => Promise<void>): Promise<Response | void> => {

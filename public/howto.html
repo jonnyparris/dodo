@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Dodo — How-To Guides</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    :root{--bg:#f5f5f0;--panel:#fff;--text:#1a1a1a;--muted:#666;--accent:#0a7c66;--accent-bg:rgba(10,124,102,.06);--border:#e0e0e0;--radius:8px;--mono:"SFMono-Regular",Consolas,monospace;--brand:#6c47ff;--danger:#c62828;--success:#0a7c66;--warning:#e65100}
+    @media(prefers-color-scheme:dark){:root{--bg:#111;--panel:#1a1a1a;--text:#e5e5e5;--muted:#999;--accent:#4ecdc4;--accent-bg:rgba(78,205,196,.08);--border:#333;--brand:#9b7dff;--danger:#ef5350;--success:#4ecdc4;--warning:#ffb74d}}
+    *{box-sizing:border-box;margin:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);font-size:15px;line-height:1.65}
+    main{max-width:820px;margin:0 auto;padding:32px 20px 80px}
+    h1{font-size:28px;margin-bottom:8px}
+    h2{font-size:20px;margin:40px 0 12px;color:var(--accent);padding-bottom:6px;border-bottom:1px solid var(--border)}
+    h3{font-size:16px;margin:24px 0 8px}
+    h4{font-size:14px;margin:16px 0 6px;color:var(--muted)}
+    p,li{margin-bottom:12px;color:var(--muted)}
+    ul{padding-left:20px;margin-bottom:16px}
+    a{color:var(--accent)}
+    code{font-family:var(--mono);font-size:13px;background:var(--accent-bg);padding:2px 6px;border-radius:4px}
+    pre{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-x:auto;font-family:var(--mono);font-size:13px;margin-bottom:16px;line-height:1.5}
+    .diagram{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:24px;margin:16px 0 24px;overflow-x:auto;text-align:center}
+    svg text{font-family:-apple-system,BlinkMacSystemFont,sans-serif}
+    table{width:100%;border-collapse:collapse;margin:12px 0 20px}
+    th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px}
+    th{font-weight:600;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+    .back{display:inline-block;margin-bottom:24px;font-size:13px}
+    .toc{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px 20px;margin:20px 0 32px}
+    .toc h4{margin:0 0 8px;color:var(--text);font-size:13px;text-transform:uppercase;letter-spacing:.04em}
+    .toc ul{columns:2;column-gap:24px;padding-left:16px;margin:0}
+    .toc li{margin-bottom:4px;font-size:13px;break-inside:avoid}
+    .toc a{text-decoration:none}
+    .toc a:hover{text-decoration:underline}
+    .callout{background:var(--accent-bg);border-left:3px solid var(--accent);border-radius:0 var(--radius) var(--radius) 0;padding:12px 16px;margin:12px 0 16px;font-size:13px}
+    .callout p{margin:0;color:var(--text)}
+    kbd{display:inline-block;padding:2px 6px;font-size:11px;font-family:var(--mono);background:var(--panel);border:1px solid var(--border);border-radius:4px;box-shadow:0 1px 0 var(--border)}
+    @media(max-width:600px){.toc ul{columns:1}main{padding:20px 16px 60px}}
+  </style>
+</head>
+<body>
+  <main>
+    <a href="/" class="back">&larr; Back to Dodo</a>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <img src="/favicon-light.svg" alt="Dodo" width="40" height="40"/>
+      <h1 style="margin:0">How-To Guides</h1>
+    </div>
+    <p>Step-by-step guides for common Dodo tasks.</p>
+
+    <nav class="toc">
+      <h4>Contents</h4>
+      <ul>
+        <li><a href="#first-session">Create Your First Session</a></li>
+        <li><a href="#clone-repo">Clone a GitHub Repo</a></li>
+        <li><a href="#fork-session">Fork a Session for Experiments</a></li>
+        <li><a href="#schedule-task">Schedule a Recurring Task</a></li>
+        <li><a href="#connect-mcp">Connect an MCP Server</a></li>
+        <li><a href="#kanban-dispatch">Dispatch Tasks from the Kanban Board</a></li>
+        <li><a href="#push-code">Push Code to GitHub</a></li>
+        <li><a href="#memory">Use Memory Across Sessions</a></li>
+      </ul>
+    </nav>
+
+    <h2 id="first-session">Create Your First Session</h2>
+    <h3>Create a session and send your first prompt</h3>
+    <p>Click the <kbd>+</kbd> floating action button in the lower-right corner to create a new session. Dodo opens a fresh workspace and chat view.</p>
+    <p>Type a prompt into the chat box, then press <kbd>Enter</kbd>. Start with something concrete, like reviewing a file, adding a route, or explaining a test failure.</p>
+    <p>Watch the streamed response as the agent thinks, reads files, and edits code. You can follow the output live in the chat timeline.</p>
+    <pre><code>Summarize this repo and tell me where the API routes live.
+</code></pre>
+    <div class="callout"><p>Tip: Give the agent one clear task per prompt. You will get better results than asking for several unrelated changes at once.</p></div>
+
+    <h2 id="clone-repo">Clone a GitHub Repo</h2>
+    <h3>Bring a repository into the session workspace</h3>
+    <p>Before cloning private GitHub repos, open <strong>Config &gt; Secrets</strong> and add your token as <code>GITHUB_TOKEN</code>. Public repos can usually clone without it, but private repos require it.</p>
+    <p>You can ask the agent in chat to clone a repo for you, or it can use the <code>git_clone</code> tool directly inside the session workspace.</p>
+    <pre><code>Clone https://github.com/user/repo
+</code></pre>
+    <pre><code>git_clone({ url: "https://github.com/user/repo", dir: "repo" })
+</code></pre>
+    <p>Once the clone finishes, ask the agent to inspect files, run tests, or start making changes inside that workspace.</p>
+    <div class="callout"><p>Warning: Set the token first if you plan to clone or push private repositories. Missing credentials usually show up as git auth errors.</p></div>
+
+    <h2 id="fork-session">Fork a Session for Experiments</h2>
+    <h3>Try risky changes without touching the original session</h3>
+    <p>Open the session you want to preserve, then click the <strong>Fork</strong> button. Dodo creates a copy with the same workspace and conversation context.</p>
+    <p>Use the fork when you want to test a large refactor, a dependency upgrade, or a prompt that may take the work in a different direction.</p>
+    <p>If you are using MCP tools, call <code>fork_session</code> instead of clicking the button. The result is the same: a new session you can modify independently.</p>
+    <pre><code>fork_session({ sessionId: "session_123" })
+</code></pre>
+    <div class="callout"><p>Tip: Name the fork clearly so you can tell the safe baseline from the experiment.</p></div>
+
+    <h2 id="schedule-task">Schedule a Recurring Task</h2>
+    <h3>Run prompts on a cron schedule</h3>
+    <p>Open the <strong>Cron</strong> tab to create a scheduled task. Enter a cron expression and the prompt you want Dodo to run automatically.</p>
+    <p>Use this for repeated work like test runs, dependency checks, or status reports. Keep the prompt focused and action-oriented.</p>
+    <pre><code>Cron: 0 * * * *
+Prompt: Run the test suite, summarize failures, and open a task if anything regressed.
+</code></pre>
+    <p>After saving, Dodo will dispatch the prompt on schedule. Review the resulting sessions to inspect logs, diffs, and outputs.</p>
+    <div class="callout"><p>Tip: Start with hourly or daily schedules until you trust the prompt. Frequent jobs can create a lot of sessions quickly.</p></div>
+
+    <h2 id="connect-mcp">Connect an MCP Server</h2>
+    <h3>Add external tool servers through Integrations</h3>
+    <p>Open the <strong>Integrations</strong> panel to connect external MCP servers such as GitHub, Sentry, or Cloudflare. These servers extend what the agent can do.</p>
+    <p>Enter the MCP server URL, then add an auth token if the server requires one. Save the integration so it becomes available to sessions.</p>
+    <pre><code>URL: https://example.com/mcp
+Token: optional-secret-token
+</code></pre>
+    <p>Once connected, ask the agent to use those tools in chat. For example, you can request GitHub issue lookups, Sentry investigation, or Cloudflare changes.</p>
+    <div class="callout"><p>Warning: Only connect MCP servers you trust. They can expose powerful external actions to the agent.</p></div>
+
+    <h2 id="kanban-dispatch">Dispatch Tasks from the Kanban Board</h2>
+    <h3>Turn tasks into autonomous agent sessions</h3>
+    <p>Open the task board and create cards for the work you want to delegate. Keep each task small enough to describe in one focused prompt.</p>
+    <p>Select one or more tasks, then dispatch them to create autonomous agent sessions. Use <kbd>Ctrl</kbd>+click or <kbd>Cmd</kbd>+click to multi-select cards before batch dispatch.</p>
+    <p>Dodo starts one session per dispatched task, so you can work through several items in parallel and review each result independently.</p>
+    <pre><code>Example task: Update the API docs for the new /howto route.
+</code></pre>
+    <div class="callout"><p>Tip: Batch dispatch works best when the selected tasks do not depend on each other.</p></div>
+
+    <h2 id="push-code">Push Code to GitHub</h2>
+    <h3>Send workspace changes to a remote repository</h3>
+    <p>First, add a git token in <strong>Config &gt; Secrets</strong> if the remote requires authentication. Without credentials, push commands will fail.</p>
+    <p>Then ask the agent to commit and push your branch, or let it use <code>git_push</code> from the session workspace. Be explicit about the branch name when you care about the destination.</p>
+    <pre><code>Commit my changes and push this branch to origin.
+</code></pre>
+    <pre><code>git_push({ remote: "origin", ref: "feat/my-branch" })
+</code></pre>
+    <p>After the push completes, verify the branch on GitHub and open a pull request if you want review before merging.</p>
+    <div class="callout"><p>Tip: Ask the agent to run tests before pushing so you do not publish a broken branch.</p></div>
+
+    <h2 id="memory">Use Memory Across Sessions</h2>
+    <h3>Store information that survives session deletion</h3>
+    <p>Dodo includes a persistent memory store for long-lived notes, decisions, and small pieces of structured data. Memory survives even if you delete the session that wrote it.</p>
+    <p>Write key-value pairs you want to reuse later, such as deployment notes, repository conventions, or customer-specific details. Search works across all saved entries.</p>
+    <pre><code>memory_write({ key: "repos/dodo/default-branch", value: "main" })
+memory_search({ query: "default branch for dodo" })
+</code></pre>
+    <p>Use memory for durable context, not large source files. Keep entries short, searchable, and specific enough to help future sessions.</p>
+    <div class="callout"><p>Tip: Save recurring setup facts in memory so you do not need to repeat them in every new session.</p></div>
+  </main>
+</body>
+</html>
