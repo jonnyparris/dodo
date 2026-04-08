@@ -322,7 +322,7 @@ async function loadBrowserStatus(){
   if(!currentSession)return;
   try{
     const result=await api(`/session/${currentSession}/browser`);
-    const enabled=result.enabled??false;
+    const enabled=result.browserEnabled??false;
     $("browser-toggle").checked=enabled;
     $("browser-status").textContent=enabled?"Enabled":"Disabled";
   }catch{

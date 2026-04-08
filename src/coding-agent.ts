@@ -182,12 +182,6 @@ const SYSTEM_PROMPT = [
   "- Never force-push unless the user explicitly asks.",
   "- Prefer `git_clone_known` for built-in repos. Use `git_push_checked` with an explicit branch ref.",
   "",
-  "## Browser",
-  "",
-  "If browser tools are enabled for this session, you have `browser_navigate` to fetch rendered page content.",
-  "Use it to read documentation, check deployed sites, or scrape data from JavaScript-heavy pages.",
-  "The tool returns visible text (not HTML) to save tokens.",
-  "",
   "## Working with errors",
   "",
   "When something fails: state what failed, fix it, move on. Don't apologize repeatedly.",
@@ -301,7 +295,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   override getSystemPrompt(): string {
-    const base = SYSTEM_PROMPT;
+    let prompt = SYSTEM_PROMPT;
+
+    // Conditionally include browser tools section
+    const browserEnabled = this.readMetadata("browser_enabled") === "true";
+    if (browserEnabled) {
+      prompt += [
+        "",
+        "",
+        "## Browser",
+        "",
+        "You have `browser_navigate` to fetch rendered page content.",
+        "Use it to read documentation, check deployed sites, or scrape data from JavaScript-heavy pages.",
+        "The tool returns visible text (not HTML) to save tokens.",
+      ].join("\n");
+    }
 
     // Inject bounded workspace summary on first turn only.
     // Use this.messages.length <= 1 because Think's chat() persists the
@@ -310,11 +318,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (this.messages.length <= 1) {
       const summary = this.getWorkspaceSummary();
       if (summary) {
-        return `${base}\n\n## Current workspace\n\n${summary}`;
+        return `${prompt}\n\n## Current workspace\n\n${summary}`;
       }
     }
 
-    return base;
+    return prompt;
   }
 
   /**
