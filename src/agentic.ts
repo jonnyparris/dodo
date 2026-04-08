@@ -3,8 +3,8 @@ import type { StateBackend } from "@cloudflare/shell";
 import { generateText, jsonSchema, stepCountIs, tool, zodSchema, type Tool as AnyToolType } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
-import puppeteer from "@cloudflare/puppeteer";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
+import { createBrowserTools } from "./browser/tools";
 import { wrapOutboundWithOwner } from "./executor";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
 import { getKnownRepo, listKnownRepos } from "./repos";
@@ -613,48 +613,24 @@ function buildTools(
   // Explore tool — search subagent for token-efficient codebase discovery
   tools.explore = buildExploreTool(workspace, config, env);
 
-  // Browser tool — headless Chrome via the BROWSER binding.
-  // Gated on: BROWSER binding exists, session has browser enabled, AND the session
-  // owner is admin. Non-admin users get browser via the MCP path (which bills to
-  // their own Cloudflare account), not the native binding (which bills to the
-  // instance owner's account).
-  if (env.BROWSER && options?.browserEnabled && options?.isAdminUser) {
-    tools.browser_navigate = tool({
-      description:
-        "Navigate to a URL in a headless browser and return the rendered page text. " +
-        "Use this to read documentation, check deployed sites, or scrape data from JavaScript-heavy pages. " +
-        "Returns the visible text content after JavaScript execution (not raw HTML).",
-      inputSchema: z.object({
-        url: z.string().url().describe("URL to navigate to"),
-        waitUntil: z
-          .enum(["load", "domcontentloaded", "networkidle0", "networkidle2"])
-          .optional()
-          .default("networkidle2")
-          .describe("When to consider navigation complete. Use networkidle0 for JS-heavy SPAs."),
-      }),
-      execute: async ({ url, waitUntil }: { url: string; waitUntil?: string }) => {
-        let browser;
-        try {
-          browser = await puppeteer.launch(env.BROWSER!);
-          const page = await browser.newPage();
-          await page.goto(url, {
-            waitUntil: (waitUntil ?? "networkidle2") as "load" | "domcontentloaded" | "networkidle0" | "networkidle2",
-            timeout: 15_000,
-          });
-          const title = await page.title();
-          // Extract visible text — much more token-efficient than raw HTML.
-          // page.evaluate runs in the browser context where `document` exists.
-          // eslint-disable-next-line no-undef
-          const text = await page.evaluate("document.body.innerText") as string;
-          const truncated = text.length > 50_000 ? text.slice(0, 50_000) + "\n\n[Truncated — page text exceeds 50k characters]" : text;
-          return { url, title, text: truncated };
-        } catch (err) {
-          return { error: `Browser navigation failed: ${err instanceof Error ? err.message : String(err)}` };
-        } finally {
-          if (browser) await browser.close().catch(() => {});
-        }
-      },
+  // Browser tools — full CDP access via code-mode pattern.
+  // Two tools: browser_search (query the ~1.7MB CDP spec server-side) and
+  // browser_execute (run CDP commands against a live headless Chrome session).
+  // Gated on: BROWSER + LOADER bindings exist, session has browser enabled,
+  // AND the session owner is admin. Non-admin users get browser via the MCP
+  // path (which bills to their own Cloudflare account).
+  if (env.BROWSER && env.LOADER && options?.browserEnabled && options?.isAdminUser) {
+    const outbound = options?.ownerId && env.OUTBOUND
+      ? wrapOutboundWithOwner(env.OUTBOUND, options.ownerId)
+      : env.OUTBOUND ?? null;
+
+    const browserTools = createBrowserTools({
+      browser: env.BROWSER,
+      loader: env.LOADER,
+      outbound,
+      timeout: 30_000,
     });
+    Object.assign(tools, browserTools);
   }
 
   return tools;

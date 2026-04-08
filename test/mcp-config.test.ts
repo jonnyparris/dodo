@@ -169,19 +169,18 @@ describe("MCP Config CRUD", () => {
 });
 
 describe("MCP Catalog", () => {
-  it("returns catalog with 5 entries", async () => {
+  it("returns catalog with 4 entries", async () => {
     const res = await fetchJson("/api/mcp-catalog");
     expect(res.status).toBe(200);
     const catalog = (await res.json()) as Array<{ id: string; name: string; description: string; url: string; setupGuide: string }>;
     expect(Array.isArray(catalog)).toBe(true);
-    expect(catalog.length).toBe(5);
+    expect(catalog.length).toBe(4);
 
     // Verify known entries exist
     const ids = catalog.map((c) => c.id);
     expect(ids).toContain("dodo-self");
     expect(ids).toContain("github");
     expect(ids).toContain("cloudflare-api");
-    expect(ids).toContain("sentry");
     expect(ids).toContain("browser-rendering");
 
     // Verify each entry has required fields
