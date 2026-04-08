@@ -271,8 +271,10 @@ async function createShareLink(){
     const result=await json(`/session/${currentSession}/share`,{permission});
     if(result.token){
       const shareUrl=`${location.origin}/shared/${result.token}`;
-      $("share-token-display").style.display="block";
-      $("share-token-display").innerHTML=`<strong>Share link (shown once):</strong><br/><a href="${esc(shareUrl)}" target="_blank" style="color:var(--accent)">${esc(shareUrl)}</a>`;
+      const display=$("share-token-display");
+      display.style.display="block";
+      display.innerHTML=`<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><strong style="flex:1">Share link (shown once)</strong><button class="sm" id="copy-share-btn" style="display:inline-flex;align-items:center;gap:4px;white-space:nowrap"><i class="ph ph-copy"></i> Copy</button></div><span style="color:var(--accent);user-select:all">${esc(shareUrl)}</span>`;
+      $("copy-share-btn").onclick=()=>{navigator.clipboard.writeText(shareUrl).then(()=>{const b=$("copy-share-btn");b.innerHTML='<i class="ph ph-check"></i> Copied!';b.classList.add('primary');setTimeout(()=>{b.innerHTML='<i class="ph ph-copy"></i> Copy';b.classList.remove('primary')},2000)})};
     }
     await loadSharesList();
   }catch(e){toast("Failed: "+(e.message||e),"error")}
