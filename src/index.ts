@@ -42,7 +42,7 @@ function maybeCleanupRateLimiters() {
 
 type PermissionLevel = "readonly" | "readwrite" | "write" | "admin";
 
-type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail: string; sessionPermission: PermissionLevel } };
+type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail: string; sessionPermission: PermissionLevel; sessionOwnerEmail: string } };
 
 const app = new Hono<HonoEnv>();
 
@@ -132,26 +132,28 @@ async function readConfig(env: Env, email: string): Promise<AppConfig> {
  * - Share cookie guest → permission from signed cookie
  * - Otherwise → null (no access)
  */
+type SessionPermissionResult = { permission: PermissionLevel; ownerEmail: string } | null;
+
 async function resolveSessionPermission(
   env: Env,
   email: string,
   sessionId: string,
   request: Request,
-): Promise<PermissionLevel | null> {
+): Promise<SessionPermissionResult> {
   // Session owner gets admin
   const ownerStub = getUserControlStub(env, email);
   const ownerCheck = await ownerStub.fetch(`https://user-control/sessions/${encodeURIComponent(sessionId)}/check`);
-  if (ownerCheck.ok) return "admin";
+  if (ownerCheck.ok) return { permission: "admin", ownerEmail: email };
 
   // Platform admin gets admin
-  if (isAdmin(email, env)) return "admin";
+  if (isAdmin(email, env)) return { permission: "admin", ownerEmail: email };
 
-  // Check SharedIndex for granted permission
+  // Check SharedIndex for granted permission (includes ownerEmail)
   const permRes = await proxyToSharedIndex(env, `/permissions/${encodeURIComponent(sessionId)}/${encodeURIComponent(email)}`);
   if (permRes.ok) {
-    const perm = (await permRes.json()) as { permission: string };
-    if (perm.permission === "readwrite") return "write";
-    if (perm.permission === "readonly") return "readonly";
+    const perm = (await permRes.json()) as { permission: string; ownerEmail?: string };
+    if (perm.permission === "readwrite") return { permission: "write", ownerEmail: perm.ownerEmail ?? "" };
+    if (perm.permission === "readonly") return { permission: "readonly", ownerEmail: perm.ownerEmail ?? "" };
   }
 
   // Check share cookie
@@ -165,11 +167,11 @@ async function resolveSessionPermission(
         const payload = await verifyCookie(signedValue, cookieSecret);
         if (payload) {
           try {
-            const parsed = JSON.parse(payload) as { sessionId?: string; permission?: string; expiresAt?: string };
+            const parsed = JSON.parse(payload) as { sessionId?: string; permission?: string; ownerEmail?: string; expiresAt?: string };
             if (parsed.sessionId === sessionId) {
               if (parsed.expiresAt && new Date(parsed.expiresAt) <= new Date()) continue;
-              if (parsed.permission === "readwrite") return "write";
-              return "readonly";
+              const perm: PermissionLevel = parsed.permission === "readwrite" ? "write" : "readonly";
+              return { permission: perm, ownerEmail: parsed.ownerEmail ?? "" };
             }
           } catch { /* invalid cookie payload */ }
         }
@@ -1089,11 +1091,12 @@ app.get("/session", async (c) => {
 app.use("/session/:id/*", async (c, next) => {
   const email = c.get("userEmail");
   const sessionId = c.req.param("id");
-  const permission = await resolveSessionPermission(c.env, email, sessionId, c.req.raw);
-  if (!permission) {
+  const result = await resolveSessionPermission(c.env, email, sessionId, c.req.raw);
+  if (!result) {
     return c.json({ error: "Session not found or access denied" }, 403);
   }
-  c.set("sessionPermission", permission);
+  c.set("sessionPermission", result.permission);
+  c.set("sessionOwnerEmail", result.ownerEmail);
   return next();
 });
 
@@ -1102,18 +1105,20 @@ app.use("/session/:id", async (c, next) => {
   if (c.req.method === "POST") return next();
   const email = c.get("userEmail");
   const sessionId = c.req.param("id");
-  const permission = await resolveSessionPermission(c.env, email, sessionId, c.req.raw);
-  if (!permission) {
+  const result = await resolveSessionPermission(c.env, email, sessionId, c.req.raw);
+  if (!result) {
     return c.json({ error: "Session not found or access denied" }, 403);
   }
-  c.set("sessionPermission", permission);
+  c.set("sessionPermission", result.permission);
+  c.set("sessionOwnerEmail", result.ownerEmail);
   return next();
 });
 
 app.get("/session/:id", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;
-  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/", { "x-owner-email": c.get("userEmail") });
+  const ownerEmail = c.get("sessionOwnerEmail") || c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/", { "x-owner-email": ownerEmail });
 });
 
 app.patch("/session/:id", async (c) => {
@@ -1296,14 +1301,16 @@ app.post("/session/:id/message", async (c) => {
   const email = c.get("userEmail");
   const rl = messageLimiter.check(`msg:${email}`, 120, 60 * 60 * 1000);
   if (!rl.allowed) return rateLimitedResponse(rl, "message", email);
-  const config = await readConfig(c.env, email);
+  // Use the session owner's config for model/gateway so guests don't override it
+  const ownerEmail = c.get("sessionOwnerEmail") || email;
+  const config = await readConfig(c.env, ownerEmail);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/message", {
     "x-dodo-ai-base-url": config.aiGatewayBaseURL,
     "x-dodo-gateway": config.activeGateway,
     "x-dodo-model": config.model,
     "x-dodo-opencode-base-url": config.opencodeBaseURL,
     "x-author-email": email,
-    "x-owner-email": email,
+    "x-owner-email": ownerEmail,
   });
 });
 
@@ -1313,14 +1320,16 @@ app.post("/session/:id/prompt", async (c) => {
   const email = c.get("userEmail");
   const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
   if (!rl.allowed) return rateLimitedResponse(rl, "prompt", email);
-  const config = await readConfig(c.env, email);
+  // Use the session owner's config for model/gateway so guests don't override it
+  const ownerEmail = c.get("sessionOwnerEmail") || email;
+  const config = await readConfig(c.env, ownerEmail);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompt", {
     "x-dodo-ai-base-url": config.aiGatewayBaseURL,
     "x-dodo-gateway": config.activeGateway,
     "x-dodo-model": config.model,
     "x-dodo-opencode-base-url": config.opencodeBaseURL,
     "x-author-email": email,
-    "x-owner-email": email,
+    "x-owner-email": ownerEmail,
   });
 });
 
