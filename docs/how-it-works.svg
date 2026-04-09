@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 420" fill="none">
+  <defs>
+    <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f97316"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="g3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="g4" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="g5" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ec4899"/>
+      <stop offset="100%" stop-color="#db2777"/>
+    </linearGradient>
+    <filter id="sh" x="-3%" y="-3%" width="106%" height="110%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+
+  <rect width="860" height="420" rx="16" fill="#0f172a"/>
+
+  <text x="430" y="38" text-anchor="middle" fill="#f8fafc" font-family="system-ui, -apple-system, sans-serif" font-size="20" font-weight="700">What Happens in a Session</text>
+  <text x="430" y="58" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="12">You send a prompt. Dodo gives the LLM a workspace, tools, and runs it to completion.</text>
+
+  <!-- Step 1 -->
+  <g filter="url(#sh)">
+    <rect x="20" y="82" width="150" height="240" rx="12" fill="#1e293b" stroke="#f97316" stroke-width="1.5"/>
+    <circle cx="95" cy="108" r="18" fill="url(#g1)"/>
+    <text x="95" y="114" text-anchor="middle" fill="#fff" font-family="system-ui, sans-serif" font-size="14" font-weight="700">1</text>
+    <text x="95" y="144" text-anchor="middle" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">You prompt</text>
+    <text x="95" y="168" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">From the web UI,</text>
+    <text x="95" y="182" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">an MCP client, or</text>
+    <text x="95" y="196" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">a scheduled cron.</text>
+
+    <rect x="32" y="216" width="126" height="90" rx="6" fill="#0f172a"/>
+    <text x="40" y="234" fill="#f97316" font-family="monospace" font-size="9">"Clone the repo,</text>
+    <text x="40" y="249" fill="#f97316" font-family="monospace" font-size="9"> fix the bug in</text>
+    <text x="40" y="264" fill="#f97316" font-family="monospace" font-size="9"> auth.ts, run the</text>
+    <text x="40" y="279" fill="#f97316" font-family="monospace" font-size="9"> tests, and push</text>
+    <text x="40" y="294" fill="#f97316" font-family="monospace" font-size="9"> a branch."</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="170" y1="200" x2="195" y2="200" stroke="#475569" stroke-width="2"/>
+  <polygon points="193,194 205,200 193,206" fill="#475569"/>
+
+  <!-- Step 2 -->
+  <g filter="url(#sh)">
+    <rect x="205" y="82" width="150" height="240" rx="12" fill="#1e293b" stroke="#3b82f6" stroke-width="1.5"/>
+    <circle cx="280" cy="108" r="18" fill="url(#g2)"/>
+    <text x="280" y="114" text-anchor="middle" fill="#fff" font-family="system-ui, sans-serif" font-size="14" font-weight="700">2</text>
+    <text x="280" y="144" text-anchor="middle" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Session starts</text>
+    <text x="280" y="168" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">A Durable Object</text>
+    <text x="280" y="182" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">spins up with its own</text>
+    <text x="280" y="196" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">filesystem and git.</text>
+
+    <rect x="217" y="216" width="126" height="90" rx="6" fill="#0f172a"/>
+    <text x="280" y="238" text-anchor="middle" fill="#64748b" font-family="system-ui, sans-serif" font-size="9">WORKSPACE</text>
+    <rect x="229" y="248" width="102" height="18" rx="3" fill="#172554" stroke="#3b82f6" stroke-width="0.75"/>
+    <text x="280" y="261" text-anchor="middle" fill="#93c5fd" font-family="system-ui, sans-serif" font-size="8">Files (SQLite + R2)</text>
+    <rect x="229" y="270" width="102" height="18" rx="3" fill="#172554" stroke="#3b82f6" stroke-width="0.75"/>
+    <text x="280" y="283" text-anchor="middle" fill="#93c5fd" font-family="system-ui, sans-serif" font-size="8">Git (clone/push)</text>
+    <rect x="229" y="292" width="102" height="18" rx="3" fill="#172554" stroke="#3b82f6" stroke-width="0.75"/>
+    <text x="280" y="305" text-anchor="middle" fill="#93c5fd" font-family="system-ui, sans-serif" font-size="8">Sandbox (JS exec)</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="355" y1="200" x2="380" y2="200" stroke="#475569" stroke-width="2"/>
+  <polygon points="378,194 390,200 378,206" fill="#475569"/>
+
+  <!-- Step 3 -->
+  <g filter="url(#sh)">
+    <rect x="390" y="82" width="150" height="240" rx="12" fill="#1e293b" stroke="#8b5cf6" stroke-width="1.5"/>
+    <circle cx="465" cy="108" r="18" fill="url(#g3)"/>
+    <text x="465" y="114" text-anchor="middle" fill="#fff" font-family="system-ui, sans-serif" font-size="14" font-weight="700">3</text>
+    <text x="465" y="144" text-anchor="middle" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Agent works</text>
+    <text x="465" y="168" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">The LLM reads files,</text>
+    <text x="465" y="182" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">writes code, runs tests,</text>
+    <text x="465" y="196" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">and iterates autonomously.</text>
+
+    <rect x="402" y="216" width="126" height="90" rx="6" fill="#0f172a"/>
+    <!-- Loop visualization -->
+    <text x="465" y="236" text-anchor="middle" fill="#a78bfa" font-family="system-ui, sans-serif" font-size="9" font-weight="600">AGENTIC LOOP</text>
+    <text x="418" y="254" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">1. Think (LLM call)</text>
+    <text x="418" y="268" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">2. Act (tool call)</text>
+    <text x="418" y="282" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">3. Observe (result)</text>
+    <text x="418" y="296" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">4. Repeat or finish</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="540" y1="200" x2="565" y2="200" stroke="#475569" stroke-width="2"/>
+  <polygon points="563,194 575,200 563,206" fill="#475569"/>
+
+  <!-- Step 4 -->
+  <g filter="url(#sh)">
+    <rect x="575" y="82" width="130" height="240" rx="12" fill="#1e293b" stroke="#10b981" stroke-width="1.5"/>
+    <circle cx="640" cy="108" r="18" fill="url(#g4)"/>
+    <text x="640" y="114" text-anchor="middle" fill="#fff" font-family="system-ui, sans-serif" font-size="14" font-weight="700">4</text>
+    <text x="640" y="144" text-anchor="middle" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Results</text>
+    <text x="640" y="168" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Code is committed,</text>
+    <text x="640" y="182" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">branch is pushed,</text>
+    <text x="640" y="196" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">session persists.</text>
+
+    <rect x="587" y="216" width="106" height="90" rx="6" fill="#0f172a"/>
+    <text x="640" y="240" text-anchor="middle" fill="#4ade80" font-family="system-ui, sans-serif" font-size="9">&#x2713; Bug fixed</text>
+    <text x="640" y="258" text-anchor="middle" fill="#4ade80" font-family="system-ui, sans-serif" font-size="9">&#x2713; Tests passing</text>
+    <text x="640" y="276" text-anchor="middle" fill="#4ade80" font-family="system-ui, sans-serif" font-size="9">&#x2713; Branch pushed</text>
+    <text x="640" y="294" text-anchor="middle" fill="#64748b" font-family="system-ui, sans-serif" font-size="9">Session preserved</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="705" y1="200" x2="730" y2="200" stroke="#475569" stroke-width="2"/>
+  <polygon points="728,194 740,200 728,206" fill="#475569"/>
+
+  <!-- Step 5 -->
+  <g filter="url(#sh)">
+    <rect x="740" y="82" width="100" height="240" rx="12" fill="#1e293b" stroke="#ec4899" stroke-width="1.5"/>
+    <circle cx="790" cy="108" r="18" fill="url(#g5)"/>
+    <text x="790" y="114" text-anchor="middle" fill="#fff" font-family="system-ui, sans-serif" font-size="14" font-weight="700">5</text>
+    <text x="790" y="144" text-anchor="middle" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Reuse</text>
+    <text x="790" y="168" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Fork the</text>
+    <text x="790" y="182" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">session, share</text>
+    <text x="790" y="196" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">it, or schedule</text>
+    <text x="790" y="210" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">follow-ups.</text>
+
+    <rect x="752" y="228" width="76" height="78" rx="6" fill="#0f172a"/>
+    <text x="790" y="250" text-anchor="middle" fill="#f9a8d4" font-family="system-ui, sans-serif" font-size="9">Fork &#x2192;</text>
+    <text x="790" y="268" text-anchor="middle" fill="#f9a8d4" font-family="system-ui, sans-serif" font-size="9">Share &#x2192;</text>
+    <text x="790" y="286" text-anchor="middle" fill="#f9a8d4" font-family="system-ui, sans-serif" font-size="9">Schedule &#x2192;</text>
+    <text x="790" y="302" text-anchor="middle" fill="#f9a8d4" font-family="system-ui, sans-serif" font-size="9">Dispatch &#x2192;</text>
+  </g>
+
+  <!-- Bottom: safety features -->
+  <rect x="60" y="345" width="740" height="52" rx="10" fill="#172554" stroke="#3b82f6" stroke-width="1"/>
+  <text x="430" y="366" text-anchor="middle" fill="#93c5fd" font-family="system-ui, sans-serif" font-size="12" font-weight="600">Built-in guardrails: doom loop detection, token budget management, context compaction, gated networking</text>
+  <text x="430" y="384" text-anchor="middle" fill="#64748b" font-family="system-ui, sans-serif" font-size="10">Sessions survive Worker evictions and reconnect seamlessly via durable fibers.</text>
+</svg>

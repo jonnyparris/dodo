@@ -5,8 +5,8 @@
 </p>
 
 <p align="center">
-  Coding agent platform on Cloudflare Workers.<br/>
-  Deploy to your Cloudflare account, connect any LLM, and dispatch autonomous sessions from a browser or MCP client.
+  <strong>A coding agent that runs on your Cloudflare account.</strong><br/>
+  Give it a task, a repo, and an LLM. It clones, codes, tests, commits, and pushes -- autonomously.
 </p>
 
 <p align="center">
@@ -15,28 +15,83 @@
   </a>
 </p>
 
-## What is Dodo?
+---
 
-Dodo is a coding agent platform built on Cloudflare Workers. Each session runs in its own [Durable Object](https://developers.cloudflare.com/durable-objects/) with persistent files, git, a chat loop backed by [`@cloudflare/think`](https://www.npmjs.com/package/@cloudflare/think), and sandboxed code execution. You bring the LLM — Dodo handles the rest.
+## What can you do with it?
 
-It deploys to your Cloudflare account. You pick the model, you control costs, and your data stays in your account.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/use-cases.svg">
+  <img alt="Use cases: autonomous coding, parallel dispatch, MCP orchestration, scheduled agents, team sharing, browser research" src="docs/use-cases.svg" width="100%">
+</picture>
+
+**Some real examples:**
+
+- **"Fix the bug in auth.ts and push a branch"** -- Dodo clones the repo, reads the code, makes the fix, runs the tests, and pushes. You review the PR.
+- **10 tasks on the kanban, one click** -- Dispatch all of them in parallel. Each gets its own isolated session with its own workspace.
+- **"Every morning at 9am, run the test suite"** -- Schedule prompts with cron expressions. Your agent works while you sleep.
+- **"Read the Cloudflare docs and write a migration script"** -- Headless Chrome is built in. The agent can browse the web, read documentation, and use what it finds.
+- **Share a session with your team** -- Read-only or read-write access, with per-user encrypted secrets.
+
+---
+
+## How it works
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works.svg">
+  <img alt="Session lifecycle: prompt, session starts, agent works, results, reuse" src="docs/how-it-works.svg" width="100%">
+</picture>
+
+1. **You prompt** -- From the web UI, an MCP client (Claude Code, Cursor, OpenCode), or a scheduled cron job.
+2. **A session starts** -- A Durable Object spins up with its own filesystem, git, and sandboxed code execution.
+3. **The agent works** -- The LLM reads files, writes code, runs tests, and iterates in an agentic loop with built-in guardrails (doom loop detection, token budget management, context compaction).
+4. **Results** -- Code is committed, branches are pushed, and the full session is preserved.
+5. **Reuse** -- Fork the session, share it with teammates, schedule follow-ups, or dispatch new work from it.
+
+Sessions survive Worker evictions and reconnect seamlessly via durable fibers. You pick the LLM. You control costs. Your data stays in your account.
+
+---
+
+## Architecture
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture.svg">
+  <img alt="Architecture: Worker with Hono router connecting to three Durable Objects (SharedIndex, UserControl, CodingAgent) backed by R2, Browser Rendering, and an LLM gateway" src="docs/architecture.svg" width="100%">
+</picture>
+
+One Worker, three Durable Object classes:
+
+| Component | Scope | What it manages |
+|-----------|-------|----------------|
+| **SharedIndex** | Global singleton | User registry, allowlist, permissions, session sharing |
+| **UserControl** | One per user | Config, sessions, memory, tasks, encrypted secrets |
+| **CodingAgent** | One per session | Chat loop, workspace (files + git), sandbox, prompts |
+
+Plus R2 for large file storage, Browser Rendering for headless Chrome, and your choice of LLM gateway.
+
+---
 
 ## Quick start
 
-### One-click deploy
+### Option A: One-click deploy
 
-Click the **Deploy to Cloudflare** button above. Cloudflare will fork the repo, provision resources (Durable Objects, R2, Workers AI, Browser Rendering), and deploy. You'll be prompted for secrets during setup — the only required one is `ADMIN_EMAIL`. See [Secrets](#secrets) for the full list.
+Click the button, follow the prompts, and you'll have a running instance in under 2 minutes:
 
-After deploy, visit the URL — you'll be logged in as the admin.
+<p align="center">
+  <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/jonnyparris/dodo">
+    <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/>
+  </a>
+</p>
 
-### Manual deploy
+You'll be prompted for secrets during setup. The only required one is `ADMIN_EMAIL` -- your email address. After deploy, visit the URL and you'll be logged in as the admin.
+
+### Option B: Manual deploy
 
 ```bash
 git clone https://github.com/jonnyparris/dodo.git
 cd dodo
 npm install
 
-# Set the one required secret — your email:
+# Set the one required secret -- your email:
 wrangler secret put ADMIN_EMAIL
 
 # Optional but recommended:
@@ -57,53 +112,41 @@ cp .dev.vars.example .dev.vars
 npm run dev
 ```
 
-The dev server uses `wrangler.dev.jsonc` with `ALLOW_UNAUTHENTICATED_DEV=true` to bypass Cloudflare Access locally.
+The dev server bypasses authentication locally via `ALLOW_UNAUTHENTICATED_DEV=true`.
+
+---
 
 ## Prerequisites
 
 - A [Cloudflare account](https://dash.cloudflare.com/sign-up) (Workers Paid plan for Durable Objects)
-- An LLM gateway token — either [OpenCode](https://opencode.cloudflare.dev) or [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/)
-- Optional: [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) for multi-user deployments (see [Authentication](#authentication))
+- An LLM gateway token -- either [OpenCode](https://opencode.cloudflare.dev) or [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/)
+- Optional: [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) for multi-user deployments
 
-## Features
+---
 
-| Category | What you get |
-|----------|-------------|
-| **Sessions** | Create, fork, soft-delete (5-min recovery), share with read/write permissions |
-| **Chat** | Sync and async prompts, SSE streaming, fiber-backed recovery across DO evictions |
-| **Workspace** | File CRUD, glob search, in-file replace via `@cloudflare/shell` (SQLite + R2 spill) |
-| **Code execution** | Sandboxed JS with workspace filesystem, git, and gated outbound fetch |
-| **Git** | Clone, commit, push, pull, branch, diff — automatic token injection for GitHub/GitLab |
-| **Scheduling** | Delayed, datetime, cron, and interval jobs that dispatch prompts automatically |
-| **Task board** | Kanban with drag-and-drop, batch dispatch, auto-sync when sessions complete |
-| **Memory** | Per-user key-value store with text search, persistent across sessions |
-| **MCP** | 46-tool server at `/mcp` for orchestration; 2-tool code-mode at `/mcp/codemode` for agents |
-| **Orchestration** | Seed sessions, deterministic edit pipelines, worker dispatch with branch verification |
-| **Browser** | Headless Chrome via native binding (admin) or user-supplied credentials (MCP). Navigate pages, read docs, scrape data. |
-| **Security** | Optional CF Access auth, user allowlist, envelope-encrypted secrets, gated sandbox networking |
-| **UI** | Three-panel responsive web app with real-time streaming, presence, and dark mode |
+## Connect your LLM
 
-## Connecting your LLM
-
-Dodo routes LLM calls through a configurable gateway. After deploying, open the UI and set your model and gateway in the sidebar config panel.
+Dodo doesn't bundle an LLM -- you bring your own. After deploying, open the UI and set your model and gateway in the sidebar config panel.
 
 | Gateway | Setup |
 |---------|-------|
 | **OpenCode** | Set `OPENCODE_GATEWAY_TOKEN` as a secret. Models populate automatically. |
 | **AI Gateway** | Set `AI_GATEWAY_KEY` as a secret. Set `AI_GATEWAY_BASE_URL` in wrangler.jsonc vars. |
 
-The model ID format is `provider/model` (e.g. `anthropic/claude-sonnet-4`, `openai/gpt-4o`). You can switch models per-session from the UI.
+Model IDs use `provider/model` format (e.g. `anthropic/claude-sonnet-4`, `openai/gpt-4o`). Switch models per-session from the UI.
 
-## Connecting via MCP
+---
 
-Dodo exposes two MCP endpoints. Use `/mcp/codemode` for coding agents (minimal context) and `/mcp` for orchestrators that need full control.
+## Connect via MCP
+
+Dodo exposes two MCP endpoints. Use the one that fits your use case:
 
 | Endpoint | Tools | Best for |
 |----------|-------|----------|
-| `/mcp` | 46 | Orchestrators — sessions, tasks, git, memory, orchestration |
-| `/mcp/codemode` | 2 | Coding agents — `search` + `execute` (~1k tokens context) |
+| `/mcp` | 46 | **Orchestrators** -- full control over sessions, tasks, git, memory |
+| `/mcp/codemode` | 2 | **Coding agents** -- just `search` + `execute` (~1k tokens context) |
 
-**Example config** (OpenCode, Claude Desktop, or any MCP client):
+**Example config** (works with OpenCode, Claude Code, Cursor, or any MCP client):
 
 ```json
 {
@@ -119,78 +162,103 @@ Dodo exposes two MCP endpoints. Use `/mcp/codemode` for coding agents (minimal c
 }
 ```
 
+---
+
+## Features
+
+### Sessions and workspace
+
+Each session gets an isolated workspace with a full filesystem (SQLite-backed with R2 spill for large files), git support (clone, commit, push, pull, branch, diff with automatic GitHub/GitLab token injection), and sandboxed JavaScript execution with gated outbound networking.
+
+Sessions can be forked (copies files + messages), soft-deleted (5-minute recovery window), and shared with read-only or read-write permissions.
+
+### Agentic loop
+
+Dodo runs its own agentic loop rather than delegating to a framework. Each iteration calls the LLM once, executes tool calls, and decides whether to continue. Built-in guardrails:
+
+- **Doom loop detection** -- Identical tool calls 3x triggers a warning; 5x forces a hard break.
+- **Token budget management** -- 70% warn, 85% wrap-up, 95% hard stop.
+- **Context compaction** -- When the context gets too large, older messages are summarized to free space.
+- **Multi-phase continuation** -- When step limits are hit, context is compacted and the agent continues for up to 5 phases.
+- **Overflow recovery** -- Emergency compaction on context-length errors.
+
+### Explore subagent
+
+For search-heavy tasks, Dodo spawns a lightweight read-only subagent (Haiku/GPT-4.1 Mini/Gemini Flash) that runs up to 5 steps of grep/find/list/read and returns a compact summary. Saves 5-20x tokens compared to dumping raw file contents into the main context.
+
+### Task board
+
+Kanban-style task management with backlog/todo/in_progress/done/cancelled states. Tasks can be dispatched to sessions individually or in batch (up to 10 at once). Tasks auto-complete when their linked session finishes.
+
+### Scheduling
+
+Four job types: delayed (N seconds), datetime (specific time), cron expression, and interval (repeating). Jobs dispatch prompts to the session automatically.
+
+### Memory
+
+Per-user key-value store with text search, persistent across sessions. Your agent can save learnings, preferences, and context that carry forward to future sessions.
+
+### Browser
+
+Headless Chrome via Cloudflare Browser Rendering. Full CDP (Chrome DevTools Protocol) access through two code-mode tools: `browser_search` (query the CDP spec) and `browser_execute` (run CDP commands). The agent can navigate pages, read documentation, fill forms, and scrape data.
+
+### Orchestration
+
+Built-in support for dispatching work to worker sessions:
+
+- **Seed sessions** -- Clone a repo once, fork for each task (avoids repeated clones).
+- **Deterministic edit pipelines** -- Apply text edits, commit, push, verify.
+- **Agent-driven dispatch** -- Send a prompt to a session and verify the result later.
+- **Worker run tracking** -- State machine from session creation through push verification.
+- **Failure snapshots** -- Captures git status/diff/log/messages for debugging failed runs.
+
+---
+
 ## Secrets
 
 Set via `wrangler secret put <NAME>` or through the Deploy to Cloudflare flow.
 
 | Secret | Required | Purpose |
 |--------|----------|---------|
-| `ADMIN_EMAIL` | **Yes** | Your email address. Auto-added to the allowlist on first request. |
-| `SECRETS_MASTER_KEY` | Recommended | 32-byte hex key for envelope encryption of per-user secrets |
+| `ADMIN_EMAIL` | **Yes** | Your email address. Auto-added to the allowlist. |
+| `SECRETS_MASTER_KEY` | Recommended | Encrypts per-user secrets at rest |
 | `COOKIE_SECRET` | Recommended | Signs session-sharing cookies |
-| `DODO_MCP_TOKEN` | Recommended | Bearer token for `/mcp` and `/mcp/codemode` |
-| `OPENCODE_GATEWAY_TOKEN` | If using OpenCode | Auth token for the OpenCode gateway |
-| `AI_GATEWAY_KEY` | If using AI Gateway | Auth key for the AI Gateway |
+| `DODO_MCP_TOKEN` | Recommended | Bearer token for MCP endpoints |
+| `OPENCODE_GATEWAY_TOKEN` | If using OpenCode | Auth token for the OpenCode LLM gateway |
+| `AI_GATEWAY_KEY` | If using AI Gateway | Auth key for the Cloudflare AI Gateway |
 | `CF_ACCESS_AUD` | If using Access | Cloudflare Access application audience tag |
 | `CF_ACCESS_TEAM_DOMAIN` | If using Access | Cloudflare Access team domain URL |
 
-Per-user secrets (GitHub token, GitLab token, ntfy topic) are stored encrypted in each user's Durable Object after passkey onboarding — not as environment variables.
+Per-user secrets (GitHub token, GitLab token) are stored encrypted in each user's Durable Object using envelope encryption (AES-256-GCM) -- not as environment variables.
+
+---
 
 ## Authentication
 
-Dodo supports two modes:
-
-**Single-user (default).** Set `ADMIN_EMAIL` and you're done. Every request is authenticated as the admin. No login page, no external auth provider. Good for personal deployments.
+**Single-user (default).** Set `ADMIN_EMAIL` and you're done. No login page, no external auth provider. Good for personal deployments.
 
 **Multi-user with Cloudflare Access.** Put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) in front of your Worker, then set `CF_ACCESS_AUD` and `CF_ACCESS_TEAM_DOMAIN` as secrets. Dodo validates the Access JWT on every request and identifies users by email. Add users to the allowlist from the admin panel.
 
 ```bash
-# Enable Access auth:
-wrangler secret put CF_ACCESS_AUD             # your Access app audience tag
-wrangler secret put CF_ACCESS_TEAM_DOMAIN     # e.g. https://your-team.cloudflareaccess.com
+wrangler secret put CF_ACCESS_AUD
+wrangler secret put CF_ACCESS_TEAM_DOMAIN
 ```
 
-When Access secrets are set, Dodo enforces JWT validation. When they're absent, it runs in single-user mode.
-
-## Architecture
-
-```
-Worker (Hono router + optional CF Access auth)
-├── SharedIndex DO (global singleton)
-│   └── users, host allowlist, models cache, session shares/permissions
-├── UserControl DO (one per user)
-│   └── config, sessions, memory, tasks, encrypted secrets, MCP configs
-├── CodingAgent DO (one per session, extends @cloudflare/think)
-│   ├── Think: messages, config, fibers
-│   ├── Dodo: metadata, prompts, cron jobs
-│   ├── Workspace: @cloudflare/shell (SQLite + R2)
-│   └── Sandbox: codemode with gated outbound
-└── AllowlistOutbound (WorkerEntrypoint, gated fetch)
-```
-
-Three Durable Object classes. **SharedIndex** is a global singleton for user management and permissions. **UserControl** (one per user, keyed by email) holds config, sessions, encrypted secrets, and tasks. **CodingAgent** (one per session) extends `Think` for persistent chat, durable fibers, and tool execution.
-
-### Key design decisions
-
-- **One Think session per DO.** `ensureSingleThinkSession()` enforces this. Think's multi-session capability is not exposed.
-- **Fibers replay from scratch.** On recovery, the fiber re-runs from the beginning using `stashFiber()` checkpoints to skip completed work.
-- **Git token hierarchy.** Per-user encrypted secrets are tried first, then env vars (`GITHUB_TOKEN`, `GITLAB_TOKEN`) as fallback.
-- **Suppressed WebSocket chat.** Think's `cf_agent_chat_*` handlers are intercepted and dropped to prevent a parallel chat path.
-- **Streaming UI.** Raw text deltas appear immediately; markdown rendering upgrades a few times per second to keep long responses responsive.
+---
 
 ## Development
 
 ```bash
-npm install
-npm run dev          # local dev server (wrangler.dev.jsonc)
-npm test             # vitest via @cloudflare/vitest-pool-workers
-npm run typecheck    # tsc --noEmit
-npm run deploy       # build + deploy to Cloudflare
+npm install          # Install dependencies
+npm run dev          # Local dev server
+npm test             # Run tests (vitest + Workers pool)
+npm run typecheck    # Type check
+npm run deploy       # Build + deploy
 ```
 
 ## Contributing
 
-Contributions welcome. Open an issue first for anything non-trivial so we can discuss the approach.
+Contributions welcome. Open an issue first for anything non-trivial.
 
 - Run `npm test` and `npm run typecheck` before submitting
 - Keep commits atomic with clear messages
