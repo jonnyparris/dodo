@@ -332,6 +332,32 @@ app.post("/api/errors", async (c) => {
   return c.json({ received: true }, 201);
 });
 
+/**
+ * Check if the request carries a valid, non-expired dodo_share cookie.
+ * Used to let share-link guests bypass the user allowlist.
+ */
+async function checkShareCookie(request: Request, env: Env): Promise<boolean> {
+  const cookieSecret = env.COOKIE_SECRET;
+  if (!cookieSecret) return false;
+  const cookieHeader = request.headers.get("Cookie") ?? "";
+  for (const cookie of cookieHeader.split(";")) {
+    const trimmed = cookie.trim();
+    if (trimmed.startsWith("dodo_share=")) {
+      const signedValue = trimmed.slice("dodo_share=".length);
+      const payload = await verifyCookie(signedValue, cookieSecret);
+      if (payload) {
+        try {
+          const parsed = JSON.parse(payload) as { sessionId?: string; expiresAt?: string };
+          if (!parsed.sessionId) continue;
+          if (parsed.expiresAt && new Date(parsed.expiresAt) <= new Date()) continue;
+          return true;
+        } catch { /* invalid payload */ }
+      }
+    }
+  }
+  return false;
+}
+
 // ─── Auth middleware ───
 
 app.use("*", async (c, next) => {
@@ -359,8 +385,14 @@ app.use("*", async (c, next) => {
   if (!isDevMode(c.env)) {
     const { allowed } = await checkAllowlist(identity.email, c.env);
     if (!allowed) {
-      log("warn", "Auth failure", { email: identity.email, source: identity.source, error: "Not on allowlist" });
-      return c.json({ error: "Not authorized — not on Dodo allowlist" }, 403);
+      // Share-link guests bypass the allowlist — session-level permissions
+      // are enforced later by the resolveSessionPermission middleware.
+      const hasValidShareCookie = await checkShareCookie(c.req.raw, c.env);
+      if (!hasValidShareCookie) {
+        log("warn", "Auth failure", { email: identity.email, source: identity.source, error: "Not on allowlist" });
+        return c.json({ error: "Not authorized — not on Dodo allowlist" }, 403);
+      }
+      log("info", "Auth: share-cookie guest bypassed allowlist", { email: identity.email });
     }
   }
 
