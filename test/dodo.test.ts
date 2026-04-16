@@ -4,7 +4,17 @@ import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 import { releaseMockSlowPrompt, resetMockAgentic } from "./helpers/agentic-mock";
 
-const { runSandboxedCodeMock, sendNotificationMock } = vi.hoisted(() => ({
+const { mockArtifacts, runSandboxedCodeMock, sendNotificationMock } = vi.hoisted(() => ({
+  mockArtifacts: {
+    create: vi.fn(async (name: string) => ({
+      name,
+      remote: `https://fake-artifacts.example/${name}.git`,
+      token: "fake-token",
+      fork: vi.fn(),
+    })),
+    get: vi.fn(async () => { throw new Error("not found"); }),
+    import: vi.fn(),
+  },
   runSandboxedCodeMock: vi.fn(),
   sendNotificationMock: vi.fn(),
 }));

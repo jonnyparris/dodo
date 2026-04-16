@@ -36,6 +36,13 @@
   "r2_buckets": [
     { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" }
   ],
+  // TODO(artifacts-beta): confirm final Wrangler config shape once Artifacts beta access is enabled.
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace_id": "TODO_SET_AFTER_BETA_ACCESS"
+    }
+  ],
   "browser": {
     "binding": "BROWSER"
   },

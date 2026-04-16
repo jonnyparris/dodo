@@ -308,6 +308,12 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     return textResult({ sessionId: newId, sourceSessionId: sessionId, forkedAt: new Date().toISOString() });
   });
 
+  server.tool("get_artifacts_remote", "Get or create the per-session Cloudflare Artifacts repo remote.", { sessionId: z.string() }, async ({ sessionId }) => {
+    const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
+    const repo = await agent.getOrCreateArtifactsRepo();
+    return textResult({ name: repo.name, remote: repo.remote, token: repo.token });
+  });
+
   server.tool("list_known_repos", "List built-in repositories that the orchestrator can clone without relying on prompt text.", {}, async () =>
     textResult({ repos: listKnownRepos() }),
   );

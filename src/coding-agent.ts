@@ -1,5 +1,6 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
+import type { ArtifactsRepo } from "./artifacts-types";
 import { generateText, streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
@@ -270,6 +271,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private mcpDepth = 0;
   /** AbortController for the currently running fiber prompt. Signalled by handleAbort(). */
   private _fiberAbortController: AbortController | null = null;
+  private _artifactsRepo: ArtifactsRepo | null = null;
   private readonly presence = new PresenceTracker();
   readonly stateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
@@ -3702,6 +3704,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private sessionId(): string {
     return this.readMetadata("session_id") ?? "";
+  }
+
+  async getOrCreateArtifactsRepo(): Promise<ArtifactsRepo> {
+    if (this._artifactsRepo) return this._artifactsRepo;
+    const name = `dodo-${this.sessionId()}`;
+    try {
+      this._artifactsRepo = await this.env.ARTIFACTS.get(name);
+    } catch {
+      this._artifactsRepo = await this.env.ARTIFACTS.create(name);
+    }
+    return this._artifactsRepo;
   }
 
   private readMetadata(key: string): string | null {

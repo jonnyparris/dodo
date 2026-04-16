@@ -1,3 +1,4 @@
+import type { Artifacts } from "./artifacts-types";
 import type { CodingAgent } from "./coding-agent";
 import type { SharedIndex } from "./shared-index";
 import type { UserControl } from "./user-control";
@@ -19,6 +20,7 @@ export interface Env {
   LOADER?: WorkerLoader;
   OPENCODE_BASE_URL: string;
   OUTBOUND?: Fetcher;
+  ARTIFACTS: Artifacts;
   WORKSPACE_BUCKET?: R2Bucket;
 
   // Durable Object bindings
