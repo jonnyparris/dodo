@@ -4,6 +4,8 @@ import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 import { releaseMockSlowPrompt, resetMockAgentic } from "./helpers/agentic-mock";
 
+// mockArtifacts is wired up for Phase 2 when the Artifacts binding is exercised by real tools.
+// In Phase 1, get_artifacts_remote exists as dormant infrastructure; no test asserts against it yet.
 const { mockArtifacts, runSandboxedCodeMock, sendNotificationMock } = vi.hoisted(() => ({
   mockArtifacts: {
     create: vi.fn(async (name: string) => ({
@@ -18,6 +20,9 @@ const { mockArtifacts, runSandboxedCodeMock, sendNotificationMock } = vi.hoisted
   runSandboxedCodeMock: vi.fn(),
   sendNotificationMock: vi.fn(),
 }));
+
+// Reference mockArtifacts so the linter doesn't flag it as unused until Phase 2 tests land.
+void mockArtifacts;
 
 vi.mock("../src/executor", () => ({
   runSandboxedCode: runSandboxedCodeMock,

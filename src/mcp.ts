@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, resolveAdminEmail } from "./auth";
+import type { CodingAgent } from "./coding-agent";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import type { Env } from "./types";
 
@@ -309,7 +310,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
   });
 
   server.tool("get_artifacts_remote", "Get or create the per-session Cloudflare Artifacts repo remote.", { sessionId: z.string() }, async ({ sessionId }) => {
-    const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
+    const agent = (await getAgentByName(env.CODING_AGENT as never, sessionId)) as unknown as CodingAgent;
     const repo = await agent.getOrCreateArtifactsRepo();
     return textResult({ name: repo.name, remote: repo.remote, token: repo.token });
   });
