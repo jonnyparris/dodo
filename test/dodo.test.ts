@@ -663,3 +663,30 @@ describe("Dodo foundation", () => {
     expect(call[2].tags).toContain("x");
   });
 });
+
+describe("Artifacts shadow commit", () => {
+  it("swallows errors so primary writes don't break", async () => {
+    const { shadowCommit } = await import("../src/artifacts-shadow");
+    const onError = vi.fn();
+    await expect(
+      shadowCommit(
+        {
+          getRepo: async () => { throw new Error("boom"); },
+          onError,
+        },
+        "write",
+        "/foo.txt",
+        "hello",
+      ),
+    ).resolves.toBeUndefined();
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError.mock.calls[0][1]).toMatchObject({ op: "write", path: "/foo.txt" });
+  });
+
+  it("is a no-op when no repo is available", async () => {
+    const { shadowCommit } = await import("../src/artifacts-shadow");
+    const getRepo = vi.fn(async () => null);
+    await shadowCommit({ getRepo }, "write", "/foo.txt", "x");
+    expect(getRepo).toHaveBeenCalled();
+  });
+});

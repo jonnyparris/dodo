@@ -1,6 +1,7 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
 import type { ArtifactsRepo } from "./artifacts-types";
+import { shadowCommit, type ShadowCommitDeps } from "./artifacts-shadow";
 import { generateText, streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
@@ -2098,6 +2099,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const path = normalizePath(url.searchParams.get("path") ?? "");
     const body = writeFileSchema.parse(await request.json());
     await this.workspace.writeFile(path, body.content, body.mimeType);
+    await shadowCommit(this.artifactsShadowDeps(), "write", path, body.content, {
+      message: `dodo: write ${path}`,
+    });
     const content = await this.workspace.readFile(path);
     this.emitEvent({ data: { path, type: "write" }, type: "file" });
     return Response.json({ content, path, written: true });
@@ -2107,6 +2111,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const path = normalizePath(url.searchParams.get("path") ?? "");
     const body = replaceFileSchema.parse(await request.json());
     const result = await this.stateBackend.replaceInFile(path, body.search, body.replacement);
+    // Shadow-commit the post-replace content. Read-after-write to capture the new state.
+    const replaced = await this.workspace.readFile(path);
+    await shadowCommit(this.artifactsShadowDeps(), "replace", path, replaced, {
+      message: `dodo: replace in ${path}`,
+    });
     this.emitEvent({ data: { path, type: "edit" }, type: "file" });
     return Response.json({ path, result });
   }
@@ -2117,6 +2126,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return Response.json({ error: "Cannot delete workspace root" }, { status: 400 });
     }
     await this.workspace.rm(path, { force: true, recursive: true });
+    await shadowCommit(this.artifactsShadowDeps(), "delete", path, null, {
+      message: `dodo: delete ${path}`,
+    });
     this.emitEvent({ data: { path, type: "delete" }, type: "file" });
     return Response.json({ deleted: true, path });
   }
@@ -3715,6 +3727,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       this._artifactsRepo = await this.env.ARTIFACTS.create(name);
     }
     return this._artifactsRepo;
+  }
+
+  private artifactsShadowDeps(): ShadowCommitDeps {
+    return {
+      getRepo: async () => {
+        try {
+          return await this.getOrCreateArtifactsRepo();
+        } catch {
+          return null;
+        }
+      },
+      onError: (err, ctx) => {
+        log("warn", `[artifacts-shadow] ${ctx.op} ${ctx.path} failed`, { err: String(err) });
+      },
+    };
   }
 
   private readMetadata(key: string): string | null {
