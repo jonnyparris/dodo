@@ -312,12 +312,16 @@ async function sendMessage(){
   const images=getPendingImages();
   if(!content&&!images)return;
   if(!content)return toast("Add a text message with your images","warning");
+  // Block sending images while a prompt is running — the queued-prompt path
+  // can't carry attachments end-to-end, and silently dropping them is worse
+  // than asking the user to wait.
+  if(isProcessing&&images)return toast("Wait for the current response before sending images","warning");
   sendTypingStop();
   if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}
   $("msg-input").value="";$("msg-input").style.height='auto';clearPendingImages();
   const payload=images?{content,images}:{content};
   if(isProcessing){
-    // Queue the prompt — show as pending bubble (images not supported in queue)
+    // Queue text-only prompts. Image-carrying prompts are blocked above.
     const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});
     if(result&&result.status==="queued"){
       showQueuedMessage(content,result.promptId,result.position);
@@ -330,7 +334,7 @@ async function sendMessage(){
 }
 async function abortPrompt(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
 async function forkSession(){if(!currentSession)return;const d=await jsonSafe(`/session/${currentSession}/fork`,{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
-async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("token-summary").style.color="";const cw=$("context-warning");if(cw)cw.style.display="none";$("presence-bar").innerHTML="";history.replaceState(null,"",location.pathname);await loadSessions();if(window.innerWidth<=900)switchTab('chat')}
+async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;clearPendingImages();$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("token-summary").style.color="";const cw=$("context-warning");if(cw)cw.style.display="none";$("presence-bar").innerHTML="";history.replaceState(null,"",location.pathname);await loadSessions();if(window.innerWidth<=900)switchTab('chat')}
 
 // --- Session rename ---
 async function renameSession(){
@@ -403,8 +407,12 @@ function sendTypingStop(){
 }
 
 // --- Image attachments ---
+// Limits kept in sync with `imageAttachmentSchema` in src/coding-agent.ts.
+// Backend caps base64 length at 4_000_000 chars (~3MB decoded per image, 5 per message);
+// 3MB raw here is a conservative frontend bound that stays under the backend limit
+// after base64 encoding (3MB * 4/3 ≈ 4MB).
 const _pendingImages=[];
-const MAX_IMAGE_SIZE=10*1024*1024; // 10MB
+const MAX_IMAGE_SIZE=3*1024*1024; // 3MB raw — pairs with ~4MB base64 on the backend
 const MAX_IMAGES=5;
 const ALLOWED_IMAGE_TYPES=new Set(["image/png","image/jpeg","image/gif","image/webp"]);
 
@@ -431,15 +439,16 @@ function handleFileSelect(input){
 
 function addImageFile(file){
   if(_pendingImages.length>=MAX_IMAGES)return toast(`Maximum ${MAX_IMAGES} images per message`,"warning");
-  if(file.size>MAX_IMAGE_SIZE)return toast("Image too large (max 10MB)","warning");
+  if(file.size>MAX_IMAGE_SIZE)return toast("Image too large (max 3MB)","warning");
   const reader=new FileReader();
   reader.onload=()=>{
     const dataUrl=reader.result;
     const base64=dataUrl.split(",")[1];
     const mediaType=file.type;
-    _pendingImages.push({data:base64,mediaType,dataUrl});
+    _pendingImages.push({data:base64,mediaType,dataUrl,name:file.name||""});
     renderImagePreviews();
   };
+  reader.onerror=()=>toast("Failed to read image file","warning");
   reader.readAsDataURL(file);
 }
 
@@ -450,11 +459,14 @@ function removeImage(idx){
 
 function renderImagePreviews(){
   const bar=$("image-preview-bar");
-  bar.innerHTML="";
+  bar.replaceChildren();
+  const total=_pendingImages.length;
   _pendingImages.forEach((img,i)=>{
     const wrap=document.createElement("div");wrap.className="image-preview-item";
-    const imgEl=document.createElement("img");imgEl.src=img.dataUrl;imgEl.alt="attachment";
+    const imgEl=document.createElement("img");imgEl.src=img.dataUrl;
+    imgEl.alt=img.name?`Attachment: ${img.name}`:`Attachment ${i+1} of ${total}`;
     const btn=document.createElement("button");btn.className="remove-btn";btn.textContent="\u00d7";
+    btn.setAttribute("aria-label",img.name?`Remove ${img.name}`:`Remove attachment ${i+1}`);
     btn.onclick=()=>removeImage(i);
     wrap.appendChild(imgEl);wrap.appendChild(btn);bar.appendChild(wrap);
   });

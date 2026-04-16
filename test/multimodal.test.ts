@@ -133,6 +133,48 @@ describe("Multimodal image support", () => {
       });
       expect(res.status).toBe(400);
     });
+
+    it("rejects images whose base64 payload exceeds the length cap", async () => {
+      // MAX_IMAGE_BASE64_LENGTH = 4_000_000. One over and it should fail schema
+      // validation before the handler ever runs. Use divisible-by-4 so it
+      // doesn't fail for the wrong reason.
+      const oversizedBase64 = "A".repeat(4_000_004);
+      const res = await fetchJson(`/session/${sessionId}/message`, {
+        body: JSON.stringify({
+          content: "Too big",
+          images: [{ data: oversizedBase64, mediaType: "image/png" }],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects base64 whose length is not divisible by 4", async () => {
+      // Valid-looking alphabet but broken framing — caught by isLikelyBase64.
+      const res = await fetchJson(`/session/${sessionId}/message`, {
+        body: JSON.stringify({
+          content: "Malformed base64",
+          images: [{ data: "AAA", mediaType: "image/png" }],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects base64 containing characters outside the base64 alphabet", async () => {
+      // 8 chars, divisible by 4, but contains `$` which isn't in the alphabet.
+      const res = await fetchJson(`/session/${sessionId}/message`, {
+        body: JSON.stringify({
+          content: "Bad chars",
+          images: [{ data: "AAAA$AAA", mediaType: "image/png" }],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(res.status).toBe(400);
+    });
   });
 
   describe("Message history", () => {

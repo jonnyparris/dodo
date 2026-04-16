@@ -78,6 +78,9 @@ function filterSessions(query){
 async function createSession(){const d=await jsonSafe("/session",{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
 async function selectSession(id){
   currentSession=id;setProcessing(false);_gitRemoteUrlCache='';history.replaceState(null,"",`#session=${id}`);
+  // Drop any staged image attachments from the previous session — they belong
+  // to whatever the user was about to send there, not here.
+  if(typeof clearPendingImages==='function')clearPendingImages();
   $("chat").innerHTML="";$("onboarding")?.remove();
   const cw=$("context-warning");if(cw)cw.style.display="none";
   showSkeleton($("chat"),5);

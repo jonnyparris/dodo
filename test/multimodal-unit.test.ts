@@ -112,4 +112,33 @@ describe("uiMessageToChatRecord — multimodal", () => {
     expect(record.attachments).toHaveLength(1);
     expect(record.attachments![0].url).toBe("data:image/jpeg;base64,/9j/4AAQ");
   });
+
+  it("drops file parts with media types outside the allowlist", () => {
+    // Defensive: even if something slips past the ingest schema (migrated data,
+    // direct DB edits), uiMessageToChatRecord must not surface non-image or
+    // non-allowlisted types as renderable attachments.
+    const msg: UIMessage = {
+      id: "msg-bad-mime",
+      role: "user",
+      parts: [
+        { type: "text", text: "Check" },
+        { type: "file", mediaType: "image/svg+xml", url: "data:image/svg+xml;base64,PHN2Zy8+" } as UIMessage["parts"][number],
+      ],
+    };
+    const record = uiMessageToChatRecord(msg);
+    expect(record.attachments).toBeUndefined();
+  });
+
+  it("drops file parts with an empty url", () => {
+    const msg: UIMessage = {
+      id: "msg-no-url",
+      role: "user",
+      parts: [
+        { type: "text", text: "Check" },
+        { type: "file", mediaType: "image/png", url: "" } as UIMessage["parts"][number],
+      ],
+    };
+    const record = uiMessageToChatRecord(msg);
+    expect(record.attachments).toBeUndefined();
+  });
 });

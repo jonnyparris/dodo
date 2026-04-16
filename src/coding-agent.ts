@@ -1,6 +1,6 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
-import { generateText, streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
+import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
 import { getUserControlStub, isAdmin } from "./auth";
@@ -73,13 +73,32 @@ const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
 /** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
 const CLEARED_MARKER = "[Old tool result content cleared]";
 
+/**
+ * Image attachment limits — keep in sync with `public/js/dodo-chat.js`.
+ * Base64 encodes 3 bytes → 4 chars, so MAX_IMAGE_BASE64_LENGTH ≈ MAX_IMAGE_BYTES * 4/3.
+ * Kept tight to protect the DO isolate: 5 images × 4MB base64 = 20MB peak payload.
+ */
+const MAX_IMAGES_PER_MESSAGE = 5;
+const MAX_IMAGE_BASE64_LENGTH = 4_000_000; // ~3MB decoded per image
+const ALLOWED_IMAGE_MEDIA_TYPES = /^image\/(png|jpeg|gif|webp)$/;
+// Sampled base64 validation — avoids running a regex across a multi-MB string, which
+// is expensive in the DO isolate. Base64 must have length divisible by 4; the head/tail
+// sampling catches most corruption without the full scan. convertToLanguageModelV3DataContent
+// in the AI SDK will surface any deeper decoding errors at send time.
+const BASE64_SAMPLE_REGEX = /^[A-Za-z0-9+/]+=*$/;
+const isLikelyBase64 = (s: string): boolean => {
+  if (s.length % 4 !== 0) return false;
+  const head = s.slice(0, 128);
+  const tail = s.slice(-128);
+  return BASE64_SAMPLE_REGEX.test(head) && BASE64_SAMPLE_REGEX.test(tail);
+};
 const imageAttachmentSchema = z.object({
-  data: z.string().min(1).max(15_000_000).regex(/^[A-Za-z0-9+/]+=*$/, "Invalid base64"),
-  mediaType: z.string().regex(/^image\/(png|jpeg|gif|webp)$/),
+  data: z.string().min(1).max(MAX_IMAGE_BASE64_LENGTH).refine(isLikelyBase64, "Invalid base64"),
+  mediaType: z.string().regex(ALLOWED_IMAGE_MEDIA_TYPES),
 }).strict();
 const sendMessageSchema = z.object({
   content: z.string().trim().min(1),
-  images: z.array(imageAttachmentSchema).max(5).optional(),
+  images: z.array(imageAttachmentSchema).max(MAX_IMAGES_PER_MESSAGE).optional(),
 }).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
 const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
@@ -3047,11 +3066,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         // tries new URL(data) which throws for raw base64 (not a valid URL),
         // so it skips the download. convertToLanguageModelV3DataContent then
         // handles the raw string as inline base64 data.
-        (parts as Array<{ type: string; mediaType: string; url: string }>).push({
+        const filePart = {
           type: "file",
           mediaType: img.mediaType,
           url: img.data,
-        });
+        } satisfies FileUIPart;
+        parts.push(filePart);
       }
     }
     const userMsg: UIMessage = {
