@@ -746,6 +746,39 @@ describe("Artifacts binding", () => {
     expect((env as unknown as { ARTIFACTS: { create: { mock: { calls: unknown[] } } } }).ARTIFACTS.create.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("forks the Artifacts repo via the CodingAgent cache when a source has been warmed up", async () => {
+    // Unit test: verify that once a session's Artifacts context is cached,
+    // calling `repo.fork(newName, opts)` on the cached repo dispatches to the
+    // mocked fork function. This covers the integration-invariant that
+    // fork_session relies on without spinning up the full MCP handler.
+    const mockForkFn = vi.fn(async (name: string) => ({
+      name,
+      remote: `https://fake.artifacts/${name}.git`,
+      token: "art_v1_forked",
+      defaultBranch: "main",
+    }));
+    const artifacts = (env as unknown as { ARTIFACTS: { get: ReturnType<typeof vi.fn> } }).ARTIFACTS;
+    artifacts.get = vi.fn(async (name: string) => ({
+      name,
+      info: async () => ({ remote: `https://fake.artifacts/${name}.git`, name }),
+      createToken: async () => ({ token: "art_v1_fresh" }),
+      fork: mockForkFn,
+    }));
+
+    const sessionId = await createSession();
+    const ns = (env as Env).CODING_AGENT;
+    const agent = await ns.get(ns.idFromName(sessionId));
+    const api = agent as unknown as {
+      getOrCreateArtifactsContext: (hint?: string) => Promise<{ repo: { fork: (name: string, opts?: unknown) => Promise<unknown> } } | null>;
+    };
+    const ctx = await api.getOrCreateArtifactsContext(sessionId);
+    expect(ctx).not.toBeNull();
+
+    await ctx!.repo.fork("dodo-forked", { defaultBranchOnly: false });
+    expect(mockForkFn).toHaveBeenCalledTimes(1);
+    expect(mockForkFn).toHaveBeenCalledWith("dodo-forked", { defaultBranchOnly: false });
+  });
+
   it("strips the expires suffix from tokens", () => {
     expect(stripTokenExpiry("art_v1_fake?expires=9999999999")).toBe("art_v1_fake");
     expect(stripTokenExpiry("art_v1_fake")).toBe("art_v1_fake");
