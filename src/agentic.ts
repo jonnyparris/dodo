@@ -5,7 +5,6 @@ import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { createBrowserTools } from "./browser/tools";
-import { wrapOutboundWithOwner } from "./executor";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
@@ -561,9 +560,7 @@ function buildTools(
   const gitTools = buildGitTools(env, workspace, config, options?.ownerEmail);
 
   if (env.LOADER) {
-    const outbound = options?.ownerId && env.OUTBOUND
-      ? wrapOutboundWithOwner(env.OUTBOUND, options.ownerId)
-      : env.OUTBOUND ?? null;
+    const outbound = env.OUTBOUND ?? null;
 
     tools.codemode = createExecuteTool({
       tools: workspaceTools,
