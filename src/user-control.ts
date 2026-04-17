@@ -76,6 +76,7 @@ const workerRunUpdateSchema = z.object({
   status: z.enum(["session_created", "repo_ready", "branch_created", "edit_applied", "commit_created", "prompt_running", "push_verified", "done", "failed"]).optional(),
   lastError: z.string().nullable().optional(),
   failureSnapshotId: z.string().nullable().optional(),
+  prUrl: z.string().nullable().optional(),
   verification: z.record(z.string(), z.unknown()).nullable().optional(),
 }).strict();
 
@@ -673,11 +674,18 @@ export class UserControl extends DurableObject<Env> {
         verification_json TEXT,
         last_error TEXT,
         failure_snapshot_id TEXT,
+        pr_url TEXT,
         status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )
     `);
+
+    try {
+      this.db.exec("ALTER TABLE worker_runs ADD COLUMN pr_url TEXT");
+    } catch {
+      // Column already exists.
+    }
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS failure_snapshots (
@@ -843,8 +851,8 @@ export class UserControl extends DurableObject<Env> {
       `INSERT INTO worker_runs (
         id, session_id, parent_session_id, repo_id, repo_url, repo_dir, branch, base_branch,
         strategy, title, commit_message, expected_files_json, verification_json, last_error,
-        failure_snapshot_id, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        failure_snapshot_id, pr_url, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       input.sessionId,
       input.parentSessionId ?? null,
@@ -857,6 +865,7 @@ export class UserControl extends DurableObject<Env> {
       input.title,
       input.commitMessage ?? null,
       JSON.stringify(input.expectedFiles),
+      null,
       null,
       null,
       null,
@@ -875,12 +884,14 @@ export class UserControl extends DurableObject<Env> {
        SET status = ?,
            last_error = ?,
            failure_snapshot_id = ?,
+           pr_url = ?,
            verification_json = ?,
            updated_at = ?
        WHERE id = ?`,
       patch.status ?? current.status,
       patch.lastError === undefined ? current.lastError : patch.lastError,
       patch.failureSnapshotId === undefined ? current.failureSnapshotId : patch.failureSnapshotId,
+      patch.prUrl === undefined ? current.prUrl : patch.prUrl,
       patch.verification === undefined
         ? (current.verification === null ? null : JSON.stringify(current.verification))
         : (patch.verification === null ? null : JSON.stringify(patch.verification)),
@@ -916,6 +927,7 @@ export class UserControl extends DurableObject<Env> {
       id: String(row.id),
       lastError: row.last_error === null ? null : String(row.last_error),
       parentSessionId: row.parent_session_id === null ? null : String(row.parent_session_id),
+      prUrl: row.pr_url === null ? null : String(row.pr_url),
       repoDir: String(row.repo_dir),
       repoId: String(row.repo_id),
       repoUrl: String(row.repo_url),

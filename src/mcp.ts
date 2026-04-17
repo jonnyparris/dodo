@@ -2,8 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, resolveAdminEmail } from "./auth";
+import { createDraftPrForRun } from "./github-pr";
 import { getKnownRepo, listKnownRepos } from "./repos";
-import type { Env } from "./types";
+import type { Env, WorkerRunRecord } from "./types";
 
 // MCP uses the admin email for all operations since MCP is token-authenticated
 // (no CF Access identity available). In Phase 2, MCP can pass user context.
@@ -109,8 +110,8 @@ async function createWorkerRun(env: Env, input: {
   });
 }
 
-async function updateWorkerRun(env: Env, runId: string, patch: { status?: string; lastError?: string | null; failureSnapshotId?: string | null; verification?: Record<string, unknown> | null }) {
-  return userJson<Record<string, unknown>>(env, `/worker-runs/${encodeURIComponent(runId)}`, {
+async function updateWorkerRun(env: Env, runId: string, patch: { status?: string; lastError?: string | null; failureSnapshotId?: string | null; verification?: Record<string, unknown> | null; prUrl?: string | null }): Promise<WorkerRunRecord> {
+  return userJson<WorkerRunRecord>(env, `/worker-runs/${encodeURIComponent(runId)}`, {
     body: JSON.stringify(patch),
     headers: { "content-type": "application/json" },
     method: "PUT",
@@ -532,6 +533,15 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
         method: "POST",
       }, depth);
       const updated = await updateWorkerRun(env, runId, { status: "done", verification });
+
+      // Auto-open draft PR. Non-fatal — failures don't regress the run.
+      const ownerEmail = mcpUserEmail(env);
+      const prUrl = await createDraftPrForRun(env, updated, ownerEmail);
+      if (prUrl) {
+        const withPr = await updateWorkerRun(env, runId, { prUrl });
+        return textResult({ run: withPr, verification });
+      }
+
       return textResult({ run: updated, verification });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
