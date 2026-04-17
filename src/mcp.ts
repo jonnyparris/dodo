@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, resolveAdminEmail } from "./auth";
+import { createDraftPrForRun } from "./github-pr";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import type { Env } from "./types";
 
@@ -532,6 +533,15 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
         method: "POST",
       }, depth);
       const updated = await updateWorkerRun(env, runId, { status: "done", verification });
+
+      // Auto-open draft PR. Non-fatal — failures don't regress the run.
+      const ownerEmail = mcpUserEmail(env);
+      const prUrl = await createDraftPrForRun(env, updated, ownerEmail);
+      if (prUrl) {
+        const withPr = await updateWorkerRun(env, runId, { prUrl });
+        return textResult({ run: withPr, verification });
+      }
+
       return textResult({ run: updated, verification });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

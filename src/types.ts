@@ -142,6 +142,7 @@ export interface WorkerRunRecord {
   id: string;
   lastError: string | null;
   parentSessionId: string | null;
+  prUrl?: string | null;
   repoDir: string;
   repoId: string;
   repoUrl: string;
