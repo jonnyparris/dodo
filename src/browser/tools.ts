@@ -83,9 +83,44 @@ declare const cdp: {
 
 Write an async arrow function in JavaScript. Do NOT use TypeScript syntax.
 
+The default viewport is 800×600. For most user-visible work (reviewing a
+page, capturing a UI bug, etc.) you should override this to a desktop
+resolution before navigating — otherwise screenshots look cramped and
+mobile-styled. Set deviceScaleFactor:2 for crisp images on HiDPI displays.
+
 Common patterns:
-// Navigate and screenshot
+// Desktop screenshot (recommended default for most tasks)
 async () => {
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 1440, height: 900, deviceScaleFactor: 2, mobile: false
+  });
+  await cdp.send("Page.enable");
+  await cdp.send("Page.navigate", { url: "https://example.com" });
+  await new Promise(r => setTimeout(r, 3000));
+  const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
+  return { screenshot: data, format: "png", encoding: "base64" };
+}
+
+// Full-page screenshot (captures the entire scrollable page, not just the viewport)
+async () => {
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 1440, height: 900, deviceScaleFactor: 2, mobile: false
+  });
+  await cdp.send("Page.enable");
+  await cdp.send("Page.navigate", { url: "https://example.com" });
+  await new Promise(r => setTimeout(r, 3000));
+  const { data } = await cdp.send("Page.captureScreenshot", {
+    format: "png",
+    captureBeyondViewport: true
+  });
+  return { screenshot: data, format: "png", encoding: "base64" };
+}
+
+// Mobile screenshot (only when the user specifically asks for a mobile view)
+async () => {
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 390, height: 844, deviceScaleFactor: 3, mobile: true
+  });
   await cdp.send("Page.enable");
   await cdp.send("Page.navigate", { url: "https://example.com" });
   await new Promise(r => setTimeout(r, 3000));
