@@ -15,10 +15,15 @@ vi.mock("../src/executor", () => ({
 
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 
-vi.mock("../src/notify", () => ({
-  sendNotification: sendNotificationMock,
-}));
+vi.mock("../src/notify", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/notify")>();
+  return {
+    ...actual,
+    sendNotification: sendNotificationMock,
+  };
+});
 
+import { sendRunNotification } from "../src/notify";
 import worker from "../src/index";
 
 const BASE_URL = "https://dodo.example";
@@ -646,5 +651,69 @@ describe("Dodo foundation", () => {
     const call = sendNotificationMock.mock.calls[0];
     expect(call[2].title).toContain("failed");
     expect(call[2].tags).toContain("x");
+  });
+});
+
+describe("Worker run notifications", () => {
+  // `sendRunNotification` calls `sendNotification` via a module-internal
+  // reference that vitest's `vi.mock` cannot intercept. Instead we observe
+  // the real side effect: the call to `waitUntil` with a promise that
+  // eventually fetches ntfy.sh. Zero calls to waitUntil ⇒ no notification.
+  const baseRun = {
+    baseBranch: "main",
+    branch: "feat/run-notifications",
+    commitMessage: null,
+    createdAt: "2026-04-17T00:00:00.000Z",
+    expectedFiles: [],
+    failureSnapshotId: null,
+    id: "run-1",
+    lastError: null,
+    parentSessionId: null,
+    repoDir: "/tmp/repo",
+    repoId: "repo-1",
+    repoUrl: "https://github.com/example/repo",
+    sessionId: "session-1",
+    strategy: "agent" as const,
+    title: "Ship notifications",
+    updatedAt: "2026-04-17T00:00:00.000Z",
+    verification: null,
+  };
+
+  it("fires ntfy when a run transitions to done", () => {
+    const waitUntil = vi.fn();
+    sendRunNotification(env as Env, { waitUntil }, {
+      ...baseRun,
+      status: "done",
+    }, "push_verified", "owner@example.com");
+    expect(waitUntil).toHaveBeenCalledOnce();
+  });
+
+  it("fires ntfy when a run transitions to failed", () => {
+    const waitUntil = vi.fn();
+    sendRunNotification(env as Env, { waitUntil }, {
+      ...baseRun,
+      failureSnapshotId: "snapshot-1",
+      lastError: "boom",
+      status: "failed",
+    }, "prompt_running", "owner@example.com");
+    expect(waitUntil).toHaveBeenCalledOnce();
+  });
+
+  it("does not fire ntfy for non-terminal status changes", () => {
+    const waitUntil = vi.fn();
+    sendRunNotification(env as Env, { waitUntil }, {
+      ...baseRun,
+      status: "repo_ready",
+    }, "session_created", "owner@example.com");
+    expect(waitUntil).not.toHaveBeenCalled();
+  });
+
+  it("does not fire ntfy when status is unchanged", () => {
+    const waitUntil = vi.fn();
+    sendRunNotification(env as Env, { waitUntil }, {
+      ...baseRun,
+      status: "done",
+    }, "done", "owner@example.com");
+    expect(waitUntil).not.toHaveBeenCalled();
   });
 });
