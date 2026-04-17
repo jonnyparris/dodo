@@ -1,6 +1,7 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
 import type { ArtifactsRepo } from "./artifacts-types";
+import { flushTurnToArtifacts } from "./artifacts-flush";
 import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
@@ -3167,6 +3168,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     };
 
     await this.chat(userMsg, callback, { signal: options?.signal });
+
+    // Flush workspace changes to Artifacts. Fire-and-forget — never blocks the turn.
+    const artifactsCtx = await this.getOrCreateArtifactsContext().catch(() => null);
+    if (artifactsCtx) {
+      void flushTurnToArtifacts({
+        workspace: this.workspace,
+        remote: artifactsCtx.remote,
+        tokenSecret: artifactsCtx.tokenSecret,
+        message: `dodo: turn ${new Date().toISOString()}`,
+        author: options?.authorEmail
+          ? { name: options.authorEmail, email: options.authorEmail }
+          : { name: "Dodo", email: "dodo@workers.dev" },
+      });
+    }
 
     // If the stream contained an error chunk that Think silently dropped,
     // throw it so the caller (runFiberPrompt) can surface it properly.

@@ -73,6 +73,20 @@ async function eventually(assertion: () => Promise<void>, attempts = 20): Promis
   throw lastError;
 }
 
+describe("Artifacts flush", () => {
+  it("swallows errors silently", async () => {
+    const { flushTurnToArtifacts } = await import("../src/artifacts-flush");
+    const workspace = {} as any;
+    const result = await flushTurnToArtifacts({
+      workspace,
+      remote: "https://fake",
+      tokenSecret: "tok",
+      message: "test",
+    });
+    expect(result).toBe(false);
+  });
+});
+
 describe("Dodo foundation", () => {
   beforeAll(async () => {
     for (let i = 0; i < 5; i++) {
