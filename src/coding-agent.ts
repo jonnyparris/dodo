@@ -425,9 +425,23 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       ownerEmail,
       sessionId: this.sessionId(),
       // Forward tool-produced attachments (e.g. browser_execute screenshots)
-      // to the SSE stream so the chat UI can render them in real time.
+      // to the SSE stream so the chat UI can render them in real time, and
+      // persist them to SQLite so history restore after reload can surface
+      // the same images. Persisted under `message_id = toolCallId` initially;
+      // `runThinkChat` rebinds the rows to the assistant message id after
+      // the stream completes.
       onToolAttachments: (toolCallId, attachments) => {
         this._toolAttachments.set(toolCallId, attachments);
+        for (const a of attachments) {
+          this.insertMessageAttachment({
+            messageId: toolCallId,
+            toolCallId,
+            mediaType: a.mediaType,
+            url: a.url,
+            size: a.size,
+            source: "tool",
+          });
+        }
         this.emitEvent({
           data: {
             toolCallId,
@@ -2091,6 +2105,36 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
+    // Attachment refs (screenshots, generated images, user uploads) tied to
+    // a specific message. Stored here instead of inside the Think UIMessage
+    // parts because:
+    //   1. Think's enforceRowSizeLimit replaces tool outputs > 1KB with a
+    //      placeholder during persistence — base64 screenshots would vanish.
+    //   2. Tool-result events fire with the tool_call_id before the assistant
+    //      message the tool ran under has an id. Persisting refs here (keyed
+    //      by message_id — initially the tool_call bucket, later rebound to
+    //      the assistant message id once known) lets history restore surface
+    //      screenshots for the right message on reload.
+    //
+    // R2 lifecycle (30 days) is the canonical retention; this table is just
+    // a pointer index. If a pointer outlives its R2 object the client gets
+    // a 404 on load — acceptable degradation for long-gone history.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS message_attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id TEXT NOT NULL,
+        tool_call_id TEXT,
+        media_type TEXT NOT NULL,
+        url TEXT NOT NULL,
+        size INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_message_attachments_msg ON message_attachments(message_id)",
+    );
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS prompts (
         id TEXT PRIMARY KEY,
@@ -3058,6 +3102,73 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     );
   }
 
+  /**
+   * Persist an attachment reference. Used for tool-produced screenshots and
+   * assistant-generated images so history restore after reload can surface
+   * the same images that were visible during the stream.
+   *
+   * For tool attachments, `messageId` is initially the tool call id (we
+   * don't know the assistant messageId at tool-result time). After the
+   * stream completes, `rebindToolAttachments` remaps the rows.
+   */
+  private insertMessageAttachment(input: {
+    messageId: string;
+    toolCallId?: string | null;
+    mediaType: string;
+    url: string;
+    size: number;
+    source: "user" | "assistant" | "tool";
+  }): void {
+    this.db.exec(
+      "INSERT INTO message_attachments (message_id, tool_call_id, media_type, url, size, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      input.messageId,
+      input.toolCallId ?? null,
+      input.mediaType,
+      input.url,
+      input.size,
+      input.source,
+      nowEpoch(),
+    );
+  }
+
+  /**
+   * Rebind attachments originally stored under a tool_call_id to the actual
+   * assistant message id, now that the stream has finished and we know it.
+   * Idempotent — repeated calls with the same args do nothing new.
+   */
+  private rebindToolAttachments(toolCallIds: string[], assistantMessageId: string): void {
+    if (toolCallIds.length === 0) return;
+    const placeholders = toolCallIds.map(() => "?").join(",");
+    this.db.exec(
+      `UPDATE message_attachments SET message_id = ? WHERE tool_call_id IN (${placeholders}) AND message_id != ?`,
+      assistantMessageId,
+      ...toolCallIds,
+      assistantMessageId,
+    );
+  }
+
+  /** List attachment refs for one or more messages, ordered by creation time. */
+  private listMessageAttachments(messageIds: string[]): Map<string, Array<{ mediaType: string; url: string; size: number }>> {
+    const result = new Map<string, Array<{ mediaType: string; url: string; size: number }>>();
+    if (messageIds.length === 0) return result;
+    const placeholders = messageIds.map(() => "?").join(",");
+    const rows = this.db.all(
+      `SELECT message_id, media_type, url, size FROM message_attachments WHERE message_id IN (${placeholders}) ORDER BY id ASC`,
+      ...messageIds,
+    );
+    for (const row of rows) {
+      const id = String(row.message_id);
+      const list = result.get(id) ?? [];
+      list.push({
+        mediaType: String(row.media_type),
+        url: String(row.url),
+        size: Number(row.size ?? 0),
+      });
+      result.set(id, list);
+    }
+    return result;
+  }
+
   /** Read metadata for a Think message. */
   private readMessageMetadata(messageId: string): MessageMetadata | null {
     const row = this.db.one(
@@ -3077,17 +3188,49 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
-   * List messages from Think storage, joined with sidecar metadata.
-   * Returns ChatMessageRecord[] for backward compatibility.
+   * List messages from Think storage, joined with sidecar metadata and
+   * persisted attachment refs. Returns ChatMessageRecord[] for backward
+   * compatibility.
+   *
+   * Attachments come from two places:
+   *   1. The UIMessage parts themselves — user uploads and assistant-
+   *      generated file parts live here. uiMessageToChatRecord handles them.
+   *   2. The message_attachments table — tool-produced screenshots and
+   *      assistant-generated images, stored separately because Think's
+   *      enforceRowSizeLimit would strip them from message parts at >1KB.
+   *
+   * We merge both so the client sees a single `attachments` list regardless
+   * of which storage path produced it.
    */
   private listThinkMessages(): ChatMessageRecord[] {
     const thinkSessionId = this.getCurrentSessionId();
     if (!thinkSessionId) return [];
     const history = this.sessions.getHistory(thinkSessionId);
-    return history.map((msg) => {
+    const records = history.map((msg) => {
       const meta = this.readMessageMetadata(msg.id);
       return uiMessageToChatRecord(msg, meta ?? undefined);
     });
+    if (records.length === 0) return records;
+    const attachmentsByMsgId = this.listMessageAttachments(records.map((r) => r.id));
+    for (const record of records) {
+      const persisted = attachmentsByMsgId.get(record.id);
+      if (!persisted || persisted.length === 0) continue;
+      // Rewrite stored URLs (dodo-attachment://) to session-scoped HTTP paths
+      // the client can load. rewriteAttachmentsForClient leaves data URLs and
+      // external URLs untouched for the local-dev fallback path.
+      const rewritten = rewriteAttachmentsForClient(persisted) ?? persisted;
+      const merged = [...(record.attachments ?? []), ...rewritten];
+      // Dedupe by URL — if the same image ended up on both the UIMessage
+      // part and the side-table (shouldn't happen in practice, but belt-
+      // and-braces), we don't want the client to render it twice.
+      const seen = new Set<string>();
+      record.attachments = merged.filter((a) => {
+        if (seen.has(a.url)) return false;
+        seen.add(a.url);
+        return true;
+      });
+    }
+    return records;
   }
 
   /**
@@ -3269,6 +3412,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         tokenInput,
         tokenOutput,
       });
+
+      // Rebind any tool-produced attachments recorded during this turn from
+      // their tool_call_id buckets to the actual assistant message id. This
+      // is what makes screenshots show up on reload — listMessageAttachments
+      // queries by message_id, and without the rebind the rows would only be
+      // findable via tool_call_id which isn't on the ChatMessageRecord.
+      const toolCallIds = Array.from(this._toolAttachments.keys());
+      if (toolCallIds.length > 0) {
+        this.rebindToolAttachments(toolCallIds, assistantMessageId);
+      }
     }
 
     // Persist any assistant-generated images to R2 and emit a message-level
@@ -3290,6 +3443,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         if (ref) uploaded.push(ref);
       }
       if (uploaded.length > 0) {
+        // Persist before emitting — if the client reloads during emission
+        // we still want the image to surface from history.
+        for (const ref of uploaded) {
+          this.insertMessageAttachment({
+            messageId: assistantMessageId,
+            mediaType: ref.mediaType,
+            url: ref.url,
+            size: ref.size,
+            source: "assistant",
+          });
+        }
         this.emitEvent({
           data: {
             messageId: assistantMessageId,
