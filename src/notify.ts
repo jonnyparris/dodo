@@ -1,5 +1,5 @@
 import { getUserControlStub } from "./auth";
-import type { Env } from "./types";
+import type { Env, WorkerRunRecord, WorkerRunStatus } from "./types";
 
 /**
  * Resolve the ntfy topic for notifications.
@@ -55,4 +55,45 @@ export function sendNotification(
       });
     })(),
   );
+}
+
+const RUN_STATUS_NOTIFY_CONFIG: Partial<Record<WorkerRunStatus, { titleSuffix: string; priority: "default" | "high"; tags: string }>> = {
+  done: { titleSuffix: "done", priority: "default", tags: "white_check_mark,robot" },
+  failed: { titleSuffix: "failed", priority: "high", tags: "x,robot" },
+};
+
+/**
+ * Send an ntfy push notification when a worker run transitions to a notable status.
+ * Only fires for terminal statuses (done, failed) to avoid notification spam on every
+ * intermediate state change.
+ */
+export function sendRunNotification(
+  env: Env,
+  ctx: { waitUntil: (promise: Promise<unknown>) => void },
+  run: WorkerRunRecord,
+  oldStatus: WorkerRunStatus,
+  ownerEmail?: string,
+): void {
+  if (run.status === oldStatus) return;
+  const config = RUN_STATUS_NOTIFY_CONFIG[run.status];
+  if (!config) return;
+
+  const lines: string[] = [
+    `Branch: ${run.branch}`,
+    `Session: ${run.sessionId}`,
+  ];
+  if (run.lastError) {
+    lines.push(`Error: ${run.lastError.slice(0, 200)}`);
+  }
+  if (run.failureSnapshotId) {
+    lines.push(`Snapshot: ${run.failureSnapshotId}`);
+  }
+
+  sendNotification(env, ctx, {
+    title: `Dodo: ${run.title} ${config.titleSuffix}`,
+    body: lines.join("\n"),
+    priority: config.priority,
+    tags: config.tags,
+    ownerEmail,
+  });
 }

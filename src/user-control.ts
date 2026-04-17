@@ -14,6 +14,7 @@ import {
 } from "./crypto";
 import { HttpMcpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
+import { sendRunNotification } from "./notify";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
 import type { AppConfig, Env, FailureSnapshotRecord, MemoryEntry, SessionIndexRecord, UpdateConfigRequest, WorkerRunRecord, WorkerRunStatus } from "./types";
 
@@ -868,6 +869,7 @@ export class UserControl extends DurableObject<Env> {
 
   private updateWorkerRun(id: string, patch: z.infer<typeof workerRunUpdateSchema>): WorkerRunRecord {
     const current = this.getWorkerRun(id);
+    const previousStatus = current.status;
     this.db.exec(
       `UPDATE worker_runs
        SET status = ?,
@@ -885,7 +887,9 @@ export class UserControl extends DurableObject<Env> {
       nowEpoch(),
       id,
     );
-    return this.getWorkerRun(id);
+    const run = this.getWorkerRun(id);
+    sendRunNotification(this.env, this.ctx, run, previousStatus, this.getOwnerEmail() ?? undefined);
+    return run;
   }
 
   private listWorkerRuns(sessionId?: string): WorkerRunRecord[] {

@@ -15,10 +15,15 @@ vi.mock("../src/executor", () => ({
 
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 
-vi.mock("../src/notify", () => ({
-  sendNotification: sendNotificationMock,
-}));
+vi.mock("../src/notify", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/notify")>();
+  return {
+    ...actual,
+    sendNotification: sendNotificationMock,
+  };
+});
 
+import { sendRunNotification } from "../src/notify";
 import worker from "../src/index";
 
 const BASE_URL = "https://dodo.example";
@@ -646,5 +651,79 @@ describe("Dodo foundation", () => {
     const call = sendNotificationMock.mock.calls[0];
     expect(call[2].title).toContain("failed");
     expect(call[2].tags).toContain("x");
+  });
+});
+
+describe("Worker run notifications", () => {
+  const baseRun = {
+    baseBranch: "main",
+    branch: "feat/run-notifications",
+    commitMessage: null,
+    createdAt: "2026-04-17T00:00:00.000Z",
+    expectedFiles: [],
+    failureSnapshotId: null,
+    id: "run-1",
+    lastError: null,
+    parentSessionId: null,
+    repoDir: "/tmp/repo",
+    repoId: "repo-1",
+    repoUrl: "https://github.com/example/repo",
+    sessionId: "session-1",
+    strategy: "agent" as const,
+    title: "Ship notifications",
+    updatedAt: "2026-04-17T00:00:00.000Z",
+    verification: null,
+  };
+
+  it("fires ntfy when a run transitions to done", () => {
+    sendNotificationMock.mockClear();
+
+    sendRunNotification(env as Env, { waitUntil: vi.fn() }, {
+      ...baseRun,
+      status: "done",
+    }, "push_verified", "owner@example.com");
+
+    expect(sendNotificationMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({
+        ownerEmail: "owner@example.com",
+        tags: expect.stringContaining("white_check_mark"),
+        title: expect.stringContaining("done"),
+      }),
+    );
+  });
+
+  it("fires ntfy when a run transitions to failed", () => {
+    sendNotificationMock.mockClear();
+
+    sendRunNotification(env as Env, { waitUntil: vi.fn() }, {
+      ...baseRun,
+      failureSnapshotId: "snapshot-1",
+      lastError: "boom",
+      status: "failed",
+    }, "prompt_running", "owner@example.com");
+
+    expect(sendNotificationMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({
+        ownerEmail: "owner@example.com",
+        priority: "high",
+        tags: expect.stringContaining("x"),
+        title: expect.stringContaining("failed"),
+      }),
+    );
+  });
+
+  it("does not fire ntfy for non-terminal status changes", () => {
+    sendNotificationMock.mockClear();
+
+    sendRunNotification(env as Env, { waitUntil: vi.fn() }, {
+      ...baseRun,
+      status: "repo_ready",
+    }, "session_created", "owner@example.com");
+
+    expect(sendNotificationMock).not.toHaveBeenCalled();
   });
 });
