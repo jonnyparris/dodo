@@ -3742,8 +3742,51 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return sessionId;
   }
 
+  private _artifactsRepo: ArtifactsRepo | null = null;
+  private _artifactsRemote: string | null = null;
+  private _artifactsTokenSecret: string | null = null;
+
   private sessionId(): string {
     return this.readMetadata("session_id") ?? "";
+  }
+
+  /**
+   * Get or create this session's Artifacts repo. Returns null if Artifacts
+   * is unavailable (network error, quota, etc.) — callers must tolerate
+   * absence silently.
+   */
+  async getOrCreateArtifactsContext(): Promise<{ repo: ArtifactsRepo; remote: string; tokenSecret: string } | null> {
+    if (this._artifactsRepo && this._artifactsRemote && this._artifactsTokenSecret) {
+      return { repo: this._artifactsRepo, remote: this._artifactsRemote, tokenSecret: this._artifactsTokenSecret };
+    }
+
+    try {
+      const name = `dodo-${this.sessionId()}`;
+      let repo = await this.env.ARTIFACTS.get(name);
+      let remote: string | null = null;
+      let tokenSecret: string | null = null;
+
+      if (!repo) {
+        const created = await this.env.ARTIFACTS.create(name, { setDefaultBranch: "main" });
+        repo = created.repo;
+        remote = created.remote;
+        tokenSecret = stripTokenExpiry(created.token);
+      } else {
+        const info = await repo.info();
+        if (!info?.remote) return null;
+        remote = info.remote;
+        const tokenResult = await repo.createToken("write", 3600);
+        tokenSecret = stripTokenExpiry(tokenResult.token);
+      }
+
+      this._artifactsRepo = repo;
+      this._artifactsRemote = remote;
+      this._artifactsTokenSecret = tokenSecret;
+      return { repo, remote, tokenSecret };
+    } catch (err) {
+      console.warn("[artifacts] failed to get/create repo:", err);
+      return null;
+    }
   }
 
   private readMetadata(key: string): string | null {
@@ -3932,4 +3975,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       this.clients.delete(writer);
     }
   }
+}
+
+/**
+ * Artifacts tokens come back as "art_v1_<secret>?expires=<unix>".
+ * Git Basic auth needs just the secret.
+ */
+export function stripTokenExpiry(token: string): string {
+  const idx = token.indexOf("?expires=");
+  return idx === -1 ? token : token.slice(0, idx);
 }

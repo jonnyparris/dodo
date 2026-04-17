@@ -7,6 +7,7 @@ export interface Env {
   AI_GATEWAY_KEY?: string;
   ALLOW_UNAUTHENTICATED_DEV?: string;
   ASSETS?: Fetcher;
+  ARTIFACTS: Artifacts;
   BROWSER?: Fetcher;
   CF_ACCESS_AUD?: string;
   CF_ACCESS_TEAM_DOMAIN?: string;
