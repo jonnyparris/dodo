@@ -1,3 +1,4 @@
+import type { Artifacts } from "./artifacts-types";
 import type { CodingAgent } from "./coding-agent";
 import type { SharedIndex } from "./shared-index";
 import type { UserControl } from "./user-control";

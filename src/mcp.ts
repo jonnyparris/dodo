@@ -332,7 +332,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
 
   server.tool("get_artifacts_remote", "Get or create the per-session Cloudflare Artifacts repo remote.", { sessionId: z.string() }, async ({ sessionId }) => {
     const agent = (await getAgentByName(env.CODING_AGENT as never, sessionId)) as unknown as CodingAgent;
-    const ctx = await agent.getOrCreateArtifactsContext();
+    const ctx = await agent.getOrCreateArtifactsContext(sessionId);
     if (!ctx) {
       return textResult({ error: "Artifacts unavailable for this session" });
     }

@@ -1,5 +1,6 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
+import type { ArtifactsRepo } from "./artifacts-types";
 import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
@@ -3755,13 +3756,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * is unavailable (network error, quota, etc.) — callers must tolerate
    * absence silently.
    */
-  async getOrCreateArtifactsContext(): Promise<{ repo: ArtifactsRepo; remote: string; tokenSecret: string } | null> {
+  async getOrCreateArtifactsContext(sessionIdHint?: string): Promise<{ repo: ArtifactsRepo; remote: string; tokenSecret: string } | null> {
     if (this._artifactsRepo && this._artifactsRemote && this._artifactsTokenSecret) {
       return { repo: this._artifactsRepo, remote: this._artifactsRemote, tokenSecret: this._artifactsTokenSecret };
     }
 
     try {
-      const name = `dodo-${this.sessionId()}`;
+      // Fall back to the hint if DO metadata isn't populated yet (e.g. when
+      // the DO is invoked via RPC from MCP before the first HTTP request
+      // sets session_id metadata).
+      const resolvedSessionId = this.sessionId() || sessionIdHint || "";
+      if (!resolvedSessionId) return null;
+      const name = `dodo-${resolvedSessionId}`;
       let repo = await this.env.ARTIFACTS.get(name);
       let remote: string | null = null;
       let tokenSecret: string | null = null;
@@ -3778,6 +3784,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const tokenResult = await repo.createToken("write", 3600);
         tokenSecret = stripTokenExpiry(tokenResult.token);
       }
+
+      if (!remote || !tokenSecret) return null;
 
       this._artifactsRepo = repo;
       this._artifactsRemote = remote;
