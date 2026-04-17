@@ -269,12 +269,23 @@ async function cancelQueued(queueId,btn){
 // or a served path like /session/:id/attachment/... — we just trust the
 // server-provided URL and only block the one footgun case (inline data URLs
 // that aren't images).
+//
+// Dedupes by URL across the entire container subtree — the server fires both
+// `tool_attachments` (early, as soon as upload completes) and `tool_result`
+// (carrying the same refs) for browser tool screenshots, and we only want to
+// show each image once.
 function _appendAttachmentImages(container, attachments){
   if(!attachments||!attachments.length)return;
+  const existing=new Set(
+    Array.from(container.querySelectorAll('.msg-attachment img'))
+      .map(i => i.getAttribute('src')),
+  );
   const wrap=document.createElement("div");wrap.className="msg-attachment";
   attachments.forEach((a,i)=>{
     if(!a||typeof a.url!=="string")return;
     if(a.url.startsWith("data:")&&!a.url.startsWith("data:image/"))return;
+    if(existing.has(a.url))return;
+    existing.add(a.url);
     const img=document.createElement("img");
     img.src=a.url;
     img.alt=`Attachment ${i+1} of ${attachments.length}`;
