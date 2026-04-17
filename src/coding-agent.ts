@@ -429,7 +429,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       onToolAttachments: (toolCallId, attachments) => {
         this._toolAttachments.set(toolCallId, attachments);
         this.emitEvent({
-          data: { toolCallId, attachments: attachments.map((a) => ({ mediaType: a.mediaType, url: a.url, size: a.size })) },
+          data: {
+            toolCallId,
+            attachments: rewriteAttachmentsForClient(
+              attachments.map((a) => ({ mediaType: a.mediaType, url: a.url, size: a.size })),
+            ),
+          },
           type: "tool_attachments",
         });
       },
