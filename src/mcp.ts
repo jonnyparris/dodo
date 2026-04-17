@@ -306,6 +306,18 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     const email = mcpUserEmail(env);
     await userControlFetch(env, "/sessions", { body: JSON.stringify({ id: newId, ownerEmail: email, createdBy: email }), headers: { "content-type": "application/json" }, method: "POST" });
     await agentFetch(env, newId, `/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`, { method: "POST" }, depth);
+    // Fork the source's Artifacts repo so the new session's workspace history
+    // is preserved in Artifacts as well. Fire-and-forget — a failure here
+    // doesn't break session forking (files already copied via snapshot).
+    try {
+      const sourceAgent = (await getAgentByName(env.CODING_AGENT as never, sessionId)) as unknown as CodingAgent;
+      const sourceCtx = await sourceAgent.getOrCreateArtifactsContext(sessionId);
+      if (sourceCtx) {
+        await sourceCtx.repo.fork(`dodo-${newId}`, { defaultBranchOnly: false });
+      }
+    } catch (err) {
+      console.warn("[fork_session] Artifacts fork failed (files still copied via snapshot):", err);
+    }
     await userControlFetch(env, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
     return textResult({ sessionId: newId, sourceSessionId: sessionId, forkedAt: new Date().toISOString() });
   });
