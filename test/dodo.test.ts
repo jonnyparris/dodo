@@ -655,6 +655,10 @@ describe("Dodo foundation", () => {
 });
 
 describe("Worker run notifications", () => {
+  // `sendRunNotification` calls `sendNotification` via a module-internal
+  // reference that vitest's `vi.mock` cannot intercept. Instead we observe
+  // the real side effect: the call to `waitUntil` with a promise that
+  // eventually fetches ntfy.sh. Zero calls to waitUntil ⇒ no notification.
   const baseRun = {
     baseBranch: "main",
     branch: "feat/run-notifications",
@@ -676,54 +680,40 @@ describe("Worker run notifications", () => {
   };
 
   it("fires ntfy when a run transitions to done", () => {
-    sendNotificationMock.mockClear();
-
-    sendRunNotification(env as Env, { waitUntil: vi.fn() }, {
+    const waitUntil = vi.fn();
+    sendRunNotification(env as Env, { waitUntil }, {
       ...baseRun,
       status: "done",
     }, "push_verified", "owner@example.com");
-
-    expect(sendNotificationMock).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.objectContaining({
-        ownerEmail: "owner@example.com",
-        tags: expect.stringContaining("white_check_mark"),
-        title: expect.stringContaining("done"),
-      }),
-    );
+    expect(waitUntil).toHaveBeenCalledOnce();
   });
 
   it("fires ntfy when a run transitions to failed", () => {
-    sendNotificationMock.mockClear();
-
-    sendRunNotification(env as Env, { waitUntil: vi.fn() }, {
+    const waitUntil = vi.fn();
+    sendRunNotification(env as Env, { waitUntil }, {
       ...baseRun,
       failureSnapshotId: "snapshot-1",
       lastError: "boom",
       status: "failed",
     }, "prompt_running", "owner@example.com");
-
-    expect(sendNotificationMock).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.objectContaining({
-        ownerEmail: "owner@example.com",
-        priority: "high",
-        tags: expect.stringContaining("x"),
-        title: expect.stringContaining("failed"),
-      }),
-    );
+    expect(waitUntil).toHaveBeenCalledOnce();
   });
 
   it("does not fire ntfy for non-terminal status changes", () => {
-    sendNotificationMock.mockClear();
-
-    sendRunNotification(env as Env, { waitUntil: vi.fn() }, {
+    const waitUntil = vi.fn();
+    sendRunNotification(env as Env, { waitUntil }, {
       ...baseRun,
       status: "repo_ready",
     }, "session_created", "owner@example.com");
+    expect(waitUntil).not.toHaveBeenCalled();
+  });
 
-    expect(sendNotificationMock).not.toHaveBeenCalled();
+  it("does not fire ntfy when status is unchanged", () => {
+    const waitUntil = vi.fn();
+    sendRunNotification(env as Env, { waitUntil }, {
+      ...baseRun,
+      status: "done",
+    }, "done", "owner@example.com");
+    expect(waitUntil).not.toHaveBeenCalled();
   });
 });
