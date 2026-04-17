@@ -249,6 +249,15 @@ function renderMessage(msg){
     }else{label.style.color="rgba(255,255,255,.75)";label.textContent="You"}
     el.appendChild(label);
     el.appendChild(document.createTextNode(msg.content));
+    if(msg.attachments&&msg.attachments.length){
+      const imgWrap=document.createElement("div");imgWrap.className="msg-attachment";
+      msg.attachments.forEach(a=>{
+        if(!a.url.startsWith("data:image/"))return;
+        const img=document.createElement("img");img.src=a.url;img.alt="attachment";img.loading="lazy";
+        imgWrap.appendChild(img);
+      });
+      el.appendChild(imgWrap);
+    }
   }
   const actions=document.createElement("div");actions.className="msg-actions";
   const copyBtn=document.createElement("button");copyBtn.textContent="Copy";copyBtn.title="Copy message";copyBtn.setAttribute("aria-label","Copy message");
@@ -299,12 +308,20 @@ function updateTokenSummary(state){
 
 // --- Chat actions ---
 async function sendMessage(){
-  const content=$("msg-input").value.trim();if(!content)return;
+  const content=$("msg-input").value.trim();
+  const images=getPendingImages();
+  if(!content&&!images)return;
+  if(!content)return toast("Add a text message with your images","warning");
+  // Block sending images while a prompt is running — the queued-prompt path
+  // can't carry attachments end-to-end, and silently dropping them is worse
+  // than asking the user to wait.
+  if(isProcessing&&images)return toast("Wait for the current response before sending images","warning");
   sendTypingStop();
   if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}
-  $("msg-input").value="";$("msg-input").style.height='auto';
+  $("msg-input").value="";$("msg-input").style.height='auto';clearPendingImages();
+  const payload=images?{content,images}:{content};
   if(isProcessing){
-    // Queue the prompt — show as pending bubble
+    // Queue text-only prompts. Image-carrying prompts are blocked above.
     const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});
     if(result&&result.status==="queued"){
       showQueuedMessage(content,result.promptId,result.position);
@@ -312,12 +329,12 @@ async function sendMessage(){
     return;
   }
   setProcessing(true);showThinking();
-  const result=await jsonSafe(`/session/${currentSession}/prompt`,{content});
+  const result=await jsonSafe(`/session/${currentSession}/prompt`,payload);
   if(!result){setProcessing(false);hideThinking()}
 }
 async function abortPrompt(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
 async function forkSession(){if(!currentSession)return;const d=await jsonSafe(`/session/${currentSession}/fork`,{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
-async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("token-summary").style.color="";const cw=$("context-warning");if(cw)cw.style.display="none";$("presence-bar").innerHTML="";history.replaceState(null,"",location.pathname);await loadSessions();if(window.innerWidth<=900)switchTab('chat')}
+async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;clearPendingImages();$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("token-summary").style.color="";const cw=$("context-warning");if(cw)cw.style.display="none";$("presence-bar").innerHTML="";history.replaceState(null,"",location.pathname);await loadSessions();if(window.innerWidth<=900)switchTab('chat')}
 
 // --- Session rename ---
 async function renameSession(){
@@ -387,4 +404,80 @@ function sendTypingStop(){
   if(wsConnection&&wsConnection.readyState===WebSocket.OPEN){
     wsConnection.send(JSON.stringify({type:"typing",isTyping:false}));
   }
+}
+
+// --- Image attachments ---
+// Limits kept in sync with `imageAttachmentSchema` in src/coding-agent.ts.
+// Backend caps base64 length at 4_000_000 chars (~3MB decoded per image, 5 per message);
+// 3MB raw here is a conservative frontend bound that stays under the backend limit
+// after base64 encoding (3MB * 4/3 ≈ 4MB).
+const _pendingImages=[];
+const MAX_IMAGE_SIZE=3*1024*1024; // 3MB raw — pairs with ~4MB base64 on the backend
+const MAX_IMAGES=5;
+const ALLOWED_IMAGE_TYPES=new Set(["image/png","image/jpeg","image/gif","image/webp"]);
+
+function handleImagePaste(event){
+  const items=event.clipboardData?.items;
+  if(!items)return;
+  for(const item of items){
+    if(ALLOWED_IMAGE_TYPES.has(item.type)){
+      event.preventDefault();
+      const file=item.getAsFile();
+      if(file)addImageFile(file);
+      return;
+    }
+  }
+}
+
+function handleFileSelect(input){
+  for(const file of input.files){
+    if(ALLOWED_IMAGE_TYPES.has(file.type))addImageFile(file);
+    else toast(`${file.type} not supported. Use PNG, JPEG, GIF, or WebP.`,"warning");
+  }
+  input.value="";
+}
+
+function addImageFile(file){
+  if(_pendingImages.length>=MAX_IMAGES)return toast(`Maximum ${MAX_IMAGES} images per message`,"warning");
+  if(file.size>MAX_IMAGE_SIZE)return toast("Image too large (max 3MB)","warning");
+  const reader=new FileReader();
+  reader.onload=()=>{
+    const dataUrl=reader.result;
+    const base64=dataUrl.split(",")[1];
+    const mediaType=file.type;
+    _pendingImages.push({data:base64,mediaType,dataUrl,name:file.name||""});
+    renderImagePreviews();
+  };
+  reader.onerror=()=>toast("Failed to read image file","warning");
+  reader.readAsDataURL(file);
+}
+
+function removeImage(idx){
+  _pendingImages.splice(idx,1);
+  renderImagePreviews();
+}
+
+function renderImagePreviews(){
+  const bar=$("image-preview-bar");
+  bar.replaceChildren();
+  const total=_pendingImages.length;
+  _pendingImages.forEach((img,i)=>{
+    const wrap=document.createElement("div");wrap.className="image-preview-item";
+    const imgEl=document.createElement("img");imgEl.src=img.dataUrl;
+    imgEl.alt=img.name?`Attachment: ${img.name}`:`Attachment ${i+1} of ${total}`;
+    const btn=document.createElement("button");btn.className="remove-btn";btn.textContent="\u00d7";
+    btn.setAttribute("aria-label",img.name?`Remove ${img.name}`:`Remove attachment ${i+1}`);
+    btn.onclick=()=>removeImage(i);
+    wrap.appendChild(imgEl);wrap.appendChild(btn);bar.appendChild(wrap);
+  });
+}
+
+function getPendingImages(){
+  if(!_pendingImages.length)return undefined;
+  return _pendingImages.map(({data,mediaType})=>({data,mediaType}));
+}
+
+function clearPendingImages(){
+  _pendingImages.length=0;
+  renderImagePreviews();
 }

@@ -92,20 +92,52 @@ export function chatRecordToUIMessage(record: ChatMessageRecord): UIMessage {
  * Convert a UIMessage back to a flat ChatMessageRecord.
  * Used for backward-compatible API responses.
  */
+/**
+ * Media types we'll render as image attachments. Kept in sync with
+ * `imageAttachmentSchema` in `src/coding-agent.ts` so only ingest-validated
+ * types are emitted into data URLs for the frontend.
+ */
+const SAFE_IMAGE_MEDIA_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+
 export function uiMessageToChatRecord(
   msg: UIMessage,
   meta: Partial<MessageMetadata> = {},
 ): ChatMessageRecord {
   // Extract text content from parts
   let content = "";
+  // NOTE: attachments carry the full base64 image data (or a data URL) so the
+  // frontend can re-render history without a round-trip to storage. This means
+  // message history grows linearly with image bytes — a known limitation. When
+  // persistent image storage lands (R2 + signed URL references), swap `url`
+  // for the storage URL and stop inlining base64 here.
+  const attachments: Array<{ mediaType: string; url: string }> = [];
   if (msg.parts) {
     content = msg.parts
       .filter((p): p is { type: "text"; text: string } => p.type === "text")
       .map((p) => p.text)
       .join("");
+    for (const p of msg.parts) {
+      if (p.type !== "file") continue;
+      const mediaType = (p as { mediaType?: string }).mediaType;
+      // Defensive: re-check mediaType here even though the schema gated it on
+      // ingest. Protects against malformed stored messages or future callers
+      // that bypass the HTTP layer.
+      if (!mediaType || !SAFE_IMAGE_MEDIA_TYPES.has(mediaType)) continue;
+      const rawUrl = (p as { url?: string }).url;
+      if (typeof rawUrl !== "string" || rawUrl.length === 0) continue;
+      // Ensure the URL is a data URL for frontend rendering — the stored value
+      // may be raw base64 (for AI SDK compatibility) or already a data URL.
+      const url = rawUrl.startsWith("data:") ? rawUrl : `data:${mediaType};base64,${rawUrl}`;
+      attachments.push({ mediaType, url });
+    }
   }
 
-  return {
+  const record: ChatMessageRecord = {
     id: msg.id,
     role: msg.role as ChatMessageRecord["role"],
     content,
@@ -118,4 +150,6 @@ export function uiMessageToChatRecord(
     tokenInput: meta.tokenInput ?? 0,
     tokenOutput: meta.tokenOutput ?? 0,
   };
+  if (attachments.length > 0) record.attachments = attachments;
+  return record;
 }
