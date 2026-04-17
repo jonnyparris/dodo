@@ -4,6 +4,7 @@ import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, resolveAdminEmail } from "./auth";
 import { createDraftPrForRun } from "./github-pr";
 import { getKnownRepo, listKnownRepos } from "./repos";
+import type { CodingAgent } from "./coding-agent";
 import type { Env, WorkerRunRecord } from "./types";
 
 // MCP uses the admin email for all operations since MCP is token-authenticated
@@ -327,6 +328,19 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
   }, async ({ seedSessionId, title }) => {
     const forked = await forkSeedSession(env, seedSessionId, title, depth);
     return textResult(forked);
+  });
+
+  server.tool("get_artifacts_remote", "Get or create the per-session Cloudflare Artifacts repo remote.", { sessionId: z.string() }, async ({ sessionId }) => {
+    const agent = (await getAgentByName(env.CODING_AGENT as never, sessionId)) as unknown as CodingAgent;
+    const ctx = await agent.getOrCreateArtifactsContext(sessionId);
+    if (!ctx) {
+      return textResult({ error: "Artifacts unavailable for this session" });
+    }
+    return textResult({
+      name: `dodo-${sessionId}`,
+      remote: ctx.remote,
+      token: ctx.tokenSecret,
+    });
   });
 
   server.tool("verify_branch", "Verify that a pushed branch is ahead of the base branch and optionally contains expected changed files.", {

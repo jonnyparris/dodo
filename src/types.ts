@@ -1,3 +1,4 @@
+import type { Artifacts } from "./artifacts-types";
 import type { CodingAgent } from "./coding-agent";
 import type { SharedIndex } from "./shared-index";
 import type { UserControl } from "./user-control";
@@ -7,6 +8,7 @@ export interface Env {
   AI_GATEWAY_KEY?: string;
   ALLOW_UNAUTHENTICATED_DEV?: string;
   ASSETS?: Fetcher;
+  ARTIFACTS: Artifacts;
   BROWSER?: Fetcher;
   CF_ACCESS_AUD?: string;
   CF_ACCESS_TEAM_DOMAIN?: string;

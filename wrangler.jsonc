@@ -39,6 +39,12 @@
   "browser": {
     "binding": "BROWSER"
   },
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "default"
+    }
+  ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1

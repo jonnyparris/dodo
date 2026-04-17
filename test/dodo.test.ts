@@ -1,4 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { stripTokenExpiry } from "../src/coding-agent";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
@@ -651,6 +652,89 @@ describe("Dodo foundation", () => {
     const call = sendNotificationMock.mock.calls[0];
     expect(call[2].title).toContain("failed");
     expect(call[2].tags).toContain("x");
+  });
+});
+
+describe("Artifacts binding", () => {
+  beforeEach(() => {
+    const fakeRepos = new Map<string, { name: string; remote: string; token: string }>();
+    (env as any).ARTIFACTS = {
+      create: vi.fn(async (name: string) => {
+        const repo = {
+          name,
+          remote: `https://fake.artifacts/${name}.git`,
+          token: "art_v1_fake?expires=9999999999",
+          info: async () => ({ remote: `https://fake.artifacts/${name}.git`, name }),
+          createToken: async () => ({ token: "art_v1_fresh?expires=9999999999" }),
+          fork: vi.fn(),
+        };
+        fakeRepos.set(name, repo);
+        return { name, remote: repo.remote, token: repo.token, defaultBranch: "main", repo };
+      }),
+      get: vi.fn(async (name: string) => {
+        const entry = fakeRepos.get(name);
+        if (!entry) return null;
+        return {
+          name: entry.name,
+          info: async () => ({ remote: entry.remote, name: entry.name }),
+          createToken: async () => ({ token: "art_v1_fresh" }),
+          fork: vi.fn(),
+        };
+      }),
+    };
+  });
+
+  it("creates a repo on first get_artifacts_remote call", async () => {
+    const sessionId = await createSession();
+    const mcpHeaders = { "content-type": "application/json", "Authorization": "Bearer test-mcp-token", "Accept": "application/json, text/event-stream" };
+
+    const initResponse = await fetchJson("/mcp", {
+      body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1, params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } } }),
+      headers: mcpHeaders,
+      method: "POST",
+    });
+    const mcpSessionId = initResponse.headers.get("mcp-session-id");
+    const toolHeaders: Record<string, string> = { ...mcpHeaders };
+    if (mcpSessionId) toolHeaders["mcp-session-id"] = mcpSessionId;
+
+    await fetchJson("/mcp", {
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      headers: toolHeaders,
+      method: "POST",
+    });
+
+    const response = await fetchJson("/mcp", {
+      body: JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 2, params: { name: "get_artifacts_remote", arguments: { sessionId } } }),
+      headers: toolHeaders,
+      method: "POST",
+    });
+
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    expect(text).toContain(`dodo-${sessionId}`);
+    expect(text).toContain(`https://fake.artifacts/dodo-${sessionId}.git`);
+    expect(text).toContain("art_v1_fake");
+    expect(text).not.toContain("?expires=");
+  });
+
+  it("caches the context across calls", async () => {
+    const sessionId = await createSession();
+    const ns = (env as Env).CODING_AGENT;
+    const agent = await ns.get(ns.idFromName(sessionId));
+
+    const api = agent as unknown as { getOrCreateArtifactsContext: (hint?: string) => Promise<{ remote: string } | null> };
+    const first = await api.getOrCreateArtifactsContext(sessionId);
+    const second = await api.getOrCreateArtifactsContext(sessionId);
+
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(first?.remote).toBe(second?.remote);
+    expect((env as unknown as { ARTIFACTS: { create: { mock: { calls: unknown[] } } } }).ARTIFACTS.create.mock.calls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("strips the expires suffix from tokens", () => {
+    expect(stripTokenExpiry("art_v1_fake?expires=9999999999")).toBe("art_v1_fake");
+    expect(stripTokenExpiry("art_v1_fake")).toBe("art_v1_fake");
   });
 });
 

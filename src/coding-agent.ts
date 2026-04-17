@@ -1,5 +1,6 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type Connection, type ConnectionContext, type WSMessage } from "agents";
+import type { ArtifactsRepo } from "./artifacts-types";
 import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
@@ -3742,8 +3743,58 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return sessionId;
   }
 
+  private _artifactsRepo: ArtifactsRepo | null = null;
+  private _artifactsRemote: string | null = null;
+  private _artifactsTokenSecret: string | null = null;
+
   private sessionId(): string {
     return this.readMetadata("session_id") ?? "";
+  }
+
+  /**
+   * Get or create this session's Artifacts repo. Returns null if Artifacts
+   * is unavailable (network error, quota, etc.) — callers must tolerate
+   * absence silently.
+   */
+  async getOrCreateArtifactsContext(sessionIdHint?: string): Promise<{ repo: ArtifactsRepo; remote: string; tokenSecret: string } | null> {
+    if (this._artifactsRepo && this._artifactsRemote && this._artifactsTokenSecret) {
+      return { repo: this._artifactsRepo, remote: this._artifactsRemote, tokenSecret: this._artifactsTokenSecret };
+    }
+
+    try {
+      // Fall back to the hint if DO metadata isn't populated yet (e.g. when
+      // the DO is invoked via RPC from MCP before the first HTTP request
+      // sets session_id metadata).
+      const resolvedSessionId = this.sessionId() || sessionIdHint || "";
+      if (!resolvedSessionId) return null;
+      const name = `dodo-${resolvedSessionId}`;
+      let repo = await this.env.ARTIFACTS.get(name);
+      let remote: string | null = null;
+      let tokenSecret: string | null = null;
+
+      if (!repo) {
+        const created = await this.env.ARTIFACTS.create(name, { setDefaultBranch: "main" });
+        repo = created.repo;
+        remote = created.remote;
+        tokenSecret = stripTokenExpiry(created.token);
+      } else {
+        const info = await repo.info();
+        if (!info?.remote) return null;
+        remote = info.remote;
+        const tokenResult = await repo.createToken("write", 3600);
+        tokenSecret = stripTokenExpiry(tokenResult.token);
+      }
+
+      if (!remote || !tokenSecret) return null;
+
+      this._artifactsRepo = repo;
+      this._artifactsRemote = remote;
+      this._artifactsTokenSecret = tokenSecret;
+      return { repo, remote, tokenSecret };
+    } catch (err) {
+      console.warn("[artifacts] failed to get/create repo:", err);
+      return null;
+    }
   }
 
   private readMetadata(key: string): string | null {
@@ -3932,4 +3983,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       this.clients.delete(writer);
     }
   }
+}
+
+/**
+ * Artifacts tokens come back as "art_v1_<secret>?expires=<unix>".
+ * Git Basic auth needs just the secret.
+ */
+export function stripTokenExpiry(token: string): string {
+  const idx = token.indexOf("?expires=");
+  return idx === -1 ? token : token.slice(0, idx);
 }
