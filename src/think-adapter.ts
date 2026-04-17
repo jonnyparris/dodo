@@ -74,6 +74,7 @@ export interface SnapshotV2 {
 // ─── Adapter functions ───
 
 import type { UIMessage } from "ai";
+import { attachmentUrlToHttpPath, isAttachmentUrl } from "./attachments";
 import type { ChatMessageRecord } from "./types";
 
 /**
@@ -104,17 +105,70 @@ const SAFE_IMAGE_MEDIA_TYPES = new Set([
   "image/webp",
 ]);
 
+/**
+ * Walk a tool result's `output` value looking for image content parts. The
+ * AI SDK's `ToolResultOutput` variant `{type: "content", value: [...]}` can
+ * carry `{type: "image-data", data, mediaType}` or `{type: "media", data,
+ * mediaType}` (deprecated). We accept either.
+ *
+ * browser_execute currently returns text output (see src/browser/tools.ts)
+ * and images flow via the `onToolAttachments` side channel, but this helper
+ * future-proofs for tools that want to use the canonical multipart path.
+ */
+function collectToolOutputImages(
+  output: unknown,
+  attachments: Array<{ mediaType: string; url: string }>,
+): void {
+  if (!output || typeof output !== "object") return;
+  const o = output as { type?: string; value?: unknown };
+  if (o.type !== "content" || !Array.isArray(o.value)) return;
+  for (const part of o.value) {
+    if (!part || typeof part !== "object") continue;
+    const p = part as { type?: string; data?: string; mediaType?: string; url?: string };
+    if (!p.mediaType || !SAFE_IMAGE_MEDIA_TYPES.has(p.mediaType)) continue;
+    // image-data (canonical) or media (deprecated) carry base64 in `data`
+    if ((p.type === "image-data" || p.type === "media") && typeof p.data === "string") {
+      attachments.push({
+        mediaType: p.mediaType,
+        url: `data:${p.mediaType};base64,${p.data}`,
+      });
+      continue;
+    }
+    // file-url carries a URL we can serve through directly
+    if (p.type === "file-url" && typeof p.url === "string") {
+      const url = toClientUrl(p.url, p.mediaType);
+      if (url) attachments.push({ mediaType: p.mediaType, url });
+    }
+  }
+}
+
+/**
+ * Rewrite a stored attachment URL to something the browser can load:
+ *   - `dodo-attachment://…` → `/session/:id/attachment/…` HTTP path
+ *   - `data:image/…;base64,…` → unchanged (inline fallback for dev without R2)
+ *   - Raw base64 → inflated to `data:<mediaType>;base64,…` (legacy messages)
+ */
+function toClientUrl(rawUrl: string, mediaType: string): string | null {
+  if (rawUrl.startsWith("data:")) return rawUrl;
+  if (isAttachmentUrl(rawUrl)) return attachmentUrlToHttpPath(rawUrl);
+  // Treat anything else as raw base64 (legacy path — pre-R2 messages stored
+  // the base64 payload directly in `url` to dodge AI SDK downloadAssets).
+  return `data:${mediaType};base64,${rawUrl}`;
+}
+
 export function uiMessageToChatRecord(
   msg: UIMessage,
   meta: Partial<MessageMetadata> = {},
 ): ChatMessageRecord {
   // Extract text content from parts
   let content = "";
-  // NOTE: attachments carry the full base64 image data (or a data URL) so the
-  // frontend can re-render history without a round-trip to storage. This means
-  // message history grows linearly with image bytes — a known limitation. When
-  // persistent image storage lands (R2 + signed URL references), swap `url`
-  // for the storage URL and stop inlining base64 here.
+  // Attachments can come from three sources on the stored UIMessage:
+  //   1. User/assistant `file` parts (direct uploads, model-generated images)
+  //   2. Tool-result parts that carry image data in their output (screenshots)
+  // In all cases the stored `url` is either a `dodo-attachment://` pointer to
+  // an R2 object or — in legacy messages or local-dev fallbacks — a data URL
+  // or raw base64. `toClientUrl()` normalises all three shapes to something
+  // the browser can load.
   const attachments: Array<{ mediaType: string; url: string }> = [];
   if (msg.parts) {
     content = msg.parts
@@ -122,18 +176,28 @@ export function uiMessageToChatRecord(
       .map((p) => p.text)
       .join("");
     for (const p of msg.parts) {
-      if (p.type !== "file") continue;
-      const mediaType = (p as { mediaType?: string }).mediaType;
-      // Defensive: re-check mediaType here even though the schema gated it on
-      // ingest. Protects against malformed stored messages or future callers
-      // that bypass the HTTP layer.
-      if (!mediaType || !SAFE_IMAGE_MEDIA_TYPES.has(mediaType)) continue;
-      const rawUrl = (p as { url?: string }).url;
-      if (typeof rawUrl !== "string" || rawUrl.length === 0) continue;
-      // Ensure the URL is a data URL for frontend rendering — the stored value
-      // may be raw base64 (for AI SDK compatibility) or already a data URL.
-      const url = rawUrl.startsWith("data:") ? rawUrl : `data:${mediaType};base64,${rawUrl}`;
-      attachments.push({ mediaType, url });
+      // File parts on user/assistant messages
+      if (p.type === "file") {
+        const mediaType = (p as { mediaType?: string }).mediaType;
+        // Defensive: re-check mediaType here even though the schema gated it on
+        // ingest. Protects against malformed stored messages or future callers
+        // that bypass the HTTP layer.
+        if (!mediaType || !SAFE_IMAGE_MEDIA_TYPES.has(mediaType)) continue;
+        const rawUrl = (p as { url?: string }).url;
+        if (typeof rawUrl !== "string" || rawUrl.length === 0) continue;
+        const url = toClientUrl(rawUrl, mediaType);
+        if (!url) continue;
+        attachments.push({ mediaType, url });
+        continue;
+      }
+      // Tool parts — Think encodes these as `type: "tool-<name>"` with an
+      // `output` field when the state is "output-available". If the output
+      // carries image content parts, surface them as attachments so the UI
+      // can render browser screenshots alongside the assistant's narration.
+      const typed = p as { type?: string; output?: unknown };
+      if (typeof typed.type === "string" && typed.type.startsWith("tool-") && typed.output) {
+        collectToolOutputImages(typed.output, attachments);
+      }
     }
   }
 

@@ -178,6 +178,38 @@ function connectSSE(id){
     renderToolCall(JSON.parse(e.data));loadFilesDebounced();
   });
 
+  // tool_result fires when a tool finishes and may carry image attachments
+  // (e.g. browser_execute screenshots). Updates the in-flight tool_call
+  // bubble in place with the output + any images.
+  eventSource.addEventListener("tool_result",(e)=>{
+    resetSseActivityTimer();
+    try{updateToolCallResult(JSON.parse(e.data))}catch{}
+    loadFilesDebounced();
+  });
+
+  // tool_attachments fires as soon as a tool extracts and uploads images to
+  // R2, before the tool output itself arrives on tool_result. We attach the
+  // images to the tool bubble early for snappy UX.
+  eventSource.addEventListener("tool_attachments",(e)=>{
+    resetSseActivityTimer();
+    try{
+      const data=JSON.parse(e.data);
+      const entry=_toolCallBubbles.get(data.toolCallId);
+      if(entry)_appendAttachmentImages(entry.el,data.attachments);
+    }catch{}
+  });
+
+  // message_attachments fires when the assistant generates images (Gemma,
+  // Gemini imagen, etc.) — the text streams first, then the finalised image
+  // references arrive. Attach them to the already-rendered bubble.
+  eventSource.addEventListener("message_attachments",(e)=>{
+    resetSseActivityTimer();
+    try{
+      const data=JSON.parse(e.data);
+      attachImagesToMessage(data.messageId,data.attachments);
+    }catch{}
+  });
+
   eventSource.addEventListener("file",()=>loadFilesDebounced());
   eventSource.addEventListener("prompt",(e)=>{
     refreshGit();
@@ -231,8 +263,32 @@ async function cancelQueued(queueId,btn){
   const el=btn.closest('.msg.queued');if(el)el.remove();
 }
 
+// Render an image attachment list into a container element. Used both on
+// message bubbles (user uploads, assistant-generated images, tool screenshots)
+// and on inline tool_call bubbles. `url` may be a data URL (inline fallback)
+// or a served path like /session/:id/attachment/... — we just trust the
+// server-provided URL and only block the one footgun case (inline data URLs
+// that aren't images).
+function _appendAttachmentImages(container, attachments){
+  if(!attachments||!attachments.length)return;
+  const wrap=document.createElement("div");wrap.className="msg-attachment";
+  attachments.forEach((a,i)=>{
+    if(!a||typeof a.url!=="string")return;
+    if(a.url.startsWith("data:")&&!a.url.startsWith("data:image/"))return;
+    const img=document.createElement("img");
+    img.src=a.url;
+    img.alt=`Attachment ${i+1} of ${attachments.length}`;
+    img.loading="lazy";
+    img.onclick=()=>window.open(a.url,"_blank","noopener,noreferrer");
+    img.style.cursor="zoom-in";
+    wrap.appendChild(img);
+  });
+  if(wrap.childElementCount>0)container.appendChild(wrap);
+}
+
 function renderMessage(msg){
   const el=document.createElement("div");el.className=`msg ${msg.role}`;
+  if(msg.id)el.dataset.msgId=msg.id;
   if(msg.role==="assistant"){
     el.innerHTML=renderMarkdown(msg.content);
     el.querySelectorAll('pre').forEach(pre=>{
@@ -240,6 +296,10 @@ function renderMessage(msg){
       btn.onclick=(e)=>{e.stopPropagation();const code=pre.querySelector('code')?.textContent||pre.textContent;navigator.clipboard.writeText(code).then(()=>{btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',1500)})};
       pre.style.position='relative';pre.appendChild(btn);
     });
+    // Assistant bubbles can also carry attachments — model-generated images
+    // from Gemini/Gemma, or screenshots surfaced via the assistant's final
+    // tool-result summary.
+    _appendAttachmentImages(el,msg.attachments);
   }else{
     const authorEmail=msg.authorEmail||msg.author||msg.email||null;
     const label=document.createElement("div");
@@ -249,15 +309,7 @@ function renderMessage(msg){
     }else{label.style.color="rgba(255,255,255,.75)";label.textContent="You"}
     el.appendChild(label);
     el.appendChild(document.createTextNode(msg.content));
-    if(msg.attachments&&msg.attachments.length){
-      const imgWrap=document.createElement("div");imgWrap.className="msg-attachment";
-      msg.attachments.forEach(a=>{
-        if(!a.url.startsWith("data:image/"))return;
-        const img=document.createElement("img");img.src=a.url;img.alt="attachment";img.loading="lazy";
-        imgWrap.appendChild(img);
-      });
-      el.appendChild(imgWrap);
-    }
+    _appendAttachmentImages(el,msg.attachments);
   }
   const actions=document.createElement("div");actions.className="msg-actions";
   const copyBtn=document.createElement("button");copyBtn.textContent="Copy";copyBtn.title="Copy message";copyBtn.setAttribute("aria-label","Copy message");
@@ -266,22 +318,84 @@ function renderMessage(msg){
   if(msg.role==="assistant"&&(msg.tokenInput||msg.tokenOutput)){const m=document.createElement("div");m.style.cssText="font-size:10px;color:var(--muted);margin-top:6px;opacity:.7";m.textContent=`${msg.tokenInput??0} in / ${msg.tokenOutput??0} out`;el.appendChild(m)}
   $("chat").appendChild(el);_smoothScrollToBottom()
 }
+// Track in-flight tool calls so tool_result events can enrich the same bubble
+// rather than creating a new one. Keyed by toolCallId.
+const _toolCallBubbles=new Map();
+
 function renderToolCall(tc){
+  // tc may come from the legacy single-event form (code+result) or the new
+  // tool_call event (toolCallId + toolName + input). We render the "call has
+  // started" state; tool_result updates the same bubble when output arrives.
   const el=document.createElement("div");el.className="msg tool_call";
-  const hasResult=tc.result!=null&&tc.result!=="null"&&JSON.stringify(tc.result)!=="null";
-  const resultStr=hasResult?JSON.stringify(tc.result,null,2):"null";
-  const truncated=resultStr.length>500;
-  const details=document.createElement("details");
-  const summary=document.createElement("summary");summary.textContent="Tool call";details.appendChild(summary);
-  const pre=document.createElement("pre");pre.style.cssText="margin:6px 0 0;font-size:11px;white-space:pre-wrap;max-height:200px;overflow:auto";pre.textContent=tc.code||"";details.appendChild(pre);
-  const resultDiv=document.createElement("div");resultDiv.style.cssText="margin-top:4px;font-size:11px;color:var(--muted)";resultDiv.textContent=hasResult?"Result: "+(truncated?resultStr.slice(0,500)+"...":resultStr):"\u2713 Done";details.appendChild(resultDiv);
-  if(truncated){
-    const expandBtn=document.createElement("button");expandBtn.className="sm";expandBtn.style.marginTop="4px";expandBtn.textContent="Show full result";
-    expandBtn.onclick=()=>{resultDiv.textContent="Result: "+resultStr;expandBtn.remove()};
-    details.appendChild(expandBtn);
+  if(tc.toolCallId)el.dataset.toolCallId=tc.toolCallId;
+  const details=document.createElement("details");details.open=false;
+  const summary=document.createElement("summary");
+  const toolName=tc.toolName||tc.name||"tool";
+  summary.textContent=`${toolName} \u2026`;
+  details.appendChild(summary);
+  // Show the tool input (args) if present — for code-mode tools this is the
+  // actual JS that ran. Legacy event shape put this in `code`.
+  const inputText=tc.code||(tc.input?JSON.stringify(tc.input,null,2):"");
+  if(inputText){
+    const pre=document.createElement("pre");
+    pre.style.cssText="margin:6px 0 0;font-size:11px;white-space:pre-wrap;max-height:200px;overflow:auto";
+    pre.textContent=inputText;
+    details.appendChild(pre);
   }
+  // Placeholder for the result — filled in by updateToolCallResult.
+  const resultDiv=document.createElement("div");
+  resultDiv.className="tool-result-body";
+  resultDiv.style.cssText="margin-top:4px;font-size:11px;color:var(--muted)";
+  resultDiv.textContent="Running\u2026";
+  details.appendChild(resultDiv);
   el.appendChild(details);
+  // Legacy callers pass `result` directly on the call event — render once.
+  if(tc.result!=null){
+    _fillToolResult(el,summary,resultDiv,{output:tc.result,attachments:tc.attachments});
+  }else if(tc.toolCallId){
+    _toolCallBubbles.set(tc.toolCallId,{el,summary,resultDiv,toolName});
+  }
   $("chat").appendChild(el);_smoothScrollToBottom()
+}
+
+function updateToolCallResult(tr){
+  if(!tr||!tr.toolCallId)return;
+  const entry=_toolCallBubbles.get(tr.toolCallId);
+  if(!entry){
+    // Result arrived with no matching call bubble — render it fresh so the
+    // image/output is still visible.
+    renderToolCall({toolCallId:tr.toolCallId,toolName:tr.toolName,result:tr.output,attachments:tr.attachments});
+    return;
+  }
+  _fillToolResult(entry.el,entry.summary,entry.resultDiv,tr);
+  _toolCallBubbles.delete(tr.toolCallId);
+}
+
+function _fillToolResult(el,summary,resultDiv,tr){
+  const output=tr.output;
+  const outputStr=typeof output==="string"?output:JSON.stringify(output,null,2);
+  const hasResult=outputStr!=null&&outputStr!=="null"&&outputStr!=="";
+  const truncated=hasResult&&outputStr.length>500;
+  summary.textContent=`${summary.textContent.replace(/\s*\u2026$/,"")} \u2713`;
+  resultDiv.textContent=hasResult?"Result: "+(truncated?outputStr.slice(0,500)+"...":outputStr):"\u2713 Done";
+  if(truncated){
+    const expandBtn=document.createElement("button");
+    expandBtn.className="sm";expandBtn.style.marginTop="4px";expandBtn.textContent="Show full result";
+    expandBtn.onclick=()=>{resultDiv.textContent="Result: "+outputStr;expandBtn.remove()};
+    resultDiv.parentElement.appendChild(expandBtn);
+  }
+  // Render any image attachments the tool produced (screenshots).
+  _appendAttachmentImages(el,tr.attachments);
+}
+
+// Attach images to an already-rendered message bubble by id. Used when the
+// stream emits `message_attachments` (assistant-generated images) after the
+// message bubble has already been painted from the text stream.
+function attachImagesToMessage(messageId,attachments){
+  if(!messageId||!attachments||!attachments.length)return;
+  const el=$("chat").querySelector(`.msg[data-msg-id="${CSS.escape(messageId)}"]`);
+  if(!el)return;
+  _appendAttachmentImages(el,attachments);
 }
 function setStatusDot(status){$("session-status-dot").className=`status-dot ${status==="running"?"running":"idle"}`}
 function updateTokenSummary(state){

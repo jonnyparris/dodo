@@ -3,12 +3,31 @@ import type { StateBackend } from "@cloudflare/shell";
 import { generateText, jsonSchema, stepCountIs, tool, zodSchema, type Tool as AnyToolType } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
+import type { AttachmentRef } from "./attachments";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { createBrowserTools } from "./browser/tools";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env } from "./types";
+
+/** Options passed through from the coding agent into tool factories. */
+export interface BuildToolsOptions {
+  authorEmail?: string;
+  browserEnabled?: boolean;
+  isAdminUser?: boolean;
+  ownerId?: string;
+  ownerEmail?: string;
+  stateBackend?: StateBackend;
+  /** Session ID — required to scope attachment R2 keys. */
+  sessionId?: string;
+  /**
+   * Fires when a tool produces image attachments. The coding agent uses this
+   * to stream `tool_result_image` SSE events so the chat UI renders screenshots
+   * before the assistant message finishes persisting.
+   */
+  onToolAttachments?: (toolCallId: string, attachments: AttachmentRef[]) => void;
+}
 
 // ─── Tool Output Caps (OpenCode Pattern #1) ───
 // Cap tool output AT THE TOOL LEVEL before it enters the AI SDK message history.
@@ -552,7 +571,7 @@ function buildTools(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; browserEnabled?: boolean; isAdminUser?: boolean; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend },
+  options?: BuildToolsOptions,
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
@@ -621,6 +640,10 @@ function buildTools(
       browser: env.BROWSER,
       loader: env.LOADER,
       timeout: 30_000,
+      env,
+      sessionId: options?.sessionId,
+      ownerEmail: options?.ownerEmail,
+      onAttachments: options?.onToolAttachments,
     });
     Object.assign(tools, browserTools);
   }
@@ -636,7 +659,7 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: { authorEmail?: string; browserEnabled?: boolean; isAdminUser?: boolean; ownerId?: string; ownerEmail?: string; stateBackend?: StateBackend; mcpGatekeepers?: McpGatekeeper[] },
+  options?: BuildToolsOptions & { mcpGatekeepers?: McpGatekeeper[] },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
 

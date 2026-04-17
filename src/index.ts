@@ -10,6 +10,7 @@ import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
 import { createDodoCodeModeMcpServer } from "./mcp-codemode";
 import { MCP_CATALOG } from "./mcp-catalog";
+import { fetchAttachment } from "./attachments";
 import { AllowlistOutbound } from "./outbound";
 import { RateLimiter } from "./rate-limit";
 import { DodoPublicApi } from "./rpc-api";
@@ -1220,6 +1221,24 @@ app.delete("/session/:id/file", async (c) => {
   const denied = requirePermission(c, "write");
   if (denied) return denied;
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`);
+});
+
+// Serve an image attachment (chat screenshot, user upload, generated image).
+// Hono wildcard captures {messageId}/{filename} as the second path segment.
+// ACL is inherited from the /session/:id/* middleware — if the caller can't
+// read the session, they can't read its attachments.
+app.get("/session/:id/attachment/:messageId/:filename", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  const messageId = c.req.param("messageId");
+  const filename = c.req.param("filename");
+  if (!sessionId || !messageId || !filename) {
+    return c.json({ error: "Missing path segment" }, 400);
+  }
+  const response = await fetchAttachment(c.env, sessionId, `${messageId}/${filename}`);
+  if (!response) return c.json({ error: "Attachment not found" }, 404);
+  return response;
 });
 
 app.post("/session/:id/search", async (c) => {

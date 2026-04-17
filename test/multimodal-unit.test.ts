@@ -141,4 +141,84 @@ describe("uiMessageToChatRecord — multimodal", () => {
     const record = uiMessageToChatRecord(msg);
     expect(record.attachments).toBeUndefined();
   });
+
+  it("rewrites dodo-attachment URLs on file parts to session-scoped HTTP paths", () => {
+    const msg: UIMessage = {
+      id: "msg-r2",
+      role: "assistant",
+      parts: [
+        { type: "text", text: "Here's the image" },
+        {
+          type: "file",
+          mediaType: "image/png",
+          url: "dodo-attachment://sess-xyz/msg-r2/pic.png",
+        } as UIMessage["parts"][number],
+      ],
+    };
+    const record = uiMessageToChatRecord(msg);
+    expect(record.attachments).toHaveLength(1);
+    expect(record.attachments![0].url).toBe(
+      "/session/sess-xyz/attachment/msg-r2/pic.png",
+    );
+  });
+
+  it("extracts images from assistant tool-result content parts", () => {
+    // Simulate the canonical multipart tool-output shape from the AI SDK.
+    // Tool parts on a stored UIMessage have `type: "tool-<name>"` with an
+    // `output` field when `state: "output-available"`.
+    const msg: UIMessage = {
+      id: "msg-tool",
+      role: "assistant",
+      parts: [
+        { type: "text", text: "Here's what the page looks like:" },
+        {
+          type: "tool-browser_execute",
+          toolCallId: "call-1",
+          toolName: "browser_execute",
+          state: "output-available",
+          output: {
+            type: "content",
+            value: [
+              { type: "text", text: "Navigated to example.com" },
+              { type: "image-data", data: "AAAA", mediaType: "image/png" },
+            ],
+          },
+        } as unknown as UIMessage["parts"][number],
+      ],
+    };
+    const record = uiMessageToChatRecord(msg);
+    expect(record.attachments).toHaveLength(1);
+    expect(record.attachments![0].mediaType).toBe("image/png");
+    expect(record.attachments![0].url).toBe("data:image/png;base64,AAAA");
+  });
+
+  it("rewrites dodo-attachment file-url parts inside tool output", () => {
+    const msg: UIMessage = {
+      id: "msg-tool2",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-browser_execute",
+          toolCallId: "call-2",
+          toolName: "browser_execute",
+          state: "output-available",
+          output: {
+            type: "content",
+            value: [
+              {
+                type: "file-url",
+                url: "dodo-attachment://sess-t/toolcall-call-2/a.png",
+                mediaType: "image/png",
+              },
+            ],
+          },
+        } as unknown as UIMessage["parts"][number],
+      ],
+    };
+    const record = uiMessageToChatRecord(msg);
+    expect(record.attachments).toHaveLength(1);
+    expect(record.attachments![0].url).toBe(
+      "/session/sess-t/attachment/toolcall-call-2/a.png",
+    );
+  });
 });

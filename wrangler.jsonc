@@ -34,6 +34,11 @@
     }
   ],
   "r2_buckets": [
+    // Chat attachments (screenshots, uploaded images, model-generated images)
+    // are stored in this bucket under the `attachments/` prefix. Run
+    // `scripts/setup-attachment-lifecycle.sh` once per account to provision
+    // the 30-day auto-expiry rule — lifecycle rules aren't yet configurable
+    // from wrangler.jsonc, so they live out-of-band.
     { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" }
   ],
   "browser": {

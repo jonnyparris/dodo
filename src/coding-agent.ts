@@ -5,6 +5,8 @@ import { flushTurnToArtifacts } from "./artifacts-flush";
 import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
+import type { AttachmentRef } from "./attachments";
+import { rewriteAttachmentsForClient, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
 import { log } from "./logger";
 import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
@@ -298,6 +300,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private mcpDepth = 0;
   /** AbortController for the currently running fiber prompt. Signalled by handleAbort(). */
   private _fiberAbortController: AbortController | null = null;
+  /**
+   * Per-tool-call attachment references captured during streaming. Populated
+   * by the `onToolAttachments` callback threaded into `buildToolsForThink`.
+   * Cleared per chat turn in `runThinkChat` so attachments from one prompt
+   * don't bleed into the next. Used to enrich the streamed `tool_result`
+   * SSE event with images produced by the tool.
+   */
+  private _toolAttachments: Map<string, AttachmentRef[]> = new Map();
   private readonly presence = new PresenceTracker();
   readonly stateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
@@ -413,6 +423,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       isAdminUser: isAdmin(ownerEmail ?? null, this.env),
       ownerId: this.resolveOwnerId(ownerEmail),
       ownerEmail,
+      sessionId: this.sessionId(),
+      // Forward tool-produced attachments (e.g. browser_execute screenshots)
+      // to the SSE stream so the chat UI can render them in real time.
+      onToolAttachments: (toolCallId, attachments) => {
+        this._toolAttachments.set(toolCallId, attachments);
+        this.emitEvent({
+          data: { toolCallId, attachments: attachments.map((a) => ({ mediaType: a.mediaType, url: a.url, size: a.size })) },
+          type: "tool_attachments",
+        });
+      },
       stateBackend: this.stateBackend,
       mcpGatekeepers: this.mcpGatekeepers,
     });
@@ -3122,20 +3142,57 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     let fullText = "";
     let streamError: string | null = null;
 
+    // Reset per-turn tool attachment cache. The map is keyed by toolCallId and
+    // populated by the onToolAttachments callback in getTools() — clearing here
+    // ensures attachments from a previous prompt don't leak into this turn's
+    // tool_result events.
+    this._toolAttachments.clear();
+    // Collect assistant-generated images streamed during this turn. Uploaded
+    // to R2 at onDone() once we know the assistant message id.
+    const generatedImages: Array<{ mediaType: string; url: string }> = [];
+
     const callback: StreamCallback = {
       onEvent: (json: string) => {
         try {
           const chunk = JSON.parse(json);
-          // Bridge Think chunk events to Dodo SSE format
+          // Bridge Think chunk events to Dodo SSE format. Chunks come from
+          // the AI SDK's `toUIMessageStream()` pipeline — see the ai package
+          // for the full chunk type union.
           if (chunk.type === "text-delta") {
             const delta = chunk.delta ?? "";
             fullText += delta;
             this.emitEvent({ data: { delta }, type: "text_delta" });
-          } else if (chunk.type === "tool-call") {
+          } else if (chunk.type === "tool-input-available") {
+            // Tool arguments finalised — show the user that a tool is running.
             this.emitEvent({
-              data: { code: chunk.args ?? "", result: chunk.toolCallId },
+              data: {
+                toolCallId: chunk.toolCallId,
+                toolName: chunk.toolName,
+                input: chunk.input,
+              },
               type: "tool_call",
             });
+          } else if (chunk.type === "tool-output-available") {
+            // Tool finished — emit the result plus any images the tool
+            // produced (streamed earlier via the onToolAttachments callback).
+            const refs = this._toolAttachments.get(chunk.toolCallId) ?? [];
+            this.emitEvent({
+              data: {
+                toolCallId: chunk.toolCallId,
+                output: chunk.output,
+                attachments: rewriteAttachmentsForClient(
+                  refs.map((r) => ({ mediaType: r.mediaType, url: r.url, size: r.size })),
+                ),
+              },
+              type: "tool_result",
+            });
+          } else if (chunk.type === "file") {
+            // Assistant generated an image (Gemini, Gemma vision, etc.).
+            // The AI SDK emits a data URL; we defer the R2 upload to onDone()
+            // so we can key it by the assistant message id.
+            if (typeof chunk.mediaType === "string" && typeof chunk.url === "string") {
+              generatedImages.push({ mediaType: chunk.mediaType, url: chunk.url });
+            }
           } else if (chunk.type === "error") {
             // AI SDK emits { type: "error", errorText: "..." } when the gateway
             // returns an error. Think's applyChunkToParts silently drops these.
@@ -3207,6 +3264,37 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         tokenInput,
         tokenOutput,
       });
+    }
+
+    // Persist any assistant-generated images to R2 and emit a message-level
+    // attachments event so the UI can render them. We do this post-stream
+    // because we need the assistant message id (only known after onDone) to
+    // key the R2 object. The inline data URL remains on the UIMessage part;
+    // `uiMessageToChatRecord` handles the transport from data URL → served URL.
+    if (assistantMessageId && generatedImages.length > 0) {
+      const uploaded: AttachmentRef[] = [];
+      for (const img of generatedImages) {
+        const ref = await uploadAttachment(this.env, {
+          sessionId: this.sessionId(),
+          messageId: assistantMessageId,
+          mediaType: img.mediaType,
+          data: img.url, // uploadAttachment strips the data: prefix
+          ownerEmail: options?.authorEmail,
+          source: "assistant",
+        });
+        if (ref) uploaded.push(ref);
+      }
+      if (uploaded.length > 0) {
+        this.emitEvent({
+          data: {
+            messageId: assistantMessageId,
+            attachments: rewriteAttachmentsForClient(
+              uploaded.map((r) => ({ mediaType: r.mediaType, url: r.url, size: r.size })),
+            ),
+          },
+          type: "message_attachments",
+        });
+      }
     }
 
     // Check if context compaction is needed.
