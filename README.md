@@ -13,6 +13,10 @@
   <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/jonnyparris/dodo">
     <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/>
   </a>
+  &nbsp;
+  <a href="https://dash.cloudflare.com/4b430e167a301330d13a9bb42f3986a2/workers/services/view/dodo/production/builds">
+    <img src="https://img.shields.io/github/check-runs/jonnyparris/dodo/main?nameFilter=Workers+Builds%3A+dodo&label=workers%20build&logo=cloudflare&logoColor=white" alt="Workers Build status"/>
+  </a>
 </p>
 
 ---
