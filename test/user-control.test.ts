@@ -76,6 +76,60 @@ describe("UserControl DO", () => {
     });
   });
 
+  it("config: switching gateway to ai-gateway auto-swaps to a Workers AI model when none is specified", async () => {
+    // Start from opencode + opencode-routable model.
+    await fetchJson("/api/config", {
+      body: JSON.stringify({ activeGateway: "opencode", model: "openai/gpt-5.4" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+
+    // Flip gateway only — no model override. Server should pick a @cf/ default.
+    const flipRes = await fetchJson("/api/config", {
+      body: JSON.stringify({ activeGateway: "ai-gateway" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    expect(flipRes.status).toBe(200);
+    const flipped = (await flipRes.json()) as { activeGateway: string; model: string };
+    expect(flipped.activeGateway).toBe("ai-gateway");
+    expect(flipped.model.startsWith("@cf/")).toBe(true);
+
+    // Flip back — model should revert to opencode-routable default.
+    const revertRes = await fetchJson("/api/config", {
+      body: JSON.stringify({ activeGateway: "opencode" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    const reverted = (await revertRes.json()) as { activeGateway: string; model: string };
+    expect(reverted.activeGateway).toBe("opencode");
+    expect(reverted.model.startsWith("@cf/")).toBe(false);
+
+    // Restore defaults
+    await fetchJson("/api/config", {
+      body: JSON.stringify({ activeGateway: "opencode", model: "claude-test" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  });
+
+  it("config: passing both activeGateway and model respects the explicit model", async () => {
+    const res = await fetchJson("/api/config", {
+      body: JSON.stringify({ activeGateway: "ai-gateway", model: "openai/gpt-5.4" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    const cfg = (await res.json()) as { model: string };
+    expect(cfg.model).toBe("openai/gpt-5.4");
+
+    // Restore
+    await fetchJson("/api/config", {
+      body: JSON.stringify({ activeGateway: "opencode", model: "claude-test" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  });
+
   // ─── Memory ───
 
   it("memory: create → search → read → update → delete", async () => {

@@ -24,12 +24,43 @@ const FALLBACK_MODELS = [
   { id: "deepseek/deepseek-reasoner", name: "DeepSeek Reasoner", provider: "DeepSeek", costInput: 0.55, costOutput: 2.19, contextWindow: 128_000 },
 ];
 
-/** Workers AI models available via AI Gateway's OpenAI-compatible endpoint. */
+/** Workers AI models available via AI Gateway's unified OpenAI-compatible endpoint.
+ *  Routed with the `workers-ai/` prefix per https://developers.cloudflare.com/ai-gateway/chat-completion/
+ *  These only work when `activeGateway === "ai-gateway"`. */
 const WORKERS_AI_MODELS = [
+  { id: "@cf/moonshotai/kimi-k2.6", name: "Kimi K2.6 (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 262_144 },
   { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B A4B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 256_000 },
   { id: "@cf/meta/llama-4-scout-17b-16e-instruct", name: "Llama 4 Scout 17B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 131_072 },
   { id: "@cf/qwen/qwen2.5-coder-32b-instruct", name: "Qwen 2.5 Coder 32B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 32_768 },
 ];
+
+/** Provider prefixes the opencode gateway can actually route.
+ *  The models.dev provider TOMLs often fall back to `anthropic/` for non-Anthropic models
+ *  (kimi, glm, qwen, mimo, minimax, etc.), which the gateway then forwards to Anthropic
+ *  and Anthropic rejects with 404. We filter those out server-side so the UI never shows
+ *  a model that will fail on first prompt. Use Workers AI (ai-gateway) instead. */
+const OPENCODE_SUPPORTED_PROVIDER_PREFIXES = new Set(["openai", "anthropic", "google", "deepseek"]);
+
+/** Slug prefixes (after the provider/) that are known to NOT be real Anthropic models.
+ *  These slugs slip through as `anthropic/…` because models.dev defaults to `anthropic` when
+ *  the TOML has no `[provider].npm`. The gateway forwards to Anthropic and 404s. */
+const OPENCODE_BAD_SLUG_PREFIXES = [
+  "kimi", "glm", "qwen", "qwen3", "mimo", "minimax", "nemotron", "trinity", "grok-code", "big-pickle",
+];
+
+function isRoutableByOpencodeGateway(id: string): boolean {
+  const slashIdx = id.indexOf("/");
+  if (slashIdx === -1) return false;
+  const providerPrefix = id.slice(0, slashIdx);
+  const slug = id.slice(slashIdx + 1);
+  if (id.startsWith("@cf/")) return false; // Workers AI — ai-gateway only
+  if (!OPENCODE_SUPPORTED_PROVIDER_PREFIXES.has(providerPrefix)) return false;
+  if (providerPrefix === "anthropic") {
+    // Filter models falsely labelled `anthropic/...` because of the models.dev fallback
+    return !OPENCODE_BAD_SLUG_PREFIXES.some((bad) => slug.startsWith(bad));
+  }
+  return true;
+}
 
 /**
  * SharedIndex DO — global singleton (`idFromName("global")`).
@@ -146,10 +177,21 @@ export class SharedIndex extends DurableObject<Env> {
         if (refresh) {
           this.db.exec("DELETE FROM models_cache");
         }
+        // `gateway` query param filters the list for the active gateway.
+        // "opencode" → only providers the opencode gateway can actually route.
+        // "ai-gateway" → upstream unified API models + Workers AI @cf/ models.
+        // (omitted) → unfiltered (legacy callers).
+        const gateway = url.searchParams.get("gateway");
         const models = await this.getModels();
-        const ids = new Set(models.map((m) => m.id));
-        const extras = WORKERS_AI_MODELS.filter((m) => !ids.has(m.id));
-        return Response.json({ models: [...models, ...extras] });
+        const filteredBase = gateway === "opencode"
+          ? models.filter((m) => isRoutableByOpencodeGateway(m.id))
+          : models;
+        const ids = new Set(filteredBase.map((m) => m.id));
+        // Workers AI models only appear when ai-gateway is the target (or no filter).
+        const extras = gateway === "opencode"
+          ? []
+          : WORKERS_AI_MODELS.filter((m) => !ids.has(m.id));
+        return Response.json({ models: [...filteredBase, ...extras] });
       }
 
       // ─── Session shares ───

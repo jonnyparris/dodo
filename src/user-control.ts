@@ -777,7 +777,22 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private updateConfig(input: UpdateConfigRequest): AppConfig {
-    const nextConfig = { ...this.readConfig(), ...input };
+    const current = this.readConfig();
+    const nextConfig = { ...current, ...input };
+
+    // Auto-swap model when the user changes gateway and the current model
+    // isn't routable by the new gateway. Prevents the "Bad Request on first prompt"
+    // failure mode reported in jonnyparris/dodo#30.
+    const gatewayChanged = input.activeGateway && input.activeGateway !== current.activeGateway;
+    const modelExplicit = Object.prototype.hasOwnProperty.call(input, "model");
+    if (gatewayChanged && !modelExplicit) {
+      if (input.activeGateway === "ai-gateway" && !nextConfig.model.startsWith("@cf/")) {
+        nextConfig.model = this.env.AI_GATEWAY_DEFAULT_MODEL ?? "@cf/moonshotai/kimi-k2.6";
+      } else if (input.activeGateway === "opencode" && nextConfig.model.startsWith("@cf/")) {
+        nextConfig.model = this.env.DEFAULT_MODEL;
+      }
+    }
+
     const now = nowEpoch();
     for (const [key, value] of Object.entries(nextConfig)) {
       this.db.exec(
