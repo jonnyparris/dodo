@@ -54,8 +54,11 @@
     "CF_ACCESS_TEAM_DOMAIN": "https://your-team.cloudflareaccess.com",
     // Set this to any model your LLM gateway supports
     "DEFAULT_MODEL": "anthropic/claude-sonnet-4",
+    // Default model used when a new session is created with activeGateway=ai-gateway.
+    "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
     "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
-    "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1",
+    // AI Gateway unified API: include /{account_id}/{gateway_id}/compat
+    "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1/your-account-id/your-gateway/compat",
     "DODO_VERSION": "0.4.0-dev",
     "ADMIN_EMAIL": "you@example.com"
   }

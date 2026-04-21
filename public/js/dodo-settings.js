@@ -117,7 +117,14 @@ function showUpdateBanner(commit){
 }
 async function loadModels(){
   try{
-    const{models}=await api("/api/models");
+    // Filter server-side by the currently selected gateway so the picker never
+    // offers a model that would fail on first prompt. Falls back to the saved
+    // config's gateway when the UI selector isn't rendered yet.
+    const gwSel=$("cfg-gateway");
+    let gw=gwSel?gwSel.value:null;
+    if(!gw){try{const cfg=await api("/api/config");gw=cfg&&cfg.activeGateway;}catch{}}
+    const qs=gw?`?gateway=${encodeURIComponent(gw)}`:"";
+    const{models}=await api(`/api/models${qs}`);
     const dl=$("model-list");dl.innerHTML="";
     models.forEach(m=>{const o=document.createElement("option");o.value=m.id;o.textContent=`${m.name}${m.costInput?` ($${m.costInput}/M in)`:''}`; dl.appendChild(o)});
   }catch{}

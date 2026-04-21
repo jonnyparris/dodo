@@ -162,6 +162,24 @@ function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
 
+/** Some model IDs need rewriting before they're sent to the upstream gateway.
+ *  - Workers AI models (`@cf/…`) need the `workers-ai/` prefix per AI Gateway
+ *    unified-API docs: https://developers.cloudflare.com/ai-gateway/chat-completion/
+ *    They only work when the active gateway is `ai-gateway`.
+ *  Returns the wire-format model ID, or throws if the combination is invalid. */
+export function resolveWireModelId(modelId: string, activeGateway: "opencode" | "ai-gateway"): string {
+  if (modelId.startsWith("@cf/")) {
+    if (activeGateway !== "ai-gateway") {
+      throw new Error(
+        `Workers AI model "${modelId}" requires the AI Gateway. ` +
+        `Switch gateway to "ai-gateway" in Settings (or via update_config).`,
+      );
+    }
+    return `workers-ai/${modelId}`;
+  }
+  return modelId;
+}
+
 export function buildProvider(config: AppConfig, env: Env) {
   const isOpencode = config.activeGateway === "opencode";
   const baseURL = isOpencode
@@ -170,13 +188,38 @@ export function buildProvider(config: AppConfig, env: Env) {
 
   const headers: Record<string, string> = isOpencode
     ? { "cf-access-token": env.OPENCODE_GATEWAY_TOKEN ?? "" }
-    : { "x-api-key": env.AI_GATEWAY_KEY ?? "" };
+    : {
+        // AI Gateway unified API: auth with `cf-aig-authorization` bearer.
+        // We keep `x-api-key` for back-compat with existing deployments.
+        "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
+        "x-api-key": env.AI_GATEWAY_KEY ?? "",
+      };
 
-  return createOpenAICompatible({
+  const provider = createOpenAICompatible({
     baseURL,
     headers,
     includeUsage: true,
     name: config.activeGateway,
+  });
+
+  // Wrap `chatModel` / `languageModel` / the callable provider so callers can pass
+  // the user-facing id (e.g. `@cf/moonshotai/kimi-k2.6`) and we translate it to the
+  // wire format (`workers-ai/@cf/moonshotai/kimi-k2.6`) exactly once, at the edge.
+  const translate = (modelId: string) => resolveWireModelId(modelId, config.activeGateway);
+  const originalChatModel = provider.chatModel.bind(provider);
+  const originalLanguageModel = provider.languageModel.bind(provider);
+
+  return new Proxy(provider, {
+    // Intercept `provider("model-id")` (the callable form).
+    apply(_target, _thisArg, args: [string, ...unknown[]]) {
+      const [modelId, ...rest] = args;
+      return originalLanguageModel(translate(modelId), ...(rest as []));
+    },
+    get(target, prop, receiver) {
+      if (prop === "chatModel") return (modelId: string) => originalChatModel(translate(modelId));
+      if (prop === "languageModel") return (modelId: string, cfg?: unknown) => originalLanguageModel(translate(modelId), cfg as Parameters<typeof originalLanguageModel>[1]);
+      return Reflect.get(target, prop, receiver);
+    },
   });
 }
 

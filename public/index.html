@@ -533,7 +533,7 @@
             <input id="cfg-model" list="model-list" style="margin-bottom:6px"/>
             <datalist id="model-list"></datalist>
             <label style="font-size:11px;color:var(--muted)">Gateway</label>
-            <select id="cfg-gateway" style="margin-bottom:6px">
+            <select id="cfg-gateway" style="margin-bottom:6px" onchange="loadModels()">
               <option value="ai-gateway">AI Gateway</option>
               <option value="opencode">OpenCode</option>
             </select>
