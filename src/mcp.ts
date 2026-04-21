@@ -500,10 +500,11 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
 
       const content = [
         `Repository is already cloned at ${repo.dir}.`,
-        `You are on the main branch. Push to remote branch '${branch}' when done.`,
+        `You are on the ${baseBranch} branch. Push to remote branch '${branch}' when done.`,
         `Do not clone again. Do not change branch names.`,
         `Use commit message: ${commitMessage}`,
         `Push with git_push_checked and ref set to '${branch}'.`,
+        `Skip npm/node verification commands (npm run typecheck, npm test, npm install) — the sandbox cannot run them. The dispatching system will verify externally.`,
         prompt,
       ].join("\n\n");
 
