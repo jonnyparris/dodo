@@ -11,9 +11,10 @@ on:
         description: Ref the dispatcher wants verified (informational — the workflow runs on the dispatched ref by default)
         required: false
         type: string
-  # Also run on push so humans get the same signal in their PRs.
-  push:
-    branches-ignore:
+  # Run on PRs so human-authored branches get the same typecheck/test signal
+  # without double-running on every push.
+  pull_request:
+    branches:
       - main
 
 jobs:

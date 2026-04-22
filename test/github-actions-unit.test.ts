@@ -61,32 +61,79 @@ describe("triggerVerifyWorkflow", () => {
     expect(result).toBeNull();
   });
 
-  it("dispatches the workflow and returns the newly-created run id", async () => {
-    const now = Date.now();
-    const fetchMock = vi
-      .fn()
-      // 1st call: workflow_dispatch — 204 No Content
+  it("matches runs by head_sha when the branch lookup succeeds", async () => {
+    const expectedSha = "abc123def456";
+    const fetchMock = vi.fn()
+      // 1st: branch lookup — returns the expected head sha
+      .mockResolvedValueOnce(new Response(JSON.stringify({ commit: { sha: expectedSha } }), { status: 200, headers: { "content-type": "application/json" } }))
+      // 2nd: workflow_dispatch — 204
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
-      // 2nd call: list runs — one run created after our trigger
+      // 3rd: list runs — the matching run has the same head_sha
       .mockResolvedValueOnce(new Response(JSON.stringify({
         workflow_runs: [
-          { id: 999, html_url: "https://github.com/jonnyparris/dodo/actions/runs/999", created_at: new Date(now).toISOString() },
+          // Decoy: older run with different sha, created within the time window
+          { id: 1, html_url: "decoy", created_at: new Date().toISOString(), head_sha: "otherSha" },
+          // Real match: head_sha matches
+          { id: 999, html_url: "https://github.com/jonnyparris/dodo/actions/runs/999", created_at: new Date().toISOString(), head_sha: expectedSha },
         ],
       }), { status: 200, headers: { "content-type": "application/json" } }));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun });
-    // Drain the internal sleep between trigger and list.
     await vi.advanceTimersByTimeAsync(600);
 
     const result = await promise;
     expect(result).toEqual({ runId: "999", htmlUrl: "https://github.com/jonnyparris/dodo/actions/runs/999" });
 
-    // Verify the dispatch call targeted the right endpoint.
-    const [triggerUrl, triggerInit] = fetchMock.mock.calls[0];
+    // Branch lookup hit the right endpoint (branch is percent-encoded).
+    const [branchUrl] = fetchMock.mock.calls[0];
+    expect(String(branchUrl)).toContain("/branches/feat%2Fx");
+    // Dispatch targeted the right workflow.
+    const [triggerUrl, triggerInit] = fetchMock.mock.calls[1];
     expect(String(triggerUrl)).toContain("/actions/workflows/dodo-verify.yml/dispatches");
     expect(triggerInit.method).toBe("POST");
     expect(JSON.parse(triggerInit.body)).toEqual({ ref: "feat/x" });
+  });
+
+  it("falls back to the 2s time window when branch sha lookup fails", async () => {
+    const now = Date.now();
+    const fetchMock = vi.fn()
+      // 1st: branch lookup — 404 (branch not yet visible, or token lacks scope)
+      .mockResolvedValueOnce(new Response("not found", { status: 404 }))
+      // 2nd: dispatch
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      // 3rd: list runs — one within the 2s window, no head_sha
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        workflow_runs: [
+          { id: 777, html_url: "https://github.com/jonnyparris/dodo/actions/runs/777", created_at: new Date(now).toISOString() },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun });
+    await vi.advanceTimersByTimeAsync(600);
+
+    const result = await promise;
+    expect(result).toEqual({ runId: "777", htmlUrl: "https://github.com/jonnyparris/dodo/actions/runs/777" });
+  });
+
+  it("rejects runs whose head_sha doesn't match even within the time window", async () => {
+    const expectedSha = "abc123";
+    const makeListResponse = () => new Response(JSON.stringify({
+      // Run created now but with a different head_sha — must not be picked up.
+      workflow_runs: [{ id: 1, html_url: "x", created_at: new Date().toISOString(), head_sha: "deadbeef" }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ commit: { sha: expectedSha } }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockImplementation(async () => makeListResponse());
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun });
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const result = await promise;
+    expect(result).toBeNull();
   });
 
   it("ignores stale workflow runs created before the trigger", async () => {
@@ -97,6 +144,8 @@ describe("triggerVerifyWorkflow", () => {
       workflow_runs: [{ id: 1, html_url: "x", created_at: staleTs }],
     }), { status: 200, headers: { "content-type": "application/json" } });
     const fetchMock = vi.fn()
+      // Branch lookup fails so we fall into the time-window path.
+      .mockResolvedValueOnce(new Response("not found", { status: 404 }))
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockImplementation(async () => makeStaleResponse());
     globalThis.fetch = fetchMock as unknown as typeof fetch;

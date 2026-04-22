@@ -54,9 +54,18 @@ async function resolveGithubToken(env: Env, ownerEmail?: string): Promise<string
  * and poll for completion.
  *
  * `workflow_dispatch` is asynchronous — GitHub responds 204 before the run
- * exists. We then query the runs list (filtered by branch + event) to find
- * the one we just triggered. We pick the most recent run created within the
- * last 2 minutes to avoid confusing ourselves with older runs.
+ * exists. We then query the runs list to find the one we just triggered.
+ *
+ * Run identification uses two signals to avoid grabbing an unrelated run
+ * (e.g. a concurrent human-dispatched run for the same branch):
+ *
+ *   1. **head_sha match** (primary). Before dispatching, we look up the
+ *      branch's current tip. A `workflow_dispatch` run records that sha as
+ *      `head_sha`, so a match is authoritative.
+ *   2. **created_at window** (secondary). Fallback when the branch sha
+ *      lookup fails. Tight 2-second window accepts real NTP skew while
+ *      rejecting runs from humans dispatching the same workflow moments
+ *      earlier.
  */
 export async function triggerVerifyWorkflow(input: {
   env: Env;
@@ -69,6 +78,9 @@ export async function triggerVerifyWorkflow(input: {
   if (!parsed) return null;
   const token = await resolveGithubToken(env, ownerEmail);
   if (!token) return null;
+
+  // Resolve the branch's current head sha so we can match runs authoritatively.
+  const expectedHeadSha = await fetchBranchHeadSha({ owner: parsed.owner, repo: parsed.repo, branch: run.branch, token });
 
   const triggerUrl = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/actions/workflows/${encodeURIComponent(run.verifyWorkflow)}/dispatches`;
   const triggeredAt = Date.now();
@@ -91,11 +103,16 @@ export async function triggerVerifyWorkflow(input: {
     const listUrl = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/actions/workflows/${encodeURIComponent(run.verifyWorkflow)}/runs?branch=${encodeURIComponent(run.branch)}&event=workflow_dispatch&per_page=5`;
     const listRes = await fetch(listUrl, { headers: ghHeaders(token) });
     if (!listRes.ok) continue;
-    const listData = (await listRes.json()) as { workflow_runs: Array<{ id: number; html_url: string; created_at: string }> };
+    const listData = (await listRes.json()) as { workflow_runs: Array<{ id: number; html_url: string; created_at: string; head_sha?: string }> };
     const candidate = listData.workflow_runs?.find((r) => {
+      // Primary: head_sha match is authoritative if we have the expected sha.
+      if (expectedHeadSha && r.head_sha === expectedHeadSha) return true;
+      if (expectedHeadSha) return false; // have sha, must match — don't fall through to time window
+
+      // Fallback: tight time window. ±2s covers NTP skew; tighter than the
+      // typical human reaction time between dispatches.
       const createdMs = Date.parse(r.created_at);
-      // Only accept runs created after we triggered (minus 10s clock skew).
-      return Number.isFinite(createdMs) && createdMs >= triggeredAt - 10_000;
+      return Number.isFinite(createdMs) && createdMs >= triggeredAt - 2_000;
     });
     if (candidate) {
       return { runId: String(candidate.id), htmlUrl: candidate.html_url };
@@ -104,6 +121,27 @@ export async function triggerVerifyWorkflow(input: {
 
   console.warn("[verify-gate] workflow dispatched but run id not found within 5s");
   return null;
+}
+
+/**
+ * Look up the current head sha for a branch. Returns null on any failure so
+ * the caller can fall back to time-window matching.
+ */
+async function fetchBranchHeadSha(input: {
+  owner: string;
+  repo: string;
+  branch: string;
+  token: string;
+}): Promise<string | null> {
+  try {
+    const url = `https://api.github.com/repos/${input.owner}/${input.repo}/branches/${encodeURIComponent(input.branch)}`;
+    const res = await fetch(url, { headers: ghHeaders(input.token) });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { commit?: { sha?: string } };
+    return data.commit?.sha ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
