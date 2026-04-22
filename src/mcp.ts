@@ -404,9 +404,12 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     });
 
     try {
-      // Clone fresh (avoids fork binary corruption issues)
+      // Clone fresh (avoids fork binary corruption issues). Deeper clone when
+      // stacking on a non-default base so later `git log` calls see the stack.
+      const isStacked = baseBranch !== repo.defaultBranch;
+      const cloneDepth = isStacked ? 20 : 1;
       await agentJson(env, worker.id, "/git/clone", {
-        body: JSON.stringify({ branch: baseBranch, dir: repo.dir, url: repo.url }),
+        body: JSON.stringify({ branch: baseBranch, depth: cloneDepth, dir: repo.dir, url: repo.url }),
         headers: { "content-type": "application/json" },
         method: "POST",
       }, depth);
@@ -488,9 +491,13 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     });
 
     try {
-      // Clone fresh
+      // Clone fresh. When stacking on a non-default base branch, fetch more
+      // history so the LLM can `git log` the existing stack without needing
+      // to pull or fetch (both of which fail under singleBranch+shallow).
+      const isStacked = baseBranch !== repo.defaultBranch;
+      const cloneDepth = isStacked ? 20 : 1;
       await agentJson(env, worker.id, "/git/clone", {
-        body: JSON.stringify({ branch: baseBranch, dir: repo.dir, url: repo.url }),
+        body: JSON.stringify({ branch: baseBranch, depth: cloneDepth, dir: repo.dir, url: repo.url }),
         headers: { "content-type": "application/json" },
         method: "POST",
       }, depth);
@@ -502,6 +509,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
         `Repository is already cloned at ${repo.dir}.`,
         `You are on the ${baseBranch} branch. Push to remote branch '${branch}' when done.`,
         `Do not clone again. Do not change branch names.`,
+        `Do NOT run git_pull or git_fetch — the clone is singleBranch+shallow. The repository is already on the correct branch.`,
         `Use commit message: ${commitMessage}`,
         `Push with git_push_checked and ref set to '${branch}'.`,
         `Skip npm/node verification commands (npm run typecheck, npm test, npm install) — the sandbox cannot run them. The dispatching system will verify externally.`,
