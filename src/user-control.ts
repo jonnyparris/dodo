@@ -57,6 +57,20 @@ const mcpConfigUpdateSchema = z
   })
   .strict();
 
+const workerRunStatusEnum = z.enum([
+  "session_created",
+  "repo_ready",
+  "branch_created",
+  "edit_applied",
+  "commit_created",
+  "prompt_running",
+  "push_verified",
+  "checks_running",
+  "checks_passed",
+  "done",
+  "failed",
+]);
+
 const workerRunCreateSchema = z.object({
   sessionId: z.string().min(1),
   parentSessionId: z.string().min(1).nullable().optional(),
@@ -69,15 +83,18 @@ const workerRunCreateSchema = z.object({
   title: z.string().min(1),
   commitMessage: z.string().min(1).nullable().optional(),
   expectedFiles: z.array(z.string()).default([]),
-  status: z.enum(["session_created", "repo_ready", "branch_created", "edit_applied", "commit_created", "prompt_running", "push_verified", "done", "failed"]).default("session_created"),
+  status: workerRunStatusEnum.default("session_created"),
+  verifyWorkflow: z.string().min(1).nullable().optional(),
 }).strict();
 
 const workerRunUpdateSchema = z.object({
-  status: z.enum(["session_created", "repo_ready", "branch_created", "edit_applied", "commit_created", "prompt_running", "push_verified", "done", "failed"]).optional(),
+  status: workerRunStatusEnum.optional(),
   lastError: z.string().nullable().optional(),
   failureSnapshotId: z.string().nullable().optional(),
   prUrl: z.string().nullable().optional(),
   verification: z.record(z.string(), z.unknown()).nullable().optional(),
+  verifyWorkflowRunId: z.string().nullable().optional(),
+  verifyWorkflowHtmlUrl: z.string().nullable().optional(),
 }).strict();
 
 const failureSnapshotCreateSchema = z.object({
@@ -675,6 +692,9 @@ export class UserControl extends DurableObject<Env> {
         last_error TEXT,
         failure_snapshot_id TEXT,
         pr_url TEXT,
+        verify_workflow TEXT,
+        verify_workflow_run_id TEXT,
+        verify_workflow_html_url TEXT,
         status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -685,6 +705,14 @@ export class UserControl extends DurableObject<Env> {
       this.db.exec("ALTER TABLE worker_runs ADD COLUMN pr_url TEXT");
     } catch {
       // Column already exists.
+    }
+
+    for (const ddl of [
+      "ALTER TABLE worker_runs ADD COLUMN verify_workflow TEXT",
+      "ALTER TABLE worker_runs ADD COLUMN verify_workflow_run_id TEXT",
+      "ALTER TABLE worker_runs ADD COLUMN verify_workflow_html_url TEXT",
+    ]) {
+      try { this.db.exec(ddl); } catch { /* column already exists */ }
     }
 
     this.db.exec(`
@@ -866,8 +894,9 @@ export class UserControl extends DurableObject<Env> {
       `INSERT INTO worker_runs (
         id, session_id, parent_session_id, repo_id, repo_url, repo_dir, branch, base_branch,
         strategy, title, commit_message, expected_files_json, verification_json, last_error,
-        failure_snapshot_id, pr_url, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        failure_snapshot_id, pr_url, verify_workflow, verify_workflow_run_id, verify_workflow_html_url,
+        status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       input.sessionId,
       input.parentSessionId ?? null,
@@ -882,6 +911,9 @@ export class UserControl extends DurableObject<Env> {
       JSON.stringify(input.expectedFiles),
       null,
       null,
+      null,
+      null,
+      input.verifyWorkflow ?? null,
       null,
       null,
       input.status,
@@ -901,6 +933,8 @@ export class UserControl extends DurableObject<Env> {
            failure_snapshot_id = ?,
            pr_url = ?,
            verification_json = ?,
+           verify_workflow_run_id = ?,
+           verify_workflow_html_url = ?,
            updated_at = ?
        WHERE id = ?`,
       patch.status ?? current.status,
@@ -910,6 +944,8 @@ export class UserControl extends DurableObject<Env> {
       patch.verification === undefined
         ? (current.verification === null ? null : JSON.stringify(current.verification))
         : (patch.verification === null ? null : JSON.stringify(patch.verification)),
+      patch.verifyWorkflowRunId === undefined ? (current.verifyWorkflowRunId ?? null) : patch.verifyWorkflowRunId,
+      patch.verifyWorkflowHtmlUrl === undefined ? (current.verifyWorkflowHtmlUrl ?? null) : patch.verifyWorkflowHtmlUrl,
       nowEpoch(),
       id,
     );
@@ -952,6 +988,9 @@ export class UserControl extends DurableObject<Env> {
       title: String(row.title),
       updatedAt: epochToIso(row.updated_at),
       verification: row.verification_json === null ? null : JSON.parse(String(row.verification_json)) as Record<string, unknown>,
+      verifyWorkflow: row.verify_workflow == null ? null : String(row.verify_workflow),
+      verifyWorkflowHtmlUrl: row.verify_workflow_html_url == null ? null : String(row.verify_workflow_html_url),
+      verifyWorkflowRunId: row.verify_workflow_run_id == null ? null : String(row.verify_workflow_run_id),
     };
   }
 

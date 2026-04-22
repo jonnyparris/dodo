@@ -1,0 +1,37 @@
+name: dodo-verify
+
+# External typecheck + test gate for dispatches. The Dodo MCP dispatches this
+# workflow via workflow_dispatch after a successful branch push, then polls
+# for completion before opening a draft PR. See src/github-actions.ts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Ref the dispatcher wants verified (informational — the workflow runs on the dispatched ref by default)
+        required: false
+        type: string
+  # Run on PRs so human-authored branches get the same typecheck/test signal
+  # without double-running on every push.
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test

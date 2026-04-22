@@ -3,6 +3,7 @@ import { getAgentByName } from "agents";
 import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, resolveAdminEmail } from "./auth";
 import { createDraftPrForRun } from "./github-pr";
+import { pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-actions";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import type { CodingAgent } from "./coding-agent";
 import type { Env, WorkerRunRecord } from "./types";
@@ -103,6 +104,7 @@ async function createWorkerRun(env: Env, input: {
   status: string;
   strategy: "deterministic" | "agent";
   title: string;
+  verifyWorkflow?: string | null;
 }) {
   return userJson<{ id: string } & Record<string, unknown>>(env, "/worker-runs", {
     body: JSON.stringify(input),
@@ -111,7 +113,15 @@ async function createWorkerRun(env: Env, input: {
   });
 }
 
-async function updateWorkerRun(env: Env, runId: string, patch: { status?: string; lastError?: string | null; failureSnapshotId?: string | null; verification?: Record<string, unknown> | null; prUrl?: string | null }): Promise<WorkerRunRecord> {
+async function updateWorkerRun(env: Env, runId: string, patch: {
+  status?: string;
+  lastError?: string | null;
+  failureSnapshotId?: string | null;
+  verification?: Record<string, unknown> | null;
+  prUrl?: string | null;
+  verifyWorkflowRunId?: string | null;
+  verifyWorkflowHtmlUrl?: string | null;
+}): Promise<WorkerRunRecord> {
   return userJson<WorkerRunRecord>(env, `/worker-runs/${encodeURIComponent(runId)}`, {
     body: JSON.stringify(patch),
     headers: { "content-type": "application/json" },
@@ -186,6 +196,110 @@ async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, b
     headers: { "content-type": "application/json" },
     method: "POST",
   }, depth);
+}
+
+/**
+ * Hard cap for the verify gate. If a GitHub Actions run stays in
+ * `queued`/`in_progress` for longer than this (e.g. runner outage, org
+ * concurrency cap, billing issue) we mark the worker run as failed rather
+ * than polling indefinitely. The dodo-verify workflow itself has a
+ * timeout-minutes of 15; we double that to absorb transient queue delays.
+ */
+const VERIFY_GATE_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * After a run reaches `done` (or we explicitly decide to open a PR without
+ * blocking on verify), attempt to open a draft PR. PR failures are non-fatal
+ * so they don't regress the run.
+ *
+ * If a prior call already opened a PR (e.g. the caller is double-polling
+ * `verify_worker_run` and both see a terminal state), skip the second
+ * attempt — `createDraftPrForRun` has no existing-PR check and would
+ * otherwise open duplicates.
+ */
+async function finalizePr(env: Env, run: WorkerRunRecord, ownerEmail: string | undefined, verification: Record<string, unknown>): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+  if (run.prUrl) {
+    return textResult({ run, verification });
+  }
+  const prUrl = await createDraftPrForRun(env, run, ownerEmail);
+  if (prUrl) {
+    const withPr = await updateWorkerRun(env, run.id, { prUrl });
+    return textResult({ run: withPr, verification });
+  }
+  return textResult({ run, verification });
+}
+
+/** Read the startedAt ISO string from the verifyGate record. Null if missing. */
+function getVerifyGateStartedAt(run: WorkerRunRecord): number | null {
+  const gate = (run.verification as Record<string, unknown> | null)?.verifyGate as Record<string, unknown> | undefined;
+  const raw = gate?.startedAt;
+  if (typeof raw !== "string") return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Poll the verify-gate workflow run for a worker run that's currently
+ * `checks_running`. If the workflow is still in flight, return a running
+ * response. On success: transition `checks_passed` → auto-PR → `done`. On
+ * failure (or timeout): capture the workflow URL in a failure snapshot and
+ * mark `failed`.
+ */
+async function pollAndFinalize(env: Env, run: WorkerRunRecord, ownerEmail: string | undefined): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: true }> {
+  const verification = (run.verification ?? {}) as Record<string, unknown>;
+  const pollResult = await pollVerifyWorkflow({ env, run, ownerEmail });
+
+  if (!pollResult) {
+    // Still running — but check the timeout cap first so we don't poll forever.
+    const startedAt = getVerifyGateStartedAt(run);
+    if (startedAt !== null && Date.now() - startedAt > VERIFY_GATE_TIMEOUT_MS) {
+      const htmlUrl = run.verifyWorkflowHtmlUrl ?? null;
+      const message = `Verify workflow timed out after ${Math.round(VERIFY_GATE_TIMEOUT_MS / 60000)} minutes${htmlUrl ? ` — see ${htmlUrl}` : ""}`;
+      const failure = await createFailureSnapshot(env, run.id, {
+        reason: "verify_gate_timeout",
+        htmlUrl,
+        startedAt: new Date(startedAt).toISOString(),
+        timeoutMs: VERIFY_GATE_TIMEOUT_MS,
+        verifyWorkflow: run.verifyWorkflow,
+      });
+      const updated = await updateWorkerRun(env, run.id, {
+        status: "failed",
+        lastError: message,
+        failureSnapshotId: String(failure.id),
+        verification: { ...verification, verifyGate: { ...(verification.verifyGate as Record<string, unknown> | undefined), conclusion: "timed_out", htmlUrl, timedOutAt: new Date().toISOString() } },
+      });
+      return errorResult({ error: message, failureSnapshotId: failure.id, run: updated, verifyWorkflowHtmlUrl: htmlUrl });
+    }
+    return textResult({ run, status: "checks_running", verifyWorkflowHtmlUrl: run.verifyWorkflowHtmlUrl });
+  }
+
+  if (pollResult.conclusion === "success") {
+    const passed = await updateWorkerRun(env, run.id, {
+      status: "checks_passed",
+      verification: { ...verification, verifyGate: { ...(verification.verifyGate as Record<string, unknown> | undefined), conclusion: "success", htmlUrl: pollResult.htmlUrl, completedAt: pollResult.completedAt } },
+    });
+    // Immediately transition to `done` so the caller sees a single terminal
+    // state, and open the draft PR.
+    const done = await updateWorkerRun(env, run.id, { status: "done" });
+    return await finalizePr(env, done, ownerEmail, passed.verification ?? {});
+  }
+
+  // Non-success conclusion — record a failure snapshot pointing at the run.
+  const failure = await createFailureSnapshot(env, run.id, {
+    reason: "verify_gate_failed",
+    conclusion: pollResult.conclusion,
+    htmlUrl: pollResult.htmlUrl,
+    completedAt: pollResult.completedAt,
+    verifyWorkflow: run.verifyWorkflow,
+  });
+  const message = `Verify workflow concluded '${pollResult.conclusion}' — see ${pollResult.htmlUrl}`;
+  const updated = await updateWorkerRun(env, run.id, {
+    status: "failed",
+    lastError: message,
+    failureSnapshotId: String(failure.id),
+    verification: { ...verification, verifyGate: { ...(verification.verifyGate as Record<string, unknown> | undefined), conclusion: pollResult.conclusion, htmlUrl: pollResult.htmlUrl, completedAt: pollResult.completedAt } },
+  });
+  return errorResult({ error: message, failureSnapshotId: failure.id, run: updated, verifyWorkflowHtmlUrl: pollResult.htmlUrl });
 }
 
 function textResult(data: unknown): { content: Array<{ type: "text"; text: string }> } {
@@ -472,7 +586,8 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     commitMessage: z.string().min(1).describe("Commit message the worker should use"),
     expectedFiles: z.array(z.string()).default([]).describe("Files expected to change on the branch"),
     prompt: z.string().min(1).describe("Worker prompt. The repo is already cloned and the branch is already checked out."),
-  }, async ({ repoId, title, branch, baseBranch, commitMessage, expectedFiles, prompt }) => {
+    verifyWorkflow: z.string().min(1).nullable().optional().describe("GitHub Actions workflow filename (e.g. 'dodo-verify.yml') to run as an external typecheck/test gate after the branch pushes. The workflow must accept a `workflow_dispatch` trigger and a `ref` input. Leave null/unset to skip the verify gate (default). See .github/workflows/dodo-verify.yml.example for a template."),
+  }, async ({ repoId, title, branch, baseBranch, commitMessage, expectedFiles, prompt, verifyWorkflow }) => {
     const repo = getKnownRepo(repoId);
     const worker = await createSessionWithTitle(env, title);
     const run = await createWorkerRun(env, {
@@ -488,6 +603,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
       status: "session_created",
       strategy: "agent",
       title,
+      verifyWorkflow: verifyWorkflow ?? null,
     });
 
     try {
@@ -531,25 +647,30 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     }
   });
 
-  server.tool("verify_worker_run", "Verify a tracked worker run. For prompt-based runs, waits for prompt completion and then verifies the remote branch before marking it done.", {
+  server.tool("verify_worker_run", "Verify a tracked worker run. For prompt-based runs, waits for prompt completion, verifies the remote branch, optionally runs a GitHub Actions verify workflow (typecheck/tests), then opens a draft PR and marks the run done.", {
     runId: z.string().min(1).describe("Worker run id"),
   }, async ({ runId }) => {
-    const run = await userJson<{
-      baseBranch: string;
-      branch: string;
-      expectedFiles: string[];
-      id: string;
-      repoDir: string;
-      sessionId: string;
-      status: string;
-      strategy: "deterministic" | "agent";
-    }>(env, `/worker-runs/${encodeURIComponent(runId)}`);
+    const run = await userJson<WorkerRunRecord>(env, `/worker-runs/${encodeURIComponent(runId)}`);
 
     if (run.strategy === "deterministic" && run.status === "done") {
       return textResult(run);
     }
 
+    const ownerEmail = mcpUserEmail(env);
+
     try {
+      // Resume a verify-gate poll if we're mid-check on a prior call.
+      if (run.status === "checks_running" && run.verifyWorkflowRunId) {
+        return await pollAndFinalize(env, run, ownerEmail);
+      }
+
+      // Don't re-trigger the verify gate if we already passed and an auto-PR
+      // attempt simply didn't land a URL. Let the caller retry that path
+      // separately if they want.
+      if (run.status === "checks_passed") {
+        return textResult({ run, note: "checks already passed; call again to retry PR creation" });
+      }
+
       const prompts = await agentJson<{ prompts: Array<{ error: string | null; status: string }> }>(env, run.sessionId, "/prompts", undefined, depth);
       const active = prompts.prompts[0];
       if (!active || active.status === "queued" || active.status === "running") {
@@ -567,17 +688,45 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
         headers: { "content-type": "application/json" },
         method: "POST",
       }, depth);
-      const updated = await updateWorkerRun(env, runId, { status: "done", verification });
 
-      // Auto-open draft PR. Non-fatal — failures don't regress the run.
-      const ownerEmail = mcpUserEmail(env);
-      const prUrl = await createDraftPrForRun(env, updated, ownerEmail);
-      if (prUrl) {
-        const withPr = await updateWorkerRun(env, runId, { prUrl });
-        return textResult({ run: withPr, verification });
+      // Verify gate (optional, opt-in). If the caller set verifyWorkflow on
+      // dispatch, trigger GitHub Actions here and return `checks_running` —
+      // the caller should call verify_worker_run again to poll.
+      if (run.verifyWorkflow) {
+        const triggered = await triggerVerifyWorkflow({ env, run, ownerEmail });
+        if (!triggered) {
+          // Couldn't trigger — don't gate the run on an infrastructure failure.
+          // Log a non-fatal note in the verification record and proceed to PR.
+          const afterVerify = await updateWorkerRun(env, runId, {
+            status: "done",
+            verification: { ...verification, verifyGate: { triggered: false, reason: "workflow_dispatch failed or missing token" } },
+          });
+          return await finalizePr(env, afterVerify, ownerEmail, verification);
+        }
+        const afterTrigger = await updateWorkerRun(env, runId, {
+          status: "checks_running",
+          verification: {
+            ...verification,
+            verifyGate: {
+              startedAt: new Date().toISOString(),
+              workflow: run.verifyWorkflow,
+              runId: triggered.runId,
+              htmlUrl: triggered.htmlUrl,
+            },
+          },
+          verifyWorkflowRunId: triggered.runId,
+          verifyWorkflowHtmlUrl: triggered.htmlUrl,
+        });
+        return textResult({
+          run: afterTrigger,
+          status: "checks_running",
+          verifyWorkflowHtmlUrl: triggered.htmlUrl,
+        });
       }
 
-      return textResult({ run: updated, verification });
+      // No verify gate — mark done and open PR (existing behavior).
+      const updated = await updateWorkerRun(env, runId, { status: "done", verification });
+      return await finalizePr(env, updated, ownerEmail, verification);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const failure = await captureFailureSnapshot(env, runId, run.sessionId, run.repoDir, depth);

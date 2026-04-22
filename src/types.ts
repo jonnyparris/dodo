@@ -132,6 +132,8 @@ export type WorkerRunStatus =
   | "commit_created"
   | "prompt_running"
   | "push_verified"
+  | "checks_running"
+  | "checks_passed"
   | "done"
   | "failed";
 
@@ -155,6 +157,12 @@ export interface WorkerRunRecord {
   title: string;
   updatedAt: string;
   verification: Record<string, unknown> | null;
+  /** GitHub Actions workflow filename for external verification (e.g. "dodo-verify.yml"). Null = skip verify gate. */
+  verifyWorkflow?: string | null;
+  /** GitHub Actions workflow run id once triggered. */
+  verifyWorkflowRunId?: string | null;
+  /** Public URL of the workflow run for humans to inspect. */
+  verifyWorkflowHtmlUrl?: string | null;
 }
 
 export interface FailureSnapshotRecord {
