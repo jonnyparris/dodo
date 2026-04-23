@@ -560,6 +560,41 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         // previous tool results on subsequent iterations.
         let messages = await self.assembleContext();
 
+        // ─── Loop-entry oversized-prompt guard (issue #34, bug 3) ───
+        // When the user prompt itself is large (detailed dispatch prompts, long
+        // pasted logs, etc.) the first streamText() call can exceed the budget
+        // on step 0. The own-loop assumed prompts fit and relied on turn-over-
+        // turn accumulation to trigger safeguards; that gave nothing to trip in
+        // the failure mode the autocompaction feature is designed for.
+        //
+        // If we're already past the compaction threshold before step 0, force a
+        // compaction pass, set compactionTriggered so the mid-loop check doesn't
+        // fire again unnecessarily, and re-assemble.
+        const entryInputTokens = estimateMessagesTokens(messages);
+        const entryUsage = entryInputTokens / tokenBudget;
+        if (entryUsage >= MID_LOOP_COMPACTION_THRESHOLD) {
+          compactionTriggered = true;
+          log("info", "own-loop: loop-entry compaction triggered", {
+            sessionId,
+            entryInputTokens,
+            tokenBudget,
+            entryUsage: `${Math.round(entryUsage * 100)}%`,
+          });
+          try {
+            await self.maybeCompactContext({ force: true });
+            const thinkSessionId = self.getCurrentSessionId();
+            if (thinkSessionId) {
+              self.messages = self.sessions.getHistory(thinkSessionId);
+            }
+            messages = await self.assembleContext();
+          } catch (err) {
+            log("warn", "own-loop: loop-entry compaction failed", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
         while (step < maxSteps) {
           if (signal?.aborted) { exitReason = "abort"; break; }
 
