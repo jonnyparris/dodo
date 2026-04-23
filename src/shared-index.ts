@@ -9,7 +9,7 @@ function normalizeHostname(hostname: string): string {
   return hostname.trim().toLowerCase();
 }
 
-const FALLBACK_MODELS = [
+export const FALLBACK_MODELS = [
   { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_000_000 },
   { id: "openai/gpt-4.1", name: "GPT-4.1", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_000_000 },
   { id: "openai/gpt-4.1-mini", name: "GPT-4.1 Mini", provider: "OpenAI", costInput: 0.4, costOutput: 1.6, contextWindow: 1_000_000 },
@@ -27,7 +27,7 @@ const FALLBACK_MODELS = [
 /** Workers AI models available via AI Gateway's unified OpenAI-compatible endpoint.
  *  Routed with the `workers-ai/` prefix per https://developers.cloudflare.com/ai-gateway/chat-completion/
  *  These only work when `activeGateway === "ai-gateway"`. */
-const WORKERS_AI_MODELS = [
+export const WORKERS_AI_MODELS = [
   { id: "@cf/moonshotai/kimi-k2.6", name: "Kimi K2.6 (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 262_144 },
   { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B A4B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 256_000 },
   { id: "@cf/meta/llama-4-scout-17b-16e-instruct", name: "Llama 4 Scout 17B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 131_072 },

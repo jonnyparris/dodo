@@ -33,28 +33,18 @@ import {
 } from "./think-adapter";
 import type { SnapshotV2 } from "./think-adapter";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
+import { FALLBACK_MODELS, WORKERS_AI_MODELS } from "./shared-index";
 
-/** Context window sizes (in tokens) by model ID prefix. Used for token budget enforcement. */
-const CONTEXT_WINDOW_TOKENS: Record<string, number> = {
-  "anthropic/claude-sonnet-4-6": 200_000,
-  "anthropic/claude-sonnet-4-5": 200_000,
-  "anthropic/claude-haiku-3.5": 200_000,
-  "anthropic/claude-haiku-4-5": 200_000,
-  "anthropic/claude-opus-4": 200_000,
-  "anthropic/claude-opus-4-6": 200_000,
-  "openai/gpt-4.1": 1_000_000,
-  "openai/gpt-4.1-mini": 1_000_000,
-  "openai/gpt-5.4": 1_000_000,
-  "openai/o3-mini": 200_000,
-  "openai/o4-mini": 200_000,
-  "google/gemini-2.5-pro": 1_000_000,
-  "google/gemini-2.5-flash": 1_000_000,
-  "deepseek/deepseek-chat": 128_000,
-  "deepseek/deepseek-reasoner": 128_000,
-  "@cf/google/gemma-4-26b-a4b-it": 256_000,
-  "@cf/meta/llama-4-scout-17b-16e-instruct": 131_072,
-  "@cf/qwen/qwen2.5-coder-32b-instruct": 32_768,
-};
+/**
+ * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
+ *
+ * Derived from the shared model catalog in shared-index.ts so the two lists
+ * cannot drift. If a model is missing from the catalog but used at runtime,
+ * DEFAULT_CONTEXT_WINDOW applies. See issue #34.
+ */
+const CONTEXT_WINDOW_TOKENS: Record<string, number> = Object.fromEntries(
+  [...FALLBACK_MODELS, ...WORKERS_AI_MODELS].map((m) => [m.id, m.contextWindow]),
+);
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 /** Budget factor — use 80% of context window for messages, leave 20% for response. */
 const CONTEXT_BUDGET_FACTOR = 0.8;
@@ -76,6 +66,30 @@ const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
 
 /** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
 const CLEARED_MARKER = "[Old tool result content cleared]";
+
+/**
+ * Rough token estimate for a single ModelMessage.
+ *
+ * Uses ~3.5 chars per token, which lands within 10-20% of real tokenizer
+ * counts for mixed English / code / JSON payloads. The same heuristic is
+ * used inside assembleContext() for cutoff decisions — keep them in sync.
+ *
+ * Cheap enough to call on every message each step; the JSON.stringify cost
+ * is dwarfed by the LLM call that follows.
+ */
+export function estimateMessageTokens(msg: ModelMessage): number {
+  return Math.ceil(JSON.stringify(msg).length / 3.5);
+}
+
+/**
+ * Sum of estimateMessageTokens across an array. Used by the pre-step budget
+ * check and the loop-entry oversized-prompt guard in onChatMessage().
+ */
+export function estimateMessagesTokens(messages: ModelMessage[]): number {
+  let total = 0;
+  for (const m of messages) total += estimateMessageTokens(m);
+  return total;
+}
 
 /**
  * Image attachment limits — keep in sync with `public/js/dodo-chat.js`.
@@ -536,6 +550,70 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         // previous tool results on subsequent iterations.
         let messages = await self.assembleContext();
 
+        // ─── Capture the original user prompt for phase-transition digests ───
+        // The auto-continuation loop rebuilds `messages` on each phase with
+        // `[firstMsg, summaryInjection, ...recentMsgs]`, where `firstMsg`
+        // defaults to `messages[0]`. If the original user prompt is large
+        // (dispatch prompts often are), preserving it in full on every phase
+        // re-sends the whole prompt to the LLM each turn, inflating input
+        // tokens on every phase transition — the prompt ends up counted N
+        // times for N phases. See issue #34 comment about prompt duplication.
+        //
+        // We capture a short digest of the original prompt here so later
+        // phases can substitute the digest for `firstMsg` instead of the full
+        // prompt.
+        const originalFirstMsg = messages[0];
+        const originalPromptDigest = ((): string => {
+          if (!originalFirstMsg) return "";
+          const content = originalFirstMsg.content;
+          const text = typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content
+                  .map((part) => (part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part ? String(part.text) : ""))
+                  .filter(Boolean)
+                  .join("\n")
+              : "";
+          // Keep the first ~500 chars — enough to carry the goal statement
+          // without dragging the whole prompt forward.
+          return text.length > 500 ? `${text.slice(0, 500)}…[truncated, see phase summary for progress]` : text;
+        })();
+
+        // ─── Loop-entry oversized-prompt guard (issue #34, bug 3) ───
+        // When the user prompt itself is large (detailed dispatch prompts, long
+        // pasted logs, etc.) the first streamText() call can exceed the budget
+        // on step 0. The own-loop assumed prompts fit and relied on turn-over-
+        // turn accumulation to trigger safeguards; that gave nothing to trip in
+        // the failure mode the autocompaction feature is designed for.
+        //
+        // If we're already past the compaction threshold before step 0, force a
+        // compaction pass, set compactionTriggered so the mid-loop check doesn't
+        // fire again unnecessarily, and re-assemble.
+        const entryInputTokens = estimateMessagesTokens(messages);
+        const entryUsage = entryInputTokens / tokenBudget;
+        if (entryUsage >= MID_LOOP_COMPACTION_THRESHOLD) {
+          compactionTriggered = true;
+          log("info", "own-loop: loop-entry compaction triggered", {
+            sessionId,
+            entryInputTokens,
+            tokenBudget,
+            entryUsage: `${Math.round(entryUsage * 100)}%`,
+          });
+          try {
+            await self.maybeCompactContext({ force: true });
+            const thinkSessionId = self.getCurrentSessionId();
+            if (thinkSessionId) {
+              self.messages = self.sessions.getHistory(thinkSessionId);
+            }
+            messages = await self.assembleContext();
+          } catch (err) {
+            log("warn", "own-loop: loop-entry compaction failed", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
         while (step < maxSteps) {
           if (signal?.aborted) { exitReason = "abort"; break; }
 
@@ -638,7 +716,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // trigger Think's compaction system to summarize older messages.
           // After compaction, re-assemble the local messages array so it
           // picks up the compacted history (with the summary injected).
-          if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered && step >= 3) {
+          //
+          // No `step >= N` guard: a large prompt + aggressive exploration can burn
+          // through the budget in steps 0-2. The `!compactionTriggered` flag already
+          // prevents compaction from firing more than once per turn, so gating on
+          // step count only delays a necessary safety net. See issue #34.
+          if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
             compactionTriggered = true;
             try {
               await self.maybeCompactContext();
@@ -664,9 +747,66 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           }
 
           // Build final messages with injections appended
-          const finalMessages = injections.length > 0
+          let finalMessages = injections.length > 0
             ? [...messages, ...injections]
             : messages;
+
+          // ─── Pre-step budget check (issue #34, bug 2) ───
+          // cumulativeInputTokens is only updated AFTER streamText() completes,
+          // so the budget-aware injections above (warn / wrap-up / hard-stop) see
+          // counters that trail the just-finished step. If a single step burns
+          // through the budget, the next step's pre-call injection won't fire in
+          // time. Estimate the input size directly from the outgoing messages and
+          // force compaction before making the LLM call if we're already past the
+          // compaction threshold.
+          const projectedInputTokens = estimateMessagesTokens(finalMessages);
+          const projectedUsage = projectedInputTokens / tokenBudget;
+
+          if (projectedUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
+            compactionTriggered = true;
+            log("info", "own-loop: pre-step compaction triggered", {
+              sessionId,
+              step,
+              projectedInputTokens,
+              tokenBudget,
+              projectedUsage: `${Math.round(projectedUsage * 100)}%`,
+            });
+            try {
+              await self.maybeCompactContext({ force: true });
+              const thinkSessionId = self.getCurrentSessionId();
+              if (thinkSessionId) {
+                self.messages = self.sessions.getHistory(thinkSessionId);
+              }
+              messages = await self.assembleContext();
+              finalMessages = injections.length > 0
+                ? [...messages, ...injections]
+                : messages;
+            } catch (err) {
+              log("warn", "own-loop: pre-step compaction failed", {
+                sessionId,
+                step,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+
+          // Hard stop if even after compaction we're projected above the budget.
+          // Without this, streamText() is guaranteed to throw a context-overflow
+          // error — better to exit cleanly with a wrap-up message.
+          const projectedAfterCompactionTokens = estimateMessagesTokens(finalMessages);
+          const projectedAfterUsage = projectedAfterCompactionTokens / tokenBudget;
+          if (projectedAfterUsage >= HARD_STOP_THRESHOLD) {
+            log("warn", "own-loop: pre-step hard stop — projected tokens exceed budget", {
+              sessionId,
+              step,
+              projectedInputTokens: projectedAfterCompactionTokens,
+              tokenBudget,
+              projectedUsage: `${Math.round(projectedAfterUsage * 100)}%`,
+            });
+            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Stopped: context budget exhausted before next step]\n\n" };
+            exitReason = "budget-limit";
+            break;
+          }
 
           // ─── Single-step LLM call with overflow recovery (Tactic 5) ───
           // Note: Prompt cache retention (Tactic 7) requires the native @ai-sdk/anthropic
@@ -897,7 +1037,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             // messages to preserve the model's findings and plan.
             const keepRecent = 12;
             if (messages.length > keepRecent + 2) {
-              const firstMsg = messages[0];
+              // Replace the original (potentially huge) user prompt at index 0
+              // with a compact synthetic system message that carries only the
+              // goal digest. See issue #34 — re-sending the full prompt on
+              // every phase duplicated input-token cost N times for N phases.
+              const firstMsg: ModelMessage = originalPromptDigest
+                ? {
+                    role: "system" as const,
+                    content: `[Original task]\n${originalPromptDigest}`,
+                  }
+                : messages[0];
               const recentMsgs = messages.slice(-keepRecent);
               const droppedMsgs = messages.slice(1, -keepRecent);
 
