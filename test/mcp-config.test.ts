@@ -205,7 +205,7 @@ describe("McpGatekeeper interface", () => {
       type: "http" as const,
       url: "https://mcp-test.example.com",
       headers: { Authorization: "Bearer abc" },
-      auth_type: "static_headers",
+      auth_type: "static_headers" as const,
       enabled: true,
     };
 
@@ -221,7 +221,7 @@ describe("McpGatekeeper interface", () => {
       id: "wrong-type",
       name: "Wrong Type",
       type: "service-binding",
-      auth_type: "static_headers",
+      auth_type: "static_headers" as const,
       enabled: true,
     })).toThrow(/only supports type "http"/);
   });
@@ -233,7 +233,7 @@ describe("McpGatekeeper interface", () => {
       id: "no-url",
       name: "No URL",
       type: "http",
-      auth_type: "static_headers",
+      auth_type: "static_headers" as const,
       enabled: true,
     })).toThrow(/requires a url/);
   });
