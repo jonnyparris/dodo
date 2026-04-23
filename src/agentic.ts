@@ -716,6 +716,8 @@ export function buildToolsForThink(
   if (options?.agent?.mcp) {
     const sdkMcpTools = buildSdkMcpTools(options.agent.mcp, existingNames);
     Object.assign(tools, sdkMcpTools);
+  } else {
+    // TODO: If buildToolsForThink stops receiving agent.mcp, thread it through here so SDK MCP tools can be exposed.
   }
 
   return tools;
@@ -763,4 +765,51 @@ function buildMcpTools(gatekeepers: McpGatekeeper[], existingNames: Set<string>)
   return tools;
 }
 
+function slugifyToolNamespace(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "mcp";
+}
 
+function buildSdkMcpTools(
+  agentMcp: { listTools: () => unknown[]; callTool: (input: { name: string; arguments: unknown; serverId: string }) => Promise<unknown> },
+  existingNames: Set<string>,
+): Record<string, AnyTool> {
+  const tools: Record<string, AnyTool> = {};
+  const listedTools = agentMcp.listTools();
+  if (!Array.isArray(listedTools)) return tools;
+
+  for (const listedTool of listedTools) {
+    if (!listedTool || typeof listedTool !== "object") continue;
+    const toolInfo = listedTool as {
+      name?: string;
+      description?: string;
+      inputSchema?: Record<string, unknown>;
+      serverId?: string;
+      displayName?: string;
+      serverName?: string;
+      serverDisplayName?: string;
+    };
+    if (!toolInfo.name || !toolInfo.serverId) continue;
+
+    const displayName = toolInfo.displayName ?? toolInfo.serverDisplayName ?? toolInfo.serverName ?? toolInfo.serverId;
+    const prefixedName = `${slugifyToolNamespace(displayName)}__${toolInfo.name}`.slice(0, 64);
+    if (existingNames.has(prefixedName) || tools[prefixedName]) continue;
+
+    tools[prefixedName] = tool({
+      description: toolInfo.description ?? `MCP tool: ${toolInfo.name}`,
+      inputSchema: toolInfo.inputSchema
+        ? jsonSchema(toolInfo.inputSchema)
+        : jsonSchema({ type: "object", properties: {} }),
+      execute: async (args: unknown) => agentMcp.callTool({
+        name: toolInfo.name as string,
+        arguments: args,
+        serverId: toolInfo.serverId as string,
+      }),
+    });
+    existingNames.add(prefixedName);
+  }
+
+  return tools;
+}
