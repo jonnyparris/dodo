@@ -77,7 +77,7 @@ const CLEARED_MARKER = "[Old tool result content cleared]";
  * Cheap enough to call on every message each step; the JSON.stringify cost
  * is dwarfed by the LLM call that follows.
  */
-function estimateMessageTokens(msg: ModelMessage): number {
+export function estimateMessageTokens(msg: ModelMessage): number {
   return Math.ceil(JSON.stringify(msg).length / 3.5);
 }
 
@@ -85,7 +85,7 @@ function estimateMessageTokens(msg: ModelMessage): number {
  * Sum of estimateMessageTokens across an array. Used by the pre-step budget
  * check and the loop-entry oversized-prompt guard in onChatMessage().
  */
-function estimateMessagesTokens(messages: ModelMessage[]): number {
+export function estimateMessagesTokens(messages: ModelMessage[]): number {
   let total = 0;
   for (const m of messages) total += estimateMessageTokens(m);
   return total;
