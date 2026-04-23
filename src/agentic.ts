@@ -703,7 +703,7 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: BuildToolsOptions & { agent?: { mcp?: { listTools: () => unknown[]; callTool: (input: unknown) => Promise<unknown> } } },
+  options?: BuildToolsOptions & { agent?: { mcp?: any } },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
   const existingNames = new Set(Object.keys(tools));
@@ -774,7 +774,7 @@ function slugifyToolNamespace(name: string): string {
 }
 
 function buildSdkMcpTools(
-  agentMcp: { listTools: () => unknown[]; callTool: (input: unknown) => Promise<unknown> },
+  agentMcp: any,
   existingNames: Set<string>,
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
