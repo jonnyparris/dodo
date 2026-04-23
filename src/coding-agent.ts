@@ -33,28 +33,18 @@ import {
 } from "./think-adapter";
 import type { SnapshotV2 } from "./think-adapter";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
+import { FALLBACK_MODELS, WORKERS_AI_MODELS } from "./shared-index";
 
-/** Context window sizes (in tokens) by model ID prefix. Used for token budget enforcement. */
-const CONTEXT_WINDOW_TOKENS: Record<string, number> = {
-  "anthropic/claude-sonnet-4-6": 200_000,
-  "anthropic/claude-sonnet-4-5": 200_000,
-  "anthropic/claude-haiku-3.5": 200_000,
-  "anthropic/claude-haiku-4-5": 200_000,
-  "anthropic/claude-opus-4": 200_000,
-  "anthropic/claude-opus-4-6": 200_000,
-  "openai/gpt-4.1": 1_000_000,
-  "openai/gpt-4.1-mini": 1_000_000,
-  "openai/gpt-5.4": 1_000_000,
-  "openai/o3-mini": 200_000,
-  "openai/o4-mini": 200_000,
-  "google/gemini-2.5-pro": 1_000_000,
-  "google/gemini-2.5-flash": 1_000_000,
-  "deepseek/deepseek-chat": 128_000,
-  "deepseek/deepseek-reasoner": 128_000,
-  "@cf/google/gemma-4-26b-a4b-it": 256_000,
-  "@cf/meta/llama-4-scout-17b-16e-instruct": 131_072,
-  "@cf/qwen/qwen2.5-coder-32b-instruct": 32_768,
-};
+/**
+ * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
+ *
+ * Derived from the shared model catalog in shared-index.ts so the two lists
+ * cannot drift. If a model is missing from the catalog but used at runtime,
+ * DEFAULT_CONTEXT_WINDOW applies. See issue #34.
+ */
+const CONTEXT_WINDOW_TOKENS: Record<string, number> = Object.fromEntries(
+  [...FALLBACK_MODELS, ...WORKERS_AI_MODELS].map((m) => [m.id, m.contextWindow]),
+);
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 /** Budget factor — use 80% of context window for messages, leave 20% for response. */
 const CONTEXT_BUDGET_FACTOR = 0.8;
