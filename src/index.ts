@@ -9,7 +9,6 @@ import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
 import { createDodoCodeModeMcpServer } from "./mcp-codemode";
-import { MCP_CATALOG } from "./mcp-catalog";
 import { fetchAttachment } from "./attachments";
 import { AllowlistOutbound } from "./outbound";
 import { RateLimiter } from "./rate-limit";
@@ -491,6 +490,32 @@ app.delete("/api/admin/errors", adminGuard as never, async (c) => proxyToSharedI
 app.post("/api/admin/health-check", adminGuard as never, async (c) => {
   const report = await runHealthCheck(c.env, c.executionCtx);
   return c.json(report);
+});
+
+app.get("/api/admin/approved-mcps", async (c) => {
+  const email = c.get("userEmail");
+  if (!isAdmin(email, c.env)) return c.json({ error: "forbidden" }, 403);
+  return proxyToUserControl(c.env, email, "/approved-mcps", { method: "GET" });
+});
+
+app.post("/api/admin/approved-mcps", async (c) => {
+  const email = c.get("userEmail");
+  if (!isAdmin(email, c.env)) return c.json({ error: "forbidden" }, 403);
+  const body = await c.req.raw.clone().text();
+  return proxyToUserControl(c.env, email, "/approved-mcps", { method: "POST", headers: { "content-type": "application/json" }, body });
+});
+
+app.put("/api/admin/approved-mcps/:url", async (c) => {
+  const email = c.get("userEmail");
+  if (!isAdmin(email, c.env)) return c.json({ error: "forbidden" }, 403);
+  const body = await c.req.raw.clone().text();
+  return proxyToUserControl(c.env, email, `/approved-mcps/${encodeURIComponent(c.req.param("url"))}`, { method: "PUT", headers: { "content-type": "application/json" }, body });
+});
+
+app.delete("/api/admin/approved-mcps/:url", async (c) => {
+  const email = c.get("userEmail");
+  if (!isAdmin(email, c.env)) return c.json({ error: "forbidden" }, 403);
+  return proxyToUserControl(c.env, email, `/approved-mcps/${encodeURIComponent(c.req.param("url"))}`, { method: "DELETE" });
 });
 
 app.get("/api/admin/sessions", adminGuard as never, async (c) => {
@@ -976,9 +1001,25 @@ app.post("/api/mcp/refresh-state", async (c) => {
   return c.json({ ok: true });
 });
 
-// ─── MCP Catalog (static) ───
+// ─── MCP Catalog ───
 
-app.get("/api/mcp-catalog", (c) => c.json(MCP_CATALOG));
+app.get("/api/mcp-catalog", async (c) => {
+  const email = c.get("userEmail");
+  const res = await proxyToUserControl(c.env, email, "/approved-mcps", { method: "GET" });
+  const entries = await res.json() as Array<{ status: string; mcp_url: string; id: string; display_name: string; description: string | null; setup_guide: string | null; known_hosts: string[]; auth_type: string }>;
+  const catalog = entries
+    .filter((e) => e.status === "enabled")
+    .map((e) => ({
+      id: e.id,
+      name: e.display_name,
+      description: e.description ?? "",
+      url: e.mcp_url,
+      setupGuide: e.setup_guide ?? "",
+      knownHosts: e.known_hosts,
+      auth_type: e.auth_type as "oauth" | "static_headers",
+    }));
+  return c.json(catalog);
+});
 
 // ─── Browser Rendering Config ───
 

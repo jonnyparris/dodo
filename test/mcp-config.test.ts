@@ -168,6 +168,13 @@ describe("MCP Config CRUD", () => {
   });
 });
 
+describe("Approved MCP catalog admin operations", () => {
+  it("GET /api/admin/approved-mcps returns 403 for non-admin", async () => {
+    const res = await fetchJson("/api/admin/approved-mcps");
+    expect(res.status).toBe(403);
+  });
+});
+
 describe("MCP Catalog", () => {
   it("returns catalog with at least 4 entries", async () => {
     const res = await fetchJson("/api/mcp-catalog");

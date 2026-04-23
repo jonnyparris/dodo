@@ -121,7 +121,7 @@ export class UserControl extends DurableObject<Env> {
     this.db = new SqlHelper(ctx.storage.sql);
     ctx.blockConcurrencyWhile(async () => {
       this.initializeSchema();
-      this.seedDefaults();
+      await this.seedDefaults();
     });
   }
 
@@ -391,6 +391,26 @@ export class UserControl extends DurableObject<Env> {
         const gatekeeper = new HttpMcpGatekeeper(config);
         const result = await gatekeeper.testConnection();
         return Response.json(result);
+      }
+
+      if (request.method === "GET" && url.pathname === "/approved-mcps") {
+        return Response.json(this.listApprovedMcps());
+      }
+      if (request.method === "POST" && url.pathname === "/approved-mcps") {
+        const body = await request.json() as Parameters<UserControl["createApprovedMcp"]>[0];
+        this.createApprovedMcp(body);
+        return Response.json({ ok: true });
+      }
+      if (request.method === "PUT" && url.pathname.match(/^\/approved-mcps\/[^/]+$/)) {
+        const mcpUrl = decodeURIComponent(url.pathname.slice("/approved-mcps/".length));
+        const body = await request.json() as Parameters<UserControl["updateApprovedMcp"]>[1];
+        const ok = this.updateApprovedMcp(mcpUrl, body);
+        return Response.json({ ok });
+      }
+      if (request.method === "DELETE" && url.pathname.match(/^\/approved-mcps\/[^/]+$/)) {
+        const mcpUrl = decodeURIComponent(url.pathname.slice("/approved-mcps/".length));
+        const ok = this.softDeleteApprovedMcp(mcpUrl);
+        return Response.json({ ok });
       }
 
       // ─── Session MCP Overrides ───
@@ -747,6 +767,22 @@ export class UserControl extends DurableObject<Env> {
     this.db.exec("UPDATE mcp_configs SET auth_type = 'static_headers' WHERE auth_type IS NULL OR auth_type = ''");
 
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS approved_mcps (
+        mcp_url TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        description TEXT,
+        setup_guide TEXT,
+        known_hosts TEXT,
+        auth_type TEXT NOT NULL DEFAULT 'static_headers',
+        status TEXT NOT NULL DEFAULT 'enabled',
+        is_deleted INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS session_mcp_overrides (
         session_id TEXT NOT NULL,
         mcp_config_id TEXT NOT NULL,
@@ -762,7 +798,7 @@ export class UserControl extends DurableObject<Env> {
     this.db.exec("DELETE FROM failure_snapshots WHERE created_at < ?", nowEpoch() - 604800);
   }
 
-  private seedDefaults(): void {
+  private async seedDefaults(): Promise<void> {
     const now = nowEpoch();
     const defaults: AppConfig = {
       activeGateway: "opencode",
@@ -775,6 +811,27 @@ export class UserControl extends DurableObject<Env> {
 
     for (const [key, value] of Object.entries(defaults)) {
       this.db.exec("INSERT OR IGNORE INTO user_config (key, value, updated_at) VALUES (?, ?, ?)", key, String(value), now);
+    }
+
+    const existingCount = this.db.one("SELECT COUNT(*) AS n FROM approved_mcps WHERE is_deleted = 0");
+    if (Number(existingCount?.n ?? 0) === 0) {
+      const { MCP_CATALOG } = await import("./mcp-catalog");
+      const seedNow = Date.now();
+      for (const entry of MCP_CATALOG) {
+        this.db.exec(
+          `INSERT INTO approved_mcps (mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status, is_deleted, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'enabled', 0, ?, ?)`,
+          entry.url,
+          entry.id,
+          entry.name,
+          entry.description ?? null,
+          entry.setupGuide ?? null,
+          JSON.stringify(entry.knownHosts ?? []),
+          entry.auth_type ?? "static_headers",
+          seedNow,
+          seedNow,
+        );
+      }
     }
   }
 
@@ -1240,6 +1297,100 @@ export class UserControl extends DurableObject<Env> {
   private listMcpConfigsSafe(): Array<McpGatekeeperConfig & { headerKeys?: string[] }> {
     return this.db.all("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")
       .map((row) => this.mapMcpConfigRowSafe(row));
+  }
+
+  public listApprovedMcps(): Array<{
+    mcp_url: string;
+    id: string;
+    display_name: string;
+    description: string | null;
+    setup_guide: string | null;
+    known_hosts: string[];
+    auth_type: "oauth" | "static_headers";
+    status: "enabled" | "disabled";
+  }> {
+    const rows = this.db.all(
+      "SELECT mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status FROM approved_mcps WHERE is_deleted = 0 ORDER BY display_name ASC",
+    );
+    return rows.map((r) => ({
+      mcp_url: String(r.mcp_url),
+      id: String(r.id),
+      display_name: String(r.display_name),
+      description: r.description as string | null,
+      setup_guide: r.setup_guide as string | null,
+      known_hosts: JSON.parse(String(r.known_hosts ?? "[]")),
+      auth_type: r.auth_type as "oauth" | "static_headers",
+      status: r.status as "enabled" | "disabled",
+    }));
+  }
+
+  public createApprovedMcp(entry: {
+    mcp_url: string;
+    id: string;
+    display_name: string;
+    description?: string;
+    setup_guide?: string;
+    known_hosts?: string[];
+    auth_type?: "oauth" | "static_headers";
+    status?: "enabled" | "disabled";
+  }): void {
+    const now = Date.now();
+    const existing = this.db.one("SELECT mcp_url, is_deleted FROM approved_mcps WHERE mcp_url = ?", entry.mcp_url);
+    if (existing) {
+      this.db.exec(
+        `UPDATE approved_mcps
+         SET id = ?, display_name = ?, description = ?, setup_guide = ?, known_hosts = ?, auth_type = ?, status = ?, is_deleted = 0, updated_at = ?
+         WHERE mcp_url = ?`,
+        entry.id,
+        entry.display_name,
+        entry.description ?? null,
+        entry.setup_guide ?? null,
+        JSON.stringify(entry.known_hosts ?? []),
+        entry.auth_type ?? "static_headers",
+        entry.status ?? "enabled",
+        now,
+        entry.mcp_url,
+      );
+      return;
+    }
+    this.db.exec(
+      `INSERT INTO approved_mcps (mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status, is_deleted, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      entry.mcp_url,
+      entry.id,
+      entry.display_name,
+      entry.description ?? null,
+      entry.setup_guide ?? null,
+      JSON.stringify(entry.known_hosts ?? []),
+      entry.auth_type ?? "static_headers",
+      entry.status ?? "enabled",
+      now,
+      now,
+    );
+  }
+
+  public updateApprovedMcp(mcp_url: string, updates: { display_name?: string; description?: string; setup_guide?: string; status?: "enabled" | "disabled" }): boolean {
+    const existing = this.db.one("SELECT mcp_url FROM approved_mcps WHERE mcp_url = ? AND is_deleted = 0", mcp_url);
+    if (!existing) return false;
+    const setClauses: string[] = [];
+    const values: unknown[] = [];
+    if (updates.display_name !== undefined) { setClauses.push("display_name = ?"); values.push(updates.display_name); }
+    if (updates.description !== undefined) { setClauses.push("description = ?"); values.push(updates.description); }
+    if (updates.setup_guide !== undefined) { setClauses.push("setup_guide = ?"); values.push(updates.setup_guide); }
+    if (updates.status !== undefined) { setClauses.push("status = ?"); values.push(updates.status); }
+    if (setClauses.length === 0) return true;
+    setClauses.push("updated_at = ?");
+    values.push(Date.now());
+    values.push(mcp_url);
+    this.db.exec(`UPDATE approved_mcps SET ${setClauses.join(", ")} WHERE mcp_url = ?`, ...values);
+    return true;
+  }
+
+  public softDeleteApprovedMcp(mcp_url: string): boolean {
+    const existing = this.db.one("SELECT mcp_url FROM approved_mcps WHERE mcp_url = ? AND is_deleted = 0", mcp_url);
+    if (!existing) return false;
+    this.db.exec("UPDATE approved_mcps SET is_deleted = 1, updated_at = ? WHERE mcp_url = ?", Date.now(), mcp_url);
+    return true;
   }
 
   private hasKeyEnvelope(): boolean {
