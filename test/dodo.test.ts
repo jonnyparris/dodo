@@ -142,22 +142,22 @@ describe("Dodo foundation", () => {
     expect(messages.messages[1].role).toBe("assistant");
   });
 
-  it("POST /api/mcp/start-auth without auth returns 401", async () => {
+  it("POST /api/mcp/start-auth without auth returns 403", async () => {
     const ctx = createExecutionContext();
     const response = await worker.fetch(new Request(`${BASE_URL}/api/mcp/start-auth`, {
       body: JSON.stringify({ mcpUrl: "https://browser.mcp.cloudflare.com/mcp" }),
       headers: { "content-type": "application/json" },
       method: "POST",
-    }), { ...(env as Env), DEV_MODE: "false" } as Env, ctx);
+    }), { ...(env as Env), DEV_MODE: "false", ADMIN_EMAIL: "test@example.com" } as Env, ctx);
     await waitOnExecutionContext(ctx);
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(403);
   });
 
-  it("/agents/* without auth returns 401", async () => {
+  it("/agents/* without auth returns 403", async () => {
     const ctx = createExecutionContext();
-    const response = await worker.fetch(new Request(`${BASE_URL}/agents/test`, { method: "GET" }), { ...(env as Env), DEV_MODE: "false" } as Env, ctx);
+    const response = await worker.fetch(new Request(`${BASE_URL}/agents/test`, { method: "GET" }), { ...(env as Env), DEV_MODE: "false", ADMIN_EMAIL: "test@example.com" } as Env, ctx);
     await waitOnExecutionContext(ctx);
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(403);
   });
 
   it("allowlist write routes require admin", async () => {
