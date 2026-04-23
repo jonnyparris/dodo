@@ -9,6 +9,7 @@ import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
 import { createDodoCodeModeMcpServer } from "./mcp-codemode";
+import { MCP_CATALOG } from "./mcp-catalog";
 import { fetchAttachment } from "./attachments";
 import { AllowlistOutbound } from "./outbound";
 import { RateLimiter } from "./rate-limit";
