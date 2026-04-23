@@ -830,6 +830,17 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     }),
   );
 
+  server.tool("generate_image", "Generate an image with Workers AI FLUX-1-schnell and post it to the session. Bypasses the chat LLM — routes straight to the image model.", {
+    sessionId: z.string().describe("Session ID"),
+    prompt: z.string().min(1).max(2048).describe("Text prompt describing the image (1-2048 chars)"),
+  }, async ({ sessionId, prompt }) =>
+    jsonFetch(env, "agent", "/generate", {
+      sessionId,
+      depth,
+      init: { body: JSON.stringify({ content: prompt }), headers: { "content-type": "application/json" }, method: "POST" },
+    }),
+  );
+
   server.tool("abort_prompt", "Abort a running async prompt", {
     sessionId: z.string().describe("Session ID"),
   }, async ({ sessionId }) =>

@@ -33,7 +33,7 @@ import {
 } from "./think-adapter";
 import type { SnapshotV2 } from "./think-adapter";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
-import { FALLBACK_MODELS, WORKERS_AI_MODELS, FLUX_IMAGE_MODEL, FLUX_IMAGE_MEDIA_TYPE, FLUX_MAX_PROMPT_LENGTH } from "./shared-index";
+import { FALLBACK_MODELS, WORKERS_AI_MODELS, FLUX_IMAGE_MODEL, FLUX_IMAGE_MEDIA_TYPE, FLUX_MAX_PROMPT_LENGTH, extractGeneratePrompt } from "./shared-index";
 
 /**
  * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
@@ -2859,6 +2859,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
     this.ensureMetadata(sessionId, ownerEmail);
 
+    // Server-side slash command routing so /generate works from every entry
+    // point (browser UI, MCP tools, webhooks) — not just the client JS. We do
+    // this before the active-prompt check because `runImageGeneration` has its
+    // own 409 handling for that case.
+    const imagePrompt = extractGeneratePrompt(input.content);
+    if (imagePrompt) {
+      this.ensureThinkConfig(request);
+      return this.runImageGeneration({
+        prompt: imagePrompt,
+        sessionId,
+        authorEmail,
+        ownerEmail,
+      });
+    }
+
     // handleMessage is synchronous — callers (MCP, external integrations) expect the
     // assistant response in the HTTP reply. Queuing would lose the response. Keep 409.
     if (this.readMetadata("active_prompt_id")) {
@@ -2919,6 +2934,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.ensureMetadata(sessionId, ownerEmail);
     this.ensureThinkConfig(request);
 
+    // Server-side slash routing — /generate works the same whether it comes
+    // from the browser UI, an MCP `send_prompt` call, a webhook, etc. Image
+    // uploads alongside /generate are ignored (FLUX-1-schnell is text-to-image
+    // only; multi-reference inputs are FLUX.2).
+    const imagePrompt = extractGeneratePrompt(input.content);
+    if (imagePrompt) {
+      return this.runImageGeneration({
+        prompt: imagePrompt,
+        sessionId,
+        authorEmail,
+        ownerEmail,
+      });
+    }
+
     // If a prompt is already running, queue this one
     if (this.readMetadata("active_prompt_id")) {
       return this.enqueuePrompt(input.content, authorEmail);
@@ -2955,6 +2984,27 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const ownerEmail = request.headers.get("x-owner-email");
     this.ensureMetadata(sessionId, ownerEmail);
     this.ensureThinkConfig(request);
+    return this.runImageGeneration({
+      prompt: input.content,
+      sessionId,
+      authorEmail,
+      ownerEmail,
+    });
+  }
+
+  /** Shared image-generation core. Invoked by `handleGenerate` (dedicated
+   *  endpoint) and by `handleMessage`/`handlePrompt` when they detect a
+   *  `/generate` slash command in the chat content. Returns a Response so
+   *  callers can bubble errors and status codes without double-wrapping. */
+  private async runImageGeneration(opts: {
+    prompt: string;
+    sessionId: string;
+    authorEmail: string | null;
+    ownerEmail: string | null;
+  }): Promise<Response> {
+    if (opts.prompt.length > FLUX_MAX_PROMPT_LENGTH) {
+      return Response.json({ error: `Prompt exceeds ${FLUX_MAX_PROMPT_LENGTH} characters` }, { status: 400 });
+    }
 
     const thinkSessionId = this.getCurrentSessionId();
     if (!thinkSessionId) {
@@ -2970,23 +3020,23 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
 
     const promptId = crypto.randomUUID();
-    const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
+    const title = this.readMetadata("title") ?? (opts.prompt.length > 72 ? opts.prompt.slice(0, 72) + "…" : opts.prompt);
 
     this.writeMetadata("title", title);
     this.writeMetadata("active_prompt_id", promptId);
     this.writeMetadata("status", "running");
-    this.insertPrompt(promptId, input.content, "queued", authorEmail);
+    this.insertPrompt(promptId, opts.prompt, "queued", opts.authorEmail);
     await this.syncSessionIndex({ status: "running", title });
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
 
     try {
       // 1. Persist user prompt message
-      const userMsgId = this.persistGenerateUserMessage(thinkSessionId, input.content, authorEmail);
+      const userMsgId = this.persistGenerateUserMessage(thinkSessionId, opts.prompt, opts.authorEmail);
 
       // 2. Generate image via Workers AI. Pass a random seed so repeat
       //    invocations of the same prompt don't collapse to identical output.
       const raw = await this.env.AI.run(FLUX_IMAGE_MODEL, {
-        prompt: input.content,
+        prompt: opts.prompt,
         seed: Math.floor(Math.random() * 1_000_000),
       });
       // Defensive parsing — type assertions would silently break if the
@@ -2999,10 +3049,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // 3. Persist assistant message with the generated image
       const assistantResult = await this.persistGeneratedImageMessage({
         thinkSessionId,
-        sessionId,
-        prompt: input.content,
+        sessionId: opts.sessionId,
+        prompt: opts.prompt,
         imageData,
-        ownerEmail: ownerEmail ?? undefined,
+        ownerEmail: opts.ownerEmail ?? undefined,
       });
 
       await this.finishPrompt(promptId, { resultMessageId: assistantResult.messageId, status: "completed" });

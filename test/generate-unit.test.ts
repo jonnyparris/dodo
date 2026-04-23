@@ -18,12 +18,14 @@ import {
   FLUX_MAX_PROMPT_LENGTH,
   WORKERS_AI_MODELS,
   WORKERS_AI_IMAGE_MODELS,
+  extractGeneratePrompt,
+  GENERATE_SLASH_REGEX,
 } from "../src/shared-index";
 
 describe("/generate slash command regex", () => {
-  // Mirror of the client-side regex in public/js/dodo-chat.js. Duplicated as a
-  // plain literal so a regex change there forces a change here too.
-  const SLASH_REGEX = /^\/generate\s+([\s\S]+)$/i;
+  // The canonical regex ships from shared-index so server handlers and the
+  // browser client use the same matcher. Guard the shape here.
+  const SLASH_REGEX = GENERATE_SLASH_REGEX;
 
   it("matches a basic prompt", () => {
     const m = "/generate a cyberpunk cat".match(SLASH_REGEX);
@@ -108,5 +110,36 @@ describe("Workers AI model catalog", () => {
     for (const m of WORKERS_AI_IMAGE_MODELS) {
       expect(m.kind).toBe("text-to-image");
     }
+  });
+});
+
+describe("extractGeneratePrompt", () => {
+  it("returns the prompt for a valid /generate message", () => {
+    expect(extractGeneratePrompt("/generate a cat")).toBe("a cat");
+  });
+
+  it("returns null for normal chat messages", () => {
+    expect(extractGeneratePrompt("hello there")).toBeNull();
+    expect(extractGeneratePrompt("let's /generate something later")).toBeNull();
+  });
+
+  it("returns null for /generate with only whitespace after", () => {
+    // Guards against routing empty image requests to FLUX.
+    expect(extractGeneratePrompt("/generate")).toBeNull();
+    expect(extractGeneratePrompt("/generate ")).toBeNull();
+    expect(extractGeneratePrompt("/generate   \n  ")).toBeNull();
+  });
+
+  it("trims surrounding whitespace from the prompt", () => {
+    expect(extractGeneratePrompt("/generate   neon cat   ")).toBe("neon cat");
+  });
+
+  it("preserves multi-line prompts", () => {
+    expect(extractGeneratePrompt("/generate line one\nline two")).toBe("line one\nline two");
+  });
+
+  it("is case-insensitive on the command keyword", () => {
+    expect(extractGeneratePrompt("/GENERATE a dog")).toBe("a dog");
+    expect(extractGeneratePrompt("/Generate a dog")).toBe("a dog");
   });
 });

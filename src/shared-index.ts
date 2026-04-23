@@ -47,6 +47,22 @@ export const FLUX_IMAGE_MEDIA_TYPE = "image/jpeg";
 /** FLUX-1-schnell API limit per the model schema (developers.cloudflare.com/workers-ai/models/flux-1-schnell). */
 export const FLUX_MAX_PROMPT_LENGTH = 2048;
 
+/** Canonical /generate slash command regex. Shared by the server entry points
+ *  (handleMessage/handlePrompt) and the browser client so all paths agree on
+ *  what qualifies as an image-generation request. `[\s\S]+` (not `.+`) preserves
+ *  multi-line prompts — dot-any-char would clip at the first newline. */
+export const GENERATE_SLASH_REGEX = /^\/generate\s+([\s\S]+)$/i;
+
+/** Extract the image prompt from a message if it's a /generate slash command.
+ *  Returns null for normal messages. The returned prompt is trimmed; callers
+ *  should reject empty strings (whitespace-only user input). */
+export function extractGeneratePrompt(content: string): string | null {
+  const match = content.match(GENERATE_SLASH_REGEX);
+  if (!match) return null;
+  const prompt = match[1].trim();
+  return prompt.length > 0 ? prompt : null;
+}
+
 /** Provider prefixes the opencode gateway can actually route.
  *  The models.dev provider TOMLs often fall back to `anthropic/` for non-Anthropic models
  *  (kimi, glm, qwen, mimo, minimax, etc.), which the gateway then forwards to Anthropic
