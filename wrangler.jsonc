@@ -63,6 +63,9 @@
   "assets": {
     "directory": "./public"
   },
+  "ai": {
+    "binding": "AI"
+  },
   "secrets": {
     "required": ["ADMIN_EMAIL"]
   },

@@ -24,15 +24,28 @@ export const FALLBACK_MODELS = [
   { id: "deepseek/deepseek-reasoner", name: "DeepSeek Reasoner", provider: "DeepSeek", costInput: 0.55, costOutput: 2.19, contextWindow: 128_000 },
 ];
 
-/** Workers AI models available via AI Gateway's unified OpenAI-compatible endpoint.
- *  Routed with the `workers-ai/` prefix per https://developers.cloudflare.com/ai-gateway/chat-completion/
- *  These only work when `activeGateway === "ai-gateway"`. */
+/** Workers AI chat/text models — advertised in the model picker so users can
+ *  set them as their session default. Routed via AI Gateway's OpenAI-compatible
+ *  endpoint. These only work when `activeGateway === "ai-gateway"`. */
 export const WORKERS_AI_MODELS = [
   { id: "@cf/moonshotai/kimi-k2.6", name: "Kimi K2.6 (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 262_144 },
   { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B A4B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 256_000 },
   { id: "@cf/meta/llama-4-scout-17b-16e-instruct", name: "Llama 4 Scout 17B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 131_072 },
   { id: "@cf/qwen/qwen2.5-coder-32b-instruct", name: "Qwen 2.5 Coder 32B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 32_768 },
 ];
+
+/** Workers AI image-generation models. Not surfaced in the chat model picker —
+ *  they're invoked via dedicated endpoints (e.g. POST /session/:id/generate).
+ *  Kept here so the catalog is documented in one place. */
+export const WORKERS_AI_IMAGE_MODELS = [
+  { id: "@cf/black-forest-labs/flux-1-schnell", name: "FLUX.1 Schnell", provider: "Workers AI", kind: "text-to-image" },
+];
+
+/** Default model for /generate. Central constant so tests and handlers stay in sync. */
+export const FLUX_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell";
+export const FLUX_IMAGE_MEDIA_TYPE = "image/jpeg";
+/** FLUX-1-schnell API limit per the model schema (developers.cloudflare.com/workers-ai/models/flux-1-schnell). */
+export const FLUX_MAX_PROMPT_LENGTH = 2048;
 
 /** Provider prefixes the opencode gateway can actually route.
  *  The models.dev provider TOMLs often fall back to `anthropic/` for non-Anthropic models
