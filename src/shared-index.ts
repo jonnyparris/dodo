@@ -32,6 +32,7 @@ export const WORKERS_AI_MODELS = [
   { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B A4B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 256_000 },
   { id: "@cf/meta/llama-4-scout-17b-16e-instruct", name: "Llama 4 Scout 17B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 131_072 },
   { id: "@cf/qwen/qwen2.5-coder-32b-instruct", name: "Qwen 2.5 Coder 32B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 32_768 },
+  { id: "@cf/black-forest-labs/flux-1-schnell", name: "FLUX.1 Schnell (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 0 },
 ];
 
 /** Provider prefixes the opencode gateway can actually route.

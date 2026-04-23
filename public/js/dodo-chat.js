@@ -444,6 +444,19 @@ async function sendMessage(){
   sendTypingStop();
   if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}
   $("msg-input").value="";$("msg-input").style.height='auto';clearPendingImages();
+
+  // Detect /generate slash command for image generation
+  const generateMatch=content.match(/^\/generate\s+(.+)$/i);
+  if(generateMatch){
+    const prompt=generateMatch[1].trim();
+    if(!prompt)return toast("Add a prompt after /generate","warning");
+    if(isProcessing)return toast("Wait for the current response before generating","warning");
+    setProcessing(true);showThinking();
+    const result=await jsonSafe(`/session/${currentSession}/generate`,{content:prompt});
+    if(!result){setProcessing(false);hideThinking()}
+    return;
+  }
+
   const payload=images?{content,images}:{content};
   if(isProcessing){
     // Queue text-only prompts. Image-carrying prompts are blocked above.

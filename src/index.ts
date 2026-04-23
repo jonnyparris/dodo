@@ -1352,6 +1352,19 @@ app.post("/session/:id/prompt", async (c) => {
   });
 });
 
+app.post("/session/:id/generate", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const rl = promptLimiter.check(`generate:${email}`, 30, 60 * 60 * 1000);
+  if (!rl.allowed) return rateLimitedResponse(rl, "generate", email);
+  const ownerEmail = c.get("sessionOwnerEmail") || email;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/generate", {
+    "x-author-email": email,
+    "x-owner-email": ownerEmail,
+  });
+});
+
 app.get("/session/:id/ws", async (c) => {
   const upgradeHeader = c.req.header("Upgrade");
   if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {

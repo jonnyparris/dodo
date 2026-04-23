@@ -4,6 +4,7 @@ import type { SharedIndex } from "./shared-index";
 import type { UserControl } from "./user-control";
 
 export interface Env {
+  AI: Ai;
   AI_GATEWAY_BASE_URL: string;
   AI_GATEWAY_DEFAULT_MODEL?: string;
   AI_GATEWAY_KEY?: string;

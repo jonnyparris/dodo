@@ -1992,6 +1992,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return await this.handlePrompt(request);
       }
 
+      if (request.method === "POST" && url.pathname === "/generate") {
+        return await this.handleGenerate(request);
+      }
+
       if (request.method === "POST" && url.pathname === "/abort") {
         return await this.handleAbort();
       }
@@ -2938,6 +2942,156 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.setPromptFiberId(promptId, fiberId);
 
     return Response.json({ promptId, status: "queued" }, { status: 202 });
+  }
+
+  private async handleGenerate(request: Request): Promise<Response> {
+    const input = sendMessageSchema.parse(await request.json());
+    const sessionId = this.requireSessionId(request);
+    const authorEmail = request.headers.get("x-author-email");
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.ensureMetadata(sessionId, ownerEmail);
+    this.ensureThinkConfig(request);
+
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) {
+      return Response.json({ error: "No Think session" }, { status: 500 });
+    }
+
+    const promptId = crypto.randomUUID();
+    const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
+
+    this.writeMetadata("title", title);
+    this.writeMetadata("active_prompt_id", promptId);
+    this.writeMetadata("status", "running");
+    this.insertPrompt(promptId, input.content, "queued", authorEmail);
+    await this.syncSessionIndex({ status: "running", title });
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+
+    try {
+      // 1. Persist user message
+      const userMsgId = crypto.randomUUID();
+      const userMsg: UIMessage = {
+        id: userMsgId,
+        role: "user",
+        parts: [{ type: "text", text: input.content }],
+      };
+      this.sessions.append(thinkSessionId, userMsg);
+      this.insertMessageMetadata({
+        messageId: userMsgId,
+        authorEmail: authorEmail ?? null,
+        model: null,
+        provider: null,
+        tokenInput: 0,
+        tokenOutput: 0,
+      });
+      const userRecord = uiMessageToChatRecord(userMsg, {
+        messageId: userMsgId,
+        authorEmail: authorEmail ?? null,
+        model: null,
+        provider: null,
+        tokenInput: 0,
+        tokenOutput: 0,
+        createdAt: nowEpoch(),
+      });
+      this.emitEvent({ data: userRecord, type: "message" });
+
+      // 2. Generate image via Workers AI
+      const fluxResult = await this.env.AI.run("@cf/black-forest-labs/flux-1-schnell", {
+        prompt: input.content,
+      }) as { image: string };
+
+      // 3. Create assistant message with the generated image
+      const assistantMsgId = crypto.randomUUID();
+      const imageData = fluxResult.image;
+      const mediaType = "image/jpeg";
+
+      // Upload to R2
+      const attachmentRef = await uploadAttachment(this.env, {
+        sessionId,
+        messageId: assistantMsgId,
+        mediaType,
+        data: imageData,
+        source: "assistant",
+        ownerEmail: ownerEmail ?? undefined,
+      });
+
+      const assistantParts: UIMessage["parts"] = [
+        { type: "text", text: `Generated image for: "${input.content}"` },
+      ];
+      if (attachmentRef) {
+        assistantParts.push({
+          type: "file",
+          mediaType,
+          url: attachmentRef.url,
+        } as FileUIPart);
+      }
+
+      const assistantMsg: UIMessage = {
+        id: assistantMsgId,
+        role: "assistant",
+        parts: assistantParts,
+      };
+      this.sessions.append(thinkSessionId, assistantMsg);
+      this.insertMessageMetadata({
+        messageId: assistantMsgId,
+        authorEmail: null,
+        model: "@cf/black-forest-labs/flux-1-schnell",
+        provider: "Workers AI",
+        tokenInput: 0,
+        tokenOutput: 0,
+      });
+
+      if (attachmentRef) {
+        this.insertMessageAttachment({
+          messageId: assistantMsgId,
+          mediaType,
+          url: attachmentRef.url,
+          size: attachmentRef.size,
+          source: "assistant",
+        });
+      }
+
+      const assistantRecord = uiMessageToChatRecord(assistantMsg, {
+        messageId: assistantMsgId,
+        authorEmail: null,
+        model: "@cf/black-forest-labs/flux-1-schnell",
+        provider: "Workers AI",
+        tokenInput: 0,
+        tokenOutput: 0,
+        createdAt: nowEpoch(),
+      });
+
+      // Emit message + attachments events
+      this.emitEvent({ data: assistantRecord, type: "message" });
+      if (attachmentRef) {
+        this.emitEvent({
+          data: {
+            messageId: assistantMsgId,
+            attachments: rewriteAttachmentsForClient([
+              { mediaType: attachmentRef.mediaType, url: attachmentRef.url, size: attachmentRef.size },
+            ]),
+          },
+          type: "message_attachments",
+        });
+      }
+
+      await this.finishPrompt(promptId, { resultMessageId: assistantMsgId, status: "completed" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+
+      return Response.json({
+        message: assistantRecord,
+        promptId,
+        status: "completed",
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Image generation failed";
+      this.emitEvent({ data: { message }, type: "error_message" });
+      await this.finishPrompt(promptId, { error: message, status: "failed" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      return Response.json({ error: message }, { status: 502 });
+    }
   }
 
   private async handleAbort(): Promise<Response> {
