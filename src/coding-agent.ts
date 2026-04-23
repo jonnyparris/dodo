@@ -4241,6 +4241,19 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.db.exec("DELETE FROM metadata WHERE key = ?", key);
   }
 
+  async refreshMcpState(mcpId: string): Promise<void> {
+    const servers = this.getMcpServers();
+    const server = servers.servers[mcpId];
+    if (!server) throw new Error(`MCP server not found: ${mcpId}`);
+    const url = server.server_url;
+    const name = server.name ?? new URL(url).host;
+    await this.removeMcpServer(mcpId);
+    await this.addMcpServer(name, url, {
+      callbackHost: this.env.WORKER_URL,
+      callbackPath: "/agents",
+    });
+  }
+
   /**
    * Connect to enabled MCP servers for this session.
    *

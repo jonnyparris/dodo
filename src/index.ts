@@ -916,6 +916,66 @@ app.post("/api/mcp-configs/:id/test", async (c) => {
   return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}/test`, { method: "POST" });
 });
 
+// OAuth callback route for MCP server auth flows
+app.all("/agents/*", async (c) => {
+  const userEmail = c.get("userEmail");
+  const id = c.env.CODING_AGENT.idFromName(userEmail);
+  const stub = c.env.CODING_AGENT.get(id);
+  return stub.fetch(c.req.raw);
+});
+
+// Start MCP OAuth flow
+app.post("/api/mcp/start-auth", async (c) => {
+  const { mcpUrl } = await c.req.json<{ mcpUrl: string }>();
+  if (!mcpUrl) return c.json({ error: "mcpUrl required" }, 400);
+
+  const userEmail = c.get("userEmail");
+  const id = c.env.CODING_AGENT.idFromName(userEmail);
+  const stub = c.env.CODING_AGENT.get(id) as unknown as {
+    addMcpServer: (name: string, url: string, opts: { callbackHost: string; callbackPath: string }) => Promise<{ state: string; authUrl?: string; id: string }>;
+  };
+
+  const displayName = new URL(mcpUrl).host;
+
+  const result = await stub.addMcpServer(displayName, mcpUrl, {
+    callbackHost: c.env.WORKER_URL,
+    callbackPath: "/agents",
+  });
+
+  if (result.state === "authenticating") {
+    return c.json({ authUrl: result.authUrl });
+  }
+  return c.json({ message: "Connected" });
+});
+
+// Delete an MCP OAuth connection
+app.post("/api/mcp/delete-auth", async (c) => {
+  const { mcpId } = await c.req.json<{ mcpId: string }>();
+  if (!mcpId) return c.json({ error: "mcpId required" }, 400);
+
+  const userEmail = c.get("userEmail");
+  const id = c.env.CODING_AGENT.idFromName(userEmail);
+  const stub = c.env.CODING_AGENT.get(id) as unknown as {
+    removeMcpServer: (id: string) => Promise<void>;
+  };
+  await stub.removeMcpServer(mcpId);
+  return c.json({ ok: true });
+});
+
+// Refresh an MCP connection (remove + re-add)
+app.post("/api/mcp/refresh-state", async (c) => {
+  const { mcpId } = await c.req.json<{ mcpId: string }>();
+  if (!mcpId) return c.json({ error: "mcpId required" }, 400);
+
+  const userEmail = c.get("userEmail");
+  const id = c.env.CODING_AGENT.idFromName(userEmail);
+  const stub = c.env.CODING_AGENT.get(id) as unknown as {
+    refreshMcpState: (id: string) => Promise<void>;
+  };
+  await stub.refreshMcpState(mcpId);
+  return c.json({ ok: true });
+});
+
 // ─── MCP Catalog (static) ───
 
 app.get("/api/mcp-catalog", (c) => c.json(MCP_CATALOG));
