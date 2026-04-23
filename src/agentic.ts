@@ -19,6 +19,7 @@ export interface BuildToolsOptions {
   ownerId?: string;
   ownerEmail?: string;
   stateBackend?: StateBackend;
+  mcpGatekeepers?: McpGatekeeper[];
   /** Session ID — required to scope attachment R2 keys. */
   sessionId?: string;
   /**
@@ -702,7 +703,7 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: BuildToolsOptions & { agent?: { mcp?: { listTools: () => unknown[]; callTool: (input: { name: string; arguments: unknown; serverId: string }) => Promise<unknown> } } },
+  options?: BuildToolsOptions & { agent?: { mcp?: { listTools: () => unknown[]; callTool: (input: unknown) => Promise<unknown> } } },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
   const existingNames = new Set(Object.keys(tools));
@@ -773,7 +774,7 @@ function slugifyToolNamespace(name: string): string {
 }
 
 function buildSdkMcpTools(
-  agentMcp: { listTools: () => unknown[]; callTool: (input: { name: string; arguments: unknown; serverId: string }) => Promise<unknown> },
+  agentMcp: { listTools: () => unknown[]; callTool: (input: unknown) => Promise<unknown> },
   existingNames: Set<string>,
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
