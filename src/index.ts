@@ -3,7 +3,7 @@ import { createMcpHandler } from "agents/mcp";
 import { newRpcResponse } from "@hono/capnweb";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { AuthError, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, verifyAccess } from "./auth";
+import { AuthError, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, resolveAdminEmail, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
 import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
@@ -43,7 +43,7 @@ function maybeCleanupRateLimiters() {
 
 type PermissionLevel = "readonly" | "readwrite" | "write" | "admin";
 
-type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail: string; sessionPermission: PermissionLevel; sessionOwnerEmail: string } };
+type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail: string; sessionPermission: PermissionLevel; sessionOwnerEmail: string; mcpServiceMode: boolean } };
 
 const app = new Hono<HonoEnv>();
 
@@ -205,18 +205,40 @@ export function requirePermission(
 const MAX_MCP_DEPTH = 3;
 
 app.all("/mcp", async (c) => {
-  const token = c.req.header("Authorization")?.replace("Bearer ", "");
-  if (!c.env.DODO_MCP_TOKEN || token !== c.env.DODO_MCP_TOKEN) {
+  const authHeader = c.req.header("Authorization") ?? "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
     return c.json({ error: "Invalid or missing MCP token" }, 401);
   }
 
-  // Loop protection: reject requests that exceed recursion depth
+  let resolvedEmail: string | null = null;
+  let isServiceMode = false;
+  if (token.startsWith("dodo_")) {
+    const lookupRes = await proxyToUserControl(c.env, "", `/user-mcp-tokens/lookup/${encodeURIComponent(token)}`, { method: "GET" });
+    const row = await lookupRes.json() as { email: string } | null;
+    if (row?.email) {
+      resolvedEmail = row.email;
+    }
+  }
+
+  if (!resolvedEmail && c.env.DODO_MCP_TOKEN && token === c.env.DODO_MCP_TOKEN) {
+    isServiceMode = true;
+    resolvedEmail = resolveAdminEmail(c.env);
+  }
+
+  if (!resolvedEmail) {
+    return c.json({ error: "Invalid or missing MCP token" }, 401);
+  }
+
+  c.set("userEmail", resolvedEmail);
+  c.set("mcpServiceMode", isServiceMode);
+
   const depth = parseInt(c.req.header("x-dodo-mcp-depth") ?? "0", 10) || 0;
   if (depth >= MAX_MCP_DEPTH) {
     return c.json({ error: "MCP recursion depth exceeded" }, 429);
   }
 
-  const server = createDodoMcpServer(c.env, depth);
+  const server = createDodoMcpServer(c.env, resolvedEmail, depth);
   const handler = createMcpHandler(server);
   return handler(c.req.raw, c.env, c.executionCtx);
 });
@@ -224,10 +246,33 @@ app.all("/mcp", async (c) => {
 // Code-mode MCP: 2 tools (search + execute) instead of 40+.
 // Use this endpoint for MCP connections from coding agents to minimize context usage.
 app.all("/mcp/codemode", async (c) => {
-  const token = c.req.header("Authorization")?.replace("Bearer ", "");
-  if (!c.env.DODO_MCP_TOKEN || token !== c.env.DODO_MCP_TOKEN) {
+  const authHeader = c.req.header("Authorization") ?? "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
     return c.json({ error: "Invalid or missing MCP token" }, 401);
   }
+
+  let resolvedEmail: string | null = null;
+  let isServiceMode = false;
+  if (token.startsWith("dodo_")) {
+    const lookupRes = await proxyToUserControl(c.env, "", `/user-mcp-tokens/lookup/${encodeURIComponent(token)}`, { method: "GET" });
+    const row = await lookupRes.json() as { email: string } | null;
+    if (row?.email) {
+      resolvedEmail = row.email;
+    }
+  }
+
+  if (!resolvedEmail && c.env.DODO_MCP_TOKEN && token === c.env.DODO_MCP_TOKEN) {
+    isServiceMode = true;
+    resolvedEmail = resolveAdminEmail(c.env);
+  }
+
+  if (!resolvedEmail) {
+    return c.json({ error: "Invalid or missing MCP token" }, 401);
+  }
+
+  c.set("userEmail", resolvedEmail);
+  c.set("mcpServiceMode", isServiceMode);
 
   const depth = parseInt(c.req.header("x-dodo-mcp-depth") ?? "0", 10) || 0;
   if (depth >= MAX_MCP_DEPTH) {
@@ -857,6 +902,34 @@ app.get("/api/secrets/:key/test", async (c) => {
 });
 
 // ─── MCP Configs (per-user via UserControl) ───
+
+app.get("/api/user/mcp-tokens", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/user-mcp-tokens", {
+    method: "GET",
+    headers: { "x-owner-email": email },
+  });
+});
+
+app.post("/api/user/mcp-tokens", async (c) => {
+  const email = c.get("userEmail");
+  const body = await c.req.raw.clone().text();
+  const parsed = body ? JSON.parse(body) as { label?: string } : {};
+  return proxyToUserControl(c.env, email, "/user-mcp-tokens", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, label: parsed.label }),
+  });
+});
+
+app.delete("/api/user/mcp-tokens/:token", async (c) => {
+  const email = c.get("userEmail");
+  const token = c.req.param("token");
+  return proxyToUserControl(c.env, email, `/user-mcp-tokens/${encodeURIComponent(token)}`, {
+    method: "DELETE",
+    headers: { "x-owner-email": email },
+  });
+});
 
 app.get("/api/mcp-configs", async (c) => {
   const email = c.get("userEmail");

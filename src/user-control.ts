@@ -382,6 +382,27 @@ export class UserControl extends DurableObject<Env> {
         return Response.json({ deleted: true, id });
       }
 
+      if (request.method === "POST" && url.pathname === "/user-mcp-tokens") {
+        const { email, label } = await request.json() as { email: string; label?: string };
+        const result = this.createUserMcpToken(email, label);
+        return Response.json(result);
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/user-mcp-tokens/lookup/")) {
+        const token = decodeURIComponent(url.pathname.slice("/user-mcp-tokens/lookup/".length));
+        const result = this.lookupUserMcpToken(token);
+        return Response.json(result);
+      }
+      if (request.method === "GET" && url.pathname === "/user-mcp-tokens") {
+        const email = request.headers.get("x-owner-email") ?? "";
+        return Response.json(this.listUserMcpTokens(email));
+      }
+      if (request.method === "DELETE" && url.pathname.match(/^\/user-mcp-tokens\/[^/]+$/)) {
+        const token = decodeURIComponent(url.pathname.slice("/user-mcp-tokens/".length));
+        const email = request.headers.get("x-owner-email") ?? "";
+        const ok = this.deleteUserMcpToken(email, token);
+        return Response.json({ ok });
+      }
+
       if (request.method === "POST" && url.pathname.match(/^\/mcp-configs\/[^/]+\/test$/)) {
         const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
         const row = this.db.one("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
@@ -790,6 +811,17 @@ export class UserControl extends DurableObject<Env> {
         PRIMARY KEY (session_id, mcp_config_id)
       )
     `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS user_mcp_tokens (
+        token TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        label TEXT,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER
+      )
+    `);
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_email ON user_mcp_tokens (email)");
 
     // TTL cleanup: remove fork snapshots older than 1 hour
     const oneHourAgo = nowEpoch() - 3600;
@@ -1297,6 +1329,48 @@ export class UserControl extends DurableObject<Env> {
   private listMcpConfigsSafe(): Array<McpGatekeeperConfig & { headerKeys?: string[] }> {
     return this.db.all("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")
       .map((row) => this.mapMcpConfigRowSafe(row));
+  }
+
+  public createUserMcpToken(email: string, label?: string): { token: string; created_at: number } {
+    const token = `dodo_${crypto.randomUUID().replace(/-/g, "")}`;
+    const now = Date.now();
+    this.db.exec(
+      "INSERT INTO user_mcp_tokens (token, email, label, created_at, last_used_at) VALUES (?, ?, ?, ?, NULL)",
+      token, email, label ?? null, now,
+    );
+    return { token, created_at: now };
+  }
+
+  public lookupUserMcpToken(token: string): { email: string; label: string | null; created_at: number } | null {
+    const row = this.db.one("SELECT email, label, created_at FROM user_mcp_tokens WHERE token = ?", token);
+    if (!row) return null;
+    this.db.exec("UPDATE user_mcp_tokens SET last_used_at = ? WHERE token = ?", Date.now(), token);
+    return {
+      email: String(row.email),
+      label: row.label as string | null,
+      created_at: Number(row.created_at),
+    };
+  }
+
+  public listUserMcpTokens(email: string): Array<{ token_prefix: string; label: string | null; created_at: number; last_used_at: number | null }> {
+    const rows = this.db.all(
+      "SELECT token, label, created_at, last_used_at FROM user_mcp_tokens WHERE email = ? ORDER BY created_at DESC",
+      email,
+    );
+    return rows.map((r) => ({
+      token_prefix: String(r.token).slice(0, 12) + "…",
+      label: r.label as string | null,
+      created_at: Number(r.created_at),
+      last_used_at: r.last_used_at === null ? null : Number(r.last_used_at),
+    }));
+  }
+
+  public deleteUserMcpToken(email: string, token: string): boolean {
+    const existing = this.db.one("SELECT email FROM user_mcp_tokens WHERE token = ?", token);
+    if (!existing) return false;
+    if (String(existing.email) !== email) return false;
+    this.db.exec("DELETE FROM user_mcp_tokens WHERE token = ?", token);
+    return true;
   }
 
   public listApprovedMcps(): Array<{
