@@ -33,7 +33,7 @@ import {
 } from "./think-adapter";
 import type { SnapshotV2 } from "./think-adapter";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
-import { FALLBACK_MODELS, WORKERS_AI_MODELS } from "./shared-index";
+import { FALLBACK_MODELS, WORKERS_AI_MODELS, FLUX_IMAGE_MODEL, FLUX_IMAGE_MEDIA_TYPE, FLUX_MAX_PROMPT_LENGTH } from "./shared-index";
 
 /**
  * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
@@ -117,6 +117,10 @@ const imageAttachmentSchema = z.object({
 const sendMessageSchema = z.object({
   content: z.string().trim().min(1),
   images: z.array(imageAttachmentSchema).max(MAX_IMAGES_PER_MESSAGE).optional(),
+}).strict();
+/** /generate schema — FLUX-1-schnell rejects >2048 chars, so enforce at the edge. */
+const generateImageSchema = z.object({
+  content: z.string().trim().min(1).max(FLUX_MAX_PROMPT_LENGTH),
 }).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
 const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
@@ -2945,7 +2949,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private async handleGenerate(request: Request): Promise<Response> {
-    const input = sendMessageSchema.parse(await request.json());
+    const input = generateImageSchema.parse(await request.json());
     const sessionId = this.requireSessionId(request);
     const authorEmail = request.headers.get("x-author-email");
     const ownerEmail = request.headers.get("x-owner-email");
@@ -2955,6 +2959,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const thinkSessionId = this.getCurrentSessionId();
     if (!thinkSessionId) {
       return Response.json({ error: "No Think session" }, { status: 500 });
+    }
+
+    // Reject when another prompt is already running so we don't corrupt
+    // `active_prompt_id` or dequeue another user's queued prompt on finish.
+    // Matches `handleMessage`'s 409 behaviour — /generate is synchronous so
+    // queueing would lose the response anyway.
+    if (this.readMetadata("active_prompt_id")) {
+      return Response.json({ error: "A prompt is already running" }, { status: 409 });
     }
 
     const promptId = crypto.randomUUID();
@@ -2968,121 +2980,40 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
 
     try {
-      // 1. Persist user message
-      const userMsgId = crypto.randomUUID();
-      const userMsg: UIMessage = {
-        id: userMsgId,
-        role: "user",
-        parts: [{ type: "text", text: input.content }],
-      };
-      this.sessions.append(thinkSessionId, userMsg);
-      this.insertMessageMetadata({
-        messageId: userMsgId,
-        authorEmail: authorEmail ?? null,
-        model: null,
-        provider: null,
-        tokenInput: 0,
-        tokenOutput: 0,
-      });
-      const userRecord = uiMessageToChatRecord(userMsg, {
-        messageId: userMsgId,
-        authorEmail: authorEmail ?? null,
-        model: null,
-        provider: null,
-        tokenInput: 0,
-        tokenOutput: 0,
-        createdAt: nowEpoch(),
-      });
-      this.emitEvent({ data: userRecord, type: "message" });
+      // 1. Persist user prompt message
+      const userMsgId = this.persistGenerateUserMessage(thinkSessionId, input.content, authorEmail);
 
-      // 2. Generate image via Workers AI
-      const fluxResult = await this.env.AI.run("@cf/black-forest-labs/flux-1-schnell", {
+      // 2. Generate image via Workers AI. Pass a random seed so repeat
+      //    invocations of the same prompt don't collapse to identical output.
+      const raw = await this.env.AI.run(FLUX_IMAGE_MODEL, {
         prompt: input.content,
-      }) as { image: string };
+        seed: Math.floor(Math.random() * 1_000_000),
+      });
+      // Defensive parsing — type assertions would silently break if the
+      // Workers AI response shape ever drifts (it already has for FLUX.2).
+      if (!raw || typeof raw !== "object" || typeof (raw as { image?: unknown }).image !== "string" || !(raw as { image: string }).image) {
+        throw new Error("FLUX returned unexpected response shape");
+      }
+      const imageData = (raw as { image: string }).image;
 
-      // 3. Create assistant message with the generated image
-      const assistantMsgId = crypto.randomUUID();
-      const imageData = fluxResult.image;
-      const mediaType = "image/jpeg";
-
-      // Upload to R2
-      const attachmentRef = await uploadAttachment(this.env, {
+      // 3. Persist assistant message with the generated image
+      const assistantResult = await this.persistGeneratedImageMessage({
+        thinkSessionId,
         sessionId,
-        messageId: assistantMsgId,
-        mediaType,
-        data: imageData,
-        source: "assistant",
+        prompt: input.content,
+        imageData,
         ownerEmail: ownerEmail ?? undefined,
       });
 
-      const assistantParts: UIMessage["parts"] = [
-        { type: "text", text: `Generated image for: "${input.content}"` },
-      ];
-      if (attachmentRef) {
-        assistantParts.push({
-          type: "file",
-          mediaType,
-          url: attachmentRef.url,
-        } as FileUIPart);
-      }
-
-      const assistantMsg: UIMessage = {
-        id: assistantMsgId,
-        role: "assistant",
-        parts: assistantParts,
-      };
-      this.sessions.append(thinkSessionId, assistantMsg);
-      this.insertMessageMetadata({
-        messageId: assistantMsgId,
-        authorEmail: null,
-        model: "@cf/black-forest-labs/flux-1-schnell",
-        provider: "Workers AI",
-        tokenInput: 0,
-        tokenOutput: 0,
-      });
-
-      if (attachmentRef) {
-        this.insertMessageAttachment({
-          messageId: assistantMsgId,
-          mediaType,
-          url: attachmentRef.url,
-          size: attachmentRef.size,
-          source: "assistant",
-        });
-      }
-
-      const assistantRecord = uiMessageToChatRecord(assistantMsg, {
-        messageId: assistantMsgId,
-        authorEmail: null,
-        model: "@cf/black-forest-labs/flux-1-schnell",
-        provider: "Workers AI",
-        tokenInput: 0,
-        tokenOutput: 0,
-        createdAt: nowEpoch(),
-      });
-
-      // Emit message + attachments events
-      this.emitEvent({ data: assistantRecord, type: "message" });
-      if (attachmentRef) {
-        this.emitEvent({
-          data: {
-            messageId: assistantMsgId,
-            attachments: rewriteAttachmentsForClient([
-              { mediaType: attachmentRef.mediaType, url: attachmentRef.url, size: attachmentRef.size },
-            ]),
-          },
-          type: "message_attachments",
-        });
-      }
-
-      await this.finishPrompt(promptId, { resultMessageId: assistantMsgId, status: "completed" });
+      await this.finishPrompt(promptId, { resultMessageId: assistantResult.messageId, status: "completed" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
       this.emitEvent({ data: this.listPrompts(), type: "prompt" });
 
       return Response.json({
-        message: assistantRecord,
+        message: assistantResult.record,
         promptId,
         status: "completed",
+        userMsgId,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Image generation failed";
@@ -3092,6 +3023,130 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       this.emitEvent({ data: this.listPrompts(), type: "prompt" });
       return Response.json({ error: message }, { status: 502 });
     }
+  }
+
+  /** Persist the user's /generate prompt as a regular text message and emit a
+   *  `message` SSE event so the UI renders it identically to a chat prompt. */
+  private persistGenerateUserMessage(thinkSessionId: string, content: string, authorEmail: string | null): string {
+    const userMsgId = crypto.randomUUID();
+    const userMsg: UIMessage = {
+      id: userMsgId,
+      role: "user",
+      parts: [{ type: "text", text: content }],
+    };
+    this.sessions.append(thinkSessionId, userMsg);
+    this.insertMessageMetadata({
+      messageId: userMsgId,
+      authorEmail: authorEmail ?? null,
+      model: null,
+      provider: null,
+      tokenInput: 0,
+      tokenOutput: 0,
+    });
+    const userRecord = uiMessageToChatRecord(userMsg, {
+      messageId: userMsgId,
+      authorEmail: authorEmail ?? null,
+      model: null,
+      provider: null,
+      tokenInput: 0,
+      tokenOutput: 0,
+      createdAt: nowEpoch(),
+    });
+    this.emitEvent({ data: userRecord, type: "message" });
+    return userMsgId;
+  }
+
+  /** Upload the FLUX-generated image to R2 and persist it as an assistant
+   *  message. If R2 is unavailable the message falls back to an inline data
+   *  URL so the user still sees the image rather than a silent stub — this
+   *  matches the design contract in `src/attachments.ts`. */
+  private async persistGeneratedImageMessage(opts: {
+    thinkSessionId: string;
+    sessionId: string;
+    prompt: string;
+    imageData: string;
+    ownerEmail: string | undefined;
+  }): Promise<{ messageId: string; record: ChatMessageRecord }> {
+    const assistantMsgId = crypto.randomUUID();
+    const mediaType = FLUX_IMAGE_MEDIA_TYPE;
+
+    const attachmentRef = await uploadAttachment(this.env, {
+      sessionId: opts.sessionId,
+      messageId: assistantMsgId,
+      mediaType,
+      data: opts.imageData,
+      source: "assistant",
+      ownerEmail: opts.ownerEmail,
+    });
+
+    // Short, non-verbose caption — the image carries the meaning. Truncate the
+    // prompt so a 2000-char prompt doesn't dominate the bubble.
+    const preview = opts.prompt.length > 80 ? `${opts.prompt.slice(0, 80).trimEnd()}…` : opts.prompt;
+    const assistantParts: UIMessage["parts"] = [
+      { type: "text", text: `🎨 ${preview}` },
+    ];
+    // Prefer the R2-backed URL; fall back to an inline data URL when R2 is
+    // unavailable so the UI still renders something useful in local dev.
+    const imageUrl = attachmentRef?.url ?? `data:${mediaType};base64,${opts.imageData}`;
+    assistantParts.push({
+      type: "file",
+      mediaType,
+      url: imageUrl,
+    } as FileUIPart);
+
+    const assistantMsg: UIMessage = {
+      id: assistantMsgId,
+      role: "assistant",
+      parts: assistantParts,
+    };
+    this.sessions.append(opts.thinkSessionId, assistantMsg);
+    this.insertMessageMetadata({
+      messageId: assistantMsgId,
+      authorEmail: null,
+      model: FLUX_IMAGE_MODEL,
+      provider: "Workers AI",
+      tokenInput: 0,
+      tokenOutput: 0,
+    });
+
+    if (attachmentRef) {
+      this.insertMessageAttachment({
+        messageId: assistantMsgId,
+        mediaType,
+        url: attachmentRef.url,
+        size: attachmentRef.size,
+        source: "assistant",
+      });
+    } else {
+      log("warn", "persistGeneratedImageMessage: R2 unavailable, falling back to inline data URL", {
+        sessionId: opts.sessionId,
+      });
+    }
+
+    const record = uiMessageToChatRecord(assistantMsg, {
+      messageId: assistantMsgId,
+      authorEmail: null,
+      model: FLUX_IMAGE_MODEL,
+      provider: "Workers AI",
+      tokenInput: 0,
+      tokenOutput: 0,
+      createdAt: nowEpoch(),
+    });
+
+    this.emitEvent({ data: record, type: "message" });
+    if (attachmentRef) {
+      this.emitEvent({
+        data: {
+          messageId: assistantMsgId,
+          attachments: rewriteAttachmentsForClient([
+            { mediaType: attachmentRef.mediaType, url: attachmentRef.url, size: attachmentRef.size },
+          ]),
+        },
+        type: "message_attachments",
+      });
+    }
+
+    return { messageId: assistantMsgId, record };
   }
 
   private async handleAbort(): Promise<Response> {

@@ -445,8 +445,9 @@ async function sendMessage(){
   if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}
   $("msg-input").value="";$("msg-input").style.height='auto';clearPendingImages();
 
-  // Detect /generate slash command for image generation
-  const generateMatch=content.match(/^\/generate\s+(.+)$/i);
+  // Detect /generate slash command for image generation.
+  // `[\s\S]+` (not `.+`) so multi-line prompts survive — `.` doesn't cross newlines by default.
+  const generateMatch=content.match(/^\/generate\s+([\s\S]+)$/i);
   if(generateMatch){
     const prompt=generateMatch[1].trim();
     if(!prompt)return toast("Add a prompt after /generate","warning");
