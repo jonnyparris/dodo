@@ -947,7 +947,10 @@ app.all("/agents/*", async (c) => {
   const userEmail = c.get("userEmail");
   const id = c.env.CODING_AGENT.idFromName(userEmail);
   const stub = c.env.CODING_AGENT.get(id);
-  return stub.fetch(c.req.raw);
+  const h = new Headers(c.req.raw.headers);
+  h.set("x-dodo-owner-email", userEmail);
+  const req = new Request(c.req.raw, { headers: h });
+  return stub.fetch(req);
 });
 
 // Start MCP OAuth flow
