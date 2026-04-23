@@ -78,6 +78,30 @@ const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
 const CLEARED_MARKER = "[Old tool result content cleared]";
 
 /**
+ * Rough token estimate for a single ModelMessage.
+ *
+ * Uses ~3.5 chars per token, which lands within 10-20% of real tokenizer
+ * counts for mixed English / code / JSON payloads. The same heuristic is
+ * used inside assembleContext() for cutoff decisions — keep them in sync.
+ *
+ * Cheap enough to call on every message each step; the JSON.stringify cost
+ * is dwarfed by the LLM call that follows.
+ */
+function estimateMessageTokens(msg: ModelMessage): number {
+  return Math.ceil(JSON.stringify(msg).length / 3.5);
+}
+
+/**
+ * Sum of estimateMessageTokens across an array. Used by the pre-step budget
+ * check and the loop-entry oversized-prompt guard in onChatMessage().
+ */
+function estimateMessagesTokens(messages: ModelMessage[]): number {
+  let total = 0;
+  for (const m of messages) total += estimateMessageTokens(m);
+  return total;
+}
+
+/**
  * Image attachment limits — keep in sync with `public/js/dodo-chat.js`.
  * Base64 encodes 3 bytes → 4 chars, so MAX_IMAGE_BASE64_LENGTH ≈ MAX_IMAGE_BYTES * 4/3.
  * Kept tight to protect the DO isolate: 5 images × 4MB base64 = 20MB peak payload.
@@ -669,9 +693,66 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           }
 
           // Build final messages with injections appended
-          const finalMessages = injections.length > 0
+          let finalMessages = injections.length > 0
             ? [...messages, ...injections]
             : messages;
+
+          // ─── Pre-step budget check (issue #34, bug 2) ───
+          // cumulativeInputTokens is only updated AFTER streamText() completes,
+          // so the budget-aware injections above (warn / wrap-up / hard-stop) see
+          // counters that trail the just-finished step. If a single step burns
+          // through the budget, the next step's pre-call injection won't fire in
+          // time. Estimate the input size directly from the outgoing messages and
+          // force compaction before making the LLM call if we're already past the
+          // compaction threshold.
+          const projectedInputTokens = estimateMessagesTokens(finalMessages);
+          const projectedUsage = projectedInputTokens / tokenBudget;
+
+          if (projectedUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
+            compactionTriggered = true;
+            log("info", "own-loop: pre-step compaction triggered", {
+              sessionId,
+              step,
+              projectedInputTokens,
+              tokenBudget,
+              projectedUsage: `${Math.round(projectedUsage * 100)}%`,
+            });
+            try {
+              await self.maybeCompactContext({ force: true });
+              const thinkSessionId = self.getCurrentSessionId();
+              if (thinkSessionId) {
+                self.messages = self.sessions.getHistory(thinkSessionId);
+              }
+              messages = await self.assembleContext();
+              finalMessages = injections.length > 0
+                ? [...messages, ...injections]
+                : messages;
+            } catch (err) {
+              log("warn", "own-loop: pre-step compaction failed", {
+                sessionId,
+                step,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+
+          // Hard stop if even after compaction we're projected above the budget.
+          // Without this, streamText() is guaranteed to throw a context-overflow
+          // error — better to exit cleanly with a wrap-up message.
+          const projectedAfterCompactionTokens = estimateMessagesTokens(finalMessages);
+          const projectedAfterUsage = projectedAfterCompactionTokens / tokenBudget;
+          if (projectedAfterUsage >= HARD_STOP_THRESHOLD) {
+            log("warn", "own-loop: pre-step hard stop — projected tokens exceed budget", {
+              sessionId,
+              step,
+              projectedInputTokens: projectedAfterCompactionTokens,
+              tokenBudget,
+              projectedUsage: `${Math.round(projectedAfterUsage * 100)}%`,
+            });
+            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Stopped: context budget exhausted before next step]\n\n" };
+            exitReason = "budget-limit";
+            break;
+          }
 
           // ─── Single-step LLM call with overflow recovery (Tactic 5) ───
           // Note: Prompt cache retention (Tactic 7) requires the native @ai-sdk/anthropic
