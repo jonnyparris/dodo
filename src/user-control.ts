@@ -384,7 +384,7 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "POST" && url.pathname === "/user-mcp-tokens") {
         const { email, label } = await request.json() as { email: string; label?: string };
-        const result = this.createUserMcpToken(email, label);
+        const result = await this.createUserMcpToken(email, label);
         return Response.json(result);
       }
       if (request.method === "GET" && url.pathname.startsWith("/user-mcp-tokens/lookup/")) {
@@ -399,7 +399,7 @@ export class UserControl extends DurableObject<Env> {
       if (request.method === "DELETE" && url.pathname.match(/^\/user-mcp-tokens\/[^/]+$/)) {
         const token = decodeURIComponent(url.pathname.slice("/user-mcp-tokens/".length));
         const email = request.headers.get("x-owner-email") ?? "";
-        const ok = this.deleteUserMcpToken(email, token);
+        const ok = await this.deleteUserMcpToken(email, token);
         return Response.json({ ok });
       }
 
@@ -1331,13 +1331,28 @@ export class UserControl extends DurableObject<Env> {
       .map((row) => this.mapMcpConfigRowSafe(row));
   }
 
-  public createUserMcpToken(email: string, label?: string): { token: string; created_at: number } {
+  public async createUserMcpToken(email: string, label?: string): Promise<{ token: string; created_at: number }> {
     const token = `dodo_${crypto.randomUUID().replace(/-/g, "")}`;
+    const normalisedEmail = email.trim().toLowerCase();
     const now = Date.now();
     this.db.exec(
       "INSERT INTO user_mcp_tokens (token, email, label, created_at, last_used_at) VALUES (?, ?, ?, ?, NULL)",
-      token, email, label ?? null, now,
+      token, normalisedEmail, label ?? null, now,
     );
+    // Sync to SharedIndex so /mcp can look the token up without knowing
+    // which user's DO to ask. Best-effort — if the index write fails, the
+    // token can still be authenticated via the fallback DODO_MCP_TOKEN, but
+    // user-scoped auth will not work for this token.
+    try {
+      const sharedIndex = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
+      await sharedIndex.fetch("https://shared-index/mcp-token-index", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token, email: normalisedEmail }),
+      });
+    } catch (err) {
+      console.warn("[user-control] Failed to sync token to SharedIndex:", err);
+    }
     return { token, created_at: now };
   }
 
@@ -1355,7 +1370,7 @@ export class UserControl extends DurableObject<Env> {
   public listUserMcpTokens(email: string): Array<{ token_prefix: string; label: string | null; created_at: number; last_used_at: number | null }> {
     const rows = this.db.all(
       "SELECT token, label, created_at, last_used_at FROM user_mcp_tokens WHERE email = ? ORDER BY created_at DESC",
-      email,
+      email.trim().toLowerCase(),
     );
     return rows.map((r) => ({
       token_prefix: String(r.token).slice(0, 12) + "…",
@@ -1365,11 +1380,19 @@ export class UserControl extends DurableObject<Env> {
     }));
   }
 
-  public deleteUserMcpToken(email: string, token: string): boolean {
+  public async deleteUserMcpToken(email: string, token: string): Promise<boolean> {
     const existing = this.db.one("SELECT email FROM user_mcp_tokens WHERE token = ?", token);
     if (!existing) return false;
-    if (String(existing.email) !== email) return false;
+    const normalisedEmail = email.trim().toLowerCase();
+    if (String(existing.email).trim().toLowerCase() !== normalisedEmail) return false;
     this.db.exec("DELETE FROM user_mcp_tokens WHERE token = ?", token);
+    // Remove the pointer from the global index too
+    try {
+      const sharedIndex = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
+      await sharedIndex.fetch(`https://shared-index/mcp-token-index/${encodeURIComponent(token)}`, { method: "DELETE" });
+    } catch (err) {
+      console.warn("[user-control] Failed to delete token from SharedIndex:", err);
+    }
     return true;
   }
 

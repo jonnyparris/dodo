@@ -69,10 +69,18 @@ function proxyRequest(url: string, request: Request, headers: Headers): Request 
   return new Request(url, init);
 }
 
-async function proxyToAgent(request: Request, env: Env, sessionId: string, path: string, extraHeaders?: HeadersInit): Promise<Response> {
+async function proxyToAgent(request: Request, env: Env, sessionId: string, path: string, extraHeaders?: HeadersInit, ownerEmail?: string): Promise<Response> {
   const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
   const headers = new Headers(request.headers);
   headers.set("x-dodo-session-id", sessionId);
+
+  // Always propagate the owner email so the DO can reconcile identity drift
+  // and clear stale OAuth MCPs when the calling user changes. Callers pass
+  // this explicitly (from the Access JWT) so we never rely on client-set
+  // headers for identity.
+  if (ownerEmail) {
+    headers.set("x-owner-email", ownerEmail);
+  }
 
   if (extraHeaders) {
     new Headers(extraHeaders).forEach((value, key) => {
@@ -204,6 +212,67 @@ export function requirePermission(
 
 const MAX_MCP_DEPTH = 3;
 
+/** Escape HTML special chars so user-supplied strings can't break out of markup. */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Timing-safe string comparison for secret tokens.
+ * Avoids leaking secret length / prefix via comparison timing.
+ * Returns false for different-length strings (length leak is unavoidable
+ * but less sensitive than content comparison).
+ */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const aBytes = new TextEncoder().encode(a);
+  const bBytes = new TextEncoder().encode(b);
+  let diff = 0;
+  for (let i = 0; i < aBytes.length; i++) {
+    diff |= aBytes[i] ^ bBytes[i];
+  }
+  return diff === 0;
+}
+
+/**
+ * Resolve an incoming MCP Bearer token to a user email.
+ *
+ * First tries the global SharedIndex token → email pointer (for user-scoped
+ * `dodo_*` tokens). Falls back to the shared `DODO_MCP_TOKEN` (service mode,
+ * resolves to ADMIN_EMAIL) for CI/service callers.
+ *
+ * Returns null if the token matches nothing.
+ */
+async function resolveMcpToken(env: Env, token: string): Promise<{ email: string; serviceMode: boolean } | null> {
+  if (token.startsWith("dodo_")) {
+    try {
+      const res = await proxyToSharedIndex(env, `/mcp-token-index/${encodeURIComponent(token)}`, { method: "GET" });
+      if (res.ok) {
+        const row = (await res.json()) as { email: string | null };
+        if (row.email) {
+          return { email: row.email, serviceMode: false };
+        }
+      }
+    } catch (err) {
+      log("warn", "mcp token lookup via SharedIndex failed", { err: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  if (env.DODO_MCP_TOKEN && timingSafeEqual(token, env.DODO_MCP_TOKEN)) {
+    const admin = resolveAdminEmail(env);
+    if (admin) {
+      return { email: admin, serviceMode: true };
+    }
+  }
+
+  return null;
+}
+
 app.all("/mcp", async (c) => {
   const authHeader = c.req.header("Authorization") ?? "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -211,34 +280,20 @@ app.all("/mcp", async (c) => {
     return c.json({ error: "Invalid or missing MCP token" }, 401);
   }
 
-  let resolvedEmail: string | null = null;
-  let isServiceMode = false;
-  if (token.startsWith("dodo_")) {
-    const lookupRes = await proxyToUserControl(c.env, "", `/user-mcp-tokens/lookup/${encodeURIComponent(token)}`, { method: "GET" });
-    const row = await lookupRes.json() as { email: string } | null;
-    if (row?.email) {
-      resolvedEmail = row.email;
-    }
-  }
-
-  if (!resolvedEmail && c.env.DODO_MCP_TOKEN && token === c.env.DODO_MCP_TOKEN) {
-    isServiceMode = true;
-    resolvedEmail = resolveAdminEmail(c.env) ?? null;
-  }
-
-  if (!resolvedEmail) {
+  const resolved = await resolveMcpToken(c.env, token);
+  if (!resolved) {
     return c.json({ error: "Invalid or missing MCP token" }, 401);
   }
 
-  c.set("userEmail", resolvedEmail);
-  c.set("mcpServiceMode", isServiceMode);
+  c.set("userEmail", resolved.email);
+  c.set("mcpServiceMode", resolved.serviceMode);
 
   const depth = parseInt(c.req.header("x-dodo-mcp-depth") ?? "0", 10) || 0;
   if (depth >= MAX_MCP_DEPTH) {
     return c.json({ error: "MCP recursion depth exceeded" }, 429);
   }
 
-  const server = createDodoMcpServer(c.env, resolvedEmail, depth);
+  const server = createDodoMcpServer(c.env, resolved.email, depth);
   const handler = createMcpHandler(server);
   return handler(c.req.raw, c.env, c.executionCtx);
 });
@@ -252,27 +307,13 @@ app.all("/mcp/codemode", async (c) => {
     return c.json({ error: "Invalid or missing MCP token" }, 401);
   }
 
-  let resolvedEmail: string | null = null;
-  let isServiceMode = false;
-  if (token.startsWith("dodo_")) {
-    const lookupRes = await proxyToUserControl(c.env, "", `/user-mcp-tokens/lookup/${encodeURIComponent(token)}`, { method: "GET" });
-    const row = await lookupRes.json() as { email: string } | null;
-    if (row?.email) {
-      resolvedEmail = row.email;
-    }
-  }
-
-  if (!resolvedEmail && c.env.DODO_MCP_TOKEN && token === c.env.DODO_MCP_TOKEN) {
-    isServiceMode = true;
-    resolvedEmail = resolveAdminEmail(c.env) ?? null;
-  }
-
-  if (!resolvedEmail) {
+  const resolved = await resolveMcpToken(c.env, token);
+  if (!resolved) {
     return c.json({ error: "Invalid or missing MCP token" }, 401);
   }
 
-  c.set("userEmail", resolvedEmail);
-  c.set("mcpServiceMode", isServiceMode);
+  c.set("userEmail", resolved.email);
+  c.set("mcpServiceMode", resolved.serviceMode);
 
   const depth = parseInt(c.req.header("x-dodo-mcp-depth") ?? "0", 10) || 0;
   if (depth >= MAX_MCP_DEPTH) {
@@ -447,6 +488,15 @@ app.use("*", async (c, next) => {
   log("info", "Auth success", { email: identity.email, source: identity.source });
   c.set("identity", identity);
   c.set("userEmail", identity.email);
+
+  // Inject owner email into the incoming request headers so proxyToAgent /
+  // proxyToUserControl forwarders can propagate it to DOs without every
+  // call site needing to thread it manually. The DO uses this to detect
+  // Access identity drift and clear stale OAuth MCP connections.
+  const mutable = new Headers(c.req.raw.headers);
+  mutable.set("x-owner-email", identity.email.trim().toLowerCase());
+  c.req.raw = new Request(c.req.raw, { headers: mutable });
+
   return next();
 });
 
@@ -1015,21 +1065,92 @@ app.post("/api/mcp-configs/:id/test", async (c) => {
   return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}/test`, { method: "POST" });
 });
 
+// OAuth success redirect — shown to the user after MCP OAuth completes.
+// The Agents SDK redirects here once token exchange finishes. Points the
+// browser back to the app root with a query flag the UI can react to.
+app.get("/mcp-oauth-success", (c) => {
+  return c.html(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MCP connected — Dodo</title>
+  <meta http-equiv="refresh" content="1;url=/?mcp=connected">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; color: #1f2937; }
+    h1 { font-size: 1.5rem; }
+    a { color: #2563eb; }
+  </style>
+</head>
+<body>
+  <h1>MCP connected</h1>
+  <p>The OAuth handshake completed. Redirecting you back to Dodo…</p>
+  <p><a href="/?mcp=connected">Return to Dodo</a> if the redirect doesn't happen automatically.</p>
+</body>
+</html>`);
+});
+
+app.get("/mcp-oauth-error", (c) => {
+  const error = new URL(c.req.url).searchParams.get("error") ?? "unknown";
+  return c.html(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MCP connection failed — Dodo</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; color: #1f2937; }
+    h1 { font-size: 1.5rem; color: #b91c1c; }
+    code { background: #f3f4f6; padding: 0.125rem 0.375rem; border-radius: 0.25rem; }
+    a { color: #2563eb; }
+  </style>
+</head>
+<body>
+  <h1>MCP connection failed</h1>
+  <p>The OAuth flow didn't complete. Error: <code>${escapeHtml(error)}</code></p>
+  <p><a href="/">Return to Dodo</a> and try again, or check the MCP server's OAuth configuration.</p>
+</body>
+</html>`, 400);
+});
+
 // OAuth callback route for MCP server auth flows
 app.all("/agents/*", async (c) => {
   const userEmail = c.get("userEmail");
   const id = c.env.CODING_AGENT.idFromName(userEmail);
   const stub = c.env.CODING_AGENT.get(id);
   const h = new Headers(c.req.raw.headers);
-  h.set("x-dodo-owner-email", userEmail);
+  h.set("x-owner-email", userEmail);
   const req = new Request(c.req.raw, { headers: h });
   return stub.fetch(req);
 });
 
 // Start MCP OAuth flow
 app.post("/api/mcp/start-auth", async (c) => {
-  const { mcpUrl } = await c.req.json<{ mcpUrl: string }>();
-  if (!mcpUrl) return c.json({ error: "mcpUrl required" }, 400);
+  let body: { mcpUrl?: string };
+  try {
+    body = await c.req.json<{ mcpUrl: string }>();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  const mcpUrl = body.mcpUrl;
+  if (!mcpUrl || typeof mcpUrl !== "string") {
+    return c.json({ error: "mcpUrl required" }, 400);
+  }
+
+  // Validate URL shape before we spin up a DO and start the OAuth handshake
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(mcpUrl);
+  } catch {
+    return c.json({ error: "mcpUrl must be a valid absolute URL" }, 400);
+  }
+  if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
+    return c.json({ error: "mcpUrl must use http or https" }, 400);
+  }
+
+  // Gate on the host allowlist — same rule used for /api/mcp-configs. Prevents
+  // users kicking off OAuth dances against arbitrary hostnames.
+  if (!(await isHostAllowed(c.env, parsedUrl.hostname))) {
+    return c.json({ error: "MCP host not on the allowlist" }, 403);
+  }
 
   const userEmail = c.get("userEmail");
   const id = c.env.CODING_AGENT.idFromName(userEmail);
@@ -1037,45 +1158,94 @@ app.post("/api/mcp/start-auth", async (c) => {
     addMcpServer: (name: string, url: string, opts: { callbackHost: string; callbackPath: string }) => Promise<{ state: string; authUrl?: string; id: string }>;
   };
 
-  const displayName = new URL(mcpUrl).host;
+  const displayName = parsedUrl.host;
 
-  const result = await stub.addMcpServer(displayName, mcpUrl, {
-    callbackHost: c.env.WORKER_URL,
-    callbackPath: "/agents",
-  });
-
-  if (result.state === "authenticating") {
-    return c.json({ authUrl: result.authUrl });
+  try {
+    const result = await stub.addMcpServer(displayName, mcpUrl, {
+      callbackHost: c.env.WORKER_URL,
+      callbackPath: "/agents",
+    });
+    if (result.state === "authenticating") {
+      return c.json({ authUrl: result.authUrl });
+    }
+    return c.json({ message: "Connected" });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "start-auth failed", { userEmail, mcpUrl, error: msg });
+    return c.json({ error: `Failed to start OAuth flow: ${msg}` }, 502);
   }
-  return c.json({ message: "Connected" });
 });
 
 // Delete an MCP OAuth connection
 app.post("/api/mcp/delete-auth", async (c) => {
-  const { mcpId } = await c.req.json<{ mcpId: string }>();
-  if (!mcpId) return c.json({ error: "mcpId required" }, 400);
+  let body: { mcpId?: string };
+  try {
+    body = await c.req.json<{ mcpId: string }>();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  const mcpId = body.mcpId;
+  if (!mcpId || typeof mcpId !== "string") {
+    return c.json({ error: "mcpId required" }, 400);
+  }
 
   const userEmail = c.get("userEmail");
   const id = c.env.CODING_AGENT.idFromName(userEmail);
   const stub = c.env.CODING_AGENT.get(id) as unknown as {
+    getMcpServers: () => { servers: Record<string, unknown> };
     removeMcpServer: (id: string) => Promise<void>;
   };
-  await stub.removeMcpServer(mcpId);
-  return c.json({ ok: true });
+
+  // Belt-and-braces: only allow deleting MCPs that actually live in this
+  // user's DO. Prevents cross-user deletion if callers ever share DO keys.
+  const servers = await stub.getMcpServers();
+  if (!servers.servers[mcpId]) {
+    return c.json({ error: "MCP not found" }, 404);
+  }
+
+  try {
+    await stub.removeMcpServer(mcpId);
+    return c.json({ ok: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "delete-auth failed", { userEmail, mcpId, error: msg });
+    return c.json({ error: `Failed to remove MCP: ${msg}` }, 500);
+  }
 });
 
 // Refresh an MCP connection (remove + re-add)
 app.post("/api/mcp/refresh-state", async (c) => {
-  const { mcpId } = await c.req.json<{ mcpId: string }>();
-  if (!mcpId) return c.json({ error: "mcpId required" }, 400);
+  let body: { mcpId?: string };
+  try {
+    body = await c.req.json<{ mcpId: string }>();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  const mcpId = body.mcpId;
+  if (!mcpId || typeof mcpId !== "string") {
+    return c.json({ error: "mcpId required" }, 400);
+  }
 
   const userEmail = c.get("userEmail");
   const id = c.env.CODING_AGENT.idFromName(userEmail);
   const stub = c.env.CODING_AGENT.get(id) as unknown as {
+    getMcpServers: () => { servers: Record<string, unknown> };
     refreshMcpState: (id: string) => Promise<void>;
   };
-  await stub.refreshMcpState(mcpId);
-  return c.json({ ok: true });
+
+  const servers = await stub.getMcpServers();
+  if (!servers.servers[mcpId]) {
+    return c.json({ error: "MCP not found" }, 404);
+  }
+
+  try {
+    await stub.refreshMcpState(mcpId);
+    return c.json({ ok: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "refresh-state failed", { userEmail, mcpId, error: msg });
+    return c.json({ error: `Failed to refresh MCP: ${msg}` }, 500);
+  }
 });
 
 // ─── MCP Catalog ───

@@ -12,11 +12,17 @@ import type { Env, WorkerRunRecord } from "./types";
  * Resolve the MCP caller's email. Prefers an explicit userEmail (from a
  * user-scoped dodo_* token validated upstream), falls back to ADMIN_EMAIL
  * for service-mode callers using the shared DODO_MCP_TOKEN.
+ *
+ * When the fallback is taken we log a warning so operators can audit
+ * operations that get attributed to the admin. In production, review the
+ * log stream periodically to confirm the expected service-mode callers
+ * (CI etc.) are the only ones hitting this path.
  */
 function mcpUserEmail(env: Env, userEmail?: string): string {
   if (userEmail) return userEmail;
   const email = resolveAdminEmail(env);
   if (!email) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
+  console.warn("[mcp] Operation attributed to admin via service-mode fallback (no userEmail threaded).");
   return email;
 }
 

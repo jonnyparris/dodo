@@ -12,6 +12,15 @@ import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env } from "./types";
 
 /** Options passed through from the coding agent into tool factories. */
+/** Metadata describing an OAuth-connected MCP tool federated from the per-user hub DO. */
+export interface OAuthToolInfo {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  serverId: string;
+  displayName?: string;
+}
+
 export interface BuildToolsOptions {
   authorEmail?: string;
   browserEnabled?: boolean;
@@ -20,6 +29,18 @@ export interface BuildToolsOptions {
   ownerEmail?: string;
   stateBackend?: StateBackend;
   mcpGatekeepers?: McpGatekeeper[];
+  /**
+   * OAuth MCP tools pre-fetched from the per-user hub DO. Session DOs don't
+   * hold OAuth credentials locally — they pass the cached tool list here
+   * and route tool calls back through `oauthToolExec`.
+   */
+  oauthTools?: OAuthToolInfo[];
+  /**
+   * Tool-call executor for OAuth MCP tools. Must route through the per-user
+   * hub DO where the OAuth credentials live. Provided by CodingAgent as
+   * `this.callOAuthToolViaHub`.
+   */
+  oauthToolExec?: (serverId: string, name: string, args: unknown) => Promise<unknown>;
   /** Session ID — required to scope attachment R2 keys. */
   sessionId?: string;
   /**
@@ -703,7 +724,7 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: BuildToolsOptions & { agent?: { mcp?: any } },
+  options?: BuildToolsOptions & { agent?: { mcp?: unknown } },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
   const existingNames = new Set(Object.keys(tools));
@@ -714,11 +735,12 @@ export function buildToolsForThink(
     Object.keys(mcpTools).forEach((name) => existingNames.add(name));
   }
 
-  if (options?.agent?.mcp) {
-    const sdkMcpTools = buildSdkMcpTools(options.agent.mcp, existingNames);
-    Object.assign(tools, sdkMcpTools);
-  } else {
-    // TODO: If buildToolsForThink stops receiving agent.mcp, thread it through here so SDK MCP tools can be exposed.
+  // Phase 1 OAuth path: tools federated from the per-user hub DO. The tool
+  // list is pre-fetched; execute() routes back to the hub via the provided
+  // executor so OAuth credentials never leave that DO.
+  if (options?.oauthTools?.length && options.oauthToolExec) {
+    const oauthTools = buildOAuthMcpTools(options.oauthTools, options.oauthToolExec, existingNames);
+    Object.assign(tools, oauthTools);
   }
 
   return tools;
@@ -770,44 +792,57 @@ function slugifyToolNamespace(name: string): string {
   return name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "mcp";
+    .replace(/^-+|-+$/g, "") || "mcp-unnamed";
 }
 
-function buildSdkMcpTools(
-  agentMcp: any,
+/**
+ * Build AI SDK tool() objects from the per-user OAuth hub's tool list.
+ *
+ * The tool list has already been fetched via RPC (`listOAuthTools`) from
+ * the per-user CodingAgent DO. `execute()` routes calls back to that hub
+ * via the provided executor (`callOAuthToolViaHub`), so OAuth credentials
+ * never leave the hub DO.
+ *
+ * Tool names are prefixed with a slug of the server's display name to
+ * avoid collisions across servers. Capped at 64 chars to satisfy AI SDK
+ * naming constraints. Collisions after truncation are logged.
+ */
+function buildOAuthMcpTools(
+  oauthTools: OAuthToolInfo[],
+  executor: (serverId: string, name: string, args: unknown) => Promise<unknown>,
   existingNames: Set<string>,
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
-  const listedTools = agentMcp.listTools();
-  if (!Array.isArray(listedTools)) return tools;
 
-  for (const listedTool of listedTools) {
-    if (!listedTool || typeof listedTool !== "object") continue;
-    const toolInfo = listedTool as {
-      name?: string;
-      description?: string;
-      inputSchema?: Record<string, unknown>;
-      serverId?: string;
-      displayName?: string;
-      serverName?: string;
-      serverDisplayName?: string;
-    };
-    if (!toolInfo.name || !toolInfo.serverId) continue;
+  for (const info of oauthTools) {
+    if (!info.name || !info.serverId) {
+      console.warn("[oauth-mcp] Skipping tool with missing name or serverId:", info);
+      continue;
+    }
 
-    const displayName = toolInfo.displayName ?? toolInfo.serverDisplayName ?? toolInfo.serverName ?? toolInfo.serverId;
-    const prefixedName = `${slugifyToolNamespace(displayName)}__${toolInfo.name}`.slice(0, 64);
-    if (existingNames.has(prefixedName) || tools[prefixedName]) continue;
+    const display = info.displayName ?? info.serverId;
+    const slug = slugifyToolNamespace(display);
+    const fullName = `${slug}__${info.name}`;
+    const prefixedName = fullName.length > 64 ? fullName.slice(0, 64) : fullName;
+
+    if (existingNames.has(prefixedName) || tools[prefixedName]) {
+      console.warn("[oauth-mcp] Skipping duplicate tool name:", { prefixedName, serverId: info.serverId, original: info.name });
+      continue;
+    }
 
     tools[prefixedName] = tool({
-      description: toolInfo.description ?? `MCP tool: ${toolInfo.name}`,
-      inputSchema: toolInfo.inputSchema
-        ? jsonSchema(toolInfo.inputSchema)
+      description: info.description ?? `OAuth MCP tool: ${info.name}`,
+      inputSchema: info.inputSchema
+        ? jsonSchema(info.inputSchema)
         : jsonSchema({ type: "object", properties: {} }),
-      execute: async (args: unknown) => agentMcp.callTool({
-        name: toolInfo.name as string,
-        arguments: args,
-        serverId: toolInfo.serverId as string,
-      }),
+      execute: async (args: unknown) => {
+        try {
+          return await executor(info.serverId, info.name, args);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { error: `OAuth MCP tool call failed: ${msg}` };
+        }
+      },
     });
     existingNames.add(prefixedName);
   }
