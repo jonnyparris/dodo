@@ -54,6 +54,7 @@
         <li><a href="#architecture">Architecture</a></li>
         <li><a href="#sessions">Sessions</a></li>
         <li><a href="#chat">Chat &amp; Streaming</a></li>
+        <li><a href="#image-gen">Image Generation</a></li>
         <li><a href="#files">Workspace Files</a></li>
         <li><a href="#git">Git</a></li>
         <li><a href="#kanban">Task Board (Kanban)</a></li>
@@ -208,9 +209,30 @@
       <li><strong>Abort</strong> — cancels a running prompt immediately.</li>
       <li><strong>Streaming renderer</strong> — text appears immediately as deltas arrive, then Dodo upgrades it into full markdown a few times per second so long messages stay responsive.</li>
       <li><strong>Markdown</strong> — assistant messages render GitHub-flavored markdown. Each code block has a copy button.</li>
+      <li><strong>Slash commands</strong> — type <code>/</code> in the input to see available commands. <kbd>↑</kbd>/<kbd>↓</kbd> to navigate, <kbd>Tab</kbd> or <kbd>Enter</kbd> to complete, <kbd>Esc</kbd> to dismiss. See <a href="#image-gen">Image generation</a>.</li>
       <li><strong>Presence</strong> — when multiple users share a session, you see avatar dots in the header and typing indicators.</li>
       <li><strong>Build marker</strong> — the header shows the deployed build hash when available, so you can confirm which revision the UI is running.</li>
     </ul>
+
+    <!-- ─── Image generation ─── -->
+    <h2 id="image-gen">Image Generation</h2>
+    <p>Dodo includes a dedicated image-generation path that bypasses the chat LLM. Type <code>/generate &lt;prompt&gt;</code> in any session to get a FLUX-1-schnell image rendered inline in a few seconds. Routes through the same R2-backed attachment pipeline as other images (see <a href="#api">Attachments</a>).</p>
+    <table>
+      <tr><th>Entry point</th><th>How to trigger</th></tr>
+      <tr><td><strong>Browser UI</strong></td><td>Type <code>/</code> for autocomplete, pick <code>/generate</code>, type a prompt, hit <kbd>Enter</kbd>.</td></tr>
+      <tr><td><strong>MCP tool</strong></td><td>Call <code>generate_image(sessionId, prompt)</code> directly. See <a href="#mcp-client">Connecting via MCP</a>.</td></tr>
+      <tr><td><strong>MCP message</strong></td><td>Any <code>send_message</code> or <code>send_prompt</code> call whose content starts with <code>/generate </code> is routed to FLUX by the server.</td></tr>
+      <tr><td><strong>HTTP endpoint</strong></td><td><code>POST /session/:id/generate</code> with <code>{ content: "..." }</code>. Returns the assistant message synchronously.</td></tr>
+    </table>
+    <h3>Limits and requirements</h3>
+    <ul>
+      <li><strong>Model</strong> — <code>@cf/black-forest-labs/flux-1-schnell</code> (Workers AI).</li>
+      <li><strong>Prompt length</strong> — 2048 characters max (FLUX schema limit).</li>
+      <li><strong>Rate limits</strong> — 30 images per hour and 100 per day per user.</li>
+      <li><strong>Concurrency</strong> — returns 409 if another prompt is already running on the session.</li>
+      <li><strong>Binding</strong> — requires <code>"ai": { "binding": "AI" }</code> in <code>wrangler.jsonc</code>. The AI binding is enabled on all paid Workers plans; the free tier has a daily neuron cap.</li>
+    </ul>
+    <div class="callout"><p>FLUX-1-schnell does not appear in the chat model picker — it's text-to-image only and would break a chat session if set as the default. Use <code>/generate</code> instead.</p></div>
 
     <!-- ─── Files ─── -->
     <h2 id="files">Workspace Files</h2>
@@ -445,7 +467,7 @@
       <tr><td>*</td><td><code>/api/secrets</code></td><td>Encrypted secrets CRUD</td></tr>
       <tr><td>*</td><td><code>/api/mcp-configs</code></td><td>Integration (MCP server) CRUD</td></tr>
       <tr><td>*</td><td><code>/api/passkey</code></td><td>Init, change passkey</td></tr>
-      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth) — 46 tools for orchestration</td></tr>
+      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth) — 48 tools for orchestration</td></tr>
       <tr><td>ALL</td><td><code>/mcp/codemode</code></td><td>Code-mode MCP endpoint — 2 tools (<code>search</code> + <code>execute</code>), ~1k tokens context. Ideal for coding agents.</td></tr>
     </table>
 
@@ -460,6 +482,7 @@
       <tr><td>POST</td><td><code>/session/:id/fork</code></td><td>Fork session (copy files + messages)</td></tr>
       <tr><td>POST</td><td><code>/session/:id/message</code></td><td>Sync message (streaming)</td></tr>
       <tr><td>POST</td><td><code>/session/:id/prompt</code></td><td>Async prompt (fiber-backed)</td></tr>
+      <tr><td>POST</td><td><code>/session/:id/generate</code></td><td>Generate an image with FLUX-1-schnell. Bypasses the chat LLM. See <a href="#image-gen">Image Generation</a>.</td></tr>
       <tr><td>POST</td><td><code>/session/:id/abort</code></td><td>Abort running prompt</td></tr>
       <tr><td>GET</td><td><code>/session/:id/events</code></td><td>SSE stream (text_delta, message, state, tool_call, ...)</td></tr>
       <tr><td>GET</td><td><code>/session/:id/messages</code></td><td>Message history</td></tr>
@@ -543,8 +566,9 @@
     <h4>Chat</h4>
     <table>
       <tr><th>Tool</th><th>Description</th></tr>
-      <tr><td><code>send_message</code></td><td>Synchronous message (waits for response)</td></tr>
-      <tr><td><code>send_prompt</code></td><td>Async prompt (returns immediately, runs in background)</td></tr>
+      <tr><td><code>send_message</code></td><td>Synchronous message (waits for response). A content starting with <code>/generate </code> is auto-routed to FLUX.</td></tr>
+      <tr><td><code>send_prompt</code></td><td>Async prompt (returns immediately, runs in background). A content starting with <code>/generate </code> is auto-routed to FLUX.</td></tr>
+      <tr><td><code>generate_image</code></td><td>Generate a FLUX-1-schnell image directly. Takes <code>sessionId</code> + <code>prompt</code> (1-2048 chars). See <a href="#image-gen">Image Generation</a>.</td></tr>
       <tr><td><code>abort_prompt</code></td><td>Abort a running prompt</td></tr>
       <tr><td><code>get_messages</code></td><td>Get message history</td></tr>
       <tr><td><code>get_prompts</code></td><td>Get prompt history</td></tr>

@@ -147,7 +147,7 @@ Dodo exposes two MCP endpoints. Use the one that fits your use case:
 
 | Endpoint | Tools | Best for |
 |----------|-------|----------|
-| `/mcp` | 47 | **Orchestrators** -- full control over sessions, tasks, git, memory, dispatch |
+| `/mcp` | 48 | **Orchestrators** -- full control over sessions, tasks, git, memory, dispatch |
 | `/mcp/codemode` | 2 | **Coding agents** -- just `search` + `execute` (~1k tokens context) |
 
 **Example config** (works with OpenCode, Claude Code, Cursor, or any MCP client):
@@ -206,13 +206,31 @@ Per-user key-value store with text search, persistent across sessions. Your agen
 
 Headless Chrome via Cloudflare Browser Rendering. Full CDP (Chrome DevTools Protocol) access through two code-mode tools: `browser_search` (query the CDP spec) and `browser_execute` (run CDP commands). The agent can navigate pages, read documentation, fill forms, and scrape data. Desktop viewport + full-page capture work out of the box. Screenshots captured via `Page.captureScreenshot` render inline in the chat and persist across reloads -- see Attachments below.
 
+### Image generation (/generate)
+
+Type `/generate a cyberpunk cat` in any chat to generate an image with Workers AI FLUX-1-schnell. Bypasses the chat LLM entirely — the image comes back in a few seconds and renders inline.
+
+- **Autocomplete** — start typing `/` in the input box to see the command menu.
+- **Routes everywhere** — works from the browser UI, MCP (`generate_image` tool, or any message containing `/generate` via `send_message`/`send_prompt`), and the dedicated `POST /session/:id/generate` endpoint.
+- **Limits** — 2048-char prompt cap (FLUX schema), 30 images/hour + 100/day per user, concurrent-prompt guard (returns 409 if another prompt is running).
+- **Requires** — the `AI` binding in `wrangler.jsonc`:
+
+  ```jsonc
+  "ai": {
+    "binding": "AI"
+  }
+  ```
+
+  Workers AI is enabled on every paid Workers plan; the free tier has a daily neuron quota.
+
 ### Attachments (images in chat)
 
-Images surface in the chat from three sources and flow through the same R2-backed pipeline:
+Images surface in the chat from four sources and flow through the same R2-backed pipeline:
 
 - **User uploads** -- Paste an image or click the paperclip to send a screenshot to a multimodal model (Claude, Gemini, GPT-4o, Gemma). Limits: 5 images per message, 3MB raw per image, PNG/JPEG/GIF/WebP.
 - **Browser tool screenshots** -- `browser_execute` extracts screenshots from the CDP result, stashes them in R2, and returns a short text summary to the model (so base64 doesn't burn context). Images render inline on the tool-result bubble.
 - **Model-generated images** -- Responses from image-generating models (e.g. Gemini imagen, Gemma vision) are captured during the stream, uploaded to R2, and rendered on the assistant bubble.
+- **`/generate` slash command** -- Type `/generate <prompt>` in any chat to bypass the LLM and hit Workers AI FLUX-1-schnell directly. Image appears inline in a few seconds. Works from the browser UI (with autocomplete — type `/` to see the menu), the MCP `generate_image` tool, or any chat message containing `/generate` (server-side slash routing catches it). Rate-limited to 30 images/hour and 100/day per user; prompts capped at 2048 chars per the FLUX schema. Requires the `AI` binding in `wrangler.jsonc`.
 
 **Storage:** Attachments live in the `dodo-workspaces` R2 bucket under the `attachments/{sessionId}/{messageId}/` prefix. Run `scripts/setup-attachment-lifecycle.sh` once per account to install the **30-day auto-expiry** lifecycle rule (lifecycle rules aren't yet configurable via `wrangler.jsonc`). Access is ACL-gated via the existing `/session/:id/*` ownership middleware — if you can't read the session, you can't read its attachments.
 
