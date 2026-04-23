@@ -484,8 +484,8 @@
       /* Hide non-essential metadata on mobile to prevent overlap */
       #session-id-display,#build-version{display:none}
 
-      /* Token summary stays visible but smaller */
-      #token-summary{font-size:10px}
+      /* Token summary stays visible but smaller and shrinkable */
+      #token-summary{font-size:10px;flex-shrink:1 !important;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50%}
       .footer{display:none}
 
       /* File entries bigger touch targets */
