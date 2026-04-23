@@ -473,13 +473,16 @@
       .msg.assistant,.msg.tool_call{max-width:100%}
 
       /* Header actions — collapse overflow on mobile */
-      .header-actions{flex-wrap:nowrap;gap:3px;padding-bottom:2px}
+      .header-actions{flex-wrap:wrap;gap:3px;justify-content:flex-end;max-width:45%}
       .header-actions button{white-space:nowrap;font-size:12px;padding:4px 6px;min-width:28px}
       .header-actions .mobile-hide{display:none}
       .top-bar-overflow{display:block}
       .btn-icon{display:inline;font-size:14px}
       .btn-label{display:none}
       .theme-toggle{font-size:14px !important;padding:4px 6px !important}
+
+      /* Hide non-essential metadata on mobile to prevent overlap */
+      #session-id-display,#token-summary,#build-version{display:none}
 
       /* Hide token summary and footer on mobile to save space */
       #token-summary{font-size:10px}
