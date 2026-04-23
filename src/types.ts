@@ -22,6 +22,7 @@ export interface Env {
   LOADER?: WorkerLoader;
   OPENCODE_BASE_URL: string;
   OUTBOUND?: Fetcher;
+  WORKER_URL: string;
   WORKSPACE_BUCKET?: R2Bucket;
 
   // Durable Object bindings

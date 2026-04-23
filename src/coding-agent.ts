@@ -433,6 +433,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const appConfig = this.getAppConfigFromThink();
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
     return buildToolsForThink(this.env, this.workspace, appConfig, {
+      agent: this,
       browserEnabled: this.readMetadata("browser_enabled") === "true",
       isAdminUser: isAdmin(ownerEmail ?? null, this.env),
       ownerId: this.resolveOwnerId(ownerEmail),
@@ -1692,6 +1693,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Initialize Think: creates SessionManager, loads existing sessions,
     // sets up protocol handlers, checks fibers if enabled.
     super.onStart();
+    this.mcp.configureOAuthCallback({
+      successRedirect: "/mcp-oauth-success",
+      errorRedirect: "/mcp-oauth-error",
+    });
 
     // Suppress Think's WebSocket chat protocol.
     // super.onStart() wraps onMessage via _setupProtocolHandlers() to intercept
@@ -4280,6 +4285,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // Filter to enabled HTTP configs with URLs
       const enabled = configs.filter((c) => {
         if (!c.enabled || c.type !== "http" || !c.url) return false;
+        if (c.auth_type === "oauth") return false;
         if (c.id === "browser-rendering" && !browserEnabled) return false;
         return true;
       });
