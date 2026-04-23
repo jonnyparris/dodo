@@ -638,7 +638,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // trigger Think's compaction system to summarize older messages.
           // After compaction, re-assemble the local messages array so it
           // picks up the compacted history (with the summary injected).
-          if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered && step >= 3) {
+          //
+          // No `step >= N` guard: a large prompt + aggressive exploration can burn
+          // through the budget in steps 0-2. The `!compactionTriggered` flag already
+          // prevents compaction from firing more than once per turn, so gating on
+          // step count only delays a necessary safety net. See issue #34.
+          if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
             compactionTriggered = true;
             try {
               await self.maybeCompactContext();
