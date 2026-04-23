@@ -70,7 +70,7 @@ One Worker, three Durable Object classes:
 | **UserControl** | One per user | Config, sessions, memory, tasks, encrypted secrets |
 | **CodingAgent** | One per session | Chat loop, workspace (files + git), sandbox, prompts |
 
-Plus R2 for large file storage, Browser Rendering for headless Chrome, and your choice of LLM gateway.
+Plus R2 for large file and attachment storage, Browser Rendering for headless Chrome, a per-session Artifacts repo on GitHub for a durable record of workspace changes, and your choice of LLM gateway (OpenCode, AI Gateway, or Workers AI via AI Gateway).
 
 ---
 
@@ -135,9 +135,9 @@ Dodo doesn't bundle an LLM -- you bring your own. After deploying, open the UI a
 | Gateway | Setup |
 |---------|-------|
 | **OpenCode** | Set `OPENCODE_GATEWAY_TOKEN` as a secret. Models populate automatically. |
-| **AI Gateway** | Set `AI_GATEWAY_KEY` as a secret. Set `AI_GATEWAY_BASE_URL` in wrangler.jsonc vars. |
+| **AI Gateway** | Set `AI_GATEWAY_KEY` as a secret. Set `AI_GATEWAY_BASE_URL` in wrangler.jsonc vars. Workers AI models (`@cf/…`) route through the same gateway. |
 
-Model IDs use `provider/model` format (e.g. `anthropic/claude-sonnet-4`, `openai/gpt-4o`). Switch models per-session from the UI.
+Model IDs use `provider/model` format (e.g. `anthropic/claude-sonnet-4`, `openai/gpt-4o`, `@cf/moonshotai/kimi-k2.6`). The model list is filtered by gateway -- OpenCode won't offer models it can't route. Switch models per-session from the UI.
 
 ---
 
@@ -147,7 +147,7 @@ Dodo exposes two MCP endpoints. Use the one that fits your use case:
 
 | Endpoint | Tools | Best for |
 |----------|-------|----------|
-| `/mcp` | 46 | **Orchestrators** -- full control over sessions, tasks, git, memory |
+| `/mcp` | 47 | **Orchestrators** -- full control over sessions, tasks, git, memory, dispatch |
 | `/mcp/codemode` | 2 | **Coding agents** -- just `search` + `execute` (~1k tokens context) |
 
 **Example config** (works with OpenCode, Claude Code, Cursor, or any MCP client):
@@ -204,7 +204,7 @@ Per-user key-value store with text search, persistent across sessions. Your agen
 
 ### Browser
 
-Headless Chrome via Cloudflare Browser Rendering. Full CDP (Chrome DevTools Protocol) access through two code-mode tools: `browser_search` (query the CDP spec) and `browser_execute` (run CDP commands). The agent can navigate pages, read documentation, fill forms, and scrape data. Screenshots captured via `Page.captureScreenshot` render inline in the chat — see Attachments below.
+Headless Chrome via Cloudflare Browser Rendering. Full CDP (Chrome DevTools Protocol) access through two code-mode tools: `browser_search` (query the CDP spec) and `browser_execute` (run CDP commands). The agent can navigate pages, read documentation, fill forms, and scrape data. Desktop viewport + full-page capture work out of the box. Screenshots captured via `Page.captureScreenshot` render inline in the chat and persist across reloads -- see Attachments below.
 
 ### Attachments (images in chat)
 
@@ -218,13 +218,20 @@ Images surface in the chat from three sources and flow through the same R2-backe
 
 ### Orchestration
 
-Built-in support for dispatching work to worker sessions:
+Built-in support for dispatching work to worker sessions and shepherding it to a reviewable PR:
 
-- **Seed sessions** -- Clone a repo once, fork for each task (avoids repeated clones).
+- **Seed sessions** -- Clone a repo once, fork for each task (avoids repeated clones). Stacked PRs work too: when `baseBranch != main`, the clone goes deeper so the LLM can see the stack's history.
 - **Deterministic edit pipelines** -- Apply text edits, commit, push, verify.
 - **Agent-driven dispatch** -- Send a prompt to a session and verify the result later.
-- **Worker run tracking** -- State machine from session creation through push verification.
-- **Failure snapshots** -- Captures git status/diff/log/messages for debugging failed runs.
+- **Worker run tracking** -- State machine from session creation through push verification to merged PR.
+- **Auto-draft-PR** -- When a dispatched run verifies successfully, Dodo opens a draft PR on GitHub and stores the URL on the run record. You get a link, not a checklist item.
+- **External verify gate (opt-in)** -- The Workers sandbox can't run `npm`/`tsc`/`vitest`, so the LLM was trusted to self-verify and routinely skipped. Pass a `verifyWorkflow` filename (e.g. `dodo-verify.yml`) and Dodo triggers a GitHub Actions workflow via `workflow_dispatch`, polls for the result, and blocks the auto-PR until checks pass. 30-minute hard cap, `head_sha`-matched run tracking. A template is in `.github/workflows/dodo-verify.yml.example`.
+- **ntfy push notifications** -- Every worker run state transition fires a notification via [ntfy](https://ntfy.sh) if `NTFY_TOPIC` is set. You know when your dispatched work lands, fails, or gets stuck in checks.
+- **Failure snapshots** -- Captures git status/diff/log/messages (and the Actions run URL for verify failures) for debugging failed runs.
+
+### Artifacts
+
+Every Dodo session automatically gets its own GitHub repo fork -- an **Artifacts repo** -- and workspace changes flush to it at the end of each agent turn. Forked sessions fork the Artifacts repo too, so branch history is preserved. You get a reviewable git history of what the agent did, without waiting for the agent to remember to commit.
 
 ---
 
@@ -242,8 +249,24 @@ Set via `wrangler secret put <NAME>` or through the Deploy to Cloudflare flow.
 | `AI_GATEWAY_KEY` | If using AI Gateway | Auth key for the Cloudflare AI Gateway |
 | `CF_ACCESS_AUD` | If using Access | Cloudflare Access application audience tag |
 | `CF_ACCESS_TEAM_DOMAIN` | If using Access | Cloudflare Access team domain URL |
+| `NTFY_TOPIC` | Optional | ntfy.sh topic for worker run push notifications |
 
 Per-user secrets (GitHub token, GitLab token) are stored encrypted in each user's Durable Object using envelope encryption (AES-256-GCM) -- not as environment variables.
+
+---
+
+## Screenshots
+
+| Desktop | Mobile |
+|---------|--------|
+| ![Landing page](docs/screenshots/01-desktop-landing.png) | ![Mobile chat](docs/screenshots/05-mobile-chat.png) |
+| Landing page with prompt suggestions | Chat view on a phone |
+| ![Active coding session](docs/screenshots/02-desktop-chat.png) | ![Mobile tools panel](docs/screenshots/06-mobile-tools.png) |
+| Dispatched task running in a session | Tools and config on mobile |
+| ![Browser screenshot inline](docs/screenshots/03-desktop-browser-capture.png) | |
+| Inline browser capture in chat | |
+| ![MCP config panel](docs/screenshots/04-desktop-mcp-config.png) | |
+| Config + integrations sidebar | |
 
 ---
 

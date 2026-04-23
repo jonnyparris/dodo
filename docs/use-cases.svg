@@ -1,107 +1,178 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 520" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 720" fill="none">
   <defs>
     <filter id="sd" x="-3%" y="-3%" width="106%" height="110%">
       <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.12"/>
     </filter>
+    <style>
+      a { cursor: pointer; }
+      a:hover rect { filter: brightness(1.12); }
+      a:hover .card-title { fill: #ffffff; }
+      a:hover .cta { fill: #86efac; }
+      .card-title, .cta { transition: fill 120ms; }
+    </style>
   </defs>
 
-  <rect width="860" height="520" rx="16" fill="#0f172a"/>
+  <rect width="920" height="720" rx="16" fill="#0f172a"/>
 
-  <text x="430" y="38" text-anchor="middle" fill="#f8fafc" font-family="system-ui, -apple-system, sans-serif" font-size="20" font-weight="700">What Can You Build With Dodo?</text>
-  <text x="430" y="58" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="12">A coding agent you control, running on infrastructure you own</text>
+  <text x="460" y="38" text-anchor="middle" fill="#f8fafc" font-family="system-ui, -apple-system, sans-serif" font-size="20" font-weight="700">What Can You Build With Dodo?</text>
+  <text x="460" y="58" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="12">A coding agent you control, running on infrastructure you own</text>
 
   <!-- Row 1 -->
   <!-- Card 1: Autonomous coding -->
-  <g filter="url(#sd)">
-    <rect x="20" y="82" width="260" height="180" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
-    <circle cx="48" cy="110" r="18" fill="#172554"/>
-    <text x="48" y="116" text-anchor="middle" fill="#60a5fa" font-family="system-ui, sans-serif" font-size="18">&#x1f4bb;</text>
-    <text x="74" y="115" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Autonomous Coding</text>
-    <rect x="32" y="132" width="236" height="60" rx="6" fill="#0f172a"/>
-    <text x="40" y="150" fill="#f97316" font-family="monospace" font-size="9">"Clone the repo, fix the failing</text>
-    <text x="40" y="164" fill="#f97316" font-family="monospace" font-size="9"> test in auth.ts, and push a</text>
-    <text x="40" y="178" fill="#f97316" font-family="monospace" font-size="9"> branch called fix/auth-test."</text>
-    <text x="32" y="210" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Dodo clones, edits, tests, commits, and</text>
-    <text x="32" y="224" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">pushes -- all in one session. You review the PR.</text>
-    <text x="32" y="248" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Works with any GitHub or GitLab repo.</text>
-  </g>
+  <a href="https://github.com/jonnyparris/dodo#features" target="_blank">
+    <g filter="url(#sd)">
+      <rect x="20" y="82" width="290" height="190" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+      <circle cx="50" cy="112" r="18" fill="#172554"/>
+      <text x="50" y="118" text-anchor="middle" fill="#60a5fa" font-family="system-ui, sans-serif" font-size="18">&#x1f4bb;</text>
+      <text x="78" y="117" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Autonomous Coding</text>
+      <rect x="32" y="134" width="266" height="60" rx="6" fill="#0f172a"/>
+      <text x="42" y="152" fill="#f97316" font-family="monospace" font-size="9">"Clone the repo, fix the failing</text>
+      <text x="42" y="166" fill="#f97316" font-family="monospace" font-size="9"> test in auth.ts, and push a</text>
+      <text x="42" y="180" fill="#f97316" font-family="monospace" font-size="9"> branch called fix/auth-test."</text>
+      <text x="32" y="214" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Dodo clones, edits, tests, commits, pushes.</text>
+      <text x="32" y="230" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">You review the PR.</text>
+      <text x="32" y="256" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Any GitHub or GitLab repo.</text>
+    </g>
+  </a>
 
-  <!-- Card 2: Batch dispatch -->
-  <g filter="url(#sd)">
-    <rect x="300" y="82" width="260" height="180" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
-    <circle cx="328" cy="110" r="18" fill="#1a2e05"/>
-    <text x="328" y="116" text-anchor="middle" fill="#4ade80" font-family="system-ui, sans-serif" font-size="18">&#x1f680;</text>
-    <text x="354" y="115" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Parallel Dispatch</text>
-    <rect x="312" y="132" width="236" height="60" rx="6" fill="#0f172a"/>
-    <text x="320" y="150" fill="#f97316" font-family="monospace" font-size="9">10 tasks on the kanban board.</text>
-    <text x="320" y="164" fill="#f97316" font-family="monospace" font-size="9">Click "Dispatch All".</text>
-    <text x="320" y="178" fill="#f97316" font-family="monospace" font-size="9">10 sessions run in parallel.</text>
-    <text x="312" y="210" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Each task gets its own isolated session.</text>
-    <text x="312" y="224" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Tasks auto-complete when sessions finish.</text>
-    <text x="312" y="248" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Parallelize work across your whole backlog.</text>
-  </g>
+  <!-- Card 2: Parallel dispatch -->
+  <a href="https://github.com/jonnyparris/dodo#orchestration" target="_blank">
+    <g filter="url(#sd)">
+      <rect x="320" y="82" width="290" height="190" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+      <circle cx="350" cy="112" r="18" fill="#1a2e05"/>
+      <text x="350" y="118" text-anchor="middle" fill="#4ade80" font-family="system-ui, sans-serif" font-size="18">&#x1f680;</text>
+      <text x="378" y="117" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Parallel Dispatch</text>
+      <rect x="332" y="134" width="266" height="60" rx="6" fill="#0f172a"/>
+      <text x="342" y="152" fill="#f97316" font-family="monospace" font-size="9">10 tasks on the kanban board.</text>
+      <text x="342" y="166" fill="#f97316" font-family="monospace" font-size="9">Click "Dispatch All".</text>
+      <text x="342" y="180" fill="#f97316" font-family="monospace" font-size="9">10 sessions run in parallel.</text>
+      <text x="332" y="214" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Each task gets its own isolated session.</text>
+      <text x="332" y="230" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Tasks auto-complete when sessions finish.</text>
+      <text x="332" y="256" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Parallelize your whole backlog.</text>
+    </g>
+  </a>
 
-  <!-- Card 3: MCP orchestration -->
-  <g filter="url(#sd)">
-    <rect x="580" y="82" width="260" height="180" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
-    <circle cx="608" cy="110" r="18" fill="#2e1065"/>
-    <text x="608" y="116" text-anchor="middle" fill="#a78bfa" font-family="system-ui, sans-serif" font-size="18">&#x1f916;</text>
-    <text x="634" y="115" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">MCP Orchestration</text>
-    <rect x="592" y="132" width="236" height="60" rx="6" fill="#0f172a"/>
-    <text x="600" y="150" fill="#f97316" font-family="monospace" font-size="9">Your local AI assistant uses</text>
-    <text x="600" y="164" fill="#f97316" font-family="monospace" font-size="9">Dodo as a remote backend --</text>
-    <text x="600" y="178" fill="#f97316" font-family="monospace" font-size="9">dispatch work to the cloud.</text>
-    <text x="592" y="210" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Claude Code, Cursor, or OpenCode connect</text>
-    <text x="592" y="224" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">via MCP and dispatch heavy jobs to Dodo.</text>
-    <text x="592" y="248" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">46-tool MCP server, or 2-tool code-mode.</text>
-  </g>
+  <!-- Card 3: Dispatched PRs -->
+  <a href="https://github.com/jonnyparris/dodo#orchestration" target="_blank">
+    <g filter="url(#sd)">
+      <rect x="620" y="82" width="290" height="190" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+      <circle cx="650" cy="112" r="18" fill="#14532d"/>
+      <text x="650" y="118" text-anchor="middle" fill="#4ade80" font-family="system-ui, sans-serif" font-size="18">&#x2713;</text>
+      <text x="678" y="117" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Verified, Auto-PR'd</text>
+      <rect x="632" y="134" width="266" height="60" rx="6" fill="#0f172a"/>
+      <text x="642" y="152" fill="#f97316" font-family="monospace" font-size="9">dispatch_repo_prompt({</text>
+      <text x="642" y="166" fill="#f97316" font-family="monospace" font-size="9">  verifyWorkflow:</text>
+      <text x="642" y="180" fill="#f97316" font-family="monospace" font-size="9">    "dodo-verify.yml" })</text>
+      <text x="632" y="214" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">GitHub Actions runs typecheck + tests.</text>
+      <text x="632" y="230" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Green checks gate an auto-draft PR.</text>
+      <text x="632" y="256" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">No more broken commits from self-verify.</text>
+    </g>
+  </a>
 
   <!-- Row 2 -->
-  <!-- Card 4: Scheduled work -->
-  <g filter="url(#sd)">
-    <rect x="20" y="282" width="260" height="180" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
-    <circle cx="48" cy="310" r="18" fill="#422006"/>
-    <text x="48" y="316" text-anchor="middle" fill="#fb923c" font-family="system-ui, sans-serif" font-size="18">&#x23f0;</text>
-    <text x="74" y="315" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Scheduled Agents</text>
-    <rect x="32" y="332" width="236" height="60" rx="6" fill="#0f172a"/>
-    <text x="40" y="350" fill="#f97316" font-family="monospace" font-size="9">"Every morning at 9am, pull</text>
-    <text x="40" y="364" fill="#f97316" font-family="monospace" font-size="9"> the latest main branch and</text>
-    <text x="40" y="378" fill="#f97316" font-family="monospace" font-size="9"> run the full test suite."</text>
-    <text x="32" y="410" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Cron, delayed, datetime, and interval</text>
-    <text x="32" y="424" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">scheduling. Prompts fire automatically.</text>
-    <text x="32" y="448" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Your agent works while you sleep.</text>
-  </g>
+  <!-- Card 4: MCP orchestration -->
+  <a href="https://github.com/jonnyparris/dodo#connect-via-mcp" target="_blank">
+    <g filter="url(#sd)">
+      <rect x="20" y="292" width="290" height="190" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+      <circle cx="50" cy="322" r="18" fill="#2e1065"/>
+      <text x="50" y="328" text-anchor="middle" fill="#a78bfa" font-family="system-ui, sans-serif" font-size="18">&#x1f916;</text>
+      <text x="78" y="327" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">MCP Orchestration</text>
+      <rect x="32" y="344" width="266" height="60" rx="6" fill="#0f172a"/>
+      <text x="42" y="362" fill="#f97316" font-family="monospace" font-size="9">Your local AI assistant uses</text>
+      <text x="42" y="376" fill="#f97316" font-family="monospace" font-size="9">Dodo as a remote backend --</text>
+      <text x="42" y="390" fill="#f97316" font-family="monospace" font-size="9">dispatch work to the cloud.</text>
+      <text x="32" y="424" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Claude Code, Cursor, or OpenCode connect</text>
+      <text x="32" y="440" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">via MCP and dispatch heavy jobs to Dodo.</text>
+      <text x="32" y="466" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">47-tool MCP server, or 2-tool code-mode.</text>
+    </g>
+  </a>
 
-  <!-- Card 5: Team sharing -->
-  <g filter="url(#sd)">
-    <rect x="300" y="282" width="260" height="180" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
-    <circle cx="328" cy="310" r="18" fill="#083344"/>
-    <text x="328" y="316" text-anchor="middle" fill="#22d3ee" font-family="system-ui, sans-serif" font-size="18">&#x1f465;</text>
-    <text x="354" y="315" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Team Sharing</text>
-    <rect x="312" y="332" width="236" height="60" rx="6" fill="#0f172a"/>
-    <text x="320" y="350" fill="#f97316" font-family="monospace" font-size="9">Share a session with your team.</text>
-    <text x="320" y="364" fill="#f97316" font-family="monospace" font-size="9">Read-only or read-write access.</text>
-    <text x="320" y="378" fill="#f97316" font-family="monospace" font-size="9">Fork it to continue the work.</text>
-    <text x="312" y="410" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Multi-user with Cloudflare Access. Each</text>
-    <text x="312" y="424" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">user gets isolated sessions and secrets.</text>
-    <text x="312" y="448" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Secrets are envelope-encrypted per user.</text>
-  </g>
+  <!-- Card 5: Scheduled work -->
+  <a href="https://github.com/jonnyparris/dodo#scheduling" target="_blank">
+    <g filter="url(#sd)">
+      <rect x="320" y="292" width="290" height="190" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+      <circle cx="350" cy="322" r="18" fill="#422006"/>
+      <text x="350" y="328" text-anchor="middle" fill="#fb923c" font-family="system-ui, sans-serif" font-size="18">&#x23f0;</text>
+      <text x="378" y="327" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Scheduled Agents</text>
+      <rect x="332" y="344" width="266" height="60" rx="6" fill="#0f172a"/>
+      <text x="342" y="362" fill="#f97316" font-family="monospace" font-size="9">"Every morning at 9am, pull</text>
+      <text x="342" y="376" fill="#f97316" font-family="monospace" font-size="9"> main and run the full test</text>
+      <text x="342" y="390" fill="#f97316" font-family="monospace" font-size="9"> suite. Ping me on failure."</text>
+      <text x="332" y="424" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Cron, delayed, datetime, and interval</text>
+      <text x="332" y="440" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">scheduling. ntfy push notifications.</text>
+      <text x="332" y="466" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Your agent works while you sleep.</text>
+    </g>
+  </a>
 
   <!-- Card 6: Browser + research -->
-  <g filter="url(#sd)">
-    <rect x="580" y="282" width="260" height="180" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
-    <circle cx="608" cy="310" r="18" fill="#3b0764"/>
-    <text x="608" y="316" text-anchor="middle" fill="#e879f9" font-family="system-ui, sans-serif" font-size="18">&#x1f310;</text>
-    <text x="634" y="315" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Browser + Research</text>
-    <rect x="592" y="332" width="236" height="60" rx="6" fill="#0f172a"/>
-    <text x="600" y="350" fill="#f97316" font-family="monospace" font-size="9">"Read the Cloudflare docs for</text>
-    <text x="600" y="364" fill="#f97316" font-family="monospace" font-size="9"> D1 and write a migration</text>
-    <text x="600" y="378" fill="#f97316" font-family="monospace" font-size="9"> script based on what you find."</text>
-    <text x="592" y="410" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Headless Chrome via Browser Rendering.</text>
-    <text x="592" y="424" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Navigate pages, read docs, scrape data.</text>
-    <text x="592" y="448" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Full CDP access for any web automation.</text>
-  </g>
+  <a href="https://github.com/jonnyparris/dodo#browser" target="_blank">
+    <g filter="url(#sd)">
+      <rect x="620" y="292" width="290" height="190" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+      <circle cx="650" cy="322" r="18" fill="#3b0764"/>
+      <text x="650" y="328" text-anchor="middle" fill="#e879f9" font-family="system-ui, sans-serif" font-size="18">&#x1f310;</text>
+      <text x="678" y="327" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Browser + Research</text>
+      <rect x="632" y="344" width="266" height="60" rx="6" fill="#0f172a"/>
+      <text x="642" y="362" fill="#f97316" font-family="monospace" font-size="9">"Read the Cloudflare docs for</text>
+      <text x="642" y="376" fill="#f97316" font-family="monospace" font-size="9"> D1 and write a migration</text>
+      <text x="642" y="390" fill="#f97316" font-family="monospace" font-size="9"> script based on what you find."</text>
+      <text x="632" y="424" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Headless Chrome via Browser Rendering.</text>
+      <text x="632" y="440" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Full-page screenshots render in chat.</text>
+      <text x="632" y="466" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Full CDP access for any web automation.</text>
+    </g>
+  </a>
+
+  <!-- Row 3 -->
+  <!-- Card 7: Team sharing -->
+  <a href="https://github.com/jonnyparris/dodo#authentication" target="_blank">
+    <g filter="url(#sd)">
+      <rect x="20" y="502" width="290" height="190" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+      <circle cx="50" cy="532" r="18" fill="#083344"/>
+      <text x="50" y="538" text-anchor="middle" fill="#22d3ee" font-family="system-ui, sans-serif" font-size="18">&#x1f465;</text>
+      <text x="78" y="537" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Team Sharing</text>
+      <rect x="32" y="554" width="266" height="60" rx="6" fill="#0f172a"/>
+      <text x="42" y="572" fill="#f97316" font-family="monospace" font-size="9">Share a session with your team.</text>
+      <text x="42" y="586" fill="#f97316" font-family="monospace" font-size="9">Read-only or read-write access.</text>
+      <text x="42" y="600" fill="#f97316" font-family="monospace" font-size="9">Fork it to continue the work.</text>
+      <text x="32" y="634" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Multi-user with Cloudflare Access. Each</text>
+      <text x="32" y="650" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">user gets isolated sessions and secrets.</text>
+      <text x="32" y="676" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Secrets envelope-encrypted per user.</text>
+    </g>
+  </a>
+
+  <!-- Card 8: Artifacts -->
+  <a href="https://github.com/jonnyparris/dodo#artifacts" target="_blank">
+    <g filter="url(#sd)">
+      <rect x="320" y="502" width="290" height="190" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+      <circle cx="350" cy="532" r="18" fill="#1a2e05"/>
+      <text x="350" y="538" text-anchor="middle" fill="#a3e635" font-family="system-ui, sans-serif" font-size="18">&#x1f4e6;</text>
+      <text x="378" y="537" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Artifacts Repo</text>
+      <rect x="332" y="554" width="266" height="60" rx="6" fill="#0f172a"/>
+      <text x="342" y="572" fill="#f97316" font-family="monospace" font-size="9">Every session auto-gets its own</text>
+      <text x="342" y="586" fill="#f97316" font-family="monospace" font-size="9">GitHub repo. Workspace changes</text>
+      <text x="342" y="600" fill="#f97316" font-family="monospace" font-size="9">flush at end of each agent turn.</text>
+      <text x="332" y="634" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Reviewable git history of what the agent</text>
+      <text x="332" y="650" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">did -- without waiting for it to commit.</text>
+      <text x="332" y="676" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Forked sessions fork the Artifacts too.</text>
+    </g>
+  </a>
+
+  <!-- Card 9: Multimodal -->
+  <a href="https://github.com/jonnyparris/dodo#attachments-images-in-chat" target="_blank">
+    <g filter="url(#sd)">
+      <rect x="620" y="502" width="290" height="190" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+      <circle cx="650" cy="532" r="18" fill="#500724"/>
+      <text x="650" y="538" text-anchor="middle" fill="#f472b6" font-family="system-ui, sans-serif" font-size="18">&#x1f5bc;</text>
+      <text x="678" y="537" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Multimodal</text>
+      <rect x="632" y="554" width="266" height="60" rx="6" fill="#0f172a"/>
+      <text x="642" y="572" fill="#f97316" font-family="monospace" font-size="9">Paste a screenshot of a bug.</text>
+      <text x="642" y="586" fill="#f97316" font-family="monospace" font-size="9">The agent sees the UI, reads</text>
+      <text x="642" y="600" fill="#f97316" font-family="monospace" font-size="9">the error, fixes the code.</text>
+      <text x="632" y="634" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Vision models (Claude, Gemini, GPT-4o).</text>
+      <text x="632" y="650" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Tool + model-generated images too.</text>
+      <text x="632" y="676" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">R2-backed, persist across reloads.</text>
+    </g>
+  </a>
 
   <!-- Footer -->
-  <text x="430" y="498" text-anchor="middle" fill="#475569" font-family="system-ui, sans-serif" font-size="11">Each session is isolated, persistent, and recoverable. Scale from one task to hundreds.</text>
+  <text x="460" y="710" text-anchor="middle" fill="#475569" font-family="system-ui, sans-serif" font-size="11">Each session is isolated, persistent, and recoverable. Scale from one task to hundreds.</text>
 </svg>
