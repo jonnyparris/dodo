@@ -550,6 +550,35 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         // previous tool results on subsequent iterations.
         let messages = await self.assembleContext();
 
+        // ─── Capture the original user prompt for phase-transition digests ───
+        // The auto-continuation loop rebuilds `messages` on each phase with
+        // `[firstMsg, summaryInjection, ...recentMsgs]`, where `firstMsg`
+        // defaults to `messages[0]`. If the original user prompt is large
+        // (dispatch prompts often are), preserving it in full on every phase
+        // re-sends the whole prompt to the LLM each turn, inflating input
+        // tokens on every phase transition — the prompt ends up counted N
+        // times for N phases. See issue #34 comment about prompt duplication.
+        //
+        // We capture a short digest of the original prompt here so later
+        // phases can substitute the digest for `firstMsg` instead of the full
+        // prompt.
+        const originalFirstMsg = messages[0];
+        const originalPromptDigest = ((): string => {
+          if (!originalFirstMsg) return "";
+          const content = originalFirstMsg.content;
+          const text = typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content
+                  .map((part) => (part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part ? String(part.text) : ""))
+                  .filter(Boolean)
+                  .join("\n")
+              : "";
+          // Keep the first ~500 chars — enough to carry the goal statement
+          // without dragging the whole prompt forward.
+          return text.length > 500 ? `${text.slice(0, 500)}…[truncated, see phase summary for progress]` : text;
+        })();
+
         // ─── Loop-entry oversized-prompt guard (issue #34, bug 3) ───
         // When the user prompt itself is large (detailed dispatch prompts, long
         // pasted logs, etc.) the first streamText() call can exceed the budget
@@ -1008,7 +1037,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             // messages to preserve the model's findings and plan.
             const keepRecent = 12;
             if (messages.length > keepRecent + 2) {
-              const firstMsg = messages[0];
+              // Replace the original (potentially huge) user prompt at index 0
+              // with a compact synthetic system message that carries only the
+              // goal digest. See issue #34 — re-sending the full prompt on
+              // every phase duplicated input-token cost N times for N phases.
+              const firstMsg: ModelMessage = originalPromptDigest
+                ? {
+                    role: "system" as const,
+                    content: `[Original task]\n${originalPromptDigest}`,
+                  }
+                : messages[0];
               const recentMsgs = messages.slice(-keepRecent);
               const droppedMsgs = messages.slice(1, -keepRecent);
 
