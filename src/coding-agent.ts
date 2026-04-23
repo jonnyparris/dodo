@@ -1767,6 +1767,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const incomingEmail = request.headers.get("x-dodo-owner-email");
+    if (incomingEmail) {
+      await this.reconcileOwnerIdentity(incomingEmail);
+    }
 
     try {
       if (request.method === "GET" && url.pathname === "/ws") {
@@ -4241,6 +4245,46 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.db.exec("DELETE FROM metadata WHERE key = ?", key);
   }
 
+  /**
+   * Clear all MCP connections — SDK-managed OAuth servers and static gatekeepers.
+   */
+  async clearAllMcpConnections(): Promise<void> {
+    try {
+      const servers = this.getMcpServers().servers;
+      for (const id of Object.keys(servers)) {
+        try {
+          await this.mcp.removeMcpServer(id);
+        } catch (err) {
+          log("warn", "Failed to remove OAuth MCP", { id, err: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    } catch (err) {
+      log("warn", "Failed to enumerate MCP servers", { err: err instanceof Error ? err.message : String(err) });
+    }
+    for (const gk of this.mcpGatekeepers) {
+      try {
+        gk.disconnect();
+      } catch (err) {
+        log("warn", "Failed to disconnect gatekeeper", { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    this.mcpGatekeepers = [];
+  }
+
+  /**
+   * Compare incoming Access email against stored owner_email metadata.
+   * On drift, clear MCPs, update the stored email, and reconnect.
+   */
+  async reconcileOwnerIdentity(incomingEmail: string | null | undefined): Promise<void> {
+    if (!incomingEmail) return;
+    const storedEmail = this.readMetadata("owner_email");
+    if (storedEmail && storedEmail === incomingEmail) return;
+    log("info", "owner identity drift", { storedEmail: storedEmail ?? null, incomingEmail });
+    await this.clearAllMcpConnections();
+    this.writeMetadata("owner_email", incomingEmail);
+    await this.connectMcpServers();
+  }
+
   async refreshMcpState(mcpId: string): Promise<void> {
     const servers = this.getMcpServers();
     const server = servers.servers[mcpId];
@@ -4345,6 +4389,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     } catch (error) {
       console.warn("connectMcpServers failed:", error instanceof Error ? error.message : error);
     }
+  }
+
+  async alarm(): Promise<void> {
+    const ownerEmail = this.readMetadata("owner_email");
+    log("info", "mcp-revocation alarm fired", { ownerEmail: ownerEmail ?? null });
+    await this.ctx.storage.setAlarm(Date.now() + 24 * 60 * 60 * 1000);
   }
 
   private async readAppConfig(): Promise<AppConfig> {
