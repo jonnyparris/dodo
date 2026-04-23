@@ -7,6 +7,7 @@ export interface McpGatekeeperConfig {
   id: string;
   name: string;
   type: "http" | "service-binding";
+  auth_type: "oauth" | "static_headers";
   url?: string;
   headers?: Record<string, string>;
   /** Header key names (without values) for display purposes. */

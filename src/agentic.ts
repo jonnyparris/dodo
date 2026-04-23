@@ -702,13 +702,20 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: BuildToolsOptions & { mcpGatekeepers?: McpGatekeeper[] },
+  options?: BuildToolsOptions & { agent?: { mcp?: { listTools: () => unknown[]; callTool: (input: { name: string; arguments: unknown; serverId: string }) => Promise<unknown> } } },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
+  const existingNames = new Set(Object.keys(tools));
 
   if (options?.mcpGatekeepers?.length) {
-    const mcpTools = buildMcpTools(options.mcpGatekeepers);
+    const mcpTools = buildMcpTools(options.mcpGatekeepers, existingNames);
     Object.assign(tools, mcpTools);
+    Object.keys(mcpTools).forEach((name) => existingNames.add(name));
+  }
+
+  if (options?.agent?.mcp) {
+    const sdkMcpTools = buildSdkMcpTools(options.agent.mcp, existingNames);
+    Object.assign(tools, sdkMcpTools);
   }
 
   return tools;
@@ -721,7 +728,7 @@ export function buildToolsForThink(
  * by the gatekeeper's listTools(). We use jsonSchema() passthrough for the
  * input schema since MCP tools define JSON Schema directly, not Zod.
  */
-function buildMcpTools(gatekeepers: McpGatekeeper[]): Record<string, AnyTool> {
+function buildMcpTools(gatekeepers: McpGatekeeper[], existingNames: Set<string>): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
   for (const gk of gatekeepers) {
@@ -731,6 +738,7 @@ function buildMcpTools(gatekeepers: McpGatekeeper[]): Record<string, AnyTool> {
     if (!cachedTools) continue;
 
     for (const mcpTool of cachedTools) {
+      if (existingNames.has(mcpTool.name) || tools[mcpTool.name]) continue;
       tools[mcpTool.name] = tool({
         description: mcpTool.description ?? `MCP tool: ${mcpTool.name}`,
         inputSchema: mcpTool.inputSchema

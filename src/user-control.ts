@@ -41,6 +41,7 @@ const mcpConfigCreateSchema = z
   .object({
     name: z.string().min(1),
     type: z.enum(["http", "service-binding"]).default("http"),
+    auth_type: z.enum(["oauth", "static_headers"]).default("static_headers"),
     url: z.string().url().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     enabled: z.boolean().default(true),
@@ -51,6 +52,7 @@ const mcpConfigUpdateSchema = z
   .object({
     name: z.string().min(1).optional(),
     type: z.enum(["http", "service-binding"]).optional(),
+    auth_type: z.enum(["oauth", "static_headers"]).optional(),
     url: z.string().url().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     enabled: z.boolean().optional(),
@@ -558,12 +560,12 @@ export class UserControl extends DurableObject<Env> {
         const existing = this.db.one("SELECT id FROM mcp_configs WHERE id = 'browser-rendering'");
         if (existing) {
           this.db.exec(
-            "UPDATE mcp_configs SET url = ?, headers_json = ?, enabled = 1, updated_at = ? WHERE id = 'browser-rendering'",
+            "UPDATE mcp_configs SET url = ?, auth_type = 'static_headers', headers_json = ?, enabled = 1, updated_at = ? WHERE id = 'browser-rendering'",
             mcpUrl, headerKeys, now,
           );
         } else {
           this.db.exec(
-            "INSERT INTO mcp_configs (id, name, type, url, headers_json, enabled, created_at, updated_at) VALUES ('browser-rendering', 'Browser Rendering', 'http', ?, ?, 1, ?, ?)",
+            "INSERT INTO mcp_configs (id, name, type, auth_type, url, headers_json, enabled, created_at, updated_at) VALUES ('browser-rendering', 'Browser Rendering', 'http', 'static_headers', ?, ?, 1, ?, ?)",
             mcpUrl, headerKeys, now, now,
           );
         }
@@ -729,6 +731,7 @@ export class UserControl extends DurableObject<Env> {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         type TEXT NOT NULL DEFAULT 'http',
+        auth_type TEXT NOT NULL DEFAULT 'static_headers',
         url TEXT,
         headers_json TEXT,
         enabled INTEGER NOT NULL DEFAULT 1,
@@ -736,6 +739,12 @@ export class UserControl extends DurableObject<Env> {
         updated_at INTEGER NOT NULL
       )
     `);
+    try {
+      this.db.exec("ALTER TABLE mcp_configs ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'static_headers'");
+    } catch {
+      // Column already exists.
+    }
+    this.db.exec("UPDATE mcp_configs SET auth_type = 'static_headers' WHERE auth_type IS NULL OR auth_type = ''");
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS session_mcp_overrides (
@@ -1136,14 +1145,14 @@ export class UserControl extends DurableObject<Env> {
    * Create an MCP config, storing headers as encrypted secrets.
    * The mcp_configs table stores only header key names (not values).
    */
-  private async createMcpConfigEncrypted(input: { name: string; type: string; url?: string; headers?: Record<string, string>; enabled: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
+  private async createMcpConfigEncrypted(input: { name: string; type: string; auth_type: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
     const id = crypto.randomUUID();
     const now = nowEpoch();
     const headerKeys = input.headers ? Object.keys(input.headers) : [];
 
     this.db.exec(
-      "INSERT INTO mcp_configs (id, name, type, url, headers_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      id, input.name, input.type, input.url ?? null, headerKeys.length > 0 ? JSON.stringify(headerKeys) : null, input.enabled ? 1 : 0, now, now,
+      "INSERT INTO mcp_configs (id, name, type, auth_type, url, headers_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id, input.name, input.type, input.auth_type, input.url ?? null, headerKeys.length > 0 ? JSON.stringify(headerKeys) : null, input.enabled ? 1 : 0, now, now,
     );
 
     // Store each header value as an encrypted secret
@@ -1160,7 +1169,7 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Update an MCP config, replacing encrypted header secrets if new headers provided.
    */
-  private async updateMcpConfigEncrypted(id: string, patch: { name?: string; type?: string; url?: string; headers?: Record<string, string>; enabled?: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
+  private async updateMcpConfigEncrypted(id: string, patch: { name?: string; type?: string; auth_type?: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled?: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
     const current = this.getMcpConfigSafe(id);
     const now = nowEpoch();
 
@@ -1180,9 +1189,10 @@ export class UserControl extends DurableObject<Env> {
     }
 
     this.db.exec(
-      "UPDATE mcp_configs SET name = ?, type = ?, url = ?, headers_json = ?, enabled = ?, updated_at = ? WHERE id = ?",
+      "UPDATE mcp_configs SET name = ?, type = ?, auth_type = ?, url = ?, headers_json = ?, enabled = ?, updated_at = ? WHERE id = ?",
       patch.name ?? current.name,
       patch.type ?? current.type,
+      patch.auth_type ?? current.auth_type,
       patch.url ?? current.url ?? null,
       headerKeys.length > 0 ? JSON.stringify(headerKeys) : null,
       (patch.enabled !== undefined ? patch.enabled : current.enabled) ? 1 : 0,
@@ -1219,7 +1229,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private getMcpConfigSafe(id: string): McpGatekeeperConfig & { headerKeys?: string[] } {
-    const row = this.db.one("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
+    const row = this.db.one("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
     if (!row) throw new Error(`MCP config ${id} not found`);
     return this.mapMcpConfigRowSafe(row);
   }
@@ -1228,7 +1238,7 @@ export class UserControl extends DurableObject<Env> {
    * List MCP configs for display. Returns header key names but not values.
    */
   private listMcpConfigsSafe(): Array<McpGatekeeperConfig & { headerKeys?: string[] }> {
-    return this.db.all("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")
+    return this.db.all("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")
       .map((row) => this.mapMcpConfigRowSafe(row));
   }
 
@@ -1260,6 +1270,7 @@ export class UserControl extends DurableObject<Env> {
       id: String(row.id),
       name: String(row.name),
       type: String(row.type) as "http" | "service-binding",
+      auth_type: row.auth_type === "oauth" ? "oauth" : "static_headers",
       url: row.url === null ? undefined : String(row.url),
       headers: undefined, // Never expose header values in listing
       headerKeys,
@@ -1287,6 +1298,7 @@ export class UserControl extends DurableObject<Env> {
       id: String(row.id),
       name: String(row.name),
       type: String(row.type) as "http" | "service-binding",
+      auth_type: row.auth_type === "oauth" ? "oauth" : "static_headers",
       url: row.url === null ? undefined : String(row.url),
       headers: undefined,
       headerKeys,
