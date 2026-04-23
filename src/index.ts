@@ -223,7 +223,7 @@ app.all("/mcp", async (c) => {
 
   if (!resolvedEmail && c.env.DODO_MCP_TOKEN && token === c.env.DODO_MCP_TOKEN) {
     isServiceMode = true;
-    resolvedEmail = resolveAdminEmail(c.env);
+    resolvedEmail = resolveAdminEmail(c.env) ?? null;
   }
 
   if (!resolvedEmail) {
@@ -264,7 +264,7 @@ app.all("/mcp/codemode", async (c) => {
 
   if (!resolvedEmail && c.env.DODO_MCP_TOKEN && token === c.env.DODO_MCP_TOKEN) {
     isServiceMode = true;
-    resolvedEmail = resolveAdminEmail(c.env);
+    resolvedEmail = resolveAdminEmail(c.env) ?? null;
   }
 
   if (!resolvedEmail) {

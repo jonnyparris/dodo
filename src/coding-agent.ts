@@ -4253,7 +4253,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       const servers = this.getMcpServers().servers;
       for (const id of Object.keys(servers)) {
         try {
-          await this.mcp.removeMcpServer(id);
+          await this.mcp.removeServer(id);
         } catch (err) {
           log("warn", "Failed to remove OAuth MCP", { id, err: err instanceof Error ? err.message : String(err) });
         }

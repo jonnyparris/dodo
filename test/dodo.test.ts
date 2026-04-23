@@ -599,7 +599,7 @@ describe("Dodo foundation", () => {
   });
 
   it("accepts MCP requests with a valid Bearer token and lists tools", async () => {
-    const mcpHeaders = { "content-type": "application/json", "Authorization": "Bearer shared-mcp-token", "Accept": "application/json, text/event-stream" };
+    const mcpHeaders = { "content-type": "application/json", "Authorization": "Bearer test-mcp-token", "Accept": "application/json, text/event-stream" };
 
     const initResponse = await fetchJson("/mcp", {
       body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1, params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } } }),
@@ -718,7 +718,7 @@ describe("Artifacts binding", () => {
 
   it("creates a repo on first get_artifacts_remote call", async () => {
     const sessionId = await createSession();
-    const mcpHeaders = { "content-type": "application/json", "Authorization": "Bearer shared-mcp-token", "Accept": "application/json, text/event-stream" };
+    const mcpHeaders = { "content-type": "application/json", "Authorization": "Bearer test-mcp-token", "Accept": "application/json, text/event-stream" };
 
     const initResponse = await fetchJson("/mcp", {
       body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1, params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } } }),
