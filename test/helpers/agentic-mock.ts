@@ -158,11 +158,11 @@ export const buildProviderForModel = vi.fn().mockImplementation((modelId: string
 // production. Kept inline rather than re-imported because this mock
 // deliberately severs the link to the real agentic module.
 export const EXPLORE_SYSTEM_PROMPT = "You are a search assistant (mock).";
-export const EXPLORE_MAX_STEPS = 12;
+export const EXPLORE_MAX_STEPS = 16;
 export const EXPLORE_TIMEOUT_MS = 60_000;
 
 export const TASK_SYSTEM_PROMPT = "You are a focused subagent (mock).";
-export const TASK_MAX_STEPS = 15;
+export const TASK_MAX_STEPS = 20;
 export const TASK_TIMEOUT_MS = 180_000;
 export const TASK_FACET_TIMEOUT_MS = 600_000;
 
@@ -170,6 +170,13 @@ export const TASK_FACET_TIMEOUT_MS = 600_000;
 // touch no I/O.
 export function capToolOutputs<T extends Record<string, unknown>>(tools: T): T {
   return tools;
+}
+
+// Prune-step helper — the mock uses a pass-through that never prunes so
+// tests remain deterministic regardless of message-history size. The real
+// pruning logic is covered directly in test/subagent-prune-unit.test.ts.
+export function subagentPrepareStep(_options?: { windowSize?: number }) {
+  return () => ({});
 }
 
 export function getExploreModel(mainModel: string): string {

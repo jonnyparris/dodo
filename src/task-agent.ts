@@ -13,6 +13,7 @@ import {
   buildProviderForModel,
   capToolOutputs,
   resolveSubagentModel,
+  subagentPrepareStep,
   TASK_SYSTEM_PROMPT,
   TASK_MAX_STEPS,
   TASK_FACET_TIMEOUT_MS,
@@ -270,6 +271,11 @@ export class TaskAgent extends Agent<Env> {
         tools: taskTools,
         stopWhen: stepCountIs(TASK_MAX_STEPS),
         maxOutputTokens: 4000,
+        // See `subagentPrepareStep` in agentic.ts — prunes tool-result
+        // accumulation across steps. Task has more tool call variety than
+        // explore (write + edit in addition to read/grep/find) so the
+        // accumulation curve is steeper without this.
+        prepareStep: subagentPrepareStep(),
         abortSignal: AbortSignal.timeout(timeoutMs),
       });
 

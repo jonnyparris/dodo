@@ -13,6 +13,7 @@ import {
   EXPLORE_MAX_STEPS,
   EXPLORE_TIMEOUT_MS,
   resolveSubagentModel,
+  subagentPrepareStep,
 } from "./agentic";
 import type { AppConfig, Env } from "./types";
 import type { CodingAgent } from "./coding-agent";
@@ -202,6 +203,10 @@ export class ExploreAgent extends Agent<Env> {
         tools: readOnlyTools,
         stopWhen: stepCountIs(EXPLORE_MAX_STEPS),
         maxOutputTokens: 4000,
+        // See `subagentPrepareStep` in agentic.ts — prunes tool-result
+        // accumulation across steps so a 16-step run doesn't ship ~300k
+        // tokens of stale context back to the model on every call.
+        prepareStep: subagentPrepareStep(),
         abortSignal: AbortSignal.timeout(EXPLORE_TIMEOUT_MS),
       });
 

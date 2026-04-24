@@ -190,7 +190,7 @@ Dodo runs its own agentic loop rather than delegating to a framework. Each itera
 
 For search-heavy and bounded-side-work tasks, Dodo spawns subagents that run in isolation from the parent turn. Two flavours:
 
-- **`explore`** -- a read-only investigator. Runs up to 12 steps of grep/find/list/read with a cheap model (Haiku, GPT-4.1 Mini, Gemini Flash) and returns a compact summary. Saves 5-20x tokens vs dumping raw file contents into the main context.
+- **`explore`** -- a read-only investigator. Runs up to 16 steps of grep/find/list/read with a cheap model (Haiku, GPT-4.1 Mini, Gemini Flash) and returns a compact summary. Per-tool output caps plus inter-step message pruning keep input-token growth bounded across long investigations.
 - **`task`** -- a write-capable side task. Same tool set as the parent plus optional **scratch workspace** mode where writes land in an isolated R2 prefix and the parent only sees them if it explicitly merges them back.
 
 Both subagents have two execution modes, configurable per-user via `exploreMode` and `taskMode`:

@@ -222,11 +222,41 @@ prod.
 
 | Constant | Value | Notes |
 |---|---|---|
-| `EXPLORE_MAX_STEPS` | 12 | Same in both modes. Tuned from observed tool-call volume. |
+| `EXPLORE_MAX_STEPS` | 16 | Same in both modes. Raised from 12 after prod A/B showed 12 exhausted the budget before the summary. Prompt tells the model to reserve the last 2 steps for a summary. |
 | `EXPLORE_TIMEOUT_MS` | 60_000 | Only applies in-process; facet runs have their own DO lifetime. |
-| `TASK_MAX_STEPS` | 15 | Same in both modes. |
+| `TASK_MAX_STEPS` | 20 | Same in both modes. Raised from 15 alongside EXPLORE_MAX_STEPS. |
 | `TASK_TIMEOUT_MS` | 180_000 | In-process timeout. |
 | `TASK_FACET_TIMEOUT_MS` | 600_000 | Facet-mode task gets 10 minutes — escapes the parent's turn budget. |
+| `SUBAGENT_MSG_WINDOW` | 4 | Number of trailing assistant+tool message groups kept between steps (see "Message pruning" below). |
+
+## Token efficiency
+
+Subagents have **two layers of context control** to stop tool-result volume from dominating cost:
+
+### Per-tool output caps
+
+`capToolOutputs` in `agentic.ts` wraps every tool's `execute` function and truncates results before they enter the message history:
+
+| Tool | Cap |
+|---|---|
+| `grep`, `find`, `list` | 100 entries |
+| `read` | 200 lines |
+| `codemode` | 32 KB |
+
+If the model wants more, it passes offset/limit or narrows the query. This is the "OpenCode pattern" — cap at the tool, not in post-processing.
+
+### Message-history pruning between steps
+
+Tool caps bound any single tool result, but a 16-step explore still accumulates all 16 prior results in the `messages` array for step 17. Observed in prod: a single facet run racked up ~300k input tokens across its step budget, entirely from stale tool-result history being re-fed on every step.
+
+`subagentPrepareStep` (wired into every `generateText` call site — in-process and facet) is a `prepareStep` callback that keeps:
+
+- The original user query (goal anchor)
+- The most recent `SUBAGENT_MSG_WINDOW` assistant+tool_result groups
+
+…and replaces the dropped middle with a single marker message so the model knows history was compacted, not corrupted. This gives the model roughly two working tool-call cycles of memory plus the current turn — enough to chain reasoning, not enough to let history balloon.
+
+Tests in `test/subagent-prune-unit.test.ts` lock in the contract.
 
 ## When to flip the switch
 

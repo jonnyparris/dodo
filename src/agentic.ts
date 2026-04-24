@@ -1,6 +1,6 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { StateBackend } from "@cloudflare/shell";
-import { generateText, jsonSchema, stepCountIs, tool, zodSchema, type Tool as AnyToolType } from "ai";
+import { generateText, jsonSchema, stepCountIs, tool, zodSchema, type ModelMessage, type Tool as AnyToolType } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import type { AttachmentRef } from "./attachments";
@@ -337,6 +337,110 @@ function capText(text: string, maxLines: number, maxBytes: number): string {
 
 function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
+}
+
+// ─── Subagent message-history pruning ───
+// Tool-level output caps (capToolOutputs above) bound the size of ANY single
+// tool result. But inside a multi-step subagent run, every prior tool result
+// stays pinned in the `messages` array and gets re-fed to the model every step.
+// A 12-step explore that reads five 200-line snippets still ships ~50k tokens
+// of stale tool output at step 12 — because steps 1-11 are still present.
+//
+// Observed in the 2026-04-24 prod A/B: a single explore facet accumulated
+// ~301k input tokens across 12 steps, within shouting distance of Haiku's
+// 200k window. No single step was over the per-tool cap; the sum was.
+//
+// `pruneSubagentHistory` plugs into `generateText`'s `prepareStep` callback.
+// It keeps:
+//   - the system message (injected by generateText, not in our `messages`)
+//   - the initial user message (the query/prompt)
+//   - the most recent N assistant+tool_result pairs
+// and replaces the dropped middle with a single marker message so the model
+// knows history was compacted, not corrupted.
+//
+// N defaults to 4. That's aggressive — two full tool-call cycles in working
+// memory plus the current turn. Subagents are supposed to do ONE bounded
+// thing; they don't need long-term conversational context. If the model
+// needed information from an earlier step, it should have summarised it
+// into its own reasoning before now.
+
+/**
+ * Keep this many trailing message groups (each group = one assistant msg
+ * plus any tool_result messages tied to it). Chosen empirically: smaller
+ * values risk dropping useful context the model hasn't condensed yet;
+ * larger values defeat the point. 4 is enough for the model to remember
+ * its last ~2 tool-call cycles plus the current turn.
+ */
+const SUBAGENT_MSG_WINDOW = 4;
+
+/**
+ * Compact tool-result marker used when we drop the middle of the message
+ * history. Surfaces a rough count so the model can self-explain if asked.
+ */
+function makePruneMarker(droppedCount: number): ModelMessage {
+  return {
+    role: "user",
+    content: `[system: ${droppedCount} earlier assistant/tool messages were pruned to keep your input token count bounded. If you need information from those steps, call the relevant tool again — don't try to reconstruct the content.]`,
+  };
+}
+
+/**
+ * Return a pruned copy of `messages` keeping the initial user prompt and the
+ * most recent `windowSize` assistant+tool_result groups. Stable when the
+ * history is already short enough.
+ *
+ * Intended for use inside `generateText({ prepareStep })`.
+ */
+export function pruneSubagentHistory(
+  messages: Array<ModelMessage>,
+  windowSize: number = SUBAGENT_MSG_WINDOW,
+): Array<ModelMessage> {
+  if (messages.length <= windowSize + 1) return messages;
+
+  // Find the first user message — this is the original query we must preserve
+  // across pruning so the model retains its goal.
+  const firstUserIdx = messages.findIndex((m) => m.role === "user");
+  if (firstUserIdx < 0) return messages; // defensive — shouldn't happen
+
+  // Walk from the end of the list backwards and group: every assistant
+  // message and the tool_result messages that follow it are one "group".
+  // We keep the last `windowSize` groups.
+  const groups: Array<{ start: number; end: number }> = [];
+  let cursor = messages.length;
+  while (cursor > firstUserIdx + 1 && groups.length < windowSize) {
+    const end = cursor;
+    let start = cursor - 1;
+    // Walk backwards through any leading non-assistant messages (tool results)
+    // until we find the assistant message that emitted them.
+    while (start > firstUserIdx + 1 && messages[start].role !== "assistant") {
+      start--;
+    }
+    groups.unshift({ start, end });
+    cursor = start;
+  }
+
+  if (groups.length === 0) return messages;
+
+  // Keep: [0 .. firstUserIdx], marker, messages[groups[0].start ..]
+  const head = messages.slice(0, firstUserIdx + 1);
+  const tailStart = groups[0].start;
+  const dropped = tailStart - (firstUserIdx + 1);
+  if (dropped <= 0) return messages;
+  const tail = messages.slice(tailStart);
+  return [...head, makePruneMarker(dropped), ...tail];
+}
+
+/**
+ * Convenience: build a `prepareStep` callback suitable for passing into
+ * `generateText` in both explore and task subagent call sites. Returns a
+ * message override only when pruning actually happens.
+ */
+export function subagentPrepareStep(options?: { windowSize?: number }) {
+  const windowSize = options?.windowSize ?? SUBAGENT_MSG_WINDOW;
+  return ({ messages }: { messages: Array<ModelMessage> }) => {
+    const pruned = pruneSubagentHistory(messages, windowSize);
+    return pruned === messages ? {} : { messages: pruned };
+  };
 }
 
 /**
@@ -832,25 +936,33 @@ function buildGitTools(
 // context window. Returns a compact summary (~500-1000 tokens) instead of
 // raw file contents (~5000-20000 tokens), saving 5-20× tokens per search.
 
+/** Max steps for the explore subagent.
+ *  History:
+ *   - Bumped 5 → 12 after the 2026-04-24 demo sessions
+ *     (`877cefcc`, `197cc126`, `fdad8393`) showed 5 steps was routinely
+ *     consumed by tool-calling before the model got a chance to summarise.
+ *   - Bumped 12 → 16 after a 2026-04-25 prod A/B surfaced the same
+ *     exhaustion pattern: multiple facet runs hit step 12 with ~25k of
+ *     accumulated grep/read context and emitted empty summaries, forcing
+ *     the parent (Opus) to retry — doubling the tokens that were supposed
+ *     to be saved. 16 + the explicit "reserve 2 for summary" rule in the
+ *     system prompt hits the same observed tool-call volume without
+ *     starving the summary. */
+export const EXPLORE_MAX_STEPS = 16;
+
 export const EXPLORE_SYSTEM_PROMPT = [
   "You are a search assistant. Your job is to find files and code relevant to the user's query.",
   "",
   "## Rules",
   "- Use grep, find, list, and read to search the workspace.",
   "- Be thorough: try multiple search terms if the first doesn't find results.",
+  `- You have a hard budget of ${EXPLORE_MAX_STEPS} steps. **Reserve the last 2 steps for your summary** — at step ${EXPLORE_MAX_STEPS - 2} or earlier, stop calling tools and write your findings.`,
   "- Return a concise summary when done: file paths, relevant line numbers, and key observations.",
   "- Do NOT return full file contents — only the relevant snippets (max 10 lines per file).",
   "- If you find too many results, narrow your search with more specific patterns.",
   "- Focus on answering the user's specific question, not cataloguing everything.",
+  "- Emitting SOME summary beats hitting the step limit silent. A rough summary is recoverable; no summary wastes the caller's retry budget.",
 ].join("\n");
-
-/** Max steps for the explore subagent.
- *  Bumped from 5 to 12 after observing in the 2026-04-24 demo sessions
- *  (`877cefcc`, `197cc126`, `fdad8393`) that 5 steps was routinely consumed
- *  by tool-calling before the model got a chance to emit its final summary.
- *  12 gives enough headroom for multi-grep/read investigations while still
- *  capping a runaway loop. */
-export const EXPLORE_MAX_STEPS = 12;
 
 /** Cheap model for the explore subagent, keyed by provider prefix.
  *  Falls back to the main model if no match (still works, just costs more). */
@@ -870,8 +982,12 @@ export function getExploreModel(mainModel: string): string {
 /** Timeout for the explore subagent (ms). Prevents indefinite blocking. */
 export const EXPLORE_TIMEOUT_MS = 60_000;
 
-/** Max steps for the generic task subagent (slightly higher than explore). */
-export const TASK_MAX_STEPS = 15;
+/** Max steps for the generic task subagent.
+ *  Bumped 15 → 20 alongside EXPLORE_MAX_STEPS 12 → 16 on 2026-04-25
+ *  to leave room for the "reserve 2 for summary" pacing rule in
+ *  TASK_SYSTEM_PROMPT. Task is write-capable and typically uses more
+ *  tool calls per run than explore. */
+export const TASK_MAX_STEPS = 20;
 
 /** Timeout for the generic task subagent (ms).
  *  Raised to 600s when the task runs inside a facet — the facet has its
@@ -885,9 +1001,11 @@ export const TASK_SYSTEM_PROMPT = [
   "## Rules",
   "- You have a subset of the main agent's tools. Use them to complete the task and ONLY the task.",
   "- Do not ask clarifying questions — make a best-effort attempt with the info given.",
+  `- You have a hard budget of ${TASK_MAX_STEPS} steps. **Reserve the last 2 steps for your summary** — at step ${TASK_MAX_STEPS - 2} or earlier, stop calling tools and write your summary.`,
   "- Return a compact text summary when done. Include: what you did, paths/line numbers touched, test results if any.",
   "- Do NOT dump large tool outputs into your final message — summarize in 5-15 lines.",
   "- If you hit your step budget without finishing, report what was done and what remains. Your caller will retry.",
+  "- Emitting SOME summary beats hitting the step limit silent. A rough summary is recoverable; no summary wastes the caller's retry budget.",
 ].join("\n");
 
 /**
@@ -961,6 +1079,11 @@ function buildSubagentTool(spec: {
           // the summary mid-sentence after the model ran its tool budget.
           // 4000 still small enough to keep the subagent's turn compact.
           maxOutputTokens: 4000,
+          // Prune older assistant/tool message groups between steps so a long
+          // investigation doesn't ship its entire tool-result history back to
+          // the model on every call. Tool-level caps bound single results; this
+          // bounds the sum across steps.
+          prepareStep: subagentPrepareStep(),
           abortSignal: AbortSignal.timeout(spec.timeoutMs),
         });
 
