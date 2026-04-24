@@ -5,6 +5,8 @@ import { flushTurnToArtifacts } from "./artifacts-flush";
 import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
+import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
+import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
 import type { AttachmentRef } from "./attachments";
 import { rewriteAttachmentsForClient, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
@@ -5176,6 +5178,26 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private resolveOwnerId(ownerEmail?: string): string | undefined {
     if (!ownerEmail) return undefined;
     return this.env.USER_CONTROL.idFromName(ownerEmail).toString();
+  }
+
+  /**
+   * Invoke an ExploreAgent facet by pool name. Thin wrapper around
+   * `this.subAgent(ExploreAgent, name).query(opts)` so tests (and, in
+   * phase 2, the explore tool) can exercise the facet round-trip
+   * without needing a protected-method escape hatch. Requires the
+   * `"experimental"` compat flag — the SDK throws without it.
+   */
+  async invokeExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
+    const stub = await this.subAgent(ExploreAgent, name);
+    return stub.query(opts);
+  }
+
+  /**
+   * Invoke a TaskAgent facet by pool name. Mirrors invokeExploreFacet.
+   */
+  async invokeTaskFacet(name: string, opts: TaskInvokeOpts): Promise<TaskInvokeResult> {
+    const stub = await this.subAgent(TaskAgent, name);
+    return stub.task(opts);
   }
 
   private async destroyStorage(): Promise<void> {

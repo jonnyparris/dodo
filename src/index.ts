@@ -5,6 +5,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { AuthError, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, resolveAdminEmail, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
+import { ExploreAgent } from "./explore-agent";
+import { TaskAgent } from "./task-agent";
 import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
@@ -2006,7 +2008,7 @@ app.get("/api/admin/account-permissions", adminGuard as never, async (c) => {
   return proxyToSharedIndex(c.env, `/account-permissions?owner=${encodeURIComponent(owner)}`);
 });
 
-export { AllowlistOutbound, CodingAgent, SharedIndex, UserControl };
+export { AllowlistOutbound, CodingAgent, ExploreAgent, SharedIndex, TaskAgent, UserControl };
 
 export default {
   fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {
