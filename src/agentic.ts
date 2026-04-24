@@ -277,6 +277,103 @@ function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
 
+/**
+ * Add Anthropic prompt-caching cache_control markers to an OpenAI-compatible
+ * request body. Invoked by @ai-sdk/openai-compatible as transformRequestBody,
+ * so this runs once per outbound request (per call to streamText / generateText).
+ *
+ * Strategy — place markers at the boundaries Anthropic expects:
+ *   1. System prompt   → cache (static per session after turn 1)
+ *   2. Tool definitions → cache (stable per session)
+ *   3. Last user message → cache (reuses cached context on retries)
+ *
+ * Anthropic allows up to 4 cache_control markers per request. We use 3 to
+ * leave one spare for future extensions (e.g. caching a compaction summary).
+ *
+ * The OpenAI-compatible wire format allows system to be a string; when
+ * routed to Anthropic the gateway re-shapes it. We upgrade to the Anthropic
+ * array-of-content-blocks shape at the wire level — most gateways that route
+ * to Anthropic pass this through unchanged; those that don't strip the
+ * cache_control field silently (no error).
+ *
+ * All modifications are idempotent: if cache_control markers already exist,
+ * we leave them alone.
+ */
+export function addAnthropicCacheMarkers(body: Record<string, unknown>): Record<string, unknown> {
+  // Shallow clone so we don't mutate the caller's object
+  const out: Record<string, unknown> = { ...body };
+
+  // 1. System prompt — upgrade string → array with cache_control
+  if (typeof out.system === "string" && out.system.length > 0) {
+    out.system = [
+      { type: "text", text: out.system, cache_control: { type: "ephemeral" } },
+    ];
+  } else if (Array.isArray(out.system) && out.system.length > 0) {
+    // Already array form — mark the last block if none has cache_control yet
+    const hasMarker = out.system.some(
+      (block) => block && typeof block === "object" && "cache_control" in (block as object),
+    );
+    if (!hasMarker) {
+      const last = out.system[out.system.length - 1];
+      if (last && typeof last === "object") {
+        out.system = [
+          ...out.system.slice(0, -1),
+          { ...(last as object), cache_control: { type: "ephemeral" } },
+        ];
+      }
+    }
+  }
+
+  // 2. Tools — attach cache_control to the last tool definition so the
+  //    whole tool-schema block is cached. Tools are stable per session, so
+  //    this produces a reliable cache hit on every subsequent step.
+  if (Array.isArray(out.tools) && out.tools.length > 0) {
+    const tools = out.tools as unknown[];
+    const hasMarker = tools.some(
+      (t) => t && typeof t === "object" && "cache_control" in (t as object),
+    );
+    if (!hasMarker) {
+      const lastIdx = tools.length - 1;
+      const last = tools[lastIdx];
+      if (last && typeof last === "object") {
+        out.tools = [
+          ...tools.slice(0, lastIdx),
+          { ...(last as object), cache_control: { type: "ephemeral" } },
+        ];
+      }
+    }
+  }
+
+  // 3. Last user message — place a cache marker so that between-step
+  //    reruns can reuse the cached input. Conservative: only upgrade if
+  //    the content is a string (don't touch multimodal arrays to avoid
+  //    accidentally breaking image-bearing messages).
+  if (Array.isArray(out.messages) && out.messages.length > 0) {
+    const messages = out.messages as Array<Record<string, unknown>>;
+    // Walk from the end to find the last user message
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg?.role !== "user") continue;
+      if (typeof msg.content === "string" && msg.content.length > 0) {
+        const updated: Record<string, unknown> = {
+          ...msg,
+          content: [
+            {
+              type: "text",
+              text: msg.content,
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        };
+        out.messages = [...messages.slice(0, i), updated, ...messages.slice(i + 1)];
+      }
+      break;
+    }
+  }
+
+  return out;
+}
+
 /** Some model IDs need rewriting before they're sent to the upstream gateway.
  *  - Workers AI models (`@cf/…`) need the `workers-ai/` prefix per AI Gateway
  *    unified-API docs: https://developers.cloudflare.com/ai-gateway/chat-completion/
@@ -310,11 +407,20 @@ export function buildProvider(config: AppConfig, env: Env) {
         "x-api-key": env.AI_GATEWAY_KEY ?? "",
       };
 
+  // Enable Anthropic prompt caching for anthropic/* models. When the
+  // underlying provider is Anthropic (either directly via OpenCode gateway
+  // or via AI Gateway's Anthropic route), sending the request body with
+  // cache_control markers unlocks ~90% input-cost reduction on multi-turn
+  // sessions with a stable system prompt + tools definition. On other
+  // providers, the extra fields are ignored.
+  const isAnthropicModel = config.model.startsWith("anthropic/");
+
   const provider = createOpenAICompatible({
     baseURL,
     headers,
     includeUsage: true,
     name: config.activeGateway,
+    transformRequestBody: isAnthropicModel ? addAnthropicCacheMarkers : undefined,
   });
 
   // Wrap `chatModel` / `languageModel` / the callable provider so callers can pass
