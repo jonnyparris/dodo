@@ -186,9 +186,25 @@ Dodo runs its own agentic loop rather than delegating to a framework. Each itera
 - **Multi-phase continuation** -- When step limits are hit, context is compacted and the agent continues for up to 5 phases. A structured tool-call digest (not just tool names) is injected at each phase boundary so the agent knows exactly which calls have already been made and avoids repeating them.
 - **Overflow recovery** -- Emergency compaction on context-length errors.
 
-### Explore subagent
+### Explore and task subagents (facets)
 
-For search-heavy tasks, Dodo spawns a lightweight read-only subagent (Haiku/GPT-4.1 Mini/Gemini Flash) that runs up to 5 steps of grep/find/list/read and returns a compact summary. Saves 5-20x tokens compared to dumping raw file contents into the main context.
+For search-heavy and bounded-side-work tasks, Dodo spawns subagents that run in isolation from the parent turn. Two flavours:
+
+- **`explore`** -- a read-only investigator. Runs up to 12 steps of grep/find/list/read with a cheap model (Haiku, GPT-4.1 Mini, Gemini Flash) and returns a compact summary. Saves 5-20x tokens vs dumping raw file contents into the main context.
+- **`task`** -- a write-capable side task. Same tool set as the parent plus optional **scratch workspace** mode where writes land in an isolated R2 prefix and the parent only sees them if it explicitly merges them back.
+
+Both subagents have two execution modes, configurable per-user via `exploreMode` and `taskMode`:
+
+| Mode | Where it runs | When to use |
+|---|---|---|
+| `inprocess` (default) | Blocking `generateText` call inside the parent turn | One-off searches, low step count, no parallelism needed |
+| `facet` | A separate Durable Object ("facet") addressable from the parent | Parallel fan-out, long-running tasks, scratch workspaces |
+
+**Parallel explore** is the headline facet feature. Ask for three investigations and the model can fire all three as separate facets that run concurrently in their own DOs, each with their own step budget (instead of serialising them in the parent's turn budget). In a real prod A/B run, a three-query prompt completed in **163s with facets vs 272s in-process** — 40% faster, same prompt, same model.
+
+**Scratch workspace** lets the `task` subagent experiment without touching the parent workspace. The task writes go to `workspace/<sessionId>/scratch/<facetName>/` in R2. The parent can then pass a subset of paths to `POST /session/:id/facets/:name/apply` to merge them back, or discard the whole lot (a 24h alarm wipes scratch R2 automatically).
+
+Full details — HTTP surface, failure modes, lifecycle — in [`docs/facets.md`](docs/facets.md).
 
 ### Task board
 
