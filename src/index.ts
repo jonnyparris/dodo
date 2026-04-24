@@ -1019,6 +1019,71 @@ app.get("/api/events", async (c) => {
   return stub.fetch("https://user-control/events", { headers });
 });
 
+// ─── Scheduled sessions (per-user via UserControl alarms) ───
+
+app.get("/api/scheduled-sessions", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/scheduled-sessions");
+});
+
+app.post("/api/scheduled-sessions", async (c) => {
+  const email = c.get("userEmail");
+  const rawBody = await c.req.raw.text();
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  // Fork-source permission check at CREATE time — matches the posture of
+  // /session/:id/cron (source is owned or shared at schedule time). If the
+  // source is later unshared/deleted, the fire will fail and the schedule
+  // will eventually stall.
+  if (parsed.source === "fork") {
+    const sourceSessionId = typeof parsed.sourceSessionId === "string" ? parsed.sourceSessionId : "";
+    if (!sourceSessionId) {
+      return c.json({ error: "fork source requires sourceSessionId" }, 400);
+    }
+    const perm = await resolveSessionPermission(c.env, email, sourceSessionId, c.req.raw);
+    if (!perm) {
+      return c.json({ error: "Source session not found or access denied" }, 403);
+    }
+    if ((PERMISSION_LEVELS[perm.permission] ?? -1) < (PERMISSION_LEVELS.write ?? 999)) {
+      return c.json({ error: "Insufficient permission on source session" }, 403);
+    }
+  }
+
+  // Inject createdBy so the DO can record the caller without trusting an
+  // untrusted body field.
+  const payload = { ...parsed, createdBy: email };
+
+  return proxyToUserControl(c.env, email, "/scheduled-sessions", {
+    body: JSON.stringify(payload),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.get("/api/scheduled-sessions/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/scheduled-sessions/${encodeURIComponent(c.req.param("id"))}`);
+});
+
+app.delete("/api/scheduled-sessions/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/scheduled-sessions/${encodeURIComponent(c.req.param("id"))}`, {
+    method: "DELETE",
+  });
+});
+
+app.post("/api/scheduled-sessions/:id/retry", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/scheduled-sessions/${encodeURIComponent(c.req.param("id"))}/retry`, {
+    method: "POST",
+  });
+});
+
 // ─── Sessions (per-user via UserControl) ───
 
 app.post("/session", async (c) => {
