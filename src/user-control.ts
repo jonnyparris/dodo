@@ -58,6 +58,10 @@ const updateConfigSchema = z
     exploreModel: z.string().max(200).optional(),
     /** Default model for the `task` subagent. Pass empty string to clear and fall back to heuristic. */
     taskModel: z.string().max(200).optional(),
+    /** Explore-subagent dispatch mode. Pass empty string to clear (→ "inprocess"). */
+    exploreMode: z.enum(["inprocess", "facet"]).optional(),
+    /** Task-subagent dispatch mode. Pass empty string to clear (→ "inprocess"). */
+    taskMode: z.enum(["inprocess", "facet"]).optional(),
   })
   .strict();
 
@@ -1068,6 +1072,8 @@ export class UserControl extends DurableObject<Env> {
       // Kimi is the best-value fit per the 2026-04-24 model comparison.
       exploreModel: get("exploreModel") ?? this.env.DEFAULT_EXPLORE_MODEL,
       taskModel: get("taskModel") ?? this.env.DEFAULT_TASK_MODEL,
+      exploreMode: get("exploreMode") === "facet" ? "facet" : "inprocess",
+      taskMode: get("taskMode") === "facet" ? "facet" : "inprocess",
     };
   }
 

@@ -634,6 +634,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
     return buildToolsForThink(this.env, this.workspace, appConfig, {
       agent: this,
+      // Parent reference for facet-mode explore/task tools.
+      // Typed loosely on the agentic side to avoid a circular import.
+      parentAgent: this,
       oauthTools: this.cachedOAuthTools,
       oauthToolExec: (serverId: string, name: string, args: unknown) => this.callOAuthToolViaHub(serverId, name, args),
       browserEnabled: this.readMetadata("browser_enabled") === "true",
@@ -1583,6 +1586,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         systemPromptPrefix: config.systemPromptPrefix,
         exploreModel: config.exploreModel,
         taskModel: config.taskModel,
+        exploreMode: config.exploreMode ?? "inprocess",
+        taskMode: config.taskMode ?? "inprocess",
       };
     }
     return {
@@ -1594,6 +1599,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       opencodeBaseURL: this.env.OPENCODE_BASE_URL,
       exploreModel: this.env.DEFAULT_EXPLORE_MODEL,
       taskModel: this.env.DEFAULT_TASK_MODEL,
+      exploreMode: "inprocess",
+      taskMode: "inprocess",
     };
   }
 
@@ -5147,6 +5154,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // the next prompt without needing a session recreate.
       exploreModel: appConfig.exploreModel,
       taskModel: appConfig.taskModel,
+      // Dispatch-mode flags propagate via DodoConfig so getTools() sees
+      // the latest value on the next prompt without a session restart.
+      exploreMode: appConfig.exploreMode ?? "inprocess",
+      taskMode: appConfig.taskMode ?? "inprocess",
     };
     this.configure(dodoConfig);
 
@@ -5182,14 +5193,65 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   /**
    * Invoke an ExploreAgent facet by pool name. Thin wrapper around
-   * `this.subAgent(ExploreAgent, name).query(opts)` so tests (and, in
-   * phase 2, the explore tool) can exercise the facet round-trip
-   * without needing a protected-method escape hatch. Requires the
-   * `"experimental"` compat flag — the SDK throws without it.
+   * `this.subAgent(ExploreAgent, name).query(opts)` so tests (and the
+   * explore tool) can exercise the facet round-trip without needing a
+   * protected-method escape hatch. Requires the `"experimental"` compat
+   * flag — the SDK throws without it.
+   *
+   * Passes the parent's sessionId so the facet can call back via
+   * `facetReadFile` / `facetReadDir` / `facetGlob` to read the parent
+   * workspace ("shared" workspace mode).
    */
   async invokeExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
+    // Raw passthrough — opts flow verbatim. Used by the scaffold test
+    // and by anything that wants to control parent-session context
+    // itself. Production explore goes through `runExploreFacet` which
+    // auto-wires the parent session id + config.
     const stub = await this.subAgent(ExploreAgent, name);
     return stub.query(opts);
+  }
+
+  /**
+   * Real explore-facet dispatch: auto-fills the parent session context
+   * (sessionId + AppConfig) so the facet can proxy workspace reads back
+   * and use the session's provider / model selection. Called from
+   * `buildExploreTool` when `config.exploreMode === "facet"`.
+   */
+  async runExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
+    const stub = await this.subAgent(ExploreAgent, name);
+    const parentSessionId = opts.parentSessionId ?? this.sessionId();
+    const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
+    return stub.query({ ...opts, parentSessionId, parentConfig });
+  }
+
+  // ─── Facet workspace RPCs ───
+  //
+  // Facets (ExploreAgent, TaskAgent) get their own Durable Object and so
+  // their own SqlStorage. To let a facet share the parent session's
+  // workspace — the "shared" workspace mode — the facet proxies reads back
+  // to the parent via these four narrow RPC methods. Writes are not
+  // exposed: explore is read-only, and task/scratch uses a facet-local
+  // Workspace instead (phase 4).
+
+  /** Read a file from the parent workspace. Returns null if missing. */
+  async facetReadFile(path: string): Promise<string | null> {
+    return this.workspace.readFile(path);
+  }
+
+  /** Stat a file/dir in the parent workspace. Matches Workspace.stat(). */
+  async facetStat(path: string): Promise<{ path: string; name: string; type: "file" | "directory" | "symlink"; mimeType: string; size: number; createdAt: number; updatedAt: number; target?: string } | null> {
+    const stat = await this.workspace.stat(path);
+    return stat ?? null;
+  }
+
+  /** Read a directory in the parent workspace. */
+  async facetReadDir(path: string, opts?: { limit?: number; offset?: number }): Promise<Array<{ path: string; name: string; type: "file" | "directory" | "symlink"; mimeType: string; size: number; createdAt: number; updatedAt: number; target?: string }>> {
+    return this.workspace.readDir(path, opts);
+  }
+
+  /** Glob the parent workspace. Used by the find and grep subtools. */
+  async facetGlob(pattern: string): Promise<Array<{ path: string; name: string; type: "file" | "directory" | "symlink"; mimeType: string; size: number; createdAt: number; updatedAt: number; target?: string }>> {
+    return this.workspace.glob(pattern);
   }
 
   /**

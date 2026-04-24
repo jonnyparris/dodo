@@ -104,3 +104,89 @@ export const buildProvider = vi.fn().mockImplementation((config: { activeGateway
 }));
 
 export const buildToolsForThink = vi.fn().mockReturnValue({});
+
+// ─── Phase 2 additions — facet path exports ─────────────────────────────
+//
+// The ExploreAgent facet imports these symbols directly from "../agentic".
+// When a test mocks the whole agentic module, every symbol the facet
+// imports must exist on the mock; otherwise the facet ends up with
+// `undefined` functions and crashes at call time inside the DO, which
+// surfaces as opaque I/O errors in vitest-pool-workers.
+//
+// `buildProviderForModel` returns the same mock chat model as
+// `buildProvider` so facet `generateText` calls produce deterministic,
+// test-shaped text without touching any network.
+
+export const buildProviderForModel = vi.fn().mockImplementation((modelId: string, config: { activeGateway?: string }) => ({
+  chatModel: (id: string) => ({
+    specificationVersion: "v2" as const,
+    provider: "mock-provider",
+    modelId: id,
+    supportedUrls: {},
+    doGenerate: async (options: { prompt: unknown }) => {
+      const prompt = extractUserText(options.prompt);
+      if (shouldFail(prompt)) {
+        throw new Error("Gateway timeout");
+      }
+      return {
+        content: [{ type: "text", text: makeText(config.activeGateway ?? "opencode", prompt) }],
+        finishReason: "stop",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        warnings: [],
+      };
+    },
+    doStream: async (options: { prompt: unknown }) => {
+      const prompt = extractUserText(options.prompt);
+      return {
+        stream: makeStream(makeText(config.activeGateway ?? "opencode", prompt)),
+      };
+    },
+  }),
+  chat: () => ({}),
+  completion: () => ({}),
+  textEmbedding: () => ({}),
+  image: () => ({}),
+  languageModel: () => ({}),
+  // Also satisfy the provider "callable" shape used by the openai-compat
+  // wrapper so downstream code that probes for `provider(modelId)` doesn't
+  // crash.
+  [Symbol.toPrimitive]: () => "mock-provider",
+}));
+
+// Explore tool constants — re-exported verbatim so the facet sees the
+// same system prompt / step budget / timeout values it would see in
+// production. Kept inline rather than re-imported because this mock
+// deliberately severs the link to the real agentic module.
+export const EXPLORE_SYSTEM_PROMPT = "You are a search assistant (mock).";
+export const EXPLORE_MAX_STEPS = 12;
+export const EXPLORE_TIMEOUT_MS = 60_000;
+
+// Pass-through helpers — real behaviour is fine for tests since they
+// touch no I/O.
+export function capToolOutputs<T extends Record<string, unknown>>(tools: T): T {
+  return tools;
+}
+
+export function getExploreModel(mainModel: string): string {
+  if (mainModel.startsWith("anthropic/")) return "anthropic/claude-haiku-4-5";
+  if (mainModel.startsWith("openai/")) return "openai/gpt-4.1-mini";
+  return mainModel;
+}
+
+// Keep the production resolver semantics in the mock so facet tests see
+// the same precedence as the real path (per-call > session default >
+// heuristic).
+export function resolveSubagentModel(
+  args: Record<string, unknown>,
+  sessionDefault: string | undefined,
+  mainModel: string,
+): string {
+  const rawArgModel = args.model;
+  if (typeof rawArgModel === "string" && rawArgModel.trim().length > 0) {
+    return rawArgModel.trim();
+  }
+  if (typeof sessionDefault === "string" && sessionDefault.trim().length > 0) {
+    return sessionDefault.trim();
+  }
+  return getExploreModel(mainModel);
+}

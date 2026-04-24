@@ -54,6 +54,18 @@ export interface BuildToolsOptions {
    * `todo_add` / `todo_update` / `todo_list` / `todo_clear` tools.
    */
   todoStore?: TodoStore;
+  /**
+   * Parent CodingAgent reference — used when `config.exploreMode` or
+   * `config.taskMode` is `"facet"` so the explore / task tools can
+   * delegate to `runExploreFacet` / `runTaskFacet`. Typed loosely here
+   * to avoid a circular type import — the concrete type is `CodingAgent`.
+   */
+  parentAgent?: {
+    runExploreFacet: (
+      name: string,
+      opts: { q: string; scope?: string; model?: string },
+    ) => Promise<{ ok: true; facetName: string; summary: string }>;
+  };
 }
 
 // ─── Tool Output Caps (OpenCode Pattern #1) ───
@@ -97,7 +109,7 @@ const CODEMODE_LOGS_MAX_BYTES = 4_000;
  * Each tool's execute function is intercepted: the result is serialized,
  * checked against its cap, and truncated with an actionable hint if exceeded.
  */
-function capToolOutputs(tools: Record<string, AnyTool>): Record<string, AnyTool> {
+export function capToolOutputs(tools: Record<string, AnyTool>): Record<string, AnyTool> {
   const wrapped: Record<string, AnyTool> = {};
   for (const [name, t] of Object.entries(tools)) {
     const caps = TOOL_OUTPUT_CAPS[name];
@@ -797,7 +809,7 @@ function buildGitTools(
 // context window. Returns a compact summary (~500-1000 tokens) instead of
 // raw file contents (~5000-20000 tokens), saving 5-20× tokens per search.
 
-const EXPLORE_SYSTEM_PROMPT = [
+export const EXPLORE_SYSTEM_PROMPT = [
   "You are a search assistant. Your job is to find files and code relevant to the user's query.",
   "",
   "## Rules",
@@ -815,7 +827,7 @@ const EXPLORE_SYSTEM_PROMPT = [
  *  by tool-calling before the model got a chance to emit its final summary.
  *  12 gives enough headroom for multi-grep/read investigations while still
  *  capping a runaway loop. */
-const EXPLORE_MAX_STEPS = 12;
+export const EXPLORE_MAX_STEPS = 12;
 
 /** Cheap model for the explore subagent, keyed by provider prefix.
  *  Falls back to the main model if no match (still works, just costs more). */
@@ -825,7 +837,7 @@ const EXPLORE_MODELS: Record<string, string> = {
   "google/": "google/gemini-2.5-flash",
   "deepseek/": "deepseek/deepseek-chat",
 };
-function getExploreModel(mainModel: string): string {
+export function getExploreModel(mainModel: string): string {
   for (const [prefix, model] of Object.entries(EXPLORE_MODELS)) {
     if (mainModel.startsWith(prefix)) return model;
   }
@@ -833,7 +845,7 @@ function getExploreModel(mainModel: string): string {
 }
 
 /** Timeout for the explore subagent (ms). Prevents indefinite blocking. */
-const EXPLORE_TIMEOUT_MS = 60_000;
+export const EXPLORE_TIMEOUT_MS = 60_000;
 
 /** Max steps for the generic task subagent (slightly higher than explore). */
 const TASK_MAX_STEPS = 15;
@@ -973,8 +985,60 @@ function buildExploreTool(
   workspace: Workspace,
   config: AppConfig,
   env: Env,
+  parentAgent?: BuildToolsOptions["parentAgent"],
 ): AnyTool {
-  // Build read-only workspace tools for the explore subagent
+  // Branch on `config.exploreMode`:
+  //
+  //   - "facet"     → delegate to the parent CodingAgent's
+  //                   `runExploreFacet`, which spins up an ExploreAgent
+  //                   facet DO and returns the same formatted summary.
+  //                   The parent's turn is still blocked on `await`, but
+  //                   the LLM turns happen in a separate DO (separate
+  //                   context window, no shared step budget).
+  //   - "inprocess" → today's path: `generateText` inside the tool's
+  //                   own execute, tools share the parent's workspace
+  //                   directly. Default — easy to roll back.
+  //
+  // Both paths return the same `## Explore results` shape so the caller
+  // model sees identical output.
+  if (config.exploreMode === "facet" && parentAgent) {
+    return tool({
+      description: [
+        "Search the workspace for files and code matching a query.",
+        "Runs an autonomous search agent that uses grep, find, list, and read to explore the codebase,",
+        "then returns a compact summary of findings (file paths, line numbers, key observations).",
+        "Much more token-efficient than reading files directly for open-ended searches.",
+        "Use this when you need to find where something is defined, locate files matching a pattern,",
+        "or understand how a feature is implemented across multiple files.",
+      ].join(" "),
+      inputSchema: zodSchema(z.object({
+        query: z.string().min(1).describe(
+          "What to search for — be specific. E.g. 'Find all files that handle CSS escaping' or 'Where is the database connection pool configured?'",
+        ),
+        scope: z.string().optional().describe(
+          "Optional directory to scope the search to (e.g. 'src/' or 'lib/utils'). Omit to search the entire workspace.",
+        ),
+        model: z.string().optional().describe(
+          "Optional model override for this call (e.g. '@cf/moonshotai/kimi-k2.6', 'anthropic/claude-haiku-4-5'). Leave unset to use the session default.",
+        ),
+      })),
+      execute: async (args: Record<string, unknown>) => {
+        try {
+          const result = await parentAgent.runExploreFacet("pool-explore-0", {
+            q: String(args.query ?? ""),
+            scope: typeof args.scope === "string" ? args.scope : undefined,
+            model: typeof args.model === "string" ? args.model : undefined,
+          });
+          return result.summary;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return `Explore failed (facet mode): ${msg}`;
+        }
+      },
+    });
+  }
+
+  // Build read-only workspace tools for the explore subagent (in-process path).
   const allWsTools = createWorkspaceTools(workspace);
   const readOnlyTools = capToolOutputs({
     read: allWsTools.read,
@@ -1287,8 +1351,10 @@ function buildTools(
   // Git tools — always available as top-level tools
   Object.assign(tools, gitTools);
 
-  // Explore tool — search subagent for token-efficient codebase discovery
-  tools.explore = buildExploreTool(workspace, config, env);
+  // Explore tool — search subagent for token-efficient codebase discovery.
+  // When `config.exploreMode === "facet"`, the tool delegates to an
+  // ExploreAgent facet DO; see `buildExploreTool` for the branch.
+  tools.explore = buildExploreTool(workspace, config, env, options?.parentAgent);
 
   // Task tool — generic subagent for bounded sub-tasks. Keeps the main
   // conversation's step budget free when a chunk of work can be safely

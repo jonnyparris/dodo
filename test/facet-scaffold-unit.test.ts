@@ -29,12 +29,17 @@ describe("facet scaffold", () => {
     const testEnv = env as Env;
     const sessionId = `scaffold-explore-${crypto.randomUUID()}`;
     const agent = await getAgentByName(testEnv.CODING_AGENT as never, sessionId) as unknown as {
-      invokeExploreFacet: (name: string, opts: { q: string; scope?: string; model?: string }) => Promise<{ ok: true; facetName: string }>;
+      invokeExploreFacet: (name: string, opts: { q: string; scope?: string; model?: string }) => Promise<{ ok: true; facetName: string; summary: string }>;
     };
 
     const result = await agent.invokeExploreFacet("pool-explore-0", { q: "hi" });
 
-    expect(result).toEqual({ ok: true, facetName: "pool-explore-0" });
+    // Placeholder path — no parentSessionId / parentConfig provided, so
+    // the facet returns its canned placeholder summary instead of
+    // trying to run a real generateText call.
+    expect(result.ok).toBe(true);
+    expect(result.facetName).toBe("pool-explore-0");
+    expect(result.summary).toContain("placeholder");
   });
 
   it("CodingAgent can spawn TaskAgent facet and round-trip task()", async () => {
@@ -58,7 +63,7 @@ describe("facet scaffold", () => {
     const testEnv = env as Env;
     const sessionId = `scaffold-reuse-${crypto.randomUUID()}`;
     const agent = await getAgentByName(testEnv.CODING_AGENT as never, sessionId) as unknown as {
-      invokeExploreFacet: (name: string, opts: { q: string }) => Promise<{ ok: true; facetName: string }>;
+      invokeExploreFacet: (name: string, opts: { q: string }) => Promise<{ ok: true; facetName: string; summary: string }>;
     };
 
     const first = await agent.invokeExploreFacet("pool-explore-0", { q: "first" });
