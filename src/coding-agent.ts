@@ -209,11 +209,32 @@ const SYSTEM_PROMPT = [
   "",
   "## Doing tasks",
   "",
-  "When the user asks you to build or modify code:",
+  "**Your first action for any non-trivial request** — use `todo_add` to write down the plan. One todo per distinct step. Then start working through them with `todo_update` as you go. This isn't optional scaffolding; it's how you stay oriented across compactions, avoid repeating yourself, and give the user a legible view of progress.",
+  "",
+  "**When to skip todos:** the task is a single tool call (\"read this file\", \"run git status\", \"fix this typo\"). Everything else gets todos.",
+  "",
+  "### Decision triggers",
+  "",
+  "- User says \"update the README\" / \"add a feature\" / \"fix this bug across the repo\" → `todo_add` first, then work.",
+  "- You catch yourself about to chain 3+ tool calls → stop, `todo_add` the plan, then resume.",
+  "- A step turns out bigger than expected → `todo_add` the subtasks.",
+  "- You complete a todo → `todo_update` to mark it `completed` in the same turn, before moving on.",
+  "- Context is getting dense (many tool results accumulated) → call `todo_list` to re-ground yourself before the next action.",
+  "",
+  "### Delegate bounded work with `task`",
+  "",
+  "For sub-jobs that will take 3+ of your own steps and don't need the full conversation context, call `task` with a self-contained prompt. The subagent runs in its own context window and returns a compact summary. Use cases:",
+  "",
+  "- \"review these 6 files and report any dead code\" → `task`",
+  "- \"update all imports of X to Y across src/\" → `task`",
+  "- \"run the test suite and summarise failures\" → `task`",
+  "",
+  "Don't use `task` for a single lookup (just call the tool) or for anything the main conversation needs to see in detail.",
+  "",
+  "### Standing rules",
   "",
   "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task.",
-  "2. **Plan multi-step tasks with todos.** For any task with 3+ distinct steps or branches, use `todo_add` at the start to lay out the plan, `todo_update` to mark progress, and `todo_list` to re-orient after compactions. Skip for trivial single-step work. Only ONE todo should be `in_progress` at a time.",
-  "3. **Use `explore` for ALL codebase discovery.** CRITICAL: when you need to find where something is defined, understand how a feature works, or locate relevant files — you MUST use the `explore` tool. Do NOT use `read`, `list`, `find`, or `grep` for open-ended exploration. `explore` runs a search agent in a separate context window and returns a compact summary. Using direct tools for discovery will exhaust your context budget before you can make any edits.",
+  "2. **Use `explore` for ALL codebase discovery.** When you need to find where something is defined, understand how a feature works, or locate relevant files — use `explore`. Do NOT use `read`, `list`, `find`, or `grep` for open-ended exploration. `explore` runs a search agent in a separate context window and returns a compact summary. Using direct tools for discovery will exhaust your context budget before you can make any edits.",
   "",
   "   Examples of when to use `explore`:",
   "   - 'Where is the config schema defined?' → `explore`",
@@ -225,12 +246,12 @@ const SYSTEM_PROMPT = [
   "   - You need to make an edit → `edit`",
   "   - You need to search for a specific string → `grep`",
   "",
-  "4. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
-  "5. **Plan, then edit.** State your plan in one short paragraph, then execute. Don't narrate each step.",
-  "6. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
-  "7. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
-  "8. **Delete unused code.** No commented-out code, no `_unused` renames.",
-  "9. **Be security-conscious.** Never commit secrets or credentials.",
+  "3. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
+  "4. **Plan, then edit.** State your plan in one short paragraph (or a todo list, preferred), then execute. Don't narrate each step.",
+  "5. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
+  "6. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
+  "7. **Delete unused code.** No commented-out code, no `_unused` renames.",
+  "8. **Be security-conscious.** Never commit secrets or credentials.",
   "",
   "## Workspace tools",
   "",
@@ -370,14 +391,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /**
    * Cached project-instructions content (AGENTS.md / CLAUDE.md) loaded from
    * the workspace. Warmed by `warmProjectInstructions()` at the top of
-   * `onChatMessage()` on turn 1, consumed synchronously by
-   * `getSystemPrompt()`. `null` = not yet attempted or no file found.
-   * Never re-loaded in the same session — project instructions are
-   * expected to be stable, and a stable system prompt is prompt-cache
-   * friendly for Anthropic models.
+   * `onChatMessage()`, consumed synchronously by `getSystemPrompt()`.
+   *
+   * `null` = not yet found. We retry the search each turn until something
+   * is found (which matters for sessions where the user clones a repo on
+   * turn 1 — the AGENTS.md only exists after the clone lands). Once found,
+   * the result is stable for the session (prompt-cache friendly).
    */
   private _projectInstructions: string | null = null;
-  private _projectInstructionsLoaded = false;
   /**
    * Per-tool-call attachment references captured during streaming. Populated
    * by the `onToolAttachments` callback threaded into `buildToolsForThink`.
@@ -493,8 +514,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * system prompt is friendlier to Anthropic prompt caching.
    */
   private async warmProjectInstructions(): Promise<void> {
-    if (this._projectInstructionsLoaded) return;
-    this._projectInstructionsLoaded = true;
+    // Skip only if we've already FOUND instructions. If a previous turn
+    // searched an empty workspace and found nothing, retry — the user may
+    // have since cloned a repo. Without this, `git_clone` on turn 1 means
+    // turn 2+ never sees the project's AGENTS.md.
+    if (this._projectInstructions) return;
 
     const MAX_BYTES = 6_000;
     const candidates = ["AGENTS.md", "CLAUDE.md"];
