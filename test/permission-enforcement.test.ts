@@ -400,10 +400,10 @@ describe("MCP URL allowlist check", () => {
 });
 
 describe("Scheduled session permissions", () => {
-  it("rejects fork source that the caller does not own", async () => {
-    // A missing session ID fails permission resolution the same way an
-    // unreachable one does — resolveSessionPermission returns null when
-    // the check endpoint 404s, so the caller gets 403 at create time.
+  it("rejects fork source that does not exist anywhere", async () => {
+    // resolveSessionPermission returns null when the sessionId isn't found
+    // in the caller's UserControl, SharedIndex, or a share cookie — so the
+    // caller gets 403 at create time.
     const res = await fetchJson("/api/scheduled-sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -417,6 +417,57 @@ describe("Scheduled session permissions", () => {
       }),
     });
     expect(res.status).toBe(403);
+  });
+
+  it("rejects fork source that belongs to a different user (no share)", async () => {
+    // Audit finding #8: previously the permission path was only tested
+    // against a nonexistent session. The "caller doesn't own the real
+    // session" case is what the permission check actually guards against,
+    // and it needs its own coverage.
+    //
+    // Approach: register a session directly in alice@example.com's
+    // UserControl DO — no permissions granted to anyone else, no share
+    // cookie. Then attempt to create a scheduled fork from the authenticated
+    // test identity (dev@dodo.local). resolveSessionPermission:
+    //   1. Checks dev@dodo.local's UserControl → 404 (dev doesn't own it)
+    //   2. Not admin (dev@dodo.local isn't ADMIN_EMAIL in test config)
+    //   3. Checks SharedIndex for granted permission → no grant → 404
+    //   4. No share cookie → null → 403
+    const typedEnv = env as Env;
+    const aliceStub = typedEnv.USER_CONTROL.get(
+      typedEnv.USER_CONTROL.idFromName("alice@example.com"),
+    );
+    const aliceSessionId = "11111111-aaaa-bbbb-cccc-000000000001";
+    const registerRes = await aliceStub.fetch("https://user-control/sessions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-owner-email": "alice@example.com",
+      },
+      body: JSON.stringify({
+        id: aliceSessionId,
+        ownerEmail: "alice@example.com",
+        createdBy: "alice@example.com",
+      }),
+    });
+    expect(registerRes.ok).toBe(true);
+
+    // Now attempt to schedule a fork of Alice's session as dev@dodo.local
+    const res = await fetchJson("/api/scheduled-sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        description: "trying to fork alice's session",
+        prompt: "x",
+        type: "delayed",
+        delayInSeconds: 300,
+        source: "fork",
+        sourceSessionId: aliceSessionId,
+      }),
+    });
+    expect(res.status).toBe(403);
+    const body = await res.json() as { error: string };
+    expect(body.error).toMatch(/Source session not found or access denied/);
   });
 
   it("accepts a fresh scheduled session with no source", async () => {

@@ -84,6 +84,31 @@ describe("Scheduled new-session lifecycle", () => {
     expect(body.error).toMatch(/future/);
   });
 
+  it("rejects scheduled date more than 90 days in the future", async () => {
+    const farFuture = new Date(Date.now() + 91 * 86400 * 1000).toISOString();
+    const res = await createScheduled({
+      description: "too-far",
+      prompt: "x",
+      type: "scheduled",
+      date: farFuture,
+      source: "fresh",
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toMatch(/90 days/);
+  });
+
+  it("rejects delay longer than 90 days", async () => {
+    const res = await createScheduled({
+      description: "too-far",
+      prompt: "x",
+      type: "delayed",
+      delayInSeconds: 91 * 86400,
+      source: "fresh",
+    });
+    expect(res.status).toBe(400);
+  });
+
   it("rejects interval below the 300s minimum", async () => {
     const res = await createScheduled({
       description: "too-fast",
@@ -301,7 +326,12 @@ describe("Scheduled new-session alarm firing", () => {
     expect(fileBody.content).toBe("from source");
   });
 
-  it("recurring interval schedule persists after firing", async () => {
+  it("recurring interval schedule cycles through multiple fires", async () => {
+    // Audit finding #21: the original test fired once and stopped. A
+    // regression where interval schedules fire once then get stuck
+    // wouldn't have been caught. This test fires twice and confirms
+    // runCount increments, lastSessionId changes, and nextRunAt keeps
+    // advancing.
     const createRes = await createScheduled({
       description: "every 5 min",
       prompt: "poll",
@@ -313,6 +343,8 @@ describe("Scheduled new-session alarm firing", () => {
     const created = await createRes.json() as ScheduledSessionRecord;
 
     const stub = getUserControlStub();
+
+    // Fire #1
     await runInDurableObject(stub, async (_, state) => {
       state.storage.sql.exec(
         "UPDATE scheduled_sessions SET next_run_epoch = 1 WHERE id = ?",
@@ -322,14 +354,78 @@ describe("Scheduled new-session alarm firing", () => {
     });
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
-    // Row still exists with run_count=1 and a future next_run_epoch.
-    const afterRes = await fetchJson(`/api/scheduled-sessions/${created.id}`);
-    expect(afterRes.status).toBe(200);
-    const after = await afterRes.json() as ScheduledSessionRecord;
-    expect(after.runCount).toBe(1);
-    expect(after.nextRunAt).not.toBeNull();
-    expect(after.lastSessionId).not.toBeNull();
-    expect(after.failureCount).toBe(0);
+    const afterFire1 = await (await fetchJson(`/api/scheduled-sessions/${created.id}`)).json() as ScheduledSessionRecord;
+    expect(afterFire1.runCount).toBe(1);
+    expect(afterFire1.lastSessionId).not.toBeNull();
+    expect(afterFire1.nextRunAt).not.toBeNull();
+    const firstLastSessionId = afterFire1.lastSessionId;
+
+    // Force it due again and fire #2
+    await runInDurableObject(stub, async (_, state) => {
+      state.storage.sql.exec(
+        "UPDATE scheduled_sessions SET next_run_epoch = 1 WHERE id = ?",
+        created.id,
+      );
+      state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const afterFire2 = await (await fetchJson(`/api/scheduled-sessions/${created.id}`)).json() as ScheduledSessionRecord;
+    expect(afterFire2.runCount).toBe(2);
+    expect(afterFire2.lastSessionId).not.toBeNull();
+    expect(afterFire2.lastSessionId).not.toBe(firstLastSessionId);
+    expect(afterFire2.failureCount).toBe(0);
+  });
+
+  it("processes ALARM_BATCH_SIZE rows per alarm, chains for overdue remainder", async () => {
+    // Audit finding #20: batching had no test coverage. Create 12 due
+    // schedules (> ALARM_BATCH_SIZE=10), fire once, and confirm exactly
+    // 10 are processed while 2 remain. Then fire again and confirm the
+    // remaining 2 are picked up.
+    const stub = getUserControlStub();
+    const schedIds: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      const res = await createScheduled({
+        description: `batch-${i}`,
+        prompt: "reply ok",
+        type: "delayed",
+        delayInSeconds: 3600, // far-future create; we'll force due below
+        source: "fresh",
+      });
+      expect(res.status).toBe(201);
+      schedIds.push((await res.json() as ScheduledSessionRecord).id);
+    }
+
+    // Mark all 12 as due so the alarm picks them all up in one pass.
+    await runInDurableObject(stub, async (_, state) => {
+      state.storage.sql.exec("UPDATE scheduled_sessions SET next_run_epoch = 1");
+      state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+    });
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    // After fire #1: exactly 10 one-shot rows should be gone, 2 remain.
+    const remaining1: string[] = [];
+    for (const id of schedIds) {
+      const res = await fetchJson(`/api/scheduled-sessions/${id}`);
+      if (res.status === 200) remaining1.push(id);
+    }
+    expect(remaining1).toHaveLength(2);
+
+    // The alarm should have re-armed to fire again soon. Force it due
+    // once more and fire — both remaining rows should clear.
+    await runInDurableObject(stub, async (_, state) => {
+      state.storage.sql.exec("UPDATE scheduled_sessions SET next_run_epoch = 1");
+      state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const remaining2: string[] = [];
+    for (const id of schedIds) {
+      const res = await fetchJson(`/api/scheduled-sessions/${id}`);
+      if (res.status === 200) remaining2.push(id);
+    }
+    expect(remaining2).toHaveLength(0);
   });
 
   it("stalls after MAX_FAILURES consecutive failures", async () => {
