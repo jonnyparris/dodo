@@ -82,6 +82,51 @@ type ParentStub = Pick<
 >;
 
 export class ExploreAgent extends Agent<Env> {
+  private transcriptInitialized = false;
+
+  /**
+   * Lazy-create the `assistant_messages` table used for the transcript
+   * log. Called from every entry point that writes rows so the table
+   * always exists before we touch it. Keeping the DDL idempotent is
+   * cheaper than wiring an explicit init hook (Agent.onStart is async
+   * and we don't want query() to await it on every call).
+   */
+  private ensureTranscriptTable(): void {
+    if (this.transcriptInitialized) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS assistant_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        model TEXT,
+        token_input INTEGER NOT NULL DEFAULT 0,
+        token_output INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.transcriptInitialized = true;
+  }
+
+  private recordTranscript(role: string, content: string, extras: { model?: string; tokenInput?: number; tokenOutput?: number } = {}): void {
+    this.ensureTranscriptTable();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO assistant_messages (role, content, model, token_input, token_output, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      role, content, extras.model ?? null, extras.tokenInput ?? 0, extras.tokenOutput ?? 0, Date.now(),
+    );
+  }
+
+  /**
+   * Return every recorded transcript row. Backs
+   * `CodingAgent.getFacetTranscript` / `GET /session/:id/facets/:name/transcript`.
+   */
+  async getTranscript(): Promise<Array<Record<string, unknown>>> {
+    this.ensureTranscriptTable();
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT id, role, content, model, token_input as tokenInput, token_output as tokenOutput, created_at as createdAt FROM assistant_messages ORDER BY id ASC"
+    ).toArray() as Array<Record<string, unknown>>;
+    return rows;
+  }
+
   /**
    * Run an exploration query inside this facet's DO.
    *
@@ -148,6 +193,8 @@ export class ExploreAgent extends Agent<Env> {
     const scope = opts.scope ? `\n\nSearch scope: ${opts.scope}` : "";
     const userMessage = `${opts.q}${scope}`;
 
+    this.recordTranscript("user", userMessage, { model: modelId });
+
     try {
       const result = await generateText({
         model,
@@ -187,13 +234,21 @@ export class ExploreAgent extends Agent<Env> {
         .filter(Boolean)
         .join("\n");
 
+      this.recordTranscript("assistant", formatted, {
+        model: modelId,
+        tokenInput: totalInput,
+        tokenOutput: totalOutput,
+      });
+
       return { ok: true, facetName: this.name, summary: formatted };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
+      const failureSummary = `Explore failed (model: ${modelId}) [facet: ${this.name}]: ${msg}`;
+      this.recordTranscript("assistant", failureSummary, { model: modelId });
       return {
         ok: true,
         facetName: this.name,
-        summary: `Explore failed (model: ${modelId}) [facet: ${this.name}]: ${msg}`,
+        summary: failureSummary,
       };
     }
   }

@@ -2175,6 +2175,27 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return await this.handleDeleteCron(url.pathname.split("/").at(-1) ?? "");
       }
 
+      // Phase 5 — facet transcripts surface. Two read-only endpoints
+      // backing the `GET /session/:id/facets` /
+      // `GET /session/:id/facets/:facetName/transcript` HTTP routes.
+      if (request.method === "GET" && url.pathname === "/facets") {
+        const limit = Number(url.searchParams.get("limit") ?? 50);
+        return Response.json({ runs: await this.listFacetRuns(limit) });
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/facets/")) {
+        const parts = url.pathname.split("/").filter(Boolean);
+        // /facets/<facetName>/transcript
+        if (parts.length === 3 && parts[2] === "transcript") {
+          const facetName = decodeURIComponent(parts[1]);
+          const transcript = await this.getFacetTranscript(facetName);
+          if (!transcript) {
+            return Response.json({ error: "facet not found" }, { status: 404 });
+          }
+          return Response.json(transcript);
+        }
+      }
+
       if (request.method === "GET" && url.pathname === "/snapshot") {
         return Response.json(await this.exportSnapshot());
       }
@@ -2638,9 +2659,33 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
+    // Phase 5 — facet run index. Tracks every ExploreAgent / TaskAgent
+    // invocation on this session so `GET /session/:id/facets` can
+    // enumerate recent facet runs and deep-link into their transcripts.
+    //
+    // One row per run; facet transcripts themselves live in the facet
+    // DO's own SQLite (see ExploreAgent.getTranscript / TaskAgent.getTranscript).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS facet_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        facet_type TEXT NOT NULL CHECK(facet_type IN ('explore','task')),
+        facet_name TEXT NOT NULL,
+        input TEXT NOT NULL,
+        summary_preview TEXT,
+        token_input INTEGER NOT NULL DEFAULT 0,
+        token_output INTEGER NOT NULL DEFAULT 0,
+        workspace_mode TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        status TEXT NOT NULL CHECK(status IN ('running','completed','failed'))
+      )
+    `);
+
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_session_todos_status ON session_todos(status)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_started ON facet_runs(started_at DESC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_name ON facet_runs(facet_name)");
   }
 
   /**
@@ -5221,7 +5266,48 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const stub = await this.subAgent(ExploreAgent, name);
     const parentSessionId = opts.parentSessionId ?? this.sessionId();
     const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
-    return stub.query({ ...opts, parentSessionId, parentConfig });
+
+    const runId = this.insertFacetRun({
+      facetType: "explore",
+      facetName: name,
+      input: opts.q,
+      workspaceMode: null,
+    });
+
+    try {
+      const result = await stub.query({ ...opts, parentSessionId, parentConfig });
+      this.completeFacetRun(runId, result.summary);
+      return result;
+    } catch (err) {
+      this.failFacetRun(runId, err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  }
+
+  private insertFacetRun(opts: { facetType: "explore" | "task"; facetName: string; input: string; workspaceMode: string | null }): number {
+    const now = nowEpoch();
+    const rows = this.db.all(
+      `INSERT INTO facet_runs (facet_type, facet_name, input, workspace_mode, started_at, status)
+       VALUES (?, ?, ?, ?, ?, 'running')
+       RETURNING id`,
+      opts.facetType, opts.facetName, opts.input, opts.workspaceMode, now,
+    ) as Array<{ id: number }>;
+    return Number(rows[0]?.id ?? 0);
+  }
+
+  private completeFacetRun(runId: number, summary: string): void {
+    const preview = summary.length > 500 ? `${summary.slice(0, 500)}…` : summary;
+    this.db.exec(
+      "UPDATE facet_runs SET status = 'completed', summary_preview = ?, finished_at = ? WHERE id = ?",
+      preview, nowEpoch(), runId,
+    );
+  }
+
+  private failFacetRun(runId: number, error: string): void {
+    this.db.exec(
+      "UPDATE facet_runs SET status = 'failed', summary_preview = ?, finished_at = ? WHERE id = ?",
+      `(failed) ${error.slice(0, 400)}`, nowEpoch(), runId,
+    );
   }
 
   // ─── Facet workspace RPCs ───
@@ -5275,7 +5361,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const stub = await this.subAgent(TaskAgent, name);
     const parentSessionId = opts.parentSessionId ?? this.sessionId();
     const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
-    const result = await stub.task({ ...opts, parentSessionId, parentConfig });
+
+    const runId = this.insertFacetRun({
+      facetType: "task",
+      facetName: name,
+      input: opts.prompt,
+      workspaceMode: opts.workspaceMode ?? "shared",
+    });
+
+    let result: TaskInvokeResult;
+    try {
+      result = await stub.task({ ...opts, parentSessionId, parentConfig });
+      this.completeFacetRun(runId, result.summary);
+    } catch (err) {
+      this.failFacetRun(runId, err instanceof Error ? err.message : String(err));
+      throw err;
+    }
 
     // Schedule a 24h cleanup only for scratch runs — shared runs don't
     // own any out-of-band R2 state.
@@ -5295,6 +5396,80 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
 
     return result;
+  }
+
+  /**
+   * List recent facet runs on this session. Most-recent first.
+   * Backs `GET /session/:id/facets`.
+   */
+  async listFacetRuns(limit: number = 50): Promise<Array<{
+    id: number;
+    facetType: "explore" | "task";
+    facetName: string;
+    input: string;
+    summaryPreview: string | null;
+    workspaceMode: string | null;
+    startedAt: string;
+    finishedAt: string | null;
+    status: "running" | "completed" | "failed";
+  }>> {
+    const rows = this.db.all(
+      `SELECT id, facet_type as facetType, facet_name as facetName, input,
+              summary_preview as summaryPreview, workspace_mode as workspaceMode,
+              started_at as startedAt, finished_at as finishedAt, status
+       FROM facet_runs
+       ORDER BY started_at DESC
+       LIMIT ?`,
+      Math.min(Math.max(limit, 1), 200),
+    ) as Array<{
+      id: number;
+      facetType: "explore" | "task";
+      facetName: string;
+      input: string;
+      summaryPreview: string | null;
+      workspaceMode: string | null;
+      startedAt: number;
+      finishedAt: number | null;
+      status: "running" | "completed" | "failed";
+    }>;
+    return rows.map((r) => ({
+      ...r,
+      startedAt: epochToIso(r.startedAt),
+      finishedAt: r.finishedAt ? epochToIso(r.finishedAt) : null,
+    }));
+  }
+
+  /**
+   * Fetch a facet's transcript (full message log) by name. Tries
+   * ExploreAgent first, then TaskAgent — matches whichever class
+   * owns the named facet. Returns null if the facet was never
+   * instantiated on this session.
+   */
+  async getFacetTranscript(facetName: string): Promise<{ facetType: "explore" | "task"; messages: Array<Record<string, unknown>> } | null> {
+    // Look the name up in the facet_runs table to figure out which
+    // facet class to ask. Falls back to trying explore first if we
+    // can't resolve the type locally — idempotent.
+    const row = this.db.all(
+      "SELECT facet_type as facetType FROM facet_runs WHERE facet_name = ? ORDER BY started_at DESC LIMIT 1",
+      facetName,
+    ) as Array<{ facetType: "explore" | "task" }>;
+
+    if (row.length === 0) return null;
+
+    const facetType = row[0].facetType;
+    try {
+      if (facetType === "explore") {
+        const stub = await this.subAgent(ExploreAgent, facetName);
+        const transcript = await stub.getTranscript();
+        return { facetType, messages: transcript };
+      } else {
+        const stub = await this.subAgent(TaskAgent, facetName);
+        const transcript = await stub.getTranscript();
+        return { facetType, messages: transcript };
+      }
+    } catch {
+      return null;
+    }
   }
 
   /**

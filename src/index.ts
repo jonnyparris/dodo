@@ -1571,6 +1571,30 @@ app.get("/session/:id/debug/compaction", async (c) => {
 
 
 
+// ─── Facet transcripts (Phase 5) ───
+//
+// Read-only surface for inspecting ExploreAgent / TaskAgent runs on a
+// session. `GET /facets` lists recent runs; `/facets/:name/transcript`
+// returns the full message log from the named facet. No write paths —
+// facet transcripts are immutable by construction.
+
+app.get("/session/:id/facets", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/facets${new URL(c.req.raw.url).search}`);
+});
+
+app.get("/session/:id/facets/:facetName/transcript", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(
+    c.req.raw,
+    c.env,
+    c.req.param("id"),
+    `/facets/${encodeURIComponent(c.req.param("facetName"))}/transcript`,
+  );
+});
+
 app.get("/session/:id/messages", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;

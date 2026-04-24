@@ -112,6 +112,44 @@ export class TaskAgent extends Agent<Env> {
    * per facet lifetime sidesteps that.
    */
   private _scratchWorkspace: Workspace | null = null;
+  private transcriptInitialized = false;
+
+  private ensureTranscriptTable(): void {
+    if (this.transcriptInitialized) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS assistant_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        model TEXT,
+        workspace_mode TEXT,
+        token_input INTEGER NOT NULL DEFAULT 0,
+        token_output INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.transcriptInitialized = true;
+  }
+
+  private recordTranscript(role: string, content: string, extras: { model?: string; workspaceMode?: string; tokenInput?: number; tokenOutput?: number } = {}): void {
+    this.ensureTranscriptTable();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO assistant_messages (role, content, model, workspace_mode, token_input, token_output, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      role, content, extras.model ?? null, extras.workspaceMode ?? null, extras.tokenInput ?? 0, extras.tokenOutput ?? 0, Date.now(),
+    );
+  }
+
+  /**
+   * Return every recorded transcript row. Backs
+   * `CodingAgent.getFacetTranscript` / `GET /session/:id/facets/:name/transcript`.
+   */
+  async getTranscript(): Promise<Array<Record<string, unknown>>> {
+    this.ensureTranscriptTable();
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT id, role, content, model, workspace_mode as workspaceMode, token_input as tokenInput, token_output as tokenOutput, created_at as createdAt FROM assistant_messages ORDER BY id ASC"
+    ).toArray() as Array<Record<string, unknown>>;
+    return rows;
+  }
 
   /**
    * Run a task. Phase 4 real implementation.
@@ -153,6 +191,8 @@ export class TaskAgent extends Agent<Env> {
     const scope = opts.scope ? `\n\nScope hint: ${opts.scope}` : "";
     const userMessage = `${opts.prompt}${scope}`;
 
+    this.recordTranscript("user", userMessage, { model: modelId, workspaceMode });
+
     const timeoutMs = workspaceMode === "scratch" ? TASK_FACET_TIMEOUT_MS : TASK_TIMEOUT_MS;
 
     try {
@@ -185,6 +225,13 @@ export class TaskAgent extends Agent<Env> {
         summaryText || "(No output — task ran its step budget without emitting a summary.)",
       ].filter(Boolean).join("\n");
 
+      this.recordTranscript("assistant", formatted, {
+        model: modelId,
+        workspaceMode,
+        tokenInput: totalInput,
+        tokenOutput: totalOutput,
+      });
+
       return {
         ok: true,
         facetName: this.name,
@@ -194,10 +241,12 @@ export class TaskAgent extends Agent<Env> {
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
+      const failureSummary = `Task failed (model: ${modelId}) [facet: ${this.name}]: ${msg}`;
+      this.recordTranscript("assistant", failureSummary, { model: modelId, workspaceMode });
       return {
         ok: true,
         facetName: this.name,
-        summary: `Task failed (model: ${modelId}) [facet: ${this.name}]: ${msg}`,
+        summary: failureSummary,
         workspaceMode,
       };
     }
