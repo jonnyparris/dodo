@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import cronParser from "cron-parser";
 import { z } from "zod";
 import {
   bytesToBase64,
@@ -16,7 +17,29 @@ import { HttpMcpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
 import { sendRunNotification } from "./notify";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
-import type { AppConfig, Env, FailureSnapshotRecord, MemoryEntry, SessionIndexRecord, UpdateConfigRequest, WorkerRunRecord, WorkerRunStatus } from "./types";
+import type {
+  AppConfig,
+  Env,
+  FailureSnapshotRecord,
+  MemoryEntry,
+  ScheduledSessionRecord,
+  ScheduledSessionSource,
+  ScheduledSessionType,
+  SessionIndexRecord,
+  UpdateConfigRequest,
+  WorkerRunRecord,
+  WorkerRunStatus,
+} from "./types";
+
+// ─── Scheduled-session constants ───
+/** After this many consecutive failures a schedule is stalled (manual retry required). */
+const MAX_FAILURES = 5;
+/** Minimum gap between fires — applies to `interval` and `cron` schedules. */
+const MIN_INTERVAL_SECONDS = 300;
+/** Hard upper bound on `delayed` schedules (90 days). */
+const MAX_DELAY_SECONDS = 90 * 86400;
+/** Maximum concurrent scheduled-session rows per user. */
+const MAX_SCHEDULES_PER_USER = 50;
 
 const updateConfigSchema = z
   .object({
@@ -107,6 +130,47 @@ const failureSnapshotCreateSchema = z.object({
   runId: z.string().min(1),
   payload: z.record(z.string(), z.unknown()),
 }).strict();
+
+// Scheduled-session schema. The request body combines a schedule descriptor
+// (delayed | scheduled | cron | interval) with a session-source descriptor
+// (fresh | fork). We can't use z.discriminatedUnion on both at once, so
+// validate the schedule shape and then validate `source` separately.
+const scheduleShapeSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("delayed"),
+    delayInSeconds: z.number().int().positive().max(MAX_DELAY_SECONDS),
+  }),
+  z.object({
+    type: z.literal("scheduled"),
+    date: z.string().datetime(),
+  }),
+  z.object({
+    type: z.literal("cron"),
+    cron: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal("interval"),
+    intervalSeconds: z.number().int().min(MIN_INTERVAL_SECONDS),
+  }),
+]);
+
+const sourceShapeSchema = z.discriminatedUnion("source", [
+  z.object({
+    source: z.literal("fresh"),
+    title: z.string().max(200).optional(),
+  }),
+  z.object({
+    source: z.literal("fork"),
+    sourceSessionId: z.string().min(1),
+    title: z.string().max(200).optional(),
+  }),
+]);
+
+const scheduledSessionBaseSchema = z.object({
+  description: z.string().min(1).max(500),
+  prompt: z.string().min(1).max(100_000),
+  createdBy: z.string().email(),
+});
 
 /**
  * UserControl DO — one per user (`idFromName(email)`).
@@ -425,6 +489,54 @@ export class UserControl extends DurableObject<Env> {
       if (request.method === "GET" && url.pathname.match(/^\/sessions\/[^/]+\/effective-mcp-configs$/)) {
         const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
         return Response.json({ configs: this.getEffectiveMcpConfigs(sessionId) });
+      }
+
+      // ─── Scheduled sessions ───
+
+      if (request.method === "GET" && url.pathname === "/scheduled-sessions") {
+        return Response.json({ scheduledSessions: this.listScheduledSessions() });
+      }
+
+      if (request.method === "POST" && url.pathname === "/scheduled-sessions") {
+        const raw = await request.json();
+        const base = scheduledSessionBaseSchema.parse(raw);
+        const schedule = scheduleShapeSchema.parse(raw);
+        const sourceInput = sourceShapeSchema.parse(raw);
+        return Response.json(
+          this.createScheduledSession(base, schedule, sourceInput),
+          { status: 201 },
+        );
+      }
+
+      if (request.method === "GET" && url.pathname.match(/^\/scheduled-sessions\/[^/]+$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        const row = this.readScheduledSessionRow(id);
+        if (!row) return Response.json({ error: `Scheduled session '${id}' not found` }, { status: 404 });
+        return Response.json(this.mapScheduledSessionRow(row));
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/scheduled-sessions\/[^/]+$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        const row = this.readScheduledSessionRow(id);
+        if (!row) return Response.json({ error: `Scheduled session '${id}' not found` }, { status: 404 });
+        this.db.exec("DELETE FROM scheduled_sessions WHERE id = ?", id);
+        await this.rearmScheduledSessionAlarm();
+        return Response.json({ deleted: true, id });
+      }
+
+      if (request.method === "POST" && url.pathname.match(/^\/scheduled-sessions\/[^/]+\/retry$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const row = this.readScheduledSessionRow(id);
+        if (!row) return Response.json({ error: `Scheduled session '${id}' not found` }, { status: 404 });
+        const nextRun = this.computeNextRun(row);
+        this.db.exec(
+          "UPDATE scheduled_sessions SET failure_count = 0, stalled_at = NULL, last_error = NULL, next_run_epoch = ? WHERE id = ?",
+          nextRun,
+          id,
+        );
+        await this.rearmScheduledSessionAlarm();
+        const refreshed = this.readScheduledSessionRow(id);
+        return Response.json(refreshed ? this.mapScheduledSessionRow(refreshed) : { retried: true, id });
       }
 
       // ─── Status ───
@@ -751,6 +863,34 @@ export class UserControl extends DurableObject<Env> {
         PRIMARY KEY (session_id, mcp_config_id)
       )
     `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS scheduled_sessions (
+        id                TEXT PRIMARY KEY,
+        description       TEXT NOT NULL,
+        prompt            TEXT NOT NULL,
+        schedule_type     TEXT NOT NULL,
+        delay_seconds     INTEGER,
+        target_epoch      INTEGER,
+        cron_expression   TEXT,
+        interval_seconds  INTEGER,
+        source_type       TEXT NOT NULL,
+        source_session_id TEXT,
+        session_title     TEXT,
+        next_run_epoch    INTEGER,
+        last_run_epoch    INTEGER,
+        last_session_id   TEXT,
+        run_count         INTEGER NOT NULL DEFAULT 0,
+        failure_count     INTEGER NOT NULL DEFAULT 0,
+        stalled_at        INTEGER,
+        last_error        TEXT,
+        created_at        INTEGER NOT NULL,
+        created_by        TEXT NOT NULL
+      )
+    `);
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_scheduled_sessions_next_run ON scheduled_sessions(next_run_epoch) WHERE next_run_epoch IS NOT NULL",
+    );
 
     // TTL cleanup: remove fork snapshots older than 1 hour
     const oneHourAgo = nowEpoch() - 3600;
@@ -1509,6 +1649,196 @@ export class UserControl extends DurableObject<Env> {
     } finally {
       dek.fill(0);
     }
+  }
+
+  // ─── Scheduled sessions ───
+
+  private createScheduledSession(
+    base: z.infer<typeof scheduledSessionBaseSchema>,
+    schedule: z.infer<typeof scheduleShapeSchema>,
+    sourceInput: z.infer<typeof sourceShapeSchema>,
+  ): ScheduledSessionRecord {
+    // Enforce the per-user cap
+    const existing = Number(this.db.one("SELECT COUNT(*) AS count FROM scheduled_sessions")?.count ?? 0);
+    if (existing >= MAX_SCHEDULES_PER_USER) {
+      throw new Error(`You have reached the maximum of ${MAX_SCHEDULES_PER_USER} scheduled sessions. Delete some to add more.`);
+    }
+
+    // Compute schedule fields + next run
+    const id = crypto.randomUUID();
+    const now = nowEpoch();
+    let delaySeconds: number | null = null;
+    let targetEpoch: number | null = null;
+    let cronExpression: string | null = null;
+    let intervalSeconds: number | null = null;
+    let nextRunEpoch: number;
+
+    if (schedule.type === "delayed") {
+      delaySeconds = schedule.delayInSeconds;
+      nextRunEpoch = now + schedule.delayInSeconds;
+    } else if (schedule.type === "scheduled") {
+      const parsed = Math.floor(Date.parse(schedule.date) / 1000);
+      if (!Number.isFinite(parsed) || parsed <= now) {
+        throw new Error("scheduled date must be in the future");
+      }
+      targetEpoch = parsed;
+      nextRunEpoch = parsed;
+    } else if (schedule.type === "cron") {
+      // Validate expression + minimum-gap (next three matches must all be
+      // at least MIN_INTERVAL_SECONDS apart). Reject sub-5-minute cron
+      // schedules to bound cost.
+      let iter: ReturnType<typeof cronParser.parseExpression>;
+      try {
+        iter = cronParser.parseExpression(schedule.cron);
+      } catch {
+        throw new Error(`Invalid cron expression: ${schedule.cron}`);
+      }
+      const fireTimes: number[] = [];
+      for (let i = 0; i < 3; i++) {
+        // next() returns CronDate (not an iterator result) when the parser
+        // was constructed without IsIterable=true. TS's inferred union type
+        // is too wide here — cast down.
+        const cronDate = iter.next() as { getTime: () => number };
+        fireTimes.push(Math.floor(cronDate.getTime() / 1000));
+      }
+      for (let i = 1; i < fireTimes.length; i++) {
+        if (fireTimes[i] - fireTimes[i - 1] < MIN_INTERVAL_SECONDS) {
+          throw new Error(`cron schedule fires too frequently; minimum gap is ${MIN_INTERVAL_SECONDS} seconds`);
+        }
+      }
+      cronExpression = schedule.cron;
+      nextRunEpoch = fireTimes[0];
+    } else {
+      // interval
+      intervalSeconds = schedule.intervalSeconds;
+      nextRunEpoch = now + schedule.intervalSeconds;
+    }
+
+    const sessionTitle = sourceInput.title ?? null;
+    const sourceSessionId = sourceInput.source === "fork" ? sourceInput.sourceSessionId : null;
+
+    this.db.exec(
+      `INSERT INTO scheduled_sessions (
+        id, description, prompt, schedule_type,
+        delay_seconds, target_epoch, cron_expression, interval_seconds,
+        source_type, source_session_id, session_title,
+        next_run_epoch, last_run_epoch, last_session_id,
+        run_count, failure_count, stalled_at, last_error,
+        created_at, created_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, NULL, NULL, ?, ?)`,
+      id,
+      base.description,
+      base.prompt,
+      schedule.type,
+      delaySeconds,
+      targetEpoch,
+      cronExpression,
+      intervalSeconds,
+      sourceInput.source,
+      sourceSessionId,
+      sessionTitle,
+      nextRunEpoch,
+      now,
+      base.createdBy,
+    );
+
+    // Re-arm the DO alarm to the earliest pending fire.
+    // rearmScheduledSessionAlarm is async only because it may call
+    // ctx.storage.setAlarm/deleteAlarm; we don't await it here because create
+    // runs inside a request handler — but fire-and-forget is safe because
+    // alarms are serialized with input gates.
+    void this.rearmScheduledSessionAlarm();
+
+    const row = this.readScheduledSessionRow(id);
+    if (!row) throw new Error("Failed to read back inserted scheduled session");
+    return this.mapScheduledSessionRow(row);
+  }
+
+  private listScheduledSessions(): ScheduledSessionRecord[] {
+    return this.db.all(
+      "SELECT * FROM scheduled_sessions ORDER BY created_at DESC",
+    ).map((row) => this.mapScheduledSessionRow(row));
+  }
+
+  private readScheduledSessionRow(id: string): SqlRow | null {
+    const row = this.db.one("SELECT * FROM scheduled_sessions WHERE id = ?", id);
+    return row ?? null;
+  }
+
+  private mapScheduledSessionRow(row: SqlRow): ScheduledSessionRecord {
+    const toIso = (epoch: unknown): string | null => {
+      if (epoch === null || epoch === undefined) return null;
+      const n = Number(epoch);
+      if (!Number.isFinite(n) || n <= 0) return null;
+      return new Date(n * 1000).toISOString();
+    };
+    return {
+      id: String(row.id),
+      description: String(row.description),
+      prompt: String(row.prompt),
+      scheduleType: String(row.schedule_type) as ScheduledSessionType,
+      delaySeconds: row.delay_seconds === null ? null : Number(row.delay_seconds),
+      targetEpoch: row.target_epoch === null ? null : Number(row.target_epoch),
+      cronExpression: row.cron_expression === null ? null : String(row.cron_expression),
+      intervalSeconds: row.interval_seconds === null ? null : Number(row.interval_seconds),
+      sourceType: String(row.source_type) as ScheduledSessionSource,
+      sourceSessionId: row.source_session_id === null ? null : String(row.source_session_id),
+      title: row.session_title === null ? null : String(row.session_title),
+      nextRunAt: toIso(row.next_run_epoch),
+      lastRunAt: toIso(row.last_run_epoch),
+      lastSessionId: row.last_session_id === null ? null : String(row.last_session_id),
+      runCount: Number(row.run_count ?? 0),
+      failureCount: Number(row.failure_count ?? 0),
+      stalledAt: toIso(row.stalled_at),
+      lastError: row.last_error === null ? null : String(row.last_error),
+      createdAt: epochToIso(row.created_at),
+      createdBy: String(row.created_by),
+    };
+  }
+
+  /**
+   * Compute the next fire time for a row. For `delayed`/`scheduled` this is
+   * a one-shot that completes after firing, so this is only called from the
+   * retry path — we use (now + delaySeconds) and (targetEpoch) respectively
+   * as "best guess" resurrection times.
+   */
+  private computeNextRun(row: SqlRow): number {
+    const now = nowEpoch();
+    const type = String(row.schedule_type) as ScheduledSessionType;
+    if (type === "delayed") {
+      return now + Number(row.delay_seconds ?? 0);
+    }
+    if (type === "scheduled") {
+      const target = Number(row.target_epoch ?? now);
+      return target > now ? target : now + 1;
+    }
+    if (type === "cron") {
+      const cron = String(row.cron_expression ?? "");
+      try {
+        const cronDate = cronParser.parseExpression(cron).next() as { getTime: () => number };
+        return Math.floor(cronDate.getTime() / 1000);
+      } catch {
+        return now + MIN_INTERVAL_SECONDS;
+      }
+    }
+    // interval
+    return now + Number(row.interval_seconds ?? MIN_INTERVAL_SECONDS);
+  }
+
+  /**
+   * Set the DO alarm to fire at the minimum next_run_epoch across all rows.
+   * Clears the alarm when there are no pending schedules.
+   */
+  private async rearmScheduledSessionAlarm(): Promise<void> {
+    const next = this.db.one(
+      "SELECT MIN(next_run_epoch) AS t FROM scheduled_sessions WHERE next_run_epoch IS NOT NULL",
+    );
+    if (next?.t == null) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const fireAtMs = Number(next.t) * 1000;
+    this.ctx.storage.setAlarm(fireAtMs);
   }
 
   // ─── User-level SSE ───

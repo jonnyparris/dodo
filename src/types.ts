@@ -254,3 +254,48 @@ export interface SessionSnapshot {
   messages: ChatMessageRecord[];
   title: string | null;
 }
+
+// ─── Scheduled new-session jobs ───
+
+export type ScheduledSessionType = "delayed" | "scheduled" | "cron" | "interval";
+export type ScheduledSessionSource = "fresh" | "fork";
+
+export interface ScheduledSessionRecord {
+  id: string;
+  description: string;
+  prompt: string;
+  scheduleType: ScheduledSessionType;
+  /** Raw schedule values — only one is populated per row. */
+  delaySeconds: number | null;
+  targetEpoch: number | null;
+  cronExpression: string | null;
+  intervalSeconds: number | null;
+  sourceType: ScheduledSessionSource;
+  sourceSessionId: string | null;
+  title: string | null;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastSessionId: string | null;
+  runCount: number;
+  failureCount: number;
+  stalledAt: string | null;
+  lastError: string | null;
+  createdAt: string;
+  createdBy: string;
+}
+
+export type CreateScheduledSessionRequest =
+  (
+    | { type: "delayed"; delayInSeconds: number }
+    | { type: "scheduled"; date: string }
+    | { type: "cron"; cron: string }
+    | { type: "interval"; intervalSeconds: number }
+  )
+  & (
+    | { source: "fresh"; title?: string }
+    | { source: "fork"; sourceSessionId: string; title?: string }
+  )
+  & {
+    description: string;
+    prompt: string;
+  };
