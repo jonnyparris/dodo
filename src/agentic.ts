@@ -462,6 +462,16 @@ export function buildProvider(config: AppConfig, env: Env) {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyTool = any;
 
+/**
+ * Default git_clone depth. Bumped from 1 to 20 after observing repeated
+ * "what's new in this repo?" failures where a depth=1 clone gave the model
+ * only the most recent commit, so it either gave up or triggered extra
+ * tool calls to get more history. 20 commits covers almost all "recent
+ * changes" style questions without materially inflating clone size.
+ * Agents can still pass depth=1 for tree-only or depth=0 for full history.
+ */
+const DEFAULT_CLONE_DEPTH = 20;
+
 function buildGitTools(
   env: Env,
   workspace: Workspace,
@@ -475,18 +485,18 @@ function buildGitTools(
 
   return {
     git_clone_known: tool({
-      description: "Clone a built-in known repository by id. Use this instead of free-form URLs when possible.",
+      description: "Clone a built-in known repository by id. Use this instead of free-form URLs when possible. Default depth is 20 commits — enough for most 'what's new / recent changes' investigations without downloading the full history. Pass depth=0 for full history or depth=1 when you only need the current tree.",
       inputSchema: zodSchema(z.object({
         repoId: z.enum(knownRepoIds as ["dodo"]).describe("Known repo id"),
         dir: z.string().optional().describe("Target directory (defaults to repo's standard dir)"),
         branch: z.string().optional().describe("Branch to clone (defaults to repo default branch)"),
-        depth: z.number().optional().describe("Clone depth. Default: 1. Use 0 for full history."),
+        depth: z.number().optional().describe("Clone depth in commits. Default: 20 (covers most 'what changed recently' questions). Use 1 for tree-only, 0 for full history."),
       })),
       execute: async ({ repoId, dir, branch, depth }) => {
         const repo = getKnownRepo(repoId);
         const targetDir = dir ?? repo.dir;
         const token = await resolveRemoteToken({ dir: targetDir, env, git, ownerEmail, url: repo.url });
-        const cloneDepth = depth === 0 ? undefined : (depth ?? 1);
+        const cloneDepth = depth === 0 ? undefined : (depth ?? DEFAULT_CLONE_DEPTH);
         return git.clone({
           branch: branch ?? repo.defaultBranch,
           depth: cloneDepth,
@@ -499,17 +509,17 @@ function buildGitTools(
     }),
 
     git_clone: tool({
-      description: "Clone a git repo into the workspace. Auth is automatic for GitHub/GitLab. Clones are shallow (depth 1) by default. Pass depth 0 for full history.",
+      description: "Clone a git repo into the workspace. Auth is automatic for GitHub/GitLab. Default depth is 20 commits — enough for 'what's new / recent changes / since commit X' style investigations without paying for full history. Pass depth=1 for tree-only (cheapest, no log context) or depth=0 for full history.",
       inputSchema: zodSchema(z.object({
         url: z.string().describe("Git repo URL (e.g. https://github.com/owner/repo)"),
         dir: z.string().optional().describe("Target directory (default: repo name)"),
         branch: z.string().optional().describe("Branch to clone"),
-        depth: z.number().optional().describe("Clone depth. Default: 1 (shallow). Use 0 for full history."),
+        depth: z.number().optional().describe("Clone depth in commits. Default: 20. Use 1 for tree-only, 0 for full history."),
       })),
       execute: async ({ url, dir, branch, depth }) => {
         const token = await resolveRemoteToken({ dir, env, git, url, ownerEmail });
-        // depth 0 = full history (pass undefined to isomorphic-git), undefined = shallow default of 1
-        const cloneDepth = depth === 0 ? undefined : (depth ?? 1);
+        // depth 0 = full history (pass undefined to isomorphic-git), undefined = default depth
+        const cloneDepth = depth === 0 ? undefined : (depth ?? DEFAULT_CLONE_DEPTH);
         return git.clone({ branch, depth: cloneDepth, dir, singleBranch: true, token, url });
       },
     }),
