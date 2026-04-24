@@ -398,3 +398,46 @@ describe("MCP URL allowlist check", () => {
     await fetchJson(`/api/mcp-configs/${body.id}`, { method: "DELETE" });
   });
 });
+
+describe("Scheduled session permissions", () => {
+  it("rejects fork source that the caller does not own", async () => {
+    // A missing session ID fails permission resolution the same way an
+    // unreachable one does — resolveSessionPermission returns null when
+    // the check endpoint 404s, so the caller gets 403 at create time.
+    const res = await fetchJson("/api/scheduled-sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        description: "unauthorized fork",
+        prompt: "x",
+        type: "delayed",
+        delayInSeconds: 300,
+        source: "fork",
+        sourceSessionId: "00000000-0000-0000-0000-deadbeefdead",
+      }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("accepts a fresh scheduled session with no source", async () => {
+    const res = await fetchJson("/api/scheduled-sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        description: "fresh schedule",
+        prompt: "x",
+        type: "delayed",
+        delayInSeconds: 300,
+        source: "fresh",
+      }),
+    });
+    // Either 201 or 400 (cap reached from earlier tests). Both prove the
+    // permission path is open — only the source="fork" branch requires
+    // session permission.
+    expect([201, 400]).toContain(res.status);
+    if (res.status === 201) {
+      const body = (await res.json()) as { id: string };
+      await fetchJson(`/api/scheduled-sessions/${body.id}`, { method: "DELETE" });
+    }
+  });
+});

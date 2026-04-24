@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { getAgentByName } from "agents";
-import cronParser from "cron-parser";
+import { parseCronExpression } from "cron-schedule";
 import { RateLimiter } from "./rate-limit";
 import { SourceSessionMissingError } from "./sessions";
 import { z } from "zod";
@@ -1695,19 +1695,19 @@ export class UserControl extends DurableObject<Env> {
       // Validate expression + minimum-gap (next three matches must all be
       // at least MIN_INTERVAL_SECONDS apart). Reject sub-5-minute cron
       // schedules to bound cost.
-      let iter: ReturnType<typeof cronParser.parseExpression>;
+      let cron: ReturnType<typeof parseCronExpression>;
       try {
-        iter = cronParser.parseExpression(schedule.cron);
-      } catch {
-        throw new Error(`Invalid cron expression: ${schedule.cron}`);
+        cron = parseCronExpression(schedule.cron);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`Invalid cron expression '${schedule.cron}': ${msg}`);
       }
       const fireTimes: number[] = [];
+      let cursor = new Date();
       for (let i = 0; i < 3; i++) {
-        // next() returns CronDate (not an iterator result) when the parser
-        // was constructed without IsIterable=true. TS's inferred union type
-        // is too wide here — cast down.
-        const cronDate = iter.next() as { getTime: () => number };
-        fireTimes.push(Math.floor(cronDate.getTime() / 1000));
+        const next = cron.getNextDate(cursor);
+        fireTimes.push(Math.floor(next.getTime() / 1000));
+        cursor = next;
       }
       for (let i = 1; i < fireTimes.length; i++) {
         if (fireTimes[i] - fireTimes[i - 1] < MIN_INTERVAL_SECONDS) {
@@ -1821,10 +1821,9 @@ export class UserControl extends DurableObject<Env> {
       return target > now ? target : now + 1;
     }
     if (type === "cron") {
-      const cron = String(row.cron_expression ?? "");
+      const cronExpr = String(row.cron_expression ?? "");
       try {
-        const cronDate = cronParser.parseExpression(cron).next() as { getTime: () => number };
-        return Math.floor(cronDate.getTime() / 1000);
+        return Math.floor(parseCronExpression(cronExpr).getNextDate().getTime() / 1000);
       } catch {
         return now + MIN_INTERVAL_SECONDS;
       }
@@ -1870,14 +1869,16 @@ export class UserControl extends DurableObject<Env> {
       )
       .map((row) => String(row.id));
 
+    // alarm() already holds the DO input gate, so fetch handlers can't
+    // interleave between rows. Re-read the row each iteration to guard
+    // against an alarm-internal mutation (e.g. a previous iteration that
+    // deleted a dependency row).
     for (const rowId of dueIds) {
-      await this.ctx.blockConcurrencyWhile(async () => {
-        const row = this.readScheduledSessionRow(rowId);
-        if (!row) return;
-        if (row.stalled_at !== null && row.stalled_at !== undefined) return;
-        if (row.next_run_epoch === null || Number(row.next_run_epoch) > nowEpoch()) return;
-        await this.fireSchedule(row);
-      });
+      const row = this.readScheduledSessionRow(rowId);
+      if (!row) continue;
+      if (row.stalled_at !== null && row.stalled_at !== undefined) continue;
+      if (row.next_run_epoch === null || Number(row.next_run_epoch) > nowEpoch()) continue;
+      await this.fireSchedule(row);
     }
 
     // Re-arm: if more rows are overdue beyond the batch, fire again in ~1s.
@@ -2092,10 +2093,9 @@ export class UserControl extends DurableObject<Env> {
     // Recurring — compute next fire time.
     let nextRun: number;
     if (scheduleType === "cron") {
-      const cron = String(row.cron_expression ?? "");
+      const cronExpr = String(row.cron_expression ?? "");
       try {
-        const cronDate = cronParser.parseExpression(cron).next() as { getTime: () => number };
-        nextRun = Math.floor(cronDate.getTime() / 1000);
+        nextRun = Math.floor(parseCronExpression(cronExpr).getNextDate().getTime() / 1000);
       } catch {
         nextRun = now + MIN_INTERVAL_SECONDS;
       }
