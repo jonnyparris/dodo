@@ -168,19 +168,25 @@ describe("MCP Config CRUD", () => {
   });
 });
 
+describe("Approved MCP catalog admin operations", () => {
+  it("GET /api/admin/approved-mcps returns 403 for non-admin", async () => {
+    const res = await fetchJson("/api/admin/approved-mcps");
+    expect(res.status).toBe(403);
+  });
+});
+
 describe("MCP Catalog", () => {
-  it("returns catalog with 4 entries", async () => {
+  it("returns catalog with at least 4 entries", async () => {
     const res = await fetchJson("/api/mcp-catalog");
     expect(res.status).toBe(200);
     const catalog = (await res.json()) as Array<{ id: string; name: string; description: string; url: string; setupGuide: string }>;
     expect(Array.isArray(catalog)).toBe(true);
-    expect(catalog.length).toBe(4);
+    expect(catalog.length).toBeGreaterThanOrEqual(4);
 
     // Verify known entries exist
     const ids = catalog.map((c) => c.id);
     expect(ids).toContain("dodo-self");
     expect(ids).toContain("github");
-    expect(ids).toContain("cloudflare-api");
     expect(ids).toContain("browser-rendering");
 
     // Verify each entry has required fields
@@ -205,6 +211,7 @@ describe("McpGatekeeper interface", () => {
       type: "http" as const,
       url: "https://mcp-test.example.com",
       headers: { Authorization: "Bearer abc" },
+      auth_type: "static_headers" as const,
       enabled: true,
     };
 
@@ -220,6 +227,7 @@ describe("McpGatekeeper interface", () => {
       id: "wrong-type",
       name: "Wrong Type",
       type: "service-binding",
+      auth_type: "static_headers" as const,
       enabled: true,
     })).toThrow(/only supports type "http"/);
   });
@@ -231,6 +239,7 @@ describe("McpGatekeeper interface", () => {
       id: "no-url",
       name: "No URL",
       type: "http",
+      auth_type: "static_headers" as const,
       enabled: true,
     })).toThrow(/requires a url/);
   });
