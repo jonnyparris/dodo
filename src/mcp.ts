@@ -973,9 +973,14 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     jsonFetch(env, "user", "/config"),
   );
 
-  server.tool("update_config", "Update Dodo's LLM gateway, model, or git author config", {
+  server.tool("update_config", "Update Dodo's LLM gateway, model, git author, or base URL overrides", {
     model: z.string().optional().describe("Model ID"),
     activeGateway: z.enum(["opencode", "ai-gateway"]).optional().describe("LLM gateway"),
+    opencodeBaseURL: z.string().url().optional().describe("OpenCode gateway base URL override. Leave unset to use the worker's env default."),
+    aiGatewayBaseURL: z.string().url().optional().describe("AI Gateway base URL override. Leave unset to use the worker's env default."),
+    gitAuthorEmail: z.string().email().optional().describe("Git author email"),
+    gitAuthorName: z.string().optional().describe("Git author name"),
+    systemPromptPrefix: z.string().optional().describe("Personal preamble prepended to the system prompt. Pass empty string to clear."),
   }, async (params) =>
     jsonFetch(env, "user", "/config", {
       init: { body: JSON.stringify(params), headers: { "content-type": "application/json" }, method: "PUT" },
