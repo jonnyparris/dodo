@@ -74,16 +74,27 @@
     // Default model used when a new session is created with activeGateway=ai-gateway.
     // Workers AI models (`@cf/…`) are only routable via AI Gateway.
     "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
-    // Default model for the `explore` / `task` subagents. Kimi K2.6 is the
-    // best-value choice per the 2026-04-24 model comparison (bundled pricing,
-    // 262k ctx, stayed under budget on the same prompt that blew Opus/Sonnet
-    // past 400 %). Auto-routed via AI Gateway regardless of main session's
-    // gateway — see buildProviderForModel in src/agentic.ts. Agents can
-    // override per call with the `model` arg on the tool.
-    "DEFAULT_EXPLORE_MODEL": "@cf/moonshotai/kimi-k2.6",
-    // Default `task` subagent model. Haiku 4.5 — needs to edit files, so a
-    // stronger instruction-follower than Kimi is worth the small cost bump.
-    // Users can override to any model via PUT /config taskModel=...
+    // Default model for the `explore` / `task` subagents.
+    //
+    // Initially set to Kimi K2.6 based on the main-model comparison, but
+    // the 2026-04-24 demo verification runs showed Kimi as an EXPLORE
+    // model keeps grep/read-ing and never synthesizes a final summary on
+    // repos this size — it burned 176k tokens across 12 steps in demo
+    // 4ffee77a and returned empty output. Haiku 4.5 completes the same
+    // query in 1 call with ~2k output tokens (demo 03c51aff: 76k total
+    // parent tokens vs 132k for the Kimi run).
+    //
+    // Conclusion: Kimi is great as a main model for investigate-and-report,
+    // but explore's success criterion (short synthesized summary from tool
+    // traces) suits an instruction-follower better. Haiku is cheap
+    // ($0.80/M in, $4/M out), fast, and converges reliably.
+    //
+    // Overrides: PUT /config exploreModel=..., or pass model=... per call.
+    // Auto-routed via AI Gateway for @cf/* models — see
+    // buildProviderForModel in src/agentic.ts.
+    "DEFAULT_EXPLORE_MODEL": "anthropic/claude-haiku-4-5",
+    // Default `task` subagent model. Same choice for the same reason —
+    // task needs to edit files then summarize; Haiku does both well.
     "DEFAULT_TASK_MODEL": "anthropic/claude-haiku-4-5",
     "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
     // AI Gateway unified API base URL — include /{account_id}/{gateway_id}/compat
