@@ -5,6 +5,7 @@ import { getSharedIndexStub, getUserControlStub, resolveAdminEmail } from "./aut
 import { createDraftPrForRun } from "./github-pr";
 import { pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-actions";
 import { getKnownRepo, listKnownRepos } from "./repos";
+import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
 import type { CodingAgent } from "./coding-agent";
 import type { Env, WorkerRunRecord } from "./types";
 
@@ -407,19 +408,17 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
   });
 
   server.tool("fork_session", "Fork a session (copy files + messages into a new session)", { sessionId: z.string().describe("Source session ID") }, async ({ sessionId }) => {
-    // Verify the source session exists
-    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`);
-    if (!checkRes.ok) {
-      return errorResult({ error: `Source session '${sessionId}' not found. Run list_sessions to see available sessions.` });
-    }
-    const snapshotRes = await agentFetch(env, sessionId, "/snapshot", undefined, depth);
-    const snapshot = await snapshotRes.text();
-    const storeRes = await userControlFetch(env, "/fork-snapshots", { body: snapshot, headers: { "content-type": "application/json" }, method: "POST" });
-    const { id: snapshotId } = (await storeRes.json()) as { id: string };
-    const newId = crypto.randomUUID();
     const email = mcpUserEmail(env);
-    await userControlFetch(env, "/sessions", { body: JSON.stringify({ id: newId, ownerEmail: email, createdBy: email }), headers: { "content-type": "application/json" }, method: "POST" });
-    await agentFetch(env, newId, `/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`, { method: "POST" }, depth);
+    let newId: string;
+    try {
+      const forked = await forkSessionInternal(env, email, sessionId, null);
+      newId = forked.id;
+    } catch (err) {
+      if (err instanceof SourceSessionMissingError) {
+        return errorResult({ error: `Source session '${sessionId}' not found. Run list_sessions to see available sessions.` });
+      }
+      return errorResult({ error: err instanceof Error ? err.message : String(err) });
+    }
     // Fork the source's Artifacts repo so the new session's workspace history
     // is preserved in Artifacts as well. Fire-and-forget — a failure here
     // doesn't break session forking (files already copied via snapshot).
@@ -432,7 +431,6 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     } catch (err) {
       console.warn("[fork_session] Artifacts fork failed (files still copied via snapshot):", err);
     }
-    await userControlFetch(env, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
     return textResult({ sessionId: newId, sourceSessionId: sessionId, forkedAt: new Date().toISOString() });
   });
 

@@ -16,6 +16,7 @@ import { RateLimiter } from "./rate-limit";
 import { DodoPublicApi } from "./rpc-api";
 import { signCookie, verifyCookie } from "./share";
 import { SharedIndex } from "./shared-index";
+import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
 import { UserControl } from "./user-control";
 import type { AccessIdentity, AppConfig, Env } from "./types";
 
@@ -1441,36 +1442,16 @@ app.post("/session/:id/fork", async (c) => {
   if (denied) return denied;
   const email = c.get("userEmail");
   const sourceId = c.req.param("id");
-  const sourceAgent = await getAgentByName(c.env.CODING_AGENT as never, sourceId);
-  const snapshotResponse = await sourceAgent.fetch(new Request("https://coding-agent/snapshot", { method: "GET" }));
-  const snapshot = await snapshotResponse.text();
-  const snapshotStoreResponse = await proxyToUserControl(c.env, email, "/fork-snapshots", {
-    body: snapshot,
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  });
-  const { id: snapshotId } = (await snapshotStoreResponse.json()) as { id: string };
-  const sessionId = crypto.randomUUID();
-  await proxyToUserControl(c.env, email, "/sessions", {
-    body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }),
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  });
-  const targetAgent = await getAgentByName(c.env.CODING_AGENT as never, sessionId);
-  const importResponse = await targetAgent.fetch(
-    new Request(`https://coding-agent/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`, {
-      headers: {
-        "x-dodo-session-id": sessionId,
-        "x-owner-email": email,
-      },
-      method: "POST",
-    }),
-  );
-  await proxyToUserControl(c.env, email, `/fork-snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" });
-  if (!importResponse.ok) {
-    return c.json({ error: await importResponse.text(), id: sessionId, sourceId }, 500);
+  try {
+    const { id, sourceId: resolvedSourceId } = await forkSessionInternal(c.env, email, sourceId, null);
+    return c.json({ id, sourceId: resolvedSourceId }, 201);
+  } catch (error) {
+    if (error instanceof SourceSessionMissingError) {
+      return c.json({ error: error.message, sourceId }, 404);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message, sourceId }, 500);
   }
-  return c.json({ id: sessionId, sourceId }, 201);
 });
 
 // ─── Share link management (session owner only) ───
