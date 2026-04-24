@@ -243,7 +243,7 @@ Type `/generate a cyberpunk cat` in any chat to generate an image with Workers A
 
 Images surface in the chat from four sources and flow through the same R2-backed pipeline:
 
-- **User uploads** -- Paste an image or click the paperclip to send a screenshot to a multimodal model (Claude, Gemini, GPT-4o, Gemma). Limits: 5 images per message, 3MB raw per image, PNG/JPEG/GIF/WebP.
+- **User uploads** -- Paste an image or click the paperclip to send a screenshot to a multimodal model (Claude, Gemini, GPT-4o, Gemma). Limits: 5 images per message, 3MB raw per image, PNG/JPEG/GIF/WebP/SVG. SVGs are sanitized (scripts, event handlers, and `javascript:` URLs stripped) before storage, and served with a restrictive CSP.
 - **Browser tool screenshots** -- `browser_execute` extracts screenshots from the CDP result, stashes them in R2, and returns a short text summary to the model (so base64 doesn't burn context). Images render inline on the tool-result bubble.
 - **Model-generated images** -- Responses from image-generating models (e.g. Gemini imagen, Gemma vision) are captured during the stream, uploaded to R2, and rendered on the assistant bubble.
 - **`/generate` slash command** -- Type `/generate <prompt>` in any chat to bypass the LLM and hit Workers AI FLUX-1-schnell directly. Image appears inline in a few seconds. Works from the browser UI (with autocomplete — type `/` to see the menu), the MCP `generate_image` tool, or any chat message containing `/generate` (server-side slash routing catches it). Rate-limited to 30 images/hour and 100/day per user; prompts capped at 2048 chars per the FLUX schema. Requires the `AI` binding in `wrangler.jsonc`.

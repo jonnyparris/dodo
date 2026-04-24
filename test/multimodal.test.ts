@@ -175,6 +175,21 @@ describe("Multimodal image support", () => {
       });
       expect(res.status).toBe(400);
     });
+
+    it("accepts image/svg+xml with a sanitizable SVG payload", async () => {
+      // Base64 of `<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>`.
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>';
+      const b64 = btoa(svg);
+      const res = await fetchJson(`/session/${sessionId}/message`, {
+        body: JSON.stringify({
+          content: "SVG upload",
+          images: [{ data: b64, mediaType: "image/svg+xml" }],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(res.status).toBe(200);
+    });
   });
 
   describe("Message history", () => {

@@ -122,11 +122,32 @@ describe("uiMessageToChatRecord — multimodal", () => {
       role: "user",
       parts: [
         { type: "text", text: "Check" },
-        { type: "file", mediaType: "image/svg+xml", url: "data:image/svg+xml;base64,PHN2Zy8+" } as UIMessage["parts"][number],
+        // application/pdf is a file but not one we'll render as an image.
+        { type: "file", mediaType: "application/pdf", url: "data:application/pdf;base64,JVBERi0=" } as UIMessage["parts"][number],
+        // image/bmp isn't in the allowlist either.
+        { type: "file", mediaType: "image/bmp", url: "data:image/bmp;base64,Qk0=" } as UIMessage["parts"][number],
       ],
     };
     const record = uiMessageToChatRecord(msg);
     expect(record.attachments).toBeUndefined();
+  });
+
+  it("keeps file parts with image/svg+xml (now in the allowlist)", () => {
+    // SVG joins png/jpeg/gif/webp in the renderable allowlist. The upload
+    // path sanitizes raw SVG text; this round-trip just ensures the media
+    // type isn't dropped from the chat record.
+    const msg: UIMessage = {
+      id: "msg-svg",
+      role: "user",
+      parts: [
+        { type: "text", text: "Here" },
+        { type: "file", mediaType: "image/svg+xml", url: "data:image/svg+xml;base64,PHN2Zy8+" } as UIMessage["parts"][number],
+      ],
+    };
+    const record = uiMessageToChatRecord(msg);
+    expect(record.attachments).toEqual([
+      { mediaType: "image/svg+xml", url: "data:image/svg+xml;base64,PHN2Zy8+" },
+    ]);
   });
 
   it("drops file parts with an empty url", () => {

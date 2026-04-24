@@ -143,7 +143,7 @@ export function estimateMessagesTokens(messages: ModelMessage[]): number {
  */
 const MAX_IMAGES_PER_MESSAGE = 5;
 const MAX_IMAGE_BASE64_LENGTH = 4_000_000; // ~3MB decoded per image
-const ALLOWED_IMAGE_MEDIA_TYPES = /^image\/(png|jpeg|gif|webp)$/;
+const ALLOWED_IMAGE_MEDIA_TYPES = /^image\/(png|jpeg|gif|webp|svg\+xml)$/;
 // Sampled base64 validation — avoids running a regex across a multi-MB string, which
 // is expensive in the DO isolate. Base64 must have length divisible by 4; the head/tail
 // sampling catches most corruption without the full scan. convertToLanguageModelV3DataContent
