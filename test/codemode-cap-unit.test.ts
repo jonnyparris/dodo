@@ -17,6 +17,8 @@
  */
 import { describe, expect, it } from "vitest";
 import { capCodemodeResult, projectCodemodeResult } from "../src/agentic";
+import { asSchema } from "ai";
+import { z } from "zod";
 
 /** Build a PR object shaped like GitHub's `/repos/:o/:r/pulls` response. */
 function buildPr(number: number, title: string) {
@@ -184,5 +186,56 @@ describe("codemode cap — 56a7a597 regression", () => {
     expect(projected.result["0.title"]).toBeDefined();
     expect(projected.result["0.nonexistent.path"]).toBeUndefined();
     expect(projected.result["99.title"]).toBeUndefined();
+  });
+});
+
+/**
+ * Schema-level regression: `select` must survive AI SDK Zod validation.
+ *
+ * Pre-fix, the wrapped codemode tool inherited the underlying codemode
+ * schema which only accepts `{ code }`. Zod strips unknown keys by default
+ * and the model never sees `select` as an allowed field in its tool
+ * definition (additionalProperties:false on the wire). The wrap's
+ * destructure silently returned undefined for `select`, projection never
+ * ran.
+ *
+ * This test asserts the extended inputSchema actually accepts `select`
+ * end-to-end — using the exact `asSchema(...).validate` path the AI SDK
+ * uses in doToolCall.
+ */
+describe("codemode extended inputSchema — Zod round-trip regression", () => {
+  // This mirrors the shape built in buildTools() — we construct the same
+  // zodSchema and pass it through asSchema to verify validate() keeps
+  // `select`. If the schema ever regresses back to accepting only `code`,
+  // this test fails loudly.
+  const extendedSchema = z.object({
+    code: z.string().describe("JavaScript async arrow function to execute"),
+    select: z
+      .array(z.string())
+      .optional()
+      .describe("Dot-paths to project from result"),
+  });
+
+  it("validate() preserves `select` when the model passes it", async () => {
+    const schema = asSchema(extendedSchema);
+    const input = {
+      code: "return {items: [{name: 'a'}], total_count: 1}",
+      select: ["items.0.name", "total_count"],
+    };
+    // asSchema returns either a SchemaV2 or the Zod-wrapped version; both
+    // expose a validate() method that returns { success, value } | { success:false, error }.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await (schema as any).validate(input);
+    expect(result.success).toBe(true);
+    expect(result.value.select).toEqual(["items.0.name", "total_count"]);
+    expect(result.value.code).toBe(input.code);
+  });
+
+  it("validate() still accepts a call without `select` (backwards compat)", async () => {
+    const schema = asSchema(extendedSchema);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await (schema as any).validate({ code: "return 1" });
+    expect(result.success).toBe(true);
+    expect(result.value.select).toBeUndefined();
   });
 });

@@ -796,18 +796,22 @@ export class UserControl extends DurableObject<Env> {
   private readConfig(): AppConfig {
     const rows = this.db.all("SELECT key, value FROM user_config");
     const values = Object.fromEntries(rows.map((row) => [String(row.key), String(row.value)]));
+    // Recover from rows poisoned by the pre-fix updateConfig that called
+    // `String(undefined)` — treat the literal strings "undefined" and
+    // "null" as "not set" for every field. This lets existing deployments
+    // recover without a manual DB fix.
+    const isBlank = (v: string | undefined): boolean =>
+      v === undefined || v === "" || v === "undefined" || v === "null";
+    const get = (key: string): string | undefined =>
+      isBlank(values[key]) ? undefined : values[key];
     return {
-      activeGateway: values.activeGateway === "ai-gateway" ? "ai-gateway" : "opencode",
-      aiGatewayBaseURL: values.aiGatewayBaseURL ?? this.env.AI_GATEWAY_BASE_URL,
-      gitAuthorEmail: values.gitAuthorEmail ?? this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
-      gitAuthorName: values.gitAuthorName ?? this.env.GIT_AUTHOR_NAME ?? "Dodo",
-      model: values.model ?? this.env.DEFAULT_MODEL,
-      opencodeBaseURL: values.opencodeBaseURL ?? this.env.OPENCODE_BASE_URL,
-      // systemPromptPrefix is an optional free-form string — undefined if unset
-      // or if the user stored an empty string (which the client uses to clear).
-      systemPromptPrefix: values.systemPromptPrefix && values.systemPromptPrefix.length > 0
-        ? values.systemPromptPrefix
-        : undefined,
+      activeGateway: get("activeGateway") === "ai-gateway" ? "ai-gateway" : "opencode",
+      aiGatewayBaseURL: get("aiGatewayBaseURL") ?? this.env.AI_GATEWAY_BASE_URL,
+      gitAuthorEmail: get("gitAuthorEmail") ?? this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
+      gitAuthorName: get("gitAuthorName") ?? this.env.GIT_AUTHOR_NAME ?? "Dodo",
+      model: get("model") ?? this.env.DEFAULT_MODEL,
+      opencodeBaseURL: get("opencodeBaseURL") ?? this.env.OPENCODE_BASE_URL,
+      systemPromptPrefix: get("systemPromptPrefix"),
     };
   }
 
@@ -830,6 +834,15 @@ export class UserControl extends DurableObject<Env> {
 
     const now = nowEpoch();
     for (const [key, value] of Object.entries(nextConfig)) {
+      // Drop undefined/null keys entirely — never persist `String(undefined)`
+      // or `String(null)` because readConfig() would treat those literal
+      // strings as set values. This matters for AppConfig fields that are
+      // `| undefined` in the type (e.g. systemPromptPrefix): every config
+      // update would otherwise poison the key with the string "undefined".
+      if (value === undefined || value === null) {
+        this.db.exec("DELETE FROM user_config WHERE key = ?", key);
+        continue;
+      }
       this.db.exec(
         "INSERT INTO user_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         key,

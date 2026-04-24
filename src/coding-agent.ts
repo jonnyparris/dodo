@@ -509,40 +509,37 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       const entries = await this.workspace.readDir("/");
       for (const entry of entries) {
         // FileInfo: { name, type: 'file' | 'directory' | 'symlink', ... }
-        const name = (entry as { name?: string }).name ?? "";
-        const type = (entry as { type?: string }).type;
-        if (type === "directory" && name && !name.startsWith(".")) {
+        if (entry.type === "directory" && entry.name && !entry.name.startsWith(".")) {
           for (const candidate of candidates) {
-            searchPaths.push(`/${name}/${candidate}`);
+            searchPaths.push(`/${entry.name}/${candidate}`);
           }
         }
       }
     } catch {
-      // No subdirs or workspace not ready — continue with root-only search
+      // readDir throws if the workspace's SQL tables aren't ready — skip
+      // subdir search and try root-only paths. Not a real error.
     }
 
     for (const path of searchPaths) {
-      try {
-        const content = await this.workspace.readFile(path);
-        if (typeof content !== "string" || content.length === 0) continue;
+      // Workspace.readFile returns Promise<string | null> — null on miss,
+      // not a throw. No try/catch needed for the normal not-found case.
+      const content = await this.workspace.readFile(path);
+      if (typeof content !== "string" || content.length === 0) continue;
 
-        let trimmed = content.trim();
-        if (trimmed.length > MAX_BYTES) {
-          const head = trimmed.slice(0, Math.floor(MAX_BYTES * 0.7));
-          const tail = trimmed.slice(-Math.floor(MAX_BYTES * 0.2));
-          trimmed = `${head}\n\n[... truncated ${content.length - head.length - tail.length} bytes of ${path} ...]\n\n${tail}`;
-        }
-
-        this._projectInstructions = `Loaded from \`${path}\`:\n\n${trimmed}`;
-        log("info", "project-instructions-loaded", {
-          sessionId: this.sessionId(),
-          path,
-          bytes: trimmed.length,
-        });
-        return;
-      } catch {
-        // File not found — continue to next candidate
+      let trimmed = content.trim();
+      if (trimmed.length > MAX_BYTES) {
+        const head = trimmed.slice(0, Math.floor(MAX_BYTES * 0.7));
+        const tail = trimmed.slice(-Math.floor(MAX_BYTES * 0.2));
+        trimmed = `${head}\n\n[... truncated ${content.length - head.length - tail.length} bytes of ${path} ...]\n\n${tail}`;
       }
+
+      this._projectInstructions = `Loaded from \`${path}\`:\n\n${trimmed}`;
+      log("info", "project-instructions-loaded", {
+        sessionId: this.sessionId(),
+        path,
+        bytes: trimmed.length,
+      });
+      return;
     }
   }
 
@@ -1686,10 +1683,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
 
-    const estimateTokens = (msg: ModelMessage): number => {
-      const s = JSON.stringify(msg);
-      return Math.ceil(s.length / 3.5);
-    };
+    // Use the top-of-file estimateMessageTokens which is content-aware
+    // (separate chars-per-token ratios for prose / code / JSON / default).
+    // Prior versions had a shadow `estimateTokens` here using a flat 3.5
+    // ratio — that under-counted code/JSON by 15-25% and let oversized
+    // messages slip past the cutoff walk below.
+    const estimateTokens = estimateMessageTokens;
 
     // ─── Protect compaction summaries from being dropped ───
     // The compaction summary (injected above or by Think's getHistory) MUST survive

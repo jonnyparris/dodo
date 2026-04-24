@@ -305,6 +305,17 @@ function trimBaseUrl(url: string): string {
  * we leave them alone.
  */
 export function addAnthropicCacheMarkers(body: Record<string, unknown>): Record<string, unknown> {
+  // No-op for non-Anthropic requests. The transform is installed on every
+  // provider instance so calls that override the session model (e.g. the
+  // compaction step pinned to claude-haiku-4-5) get caching too. Detect
+  // Anthropic by checking the outbound model field — it's already been
+  // translated to the wire format (e.g. "anthropic/claude-opus-4-7") by
+  // the time transformRequestBody runs.
+  const modelId = typeof body.model === "string" ? body.model : "";
+  if (!modelId.startsWith("anthropic/") && !modelId.startsWith("claude-")) {
+    return body;
+  }
+
   // Shallow clone so we don't mutate the caller's object
   const out: Record<string, unknown> = { ...body };
 
@@ -412,20 +423,19 @@ export function buildProvider(config: AppConfig, env: Env) {
         "x-api-key": env.AI_GATEWAY_KEY ?? "",
       };
 
-  // Enable Anthropic prompt caching for anthropic/* models. When the
-  // underlying provider is Anthropic (either directly via OpenCode gateway
-  // or via AI Gateway's Anthropic route), sending the request body with
-  // cache_control markers unlocks ~90% input-cost reduction on multi-turn
-  // sessions with a stable system prompt + tools definition. On other
-  // providers, the extra fields are ignored.
-  const isAnthropicModel = config.model.startsWith("anthropic/");
-
+  // Anthropic prompt caching. The transform checks the outbound model per
+  // request and only acts when the wire-format model ID starts with
+  // "anthropic/" (or "claude-"). Always installing it ensures we still get
+  // caching on calls that use a different model than the session default —
+  // most importantly the compaction step, which hardcodes
+  // anthropic/claude-haiku-4-5 regardless of the session model.
+  // For non-Anthropic requests the transform is a no-op.
   const provider = createOpenAICompatible({
     baseURL,
     headers,
     includeUsage: true,
     name: config.activeGateway,
-    transformRequestBody: isAnthropicModel ? addAnthropicCacheMarkers : undefined,
+    transformRequestBody: addAnthropicCacheMarkers,
   });
 
   // Wrap `chatModel` / `languageModel` / the callable provider so callers can pass
@@ -1062,6 +1072,24 @@ function buildTools(
       | undefined;
 
     if (originalExecute) {
+      // Replace codemode's inputSchema with one that includes the `select`
+      // field. Must be done at the schema level — AI SDK strips unknown
+      // keys during Zod validation (and adds additionalProperties:false to
+      // the schema sent to the model), so putting `select` only in the
+      // description would mean the model never emits it and even if it did,
+      // it'd be dropped before reaching our wrapped execute.
+      const extendedInputSchema = zodSchema(
+        z.object({
+          code: z.string().describe("JavaScript async arrow function to execute"),
+          select: z
+            .array(z.string())
+            .optional()
+            .describe(
+              "Optional dot-paths to project from the execution result (e.g. [\"items.0.name\", \"total_count\"]). Applied before the 32 KB cap — use for narrow API responses to avoid wasting context on unused fields.",
+            ),
+        }),
+      );
+
       tools.codemode = {
         ...codemodeTool,
         // Extend the tool's description so the model knows about `select`.
@@ -1072,6 +1100,7 @@ function buildTools(
           "(e.g. [\"items.0.name\", \"total_count\"]) — and the result is projected to those fields",
           "before being returned. This saves context for the full multi-step loop.",
         ].filter(Boolean).join("\n"),
+        inputSchema: extendedInputSchema,
         execute: async (args: unknown, ...rest: unknown[]) => {
           // Extract + strip the `select` field before forwarding to the
           // underlying executor (which doesn't know about it).
@@ -1082,9 +1111,9 @@ function buildTools(
               select = a.select as string[];
             }
           }
-          const cleanArgs = select && args && typeof args === "object"
+          const cleanArgs = args && typeof args === "object"
             ? (() => {
-                const { select: _, ...rest } = args as { select?: unknown };
+                const { select: _discard, ...rest } = args as { select?: unknown };
                 return rest;
               })()
             : args;

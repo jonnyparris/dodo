@@ -3,16 +3,21 @@
  *
  * The transform is pure: it takes an OpenAI-compatible request body and
  * returns a new one with cache_control markers in three places (system,
- * last tool, last user message). Non-Anthropic providers ignore the extra
- * fields; Anthropic (via either gateway) honours them for ~90% input-cost
- * reduction on multi-turn sessions with stable system prompt + tools.
+ * last tool, last user message). It inspects the body's `model` field and
+ * only acts when the outbound model is Anthropic — non-Anthropic requests
+ * are returned unchanged so the transform can safely be installed on every
+ * provider instance (including ones that sometimes route to Haiku for
+ * compaction, regardless of the session's default model).
  */
 import { describe, expect, it } from "vitest";
 import { addAnthropicCacheMarkers } from "../src/agentic";
 
+const ANTHROPIC_MODEL = "anthropic/claude-opus-4-7";
+
 describe("addAnthropicCacheMarkers", () => {
   it("upgrades a string system prompt to array-of-blocks with cache_control", () => {
     const out = addAnthropicCacheMarkers({
+      model: ANTHROPIC_MODEL,
       system: "You are Dodo.",
       messages: [{ role: "user", content: "hi" }],
     });
@@ -26,13 +31,13 @@ describe("addAnthropicCacheMarkers", () => {
 
   it("does not double-mark an already-marked system prompt", () => {
     const input = {
+      model: ANTHROPIC_MODEL,
       system: [
         { type: "text", text: "rules", cache_control: { type: "ephemeral" } },
       ],
       messages: [{ role: "user", content: "hi" }],
     };
     const out = addAnthropicCacheMarkers(input);
-    // Equal reference to the same marker object
     const system = out.system as Array<Record<string, unknown>>;
     expect(system).toHaveLength(1);
     expect(system[0].cache_control).toEqual({ type: "ephemeral" });
@@ -40,6 +45,7 @@ describe("addAnthropicCacheMarkers", () => {
 
   it("adds cache_control to the last tool definition when no marker exists", () => {
     const out = addAnthropicCacheMarkers({
+      model: ANTHROPIC_MODEL,
       system: "x",
       tools: [
         { type: "function", function: { name: "read" } },
@@ -60,6 +66,7 @@ describe("addAnthropicCacheMarkers", () => {
       cache_control: { type: "ephemeral" },
     };
     const out = addAnthropicCacheMarkers({
+      model: ANTHROPIC_MODEL,
       system: "x",
       tools: [{ type: "function", function: { name: "read" } }, existing],
       messages: [{ role: "user", content: "hi" }],
@@ -71,6 +78,7 @@ describe("addAnthropicCacheMarkers", () => {
 
   it("adds cache_control to the last user message (string content)", () => {
     const out = addAnthropicCacheMarkers({
+      model: ANTHROPIC_MODEL,
       system: "x",
       messages: [
         { role: "user", content: "old" },
@@ -95,6 +103,7 @@ describe("addAnthropicCacheMarkers", () => {
       { type: "image", image: "..." },
     ];
     const out = addAnthropicCacheMarkers({
+      model: ANTHROPIC_MODEL,
       system: "x",
       messages: [{ role: "user", content: multimodal }],
     });
@@ -104,6 +113,7 @@ describe("addAnthropicCacheMarkers", () => {
 
   it("does not mutate the input body", () => {
     const input = {
+      model: ANTHROPIC_MODEL,
       system: "rules",
       tools: [{ type: "function", function: { name: "read" } }],
       messages: [{ role: "user", content: "hi" }],
@@ -113,8 +123,42 @@ describe("addAnthropicCacheMarkers", () => {
     expect(JSON.stringify(input)).toBe(snapshot);
   });
 
-  it("handles a body with no tools or messages gracefully", () => {
-    const out = addAnthropicCacheMarkers({ system: "rules" });
+  it("is a no-op for non-Anthropic models (returns body unchanged)", () => {
+    const input = {
+      model: "openai/gpt-4o",
+      system: "rules",
+      messages: [{ role: "user", content: "hi" }],
+    };
+    const out = addAnthropicCacheMarkers(input);
+    // system is still the plain string, not upgraded to blocks
+    expect(out.system).toBe("rules");
+    expect(out).toBe(input); // same reference
+  });
+
+  it("is a no-op when model is missing", () => {
+    const input = {
+      system: "rules",
+      messages: [{ role: "user", content: "hi" }],
+    };
+    const out = addAnthropicCacheMarkers(input);
+    expect(out.system).toBe("rules");
+    expect(out).toBe(input);
+  });
+
+  it("applies to Anthropic-direct model IDs (claude-*) too", () => {
+    const out = addAnthropicCacheMarkers({
+      model: "claude-haiku-4-5",
+      system: "rules",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(Array.isArray(out.system)).toBe(true);
+  });
+
+  it("handles an Anthropic body with no tools or messages gracefully", () => {
+    const out = addAnthropicCacheMarkers({
+      model: ANTHROPIC_MODEL,
+      system: "rules",
+    });
     expect(Array.isArray(out.system)).toBe(true);
     expect(out.tools).toBeUndefined();
     expect(out.messages).toBeUndefined();

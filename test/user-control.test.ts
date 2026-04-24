@@ -130,6 +130,50 @@ describe("UserControl DO", () => {
     });
   });
 
+  it("config: systemPromptPrefix survives a config update that doesn't touch it (regression)", async () => {
+    // Set a prefix
+    await fetchJson("/api/config", {
+      body: JSON.stringify({ systemPromptPrefix: "ALWAYS SAY HELLO" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+
+    // Trigger an unrelated update — model change. Pre-fix, this caused
+    // readConfig() to spread `{ systemPromptPrefix: undefined }` into the
+    // next persisted row, ending up as the literal string "undefined".
+    await fetchJson("/api/config", {
+      body: JSON.stringify({ model: "claude-test-2" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+
+    const res = await fetchJson("/api/config");
+    const cfg = (await res.json()) as { systemPromptPrefix?: string };
+    expect(cfg.systemPromptPrefix).toBe("ALWAYS SAY HELLO");
+
+    // Clean up by clearing (empty string)
+    await fetchJson("/api/config", {
+      body: JSON.stringify({ systemPromptPrefix: "" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  });
+
+  it("config: systemPromptPrefix stays undefined (not the string 'undefined') when never set", async () => {
+    // Trigger any update
+    await fetchJson("/api/config", {
+      body: JSON.stringify({ model: "claude-test-3" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    const res = await fetchJson("/api/config");
+    const cfg = (await res.json()) as { systemPromptPrefix?: unknown };
+    // Pre-fix bug symptom: systemPromptPrefix would be the string "undefined"
+    // (9 chars, truthy). Post-fix: it's actually absent from the response.
+    expect(cfg.systemPromptPrefix).not.toBe("undefined");
+    expect(cfg.systemPromptPrefix).toBeUndefined();
+  });
+
   // ─── Memory ───
 
   it("memory: create → search → read → update → delete", async () => {
