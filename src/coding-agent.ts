@@ -209,17 +209,25 @@ const SYSTEM_PROMPT = [
   "",
   "## Doing tasks",
   "",
-  "**Your first action for any non-trivial request** — use `todo_add` to write down the plan. One todo per distinct step. Then start working through them with `todo_update` as you go. This isn't optional scaffolding; it's how you stay oriented across compactions, avoid repeating yourself, and give the user a legible view of progress.",
+  "**Default to planning with todos.** For any request where you're not sure you can finish in one tool call, call `todo_add` first, lay out the steps, then work through them with `todo_update`. Todos survive context compaction — they're the single most reliable way to preserve your plan across long sessions.",
   "",
-  "**When to skip todos:** the task is a single tool call (\"read this file\", \"run git status\", \"fix this typo\"). Everything else gets todos.",
+  "**Requests that ALWAYS need todos** (even if they seem simple):",
   "",
-  "### Decision triggers",
+  "- Anything involving a cloned repo (\"what's new in X?\", \"review commits since Y\", \"check the README against recent changes\")",
+  "- Multi-file work (\"update imports across src/\", \"rename X to Y\", \"add tests for Z\")",
+  "- Investigate-then-report tasks (\"find all usages\", \"summarise what changed\", \"audit for Z\")",
+  "- Any task with the words \"review\", \"investigate\", \"check\", \"audit\", \"update docs\", \"compare\"",
   "",
-  "- User says \"update the README\" / \"add a feature\" / \"fix this bug across the repo\" → `todo_add` first, then work.",
-  "- You catch yourself about to chain 3+ tool calls → stop, `todo_add` the plan, then resume.",
+  "**Requests that can skip todos:**",
+  "",
+  "- A single tool call (\"read this file\", \"show git status\", \"fix this typo on line 42\")",
+  "- Direct factual questions that don't need tool use",
+  "",
+  "### How to use todos mid-task",
+  "",
+  "- You complete a step → `todo_update` to mark it `completed` before moving on. One `in_progress` at a time.",
   "- A step turns out bigger than expected → `todo_add` the subtasks.",
-  "- You complete a todo → `todo_update` to mark it `completed` in the same turn, before moving on.",
-  "- Context is getting dense (many tool results accumulated) → call `todo_list` to re-ground yourself before the next action.",
+  "- Context is getting dense (many tool results accumulated) → call `todo_list` to re-ground yourself before the next action. This is especially important after an auto-continuation — the summary won't list your todos, so `todo_list` is how you remember the plan.",
   "",
   "### Delegate bounded work with `task`",
   "",
@@ -1228,19 +1236,50 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               const droppedToolNames = new Set<string>();
               const discoveredFiles = new Set<string>();
               const assistantTexts: string[] = [];
+              // Compact record of each dropped tool call: `name(sanitized-args)`.
+              // Previously we only preserved distinct tool *names* plus any
+              // `input.path`, which meant after compaction the model lost
+              // specifics like 'git_clone was called with {url, depth: 30,
+              // dir: /dodo}' and just saw 'git_clone was used'. It then
+              // re-cloned. This cost us ~200k tokens across phases in the
+              // repeatable session-6d85ea02 / 1243c636 failure. Capping each
+              // entry at 160 chars and the whole list at 2 KB keeps the
+              // digest small even for 30+ tool calls.
+              const toolCallDigest: string[] = [];
+              const MAX_TOOL_CALL_ENTRY_CHARS = 160;
+              const MAX_TOOL_CALL_DIGEST_CHARS = 2_000;
 
               for (const msg of droppedMsgs) {
                 if (typeof msg.content === "object" && Array.isArray(msg.content)) {
                   for (const part of msg.content) {
                     if (part && typeof part === "object" && "type" in part) {
                       if (part.type === "tool-call" && "toolName" in part) {
-                        droppedToolNames.add(String(part.toolName));
-                        // Extract file paths from tool-call arguments
+                        const toolName = String(part.toolName);
+                        droppedToolNames.add(toolName);
                         if ("input" in part && part.input && typeof part.input === "object") {
                           const input = part.input as Record<string, unknown>;
                           if (typeof input.path === "string" && input.path.length > 1) {
                             discoveredFiles.add(input.path);
                           }
+                          // Sanitize + cap the input for the tool-call digest.
+                          // Strip long string fields (content / code / old_string /
+                          // new_string) before serializing so a single write
+                          // doesn't eat the whole budget.
+                          const sanitized: Record<string, unknown> = {};
+                          for (const [k, v] of Object.entries(input)) {
+                            if (typeof v === "string" && v.length > 80) {
+                              sanitized[k] = `<${v.length}-char ${k}>`;
+                            } else {
+                              sanitized[k] = v;
+                            }
+                          }
+                          let entry = `${toolName}(${JSON.stringify(sanitized)})`;
+                          if (entry.length > MAX_TOOL_CALL_ENTRY_CHARS) {
+                            entry = entry.slice(0, MAX_TOOL_CALL_ENTRY_CHARS - 3) + "...";
+                          }
+                          toolCallDigest.push(entry);
+                        } else {
+                          toolCallDigest.push(`${toolName}()`);
                         }
                       }
                       // Extract the model's text output (findings, plans, decisions)
@@ -1253,10 +1292,28 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 }
               }
 
+              // Tail-trim tool-call digest so the most recent calls survive.
+              // Older calls are less relevant — the model has likely acted on them.
+              let toolCallList = toolCallDigest.join("\n");
+              if (toolCallList.length > MAX_TOOL_CALL_DIGEST_CHARS) {
+                let bytes = 0;
+                const kept: string[] = [];
+                for (let i = toolCallDigest.length - 1; i >= 0; i--) {
+                  const entry = toolCallDigest[i];
+                  if (bytes + entry.length + 1 > MAX_TOOL_CALL_DIGEST_CHARS) break;
+                  kept.unshift(entry);
+                  bytes += entry.length + 1;
+                }
+                toolCallList = `[...older tool calls elided...]\n${kept.join("\n")}`;
+              }
+
               // Build a summary that preserves the model's key findings
               const toolsSummary = [...droppedToolNames].join(", ") || "none";
               const filesList = discoveredFiles.size > 0
                 ? "\n\nFiles discovered in previous phases:\n" + [...discoveredFiles].join("\n")
+                : "";
+              const callsList = toolCallList.length > 0
+                ? "\n\nTool calls already made in previous phases (DO NOT repeat these):\n" + toolCallList
                 : "";
               const findingsDigest = assistantTexts.length > 0
                 ? "\n\nKey findings from previous phases:\n" + assistantTexts.join("\n").slice(-1500)
@@ -1264,7 +1321,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
               const summaryInjection: ModelMessage = {
                 role: "system" as const,
-                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${toolsSummary}. The task is not yet complete. Do NOT re-explore files you already found — use the file paths and findings below to continue making edits.${filesList}${findingsDigest}]`,
+                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${toolsSummary}. The task is not yet complete. Do NOT re-explore files you already found and do NOT repeat tool calls already made — use the file paths, tool-call history, and findings below to continue making edits.${callsList}${filesList}${findingsDigest}]`,
               };
 
               messages = [firstMsg, summaryInjection, ...recentMsgs];
@@ -1273,8 +1330,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 originalCount: messages.length + droppedCount,
                 keptCount: messages.length,
                 droppedTools: [...droppedToolNames],
+                droppedToolCalls: toolCallDigest.length,
                 discoveredFiles: discoveredFiles.size,
                 findingsLength: findingsDigest.length,
+                toolCallDigestLength: toolCallList.length,
               });
             }
 
