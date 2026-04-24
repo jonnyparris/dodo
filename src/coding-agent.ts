@@ -374,6 +374,17 @@ function normalizePath(path: string): string {
   return `/${resolved.join("/")}`;
 }
 
+/**
+ * Thrown when a caller references a facet name that has no run history
+ * on this session. Maps to HTTP 404 at the request boundary.
+ */
+export class FacetNotFoundError extends Error {
+  constructor(public readonly facetName: string) {
+    super(`facet not found: ${facetName}`);
+    this.name = "FacetNotFoundError";
+  }
+}
+
 export class CodingAgent extends Think<Env, DodoConfig> {
   initialState: SessionState = {
     activePromptId: null,
@@ -2223,8 +2234,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               { status: 400 },
             );
           }
-          const result = await this.applyTaskScratch(facetName, paths);
-          return Response.json(result);
+          try {
+            const result = await this.applyTaskScratch(facetName, paths);
+            return Response.json(result);
+          } catch (err) {
+            if (err instanceof FacetNotFoundError) {
+              return Response.json({ error: "facet not found" }, { status: 404 });
+            }
+            throw err;
+          }
         }
       }
 
@@ -5512,10 +5530,46 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * Not surfaced on any public HTTP route. Parent owns the facet name
    * → facet stub resolution so tests don't have to know the facet SDK
    * plumbing.
+   *
+   * Also inserts a synthetic completed `facet_runs` row so the
+   * production-grade `facetExists` gate used by `applyTaskScratch` and
+   * `getFacetTranscript` sees this facet as legitimate. A real task()
+   * run would create this row via `insertFacetRun` — tests that skip
+   * the model have to recreate that state to stay realistic.
    */
   async testWriteScratchFile(facetName: string, parentSessionId: string, path: string, content: string): Promise<{ ok: true }> {
+    if (!this.facetExists(facetName, "task")) {
+      const runId = this.insertFacetRun({
+        facetType: "task",
+        facetName,
+        input: "(test-seeded scratch write)",
+        workspaceMode: "scratch",
+      });
+      this.completeFacetRun(runId, "(test-seeded)", { input: 0, output: 0 });
+    }
     const stub = await this.subAgent(TaskAgent, facetName);
     return stub.writeScratchForTest(parentSessionId, path, content);
+  }
+
+  /**
+   * Check whether a facet with this name has ever actually run on this
+   * session. Used to 404 apply/transcript requests for arbitrary names
+   * — without this gate, `this.subAgent(TaskAgent, anyName)` would
+   * create a fresh DO on demand, letting any authenticated caller spawn
+   * unbounded empty facet DOs (billable storage, log noise) by looping
+   * random names through the apply route.
+   */
+  private facetExists(facetName: string, facetType?: "explore" | "task"): boolean {
+    const rows = facetType
+      ? this.db.all(
+          "SELECT 1 as hit FROM facet_runs WHERE facet_name = ? AND facet_type = ? LIMIT 1",
+          facetName, facetType,
+        )
+      : this.db.all(
+          "SELECT 1 as hit FROM facet_runs WHERE facet_name = ? LIMIT 1",
+          facetName,
+        );
+    return rows.length > 0;
   }
 
   /**
@@ -5526,8 +5580,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * Idempotent — re-applying the same paths overwrites with the latest
    * scratch content. Paths not present in the scratch-writes index
    * come back in the `skipped` array with a reason.
+   *
+   * Throws if the facet name has no run history on this session —
+   * prevents spawning an empty facet DO via an unknown name.
    */
   async applyTaskScratch(facetName: string, paths: string[]): Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }> {
+    if (!this.facetExists(facetName, "task")) {
+      throw new FacetNotFoundError(facetName);
+    }
     const stub = await this.subAgent(TaskAgent, facetName);
     return stub.applyFromScratch(paths);
   }

@@ -194,4 +194,25 @@ describe("Facet transcripts — HTTP surface", () => {
     });
     expect(wrongType.status).toBe(400);
   });
+
+  it("POST /facets/:name/apply 404s on unknown facet name — resource-exhaustion guard", async () => {
+    // Any facet name that has not actually run on this session must not
+    // cause `subAgent(TaskAgent, name)` to instantiate a fresh DO.
+    // Without this guard, a malicious caller with `write` permission
+    // can spawn unbounded empty facet DOs (billable storage, log noise)
+    // by looping random names through this route.
+    const sessionId = await createSession();
+
+    const response = await fetchJson(
+      `/session/${sessionId}/facets/never-ran-${crypto.randomUUID()}/apply`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paths: ["/foo.txt"] }),
+      },
+    );
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("facet not found");
+  });
 });

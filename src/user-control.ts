@@ -182,6 +182,15 @@ const scheduledSessionBaseSchema = z.object({
 });
 
 /**
+ * Validate a subagent mode value read from storage. Keeps readConfig
+ * tolerant of poisoned or legacy rows — unknown values fall through
+ * to "inprocess", the safe default that preserves pre-facet behaviour.
+ */
+function toAgentMode(value: string | undefined): "inprocess" | "facet" {
+  return value === "facet" ? "facet" : "inprocess";
+}
+
+/**
  * UserControl DO — one per user (`idFromName(email)`).
  *
  * Owns per-user state: sessions, config, memory, tasks,
@@ -1072,8 +1081,13 @@ export class UserControl extends DurableObject<Env> {
       // Kimi is the best-value fit per the 2026-04-24 model comparison.
       exploreModel: get("exploreModel") ?? this.env.DEFAULT_EXPLORE_MODEL,
       taskModel: get("taskModel") ?? this.env.DEFAULT_TASK_MODEL,
-      exploreMode: get("exploreMode") === "facet" ? "facet" : "inprocess",
-      taskMode: get("taskMode") === "facet" ? "facet" : "inprocess",
+      // Schema (UpdateConfigRequest) enforces the enum on write, but we
+      // re-validate on read so a poisoned row (e.g. from a pre-schema
+      // deployment or a direct SQL edit) still resolves to a valid mode
+      // rather than crashing downstream. Unknown values default to
+      // "inprocess" — the safe, behaviour-preserving choice.
+      exploreMode: toAgentMode(get("exploreMode")),
+      taskMode: toAgentMode(get("taskMode")),
     };
   }
 

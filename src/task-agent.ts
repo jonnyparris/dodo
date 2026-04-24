@@ -234,6 +234,16 @@ export class TaskAgent extends Agent<Env> {
     // lifetime to be eligible for merge-back.
     this.ensureSchema();
 
+    // Persist parentSessionId up-front so a later applyFromScratch()
+    // after DO eviction can recover the scratch R2 prefix. Previously
+    // this was a fire-and-forget `void ctx.storage.put(...)` inside
+    // openScratchWorkspace — that write could in principle be dropped
+    // if called outside a request-gated path. Awaiting it here guarantees
+    // durability before the first tool invocation can run.
+    if (workspaceMode === "scratch") {
+      await this.persistParentSessionId(parentSessionId);
+    }
+
     // Build the task tool set. Shared mode proxies everything through
     // the parent so all writes hit the parent workspace. Scratch mode
     // uses a facet-local Workspace rooted at a scratch R2 prefix.
@@ -367,12 +377,12 @@ export class TaskAgent extends Agent<Env> {
    * Open the facet's scratch Workspace, keyed on the facet's own SQL
    * storage and an R2 prefix derived from the parent session id.
    *
-   * Persisting parentSessionId keeps the scratch prefix stable across
-   * DO eviction — the next task() or applyFromScratch() resumes against
-   * the same R2 objects.
+   * parentSessionId durability is the caller's responsibility — real
+   * runs go through `task()` which awaits `persistParentSessionId`
+   * before any tool can fire. This method stays synchronous so tool
+   * op closures can open the workspace without refactoring to async.
    */
   private openScratchWorkspace(parentSessionId: string): Workspace {
-    void this.ctx.storage.put("parentSessionId", parentSessionId);
     if (this._scratchWorkspace) return this._scratchWorkspace;
     this._scratchWorkspace = new Workspace({
       sql: this.ctx.storage.sql,
@@ -381,6 +391,18 @@ export class TaskAgent extends Agent<Env> {
       name: () => this.name,
     });
     return this._scratchWorkspace;
+  }
+
+  /**
+   * Persist parentSessionId to DO KV storage so
+   * `applyFromScratch` can recover it after DO eviction. Guarded by
+   * an in-memory flag to avoid redundant writes on hot paths.
+   */
+  private _persistedParent: string | null = null;
+  private async persistParentSessionId(parentSessionId: string): Promise<void> {
+    if (this._persistedParent === parentSessionId) return;
+    await this.ctx.storage.put("parentSessionId", parentSessionId);
+    this._persistedParent = parentSessionId;
   }
 
   /**
@@ -556,6 +578,11 @@ export class TaskAgent extends Agent<Env> {
    * test contexts. Not surfaced on any public HTTP route.
    */
   async writeScratchForTest(parentSessionId: string, path: string, content: string): Promise<{ ok: true }> {
+    // Mirror the real runtime path: task() awaits persistParentSessionId
+    // before the first write tool can fire. Tests that drive scratch
+    // writes without calling task() must do the same, otherwise a later
+    // applyFromScratch() can't recover parentSessionId from storage.
+    await this.persistParentSessionId(parentSessionId);
     const scratch = this.openScratchWorkspace(parentSessionId);
     await scratch.writeFile(path, content);
     this.recordScratchWrite(path);
@@ -568,6 +595,7 @@ export class TaskAgent extends Agent<Env> {
    * round-tripping through the model.
    */
   async readScratchForTest(parentSessionId: string, path: string): Promise<string | null> {
+    await this.persistParentSessionId(parentSessionId);
     const scratch = this.openScratchWorkspace(parentSessionId);
     return scratch.readFile(path);
   }
@@ -582,16 +610,18 @@ export class TaskAgent extends Agent<Env> {
     if (!bucket) return { deleted: 0 };
     const prefix = `workspace/${parentSessionId}/scratch/${this.name}/`;
     let deleted = 0;
-    let cursor: string | undefined;
+    // Re-list from the prefix on every iteration rather than advancing
+    // via cursor. Each iteration deletes the batch it just listed, so
+    // the next list starts from whatever is left under the prefix —
+    // which terminates naturally when nothing is left. Avoids the
+    // brittleness of relying on cursor semantics across concurrent
+    // deletes from the same listing.
     for (;;) {
-      const listed = await bucket.list({ prefix, cursor, limit: 1000 });
-      if (listed.objects.length > 0) {
-        await bucket.delete(listed.objects.map((o) => o.key));
-        deleted += listed.objects.length;
-      }
+      const listed = await bucket.list({ prefix, limit: 1000 });
+      if (listed.objects.length === 0) break;
+      await bucket.delete(listed.objects.map((o) => o.key));
+      deleted += listed.objects.length;
       if (!listed.truncated) break;
-      cursor = listed.truncated ? listed.cursor : undefined;
-      if (!cursor) break;
     }
     this.clearScratchWrites();
     return { deleted };
