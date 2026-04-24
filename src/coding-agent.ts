@@ -5255,6 +5255,87 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
+   * Write a file into the parent workspace. Used by shared-mode task
+   * facets and by `applyFromScratch` when a scratch task merges files
+   * back. Only invoked via facet RPC — the main agent writes through
+   * `this.workspace` directly.
+   */
+  async facetWriteFile(path: string, content: string): Promise<void> {
+    await this.workspace.writeFile(path, content);
+  }
+
+  /**
+   * Real task-facet dispatch. Mirrors runExploreFacet with the added
+   * responsibility of scheduling a 24h cleanup alarm on the parent
+   * when the task runs in scratch mode — facets can't self-schedule
+   * (the Agents SDK throws on setAlarm inside a facet), so the parent
+   * owns that side of the lifecycle.
+   */
+  async runTaskFacet(name: string, opts: TaskInvokeOpts): Promise<TaskInvokeResult> {
+    const stub = await this.subAgent(TaskAgent, name);
+    const parentSessionId = opts.parentSessionId ?? this.sessionId();
+    const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
+    const result = await stub.task({ ...opts, parentSessionId, parentConfig });
+
+    // Schedule a 24h cleanup only for scratch runs — shared runs don't
+    // own any out-of-band R2 state.
+    if (result.workspaceMode === "scratch") {
+      // 24 hours in seconds. Think's `this.schedule(seconds, method, payload)`
+      // writes a row to cron_jobs and triggers an alarm at the wall time.
+      try {
+        await this.schedule(24 * 60 * 60, "cleanupScratchFacet", {
+          facetName: name,
+          parentSessionId,
+        });
+      } catch (err) {
+        // Don't fail the task over a scheduling hiccup; the lazy
+        // cleanup path (on next task in the facet) still protects us.
+        log("warn", "Failed to schedule scratch cleanup", { facetName: name, err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Test-only: thin pass-through to the facet's scratch-write helper
+   * so unit tests can drive scratch writes without running the model.
+   * Not surfaced on any public HTTP route. Parent owns the facet name
+   * → facet stub resolution so tests don't have to know the facet SDK
+   * plumbing.
+   */
+  async testWriteScratchFile(facetName: string, parentSessionId: string, path: string, content: string): Promise<{ ok: true }> {
+    const stub = await this.subAgent(TaskAgent, facetName);
+    return stub.writeScratchForTest(parentSessionId, path, content);
+  }
+
+  /** Test-only: drive applyFromScratch on a named facet. */
+  async testApplyFromScratch(facetName: string, paths: string[]): Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }> {
+    const stub = await this.subAgent(TaskAgent, facetName);
+    return stub.applyFromScratch(paths);
+  }
+
+  /**
+   * Scheduled callback for scratch workspace cleanup. Invoked 24h
+   * after a scratch task completes (see runTaskFacet). Deletes the
+   * R2 prefix via the facet itself, then removes the facet's DO
+   * storage entirely.
+   */
+  async cleanupScratchFacet(payload: { facetName: string; parentSessionId: string }): Promise<void> {
+    try {
+      const stub = await this.subAgent(TaskAgent, payload.facetName);
+      await stub.cleanupScratch(payload.parentSessionId);
+    } catch (err) {
+      log("warn", "Scratch cleanup R2 sweep failed", { facetName: payload.facetName, err: err instanceof Error ? err.message : String(err) });
+    }
+    try {
+      this.deleteSubAgent(TaskAgent, payload.facetName);
+    } catch (err) {
+      log("warn", "deleteSubAgent failed during scratch cleanup", { facetName: payload.facetName, err: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
    * Invoke a TaskAgent facet by pool name. Mirrors invokeExploreFacet.
    */
   async invokeTaskFacet(name: string, opts: TaskInvokeOpts): Promise<TaskInvokeResult> {

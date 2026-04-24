@@ -65,6 +65,21 @@ export interface BuildToolsOptions {
       name: string,
       opts: { q: string; scope?: string; model?: string },
     ) => Promise<{ ok: true; facetName: string; summary: string }>;
+    runTaskFacet: (
+      name: string,
+      opts: {
+        prompt: string;
+        scope?: string;
+        model?: string;
+        workspaceMode?: "shared" | "scratch";
+      },
+    ) => Promise<{
+      ok: true;
+      facetName: string;
+      summary: string;
+      workspaceMode: "shared" | "scratch";
+      scratchWrites?: string[];
+    }>;
   };
 }
 
@@ -848,12 +863,15 @@ export function getExploreModel(mainModel: string): string {
 export const EXPLORE_TIMEOUT_MS = 60_000;
 
 /** Max steps for the generic task subagent (slightly higher than explore). */
-const TASK_MAX_STEPS = 15;
+export const TASK_MAX_STEPS = 15;
 
-/** Timeout for the generic task subagent (ms). */
-const TASK_TIMEOUT_MS = 180_000;
+/** Timeout for the generic task subagent (ms).
+ *  Raised to 600s when the task runs inside a facet — the facet has its
+ *  own DO request lifetime and isn't bound by the parent's turn budget. */
+export const TASK_TIMEOUT_MS = 180_000;
+export const TASK_FACET_TIMEOUT_MS = 600_000;
 
-const TASK_SYSTEM_PROMPT = [
+export const TASK_SYSTEM_PROMPT = [
   "You are a focused subagent dispatched by the main Dodo agent to handle one bounded task.",
   "",
   "## Rules",
@@ -1210,10 +1228,71 @@ function buildTaskTool(
   workspace: Workspace,
   config: AppConfig,
   env: Env,
+  parentAgent?: BuildToolsOptions["parentAgent"],
 ): AnyTool {
-  // Read-write tool subset — mutating tools included so the task can edit
-  // files, but no git tools (we don't want a subagent pushing branches)
-  // and no codemode (too broad — the main agent should own that).
+  // Facet branch — delegate to the parent's runTaskFacet which spins up
+  // a TaskAgent facet DO. Supports a new `workspaceMode` arg that the
+  // in-process path can't offer (the in-process subagent always shares
+  // the parent's workspace).
+  if (config.taskMode === "facet" && parentAgent) {
+    return tool({
+      description: [
+        "Delegate a focused, bounded sub-task to a TaskAgent facet with its own context window.",
+        "The facet gets workspace tools (read, list, find, grep, write, edit) and returns a compact summary.",
+        "Use for multi-step sub-tasks that would otherwise eat the main conversation's step budget and context:",
+        "'update all imports of X to Y', 'review these 6 files and list bugs', 'rename MyClass to TheirClass everywhere'.",
+        "",
+        "workspaceMode:",
+        "  - 'shared' (default) — facet writes land directly in the main workspace",
+        "  - 'scratch' — facet writes go to a scratch workspace; call applyFromScratch to merge back",
+        "",
+        "Do NOT use for one-shot operations (just call the tool directly) or anything requiring git/codemode/browser.",
+      ].join("\n"),
+      inputSchema: zodSchema(z.object({
+        prompt: z.string().min(1).describe(
+          "The task to perform. Be specific and self-contained — the facet has no access to your conversation. Include file paths, names, and acceptance criteria.",
+        ),
+        scope: z.string().optional().describe(
+          "Optional directory to scope the task to (e.g. 'src/'). Hint only.",
+        ),
+        model: z.string().optional().describe(
+          "Optional model override for this call. Leave unset to use the session default.",
+        ),
+        workspaceMode: z.enum(["shared", "scratch"]).optional().describe(
+          "Workspace isolation. 'shared' (default) writes to the main workspace. 'scratch' writes to an isolated workspace you can merge back via applyFromScratch. Use 'scratch' for reversible experiments.",
+        ),
+      })),
+      execute: async (args: Record<string, unknown>) => {
+        const workspaceMode = args.workspaceMode === "scratch" ? "scratch" : "shared";
+        try {
+          const result = await parentAgent.runTaskFacet("pool-task-0", {
+            prompt: String(args.prompt ?? ""),
+            scope: typeof args.scope === "string" ? args.scope : undefined,
+            model: typeof args.model === "string" ? args.model : undefined,
+            workspaceMode,
+          });
+          if (result.workspaceMode === "scratch" && result.scratchWrites?.length) {
+            return [
+              result.summary,
+              "",
+              `**Scratch writes (${result.scratchWrites.length} files):**`,
+              ...result.scratchWrites.map((p) => `- ${p}`),
+              "",
+              "Call the task facet's applyFromScratch RPC with any subset of these paths to merge them into the main workspace.",
+            ].join("\n");
+          }
+          return result.summary;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return `Task failed (facet mode): ${msg}`;
+        }
+      },
+    });
+  }
+
+  // In-process branch (default) — unchanged from before phase 4. Workspace
+  // is always shared; workspaceMode arg is silently ignored here since
+  // in-process has no scratch implementation.
   const allWsTools = createWorkspaceTools(workspace);
   const taskTools = capToolOutputs({
     read: allWsTools.read,
@@ -1232,6 +1311,7 @@ function buildTaskTool(
       "Use for multi-step sub-tasks that would otherwise eat the main conversation's step budget and context:",
       "'update all imports of X to Y', 'review these 6 files and list bugs', 'rename MyClass to TheirClass everywhere'.",
       "Do NOT use for one-shot operations (just call the tool directly) or anything requiring git/codemode/browser.",
+      "NOTE: in-process mode always shares the main workspace. Switch to taskMode=facet to enable scratch workspaces.",
     ].join(" "),
     systemPrompt: TASK_SYSTEM_PROMPT,
     inputSchema: zodSchema(z.object({
@@ -1472,8 +1552,9 @@ function buildTools(
 
   // Task tool — generic subagent for bounded sub-tasks. Keeps the main
   // conversation's step budget free when a chunk of work can be safely
-  // delegated to a fresh context window.
-  tools.task = buildTaskTool(workspace, config, env);
+  // delegated to a fresh context window. When `config.taskMode === "facet"`,
+  // delegates to a TaskAgent facet DO and unlocks scratch-workspace mode.
+  tools.task = buildTaskTool(workspace, config, env, options?.parentAgent);
 
   // Todo tools — durable checklist backed by per-session SQLite. Helps the
   // model stay oriented across long multi-step tasks and compactions.

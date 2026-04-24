@@ -161,6 +161,11 @@ export const EXPLORE_SYSTEM_PROMPT = "You are a search assistant (mock).";
 export const EXPLORE_MAX_STEPS = 12;
 export const EXPLORE_TIMEOUT_MS = 60_000;
 
+export const TASK_SYSTEM_PROMPT = "You are a focused subagent (mock).";
+export const TASK_MAX_STEPS = 15;
+export const TASK_TIMEOUT_MS = 180_000;
+export const TASK_FACET_TIMEOUT_MS = 600_000;
+
 // Pass-through helpers — real behaviour is fine for tests since they
 // touch no I/O.
 export function capToolOutputs<T extends Record<string, unknown>>(tools: T): T {

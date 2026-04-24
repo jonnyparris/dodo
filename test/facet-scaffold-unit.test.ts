@@ -47,7 +47,7 @@ describe("facet scaffold", () => {
     const testEnv = env as Env;
     const sessionId = `scaffold-task-${crypto.randomUUID()}`;
     const agent = await getAgentByName(testEnv.CODING_AGENT as never, sessionId) as unknown as {
-      invokeTaskFacet: (name: string, opts: { prompt: string; scope?: string; model?: string; workspaceMode?: "shared" | "scratch" }) => Promise<{ ok: true; facetName: string }>;
+      invokeTaskFacet: (name: string, opts: { prompt: string; scope?: string; model?: string; workspaceMode?: "shared" | "scratch" }) => Promise<{ ok: true; facetName: string; summary: string; workspaceMode: "shared" | "scratch" }>;
     };
 
     const result = await agent.invokeTaskFacet("pool-task-0", {
@@ -55,7 +55,14 @@ describe("facet scaffold", () => {
       workspaceMode: "shared",
     });
 
-    expect(result).toEqual({ ok: true, facetName: "pool-task-0" });
+    // Placeholder path: invokeTaskFacet is the raw passthrough and the
+    // test calls it without parentSessionId / parentConfig, so the
+    // facet returns its canned placeholder summary without touching
+    // the model.
+    expect(result.ok).toBe(true);
+    expect(result.facetName).toBe("pool-task-0");
+    expect(result.workspaceMode).toBe("shared");
+    expect(result.summary).toContain("placeholder");
   });
 
   it("the same pooled name returns a reused facet (by-name semantics)", async () => {
