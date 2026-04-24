@@ -1,5 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
+import { getAgentByName } from "agents";
 import cronParser from "cron-parser";
+import { RateLimiter } from "./rate-limit";
+import { SourceSessionMissingError } from "./sessions";
 import { z } from "zod";
 import {
   bytesToBase64,
@@ -183,6 +186,11 @@ export class UserControl extends DurableObject<Env> {
   private readonly db: SqlHelper;
   /** SSE clients for user-level events (session list changes, etc.) */
   private readonly sseClients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
+  /** Per-DO rate limiter for scheduled-session fires. Owner-scoped so
+   *  each user has an independent budget. Lives in memory — that's
+   *  acceptable because the alarm handler is the sole consumer and the
+   *  DO isolate only rehydrates rate windows as fires happen. */
+  private readonly scheduledFireLimiter = new RateLimiter();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1839,6 +1847,308 @@ export class UserControl extends DurableObject<Env> {
     }
     const fireAtMs = Number(next.t) * 1000;
     this.ctx.storage.setAlarm(fireAtMs);
+  }
+
+  /**
+   * Alarm handler for scheduled sessions. Fires any overdue rows in
+   * batches of ALARM_BATCH_SIZE. Further overdue rows get a near-immediate
+   * follow-up alarm.
+   *
+   * The input gate serialises alarm() with fetch() handlers, so mutations
+   * here don't race with /scheduled-sessions POST/DELETE. Individual row
+   * processing re-reads under blockConcurrencyWhile so a DELETE mid-alarm
+   * is safe.
+   */
+  async alarm(): Promise<void> {
+    const ALARM_BATCH_SIZE = 10;
+    const now = nowEpoch();
+    const dueIds = this.db
+      .all(
+        "SELECT id FROM scheduled_sessions WHERE next_run_epoch IS NOT NULL AND next_run_epoch <= ? ORDER BY next_run_epoch LIMIT ?",
+        now,
+        ALARM_BATCH_SIZE,
+      )
+      .map((row) => String(row.id));
+
+    for (const rowId of dueIds) {
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const row = this.readScheduledSessionRow(rowId);
+        if (!row) return;
+        if (row.stalled_at !== null && row.stalled_at !== undefined) return;
+        if (row.next_run_epoch === null || Number(row.next_run_epoch) > nowEpoch()) return;
+        await this.fireSchedule(row);
+      });
+    }
+
+    // Re-arm: if more rows are overdue beyond the batch, fire again in ~1s.
+    const remainingOverdue = this.db.one(
+      "SELECT MIN(next_run_epoch) AS t FROM scheduled_sessions WHERE next_run_epoch IS NOT NULL AND next_run_epoch <= ?",
+      nowEpoch(),
+    );
+    if (remainingOverdue?.t != null) {
+      this.ctx.storage.setAlarm(Date.now() + 1000);
+      return;
+    }
+    await this.rearmScheduledSessionAlarm();
+  }
+
+  /**
+   * Fire a single scheduled-session row.
+   *
+   * Creates the session (fresh or fork), dispatches the prompt to the new
+   * CodingAgent, and updates the row with run stats. On failure, bumps
+   * failure_count; after MAX_FAILURES the row is marked stalled.
+   */
+  private async fireSchedule(row: SqlRow): Promise<void> {
+    const id = String(row.id);
+    const scheduleType = String(row.schedule_type) as ScheduledSessionType;
+    const sourceType = String(row.source_type) as ScheduledSessionSource;
+    const ownerEmail = this.getOwnerEmail();
+
+    if (!ownerEmail) {
+      // Can't fire without an owner email to attribute the session to.
+      // Mark stalled so the user notices — probably onboarding hasn't
+      // completed yet.
+      this.db.exec(
+        "UPDATE scheduled_sessions SET failure_count = failure_count + 1, last_error = ?, stalled_at = ?, next_run_epoch = NULL WHERE id = ?",
+        "owner_email not established",
+        nowEpoch(),
+        id,
+      );
+      this.emitUserEvent({ type: "scheduled_session_fired", id, ok: false, error: "owner_email not established" });
+      return;
+    }
+
+    // Rate-limit check — matches the interactive prompt route's limits
+    // (60 prompts per user per hour).
+    const rl = this.scheduledFireLimiter.check(`prompt:${ownerEmail}`, 60, 60 * 60 * 1000);
+    if (!rl.allowed) {
+      const retryAfter = rl.retryAfter ?? 60;
+      const nextRun = nowEpoch() + retryAfter;
+      this.db.exec(
+        "UPDATE scheduled_sessions SET next_run_epoch = ?, last_error = ? WHERE id = ?",
+        nextRun,
+        "rate_limited",
+        id,
+      );
+      this.emitUserEvent({ type: "scheduled_session_fired", id, ok: false, error: "rate_limited" });
+      return;
+    }
+
+    const title = row.session_title === null || row.session_title === undefined
+      ? null
+      : String(row.session_title);
+
+    try {
+      // 1. Create the session
+      let newSessionId: string;
+      if (sourceType === "fresh") {
+        newSessionId = this.registerScheduledFreshSession(ownerEmail, title);
+      } else {
+        const sourceSessionId = row.source_session_id === null ? null : String(row.source_session_id);
+        if (!sourceSessionId) throw new Error("fork schedule has no source_session_id");
+        newSessionId = await this.forkScheduledSession(ownerEmail, sourceSessionId, title);
+      }
+
+      // 2. Dispatch the prompt using the owner's CURRENT config
+      //    (not the config at create time — matches interactive prompt
+      //    behaviour).
+      const config = this.readConfig();
+      const prompt = String(row.prompt);
+      const agent = await getAgentByName(this.env.CODING_AGENT as never, newSessionId);
+      const dispatchRes = await agent.fetch(
+        new Request("https://coding-agent/prompt", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-dodo-session-id": newSessionId,
+            "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+            "x-dodo-gateway": config.activeGateway,
+            "x-dodo-model": config.model,
+            "x-dodo-opencode-base-url": config.opencodeBaseURL,
+            "x-author-email": "scheduled-session",
+            "x-owner-email": ownerEmail,
+          },
+          body: JSON.stringify({ content: prompt }),
+        }),
+      );
+
+      if (!dispatchRes.ok) {
+        const body = await dispatchRes.text();
+        throw new Error(`prompt dispatch failed (${dispatchRes.status}): ${body.slice(0, 200)}`);
+      }
+
+      // 3. Success: update stats + compute next run (or delete if one-shot)
+      this.onScheduleSuccess(id, newSessionId, scheduleType, row);
+      this.emitUserEvent({ type: "scheduled_session_fired", id, ok: true, lastSessionId: newSessionId });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const isSourceMissing = error instanceof SourceSessionMissingError;
+      this.onScheduleFailure(id, isSourceMissing ? "source_session_missing" : message);
+      this.emitUserEvent({ type: "scheduled_session_fired", id, ok: false, error: message });
+    }
+  }
+
+  /** Register a fresh session row directly in this DO's session table.
+   *  Avoids DO-to-self round-tripping which would deadlock under the
+   *  alarm's input gate. */
+  private registerScheduledFreshSession(ownerEmail: string, title: string | null): string {
+    const sessionId = crypto.randomUUID();
+    const now = nowEpoch();
+    this.db.exec(
+      "INSERT INTO sessions (id, title, status, owner_email, created_by, created_at, updated_at) VALUES (?, ?, 'idle', ?, ?, ?, ?)",
+      sessionId,
+      title,
+      ownerEmail,
+      "scheduled-session",
+      now,
+      now,
+    );
+    this.emitUserEvent({ type: "sessions_changed", reason: "created", sessionId });
+    return sessionId;
+  }
+
+  /** Fork an existing session into a new one, driven from inside the DO.
+   *  Uses local fork_snapshots storage (same as the external helper) but
+   *  avoids calling back into this DO via the stub (which would deadlock). */
+  private async forkScheduledSession(
+    ownerEmail: string,
+    sourceSessionId: string,
+    title: string | null,
+  ): Promise<string> {
+    // Verify the source session exists in THIS DO. Scheduled sessions can
+    // only fork from sessions owned by the same user — the create-time
+    // permission check already ensured the caller had write on the source.
+    const sourceRow = this.db.one("SELECT id FROM sessions WHERE id = ?", sourceSessionId);
+    if (!sourceRow) {
+      throw new SourceSessionMissingError(sourceSessionId);
+    }
+
+    // Snapshot the source agent.
+    const sourceAgent = await getAgentByName(this.env.CODING_AGENT as never, sourceSessionId);
+    const snapshotRes = await sourceAgent.fetch(
+      new Request("https://coding-agent/snapshot", { method: "GET" }),
+    );
+    if (!snapshotRes.ok) {
+      throw new Error(`snapshot of source session failed (${snapshotRes.status})`);
+    }
+    const snapshotPayload = await snapshotRes.text();
+
+    // Store snapshot in local fork_snapshots table.
+    const snapshotId = crypto.randomUUID();
+    this.db.exec(
+      "INSERT INTO fork_snapshots (id, payload, created_at) VALUES (?, ?, ?)",
+      snapshotId,
+      snapshotPayload,
+      nowEpoch(),
+    );
+
+    // Register the new session.
+    const sessionId = this.registerScheduledFreshSession(ownerEmail, title);
+
+    // Ask the target agent to import the snapshot.
+    let importOk = false;
+    try {
+      const targetAgent = await getAgentByName(this.env.CODING_AGENT as never, sessionId);
+      const importRes = await targetAgent.fetch(
+        new Request(
+          `https://coding-agent/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`,
+          {
+            method: "POST",
+            headers: {
+              "x-dodo-session-id": sessionId,
+              "x-owner-email": ownerEmail,
+            },
+          },
+        ),
+      );
+      if (!importRes.ok) {
+        const body = await importRes.text();
+        throw new Error(`snapshot import failed (${importRes.status}): ${body.slice(0, 200)}`);
+      }
+      importOk = true;
+    } finally {
+      // Always clean up the snapshot row.
+      this.db.exec("DELETE FROM fork_snapshots WHERE id = ?", snapshotId);
+    }
+
+    if (!importOk) throw new Error("fork import did not complete");
+    return sessionId;
+  }
+
+  private onScheduleSuccess(
+    id: string,
+    newSessionId: string,
+    scheduleType: ScheduledSessionType,
+    row: SqlRow,
+  ): void {
+    const now = nowEpoch();
+    if (scheduleType === "delayed" || scheduleType === "scheduled") {
+      // One-shot complete — delete the row entirely.
+      this.db.exec("DELETE FROM scheduled_sessions WHERE id = ?", id);
+      return;
+    }
+
+    // Recurring — compute next fire time.
+    let nextRun: number;
+    if (scheduleType === "cron") {
+      const cron = String(row.cron_expression ?? "");
+      try {
+        const cronDate = cronParser.parseExpression(cron).next() as { getTime: () => number };
+        nextRun = Math.floor(cronDate.getTime() / 1000);
+      } catch {
+        nextRun = now + MIN_INTERVAL_SECONDS;
+      }
+    } else {
+      // interval
+      nextRun = now + Number(row.interval_seconds ?? MIN_INTERVAL_SECONDS);
+    }
+
+    this.db.exec(
+      `UPDATE scheduled_sessions
+         SET last_run_epoch = ?,
+             last_session_id = ?,
+             run_count = run_count + 1,
+             failure_count = 0,
+             last_error = NULL,
+             stalled_at = NULL,
+             next_run_epoch = ?
+       WHERE id = ?`,
+      now,
+      newSessionId,
+      nextRun,
+      id,
+    );
+  }
+
+  private onScheduleFailure(id: string, errorMessage: string): void {
+    const now = nowEpoch();
+    const row = this.readScheduledSessionRow(id);
+    if (!row) return;
+
+    const failureCount = Number(row.failure_count ?? 0) + 1;
+
+    if (failureCount >= MAX_FAILURES) {
+      // Stall — next_run_epoch NULL so alarm() skips it until manual retry.
+      this.db.exec(
+        "UPDATE scheduled_sessions SET failure_count = ?, last_error = ?, stalled_at = ?, next_run_epoch = NULL WHERE id = ?",
+        failureCount,
+        errorMessage.slice(0, 500),
+        now,
+        id,
+      );
+      return;
+    }
+
+    // Exponential backoff: 60s, 120s, 240s, 480s, capped at 3600s.
+    const backoff = Math.min(60 * 2 ** failureCount, 3600);
+    this.db.exec(
+      "UPDATE scheduled_sessions SET failure_count = ?, last_error = ?, next_run_epoch = ? WHERE id = ?",
+      failureCount,
+      errorMessage.slice(0, 500),
+      now + backoff,
+      id,
+    );
   }
 
   // ─── User-level SSE ───
