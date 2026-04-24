@@ -51,8 +51,19 @@ const TOOL_OUTPUT_CAPS: Record<string, { maxLines?: number; maxBytes?: number; m
                                 // Think caps at 2000 lines but that's ~60k tokens — too
                                 // much for discovery. 200 lines is enough for a preview;
                                 // the truncation hint tells the model to use offset/limit.
+  // codemode — 32 KB soft cap. codemode lets the model call arbitrary JS
+  // including fetch() against external APIs; without a cap, a single
+  // GitHub-API-style response can burn 200k+ input tokens. Enforced in
+  // capCodemodeResult() below because codemode's result shape is
+  // `{ code, result, logs? }` rather than the generic shapes handled by
+  // capResult(). Pairs with the `select` schema projection (described in
+  // the tool's prompt) so the model can pre-narrow before output hits here.
+  codemode: { maxBytes: 32_000 },
   // write, edit, delete — already produce small output, no cap needed
 };
+
+/** Max bytes for a codemode `logs` field; kept separate from result. */
+const CODEMODE_LOGS_MAX_BYTES = 4_000;
 
 /**
  * Wrap a tool set to enforce per-tool output caps.
@@ -140,6 +151,110 @@ function capResult(
   }
 
   return result;
+}
+
+/**
+ * Middle-truncate a string to fit within a byte budget. Keeps head and tail
+ * so both the shape of the value and its end (often the most recent /
+ * interesting data) are preserved. Produces a `[... truncated N bytes ...]`
+ * hint in the middle.
+ */
+function middleTruncate(text: string, maxBytes: number): string {
+  if (text.length <= maxBytes) return text;
+  // Leave room for the truncation marker
+  const marker = "\n[... truncated %d bytes. Pass `select` to codemode to project only the fields you need. ...]\n";
+  const overhead = marker.length + 12; // room for %d replacement
+  const headBudget = Math.floor((maxBytes - overhead) * 0.6);
+  const tailBudget = Math.floor((maxBytes - overhead) * 0.4);
+  if (headBudget <= 0 || tailBudget <= 0) return text.slice(0, maxBytes);
+  const head = text.slice(0, headBudget);
+  const tail = text.slice(-tailBudget);
+  const dropped = text.length - headBudget - tailBudget;
+  return `${head}${marker.replace("%d", String(dropped))}${tail}`;
+}
+
+/**
+ * Cap a codemode tool result. Handles the `{ code, result, logs? }` shape
+ * returned by `createExecuteTool`. The `result` field is whatever the
+ * sandboxed JS returned (often a fetched JSON blob); it's serialized and
+ * middle-truncated against `maxBytes`. `logs` is trimmed separately.
+ *
+ * The `code` field is left untouched — it's typically small, and we want the
+ * model to be able to diff what it sent vs what came back.
+ */
+function capCodemodeResult(result: unknown, maxBytes: number): unknown {
+  if (!result || typeof result !== "object") return result;
+  const obj = result as { code?: unknown; result?: unknown; logs?: unknown };
+  const out: Record<string, unknown> = { ...obj };
+
+  if (obj.result !== undefined) {
+    let serialized: string;
+    try {
+      serialized = typeof obj.result === "string" ? obj.result : JSON.stringify(obj.result);
+    } catch {
+      serialized = String(obj.result);
+    }
+    if (serialized.length > maxBytes) {
+      out.result = middleTruncate(serialized, maxBytes);
+      out._truncated = `codemode result exceeded ${maxBytes} bytes (was ${serialized.length}). Result was serialized to string and middle-truncated. Use \`select\` to return only the fields you need.`;
+    }
+  }
+
+  if (typeof obj.logs === "string" && obj.logs.length > CODEMODE_LOGS_MAX_BYTES) {
+    out.logs = middleTruncate(obj.logs, CODEMODE_LOGS_MAX_BYTES);
+  }
+
+  return out;
+}
+
+/**
+ * Project a codemode result to the caller-provided dot-paths.
+ *
+ * Only the `result` field of the returned object is projected — `code`,
+ * `logs`, and any other fields are left alone. Supports numeric indices
+ * in paths (e.g. `items.0.name`). Missing paths are silently skipped.
+ *
+ * Returns a new object shaped like:
+ *   { code, result: { "items.0.name": "foo", "total_count": 42 }, logs? }
+ * so the model sees exactly what it asked for, flat-keyed by path.
+ */
+function projectCodemodeResult(result: unknown, paths: string[]): unknown {
+  if (!result || typeof result !== "object") return result;
+  const obj = result as { code?: unknown; result?: unknown; logs?: unknown };
+  if (obj.result === undefined) return result;
+
+  const projected: Record<string, unknown> = {};
+  for (const path of paths) {
+    const value = getByPath(obj.result, path);
+    if (value !== undefined) projected[path] = value;
+  }
+
+  return {
+    ...obj,
+    result: projected,
+    _projected_paths: paths,
+  };
+}
+
+/** Walk a dot-path through a value. `items.0.name` handles arrays. */
+function getByPath(value: unknown, path: string): unknown {
+  const parts = path.split(".");
+  let current: unknown = value;
+  for (const part of parts) {
+    if (current === null || current === undefined) return undefined;
+    if (Array.isArray(current)) {
+      const idx = Number(part);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= current.length) return undefined;
+      current = current[idx];
+      continue;
+    }
+    if (typeof current === "object") {
+      current = (current as Record<string, unknown>)[part];
+      continue;
+    }
+    return undefined;
+  }
+  return current;
 }
 
 /** Truncate text by line count and byte size, keeping the head. */
@@ -624,7 +739,7 @@ function buildTools(
   if (env.LOADER) {
     const outbound = env.OUTBOUND ?? null;
 
-    tools.codemode = createExecuteTool({
+    const codemodeTool = createExecuteTool({
       tools: workspaceTools,
       state: options?.stateBackend,
       loader: env.LOADER,
@@ -634,6 +749,57 @@ function buildTools(
         { name: "git", tools: gitTools },
       ],
     });
+
+    // Wrap codemode's execute to enforce an output cap and support
+    // schema projection. Without this, a single `await fetch(...)` against
+    // a large API in codemode can one-shot the input-token budget before
+    // any downstream safeguard can react (see dodo session 56a7a597).
+    const caps = TOOL_OUTPUT_CAPS.codemode ?? { maxBytes: 32_000 };
+    const maxBytes = caps.maxBytes ?? 32_000;
+
+    const originalExecute = (codemodeTool as AnyTool).execute as
+      | ((args: unknown, ...rest: unknown[]) => Promise<unknown>)
+      | undefined;
+
+    if (originalExecute) {
+      tools.codemode = {
+        ...codemodeTool,
+        // Extend the tool's description so the model knows about `select`.
+        description: [
+          (codemodeTool as AnyTool).description ?? "",
+          "",
+          "Output is capped at 32 KB. For large API responses, pass `select` — an array of dot-paths",
+          "(e.g. [\"items.0.name\", \"total_count\"]) — and the result is projected to those fields",
+          "before being returned. This saves context for the full multi-step loop.",
+        ].filter(Boolean).join("\n"),
+        execute: async (args: unknown, ...rest: unknown[]) => {
+          // Extract + strip the `select` field before forwarding to the
+          // underlying executor (which doesn't know about it).
+          let select: string[] | undefined;
+          if (args && typeof args === "object") {
+            const a = args as { select?: unknown };
+            if (Array.isArray(a.select) && a.select.every((s) => typeof s === "string")) {
+              select = a.select as string[];
+            }
+          }
+          const cleanArgs = select && args && typeof args === "object"
+            ? (() => {
+                const { select: _, ...rest } = args as { select?: unknown };
+                return rest;
+              })()
+            : args;
+
+          const result = await originalExecute(cleanArgs, ...rest);
+
+          // Schema projection — apply BEFORE size cap so the projected result
+          // is what counts against the budget.
+          const projected = select ? projectCodemodeResult(result, select) : result;
+          return capCodemodeResult(projected, maxBytes);
+        },
+      } as AnyTool;
+    } else {
+      tools.codemode = codemodeTool;
+    }
   }
 
   // Workspace tools — available as top-level tools alongside codemode.

@@ -26,6 +26,8 @@ const updateConfigSchema = z
     gitAuthorName: z.string().min(1).optional(),
     model: z.string().min(1).optional(),
     opencodeBaseURL: z.string().url().optional(),
+    /** User preamble for the system prompt. Pass empty string to clear. */
+    systemPromptPrefix: z.string().max(4_000).optional(),
   })
   .strict();
 
@@ -801,6 +803,11 @@ export class UserControl extends DurableObject<Env> {
       gitAuthorName: values.gitAuthorName ?? this.env.GIT_AUTHOR_NAME ?? "Dodo",
       model: values.model ?? this.env.DEFAULT_MODEL,
       opencodeBaseURL: values.opencodeBaseURL ?? this.env.OPENCODE_BASE_URL,
+      // systemPromptPrefix is an optional free-form string — undefined if unset
+      // or if the user stored an empty string (which the client uses to clear).
+      systemPromptPrefix: values.systemPromptPrefix && values.systemPromptPrefix.length > 0
+        ? values.systemPromptPrefix
+        : undefined,
     };
   }
 

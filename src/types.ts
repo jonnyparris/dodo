@@ -52,6 +52,8 @@ export interface AppConfig {
   gitAuthorName: string;
   model: string;
   opencodeBaseURL: string;
+  /** Optional user preamble prepended to the system prompt every session. */
+  systemPromptPrefix?: string;
 }
 
 export interface AccessIdentity {
@@ -97,6 +99,8 @@ export interface UpdateConfigRequest {
   gitAuthorName?: string;
   model?: string;
   opencodeBaseURL?: string;
+  /** Pass empty string to clear. Capped server-side at 4 KB. */
+  systemPromptPrefix?: string;
 }
 
 export interface SessionIndexRecord {

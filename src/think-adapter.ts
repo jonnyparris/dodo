@@ -38,6 +38,13 @@ export interface DodoConfig {
   model: string;
   opencodeBaseURL: string;
   aiGatewayBaseURL: string;
+  /**
+   * Optional user-editable preamble prepended to the system prompt for
+   * every session. Use for personal rules (writing style, tone, coding
+   * conventions) or team conventions. Capped at 4 KB by the config
+   * endpoint. Empty/undefined = no prefix.
+   */
+  systemPromptPrefix?: string;
 }
 
 /** Sidecar metadata for each Think message — Dodo-specific fields. */

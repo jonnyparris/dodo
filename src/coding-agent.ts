@@ -319,6 +319,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /** AbortController for the currently running fiber prompt. Signalled by handleAbort(). */
   private _fiberAbortController: AbortController | null = null;
   /**
+   * Cached project-instructions content (AGENTS.md / CLAUDE.md) loaded from
+   * the workspace. Warmed by `warmProjectInstructions()` at the top of
+   * `onChatMessage()` on turn 1, consumed synchronously by
+   * `getSystemPrompt()`. `null` = not yet attempted or no file found.
+   * Never re-loaded in the same session — project instructions are
+   * expected to be stable, and a stable system prompt is prompt-cache
+   * friendly for Anthropic models.
+   */
+  private _projectInstructions: string | null = null;
+  private _projectInstructionsLoaded = false;
+  /**
    * Per-tool-call attachment references captured during streaming. Populated
    * by the `onToolAttachments` callback threaded into `buildToolsForThink`.
    * Cleared per chat turn in `runThinkChat` so attachments from one prompt
@@ -395,11 +406,95 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (this.messages.length <= 1) {
       const summary = this.getWorkspaceSummary();
       if (summary) {
-        return `${prompt}\n\n## Current workspace\n\n${summary}`;
+        prompt = `${prompt}\n\n## Current workspace\n\n${summary}`;
       }
     }
 
+    // Inject project instructions (AGENTS.md / CLAUDE.md) if loaded.
+    // Warmed by `warmProjectInstructions()` in onChatMessage before this
+    // call, so it's safe to read synchronously. Included on every turn so
+    // compaction summaries don't lose project-specific rules.
+    if (this._projectInstructions) {
+      prompt = `${prompt}\n\n## Project instructions\n\n${this._projectInstructions}`;
+    }
+
+    // Prepend user-customisable prefix (systemPromptPrefix in DodoConfig).
+    // Placed at the very top so user rules take precedence over the default
+    // Dodo prompt when models resolve conflicts.
+    const config = this.getConfig();
+    const prefix = config?.systemPromptPrefix?.trim();
+    if (prefix) {
+      prompt = `${prefix}\n\n---\n\n${prompt}`;
+    }
+
     return prompt;
+  }
+
+  /**
+   * Load project-local agent instructions from the workspace and cache
+   * them on this instance. Called from onChatMessage() before
+   * getSystemPrompt() so the sync accessor can see them.
+   *
+   * Searches (in order) for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`,
+   * `.rules` at the workspace root and the first direct subdirectory (git
+   * clones typically land under `/<repo-name>/`). First match wins. Content
+   * is capped at 6 KB with a middle-truncation notice.
+   *
+   * Idempotent: once attempted (success or miss), won't re-run. Stable
+   * system prompt is friendlier to Anthropic prompt caching.
+   */
+  private async warmProjectInstructions(): Promise<void> {
+    if (this._projectInstructionsLoaded) return;
+    this._projectInstructionsLoaded = true;
+
+    const MAX_BYTES = 6_000;
+    const candidates = ["AGENTS.md", "CLAUDE.md"];
+
+    // Build search paths: workspace root + first-level subdirs (common for clones)
+    const searchPaths: string[] = [];
+    for (const name of candidates) {
+      searchPaths.push(`/${name}`);
+    }
+    // Add first-level subdir candidates — most clones land under /<repo>/
+    try {
+      const entries = await this.workspace.readDir("/");
+      for (const entry of entries) {
+        // FileInfo: { name, type: 'file' | 'directory' | 'symlink', ... }
+        const name = (entry as { name?: string }).name ?? "";
+        const type = (entry as { type?: string }).type;
+        if (type === "directory" && name && !name.startsWith(".")) {
+          for (const candidate of candidates) {
+            searchPaths.push(`/${name}/${candidate}`);
+          }
+        }
+      }
+    } catch {
+      // No subdirs or workspace not ready — continue with root-only search
+    }
+
+    for (const path of searchPaths) {
+      try {
+        const content = await this.workspace.readFile(path);
+        if (typeof content !== "string" || content.length === 0) continue;
+
+        let trimmed = content.trim();
+        if (trimmed.length > MAX_BYTES) {
+          const head = trimmed.slice(0, Math.floor(MAX_BYTES * 0.7));
+          const tail = trimmed.slice(-Math.floor(MAX_BYTES * 0.2));
+          trimmed = `${head}\n\n[... truncated ${content.length - head.length - tail.length} bytes of ${path} ...]\n\n${tail}`;
+        }
+
+        this._projectInstructions = `Loaded from \`${path}\`:\n\n${trimmed}`;
+        log("info", "project-instructions-loaded", {
+          sessionId: this.sessionId(),
+          path,
+          bytes: trimmed.length,
+        });
+        return;
+      } catch {
+        // File not found — continue to next candidate
+      }
+    }
   }
 
   /**
@@ -494,6 +589,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   override async onChatMessage(options?: ChatMessageOptions): Promise<StreamableResult> {
     this._lastUsage = null;
+
+    // Warm project instructions (AGENTS.md / CLAUDE.md) before getSystemPrompt()
+    // reads them. Idempotent — only loads once per session.
+    await this.warmProjectInstructions();
 
     const baseTools = this.getTools();
     const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
@@ -4608,6 +4707,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       model: existing?.model ?? appConfig.model,
       opencodeBaseURL: existing?.opencodeBaseURL ?? appConfig.opencodeBaseURL,
       aiGatewayBaseURL: existing?.aiGatewayBaseURL ?? appConfig.aiGatewayBaseURL,
+      // Always pull the latest prefix from UserControl so config changes
+      // take effect on the next prompt without requiring a session restart.
+      systemPromptPrefix: appConfig.systemPromptPrefix,
     };
     this.configure(dodoConfig);
 
