@@ -8,7 +8,7 @@ import { buildProvider, buildToolsForThink } from "./agentic";
 import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
 import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
 import type { AttachmentRef } from "./attachments";
-import { rewriteAttachmentsForClient, uploadAttachment } from "./attachments";
+import { rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
 import { log } from "./logger";
 import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
@@ -4130,6 +4130,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const parts: UIMessage["parts"] = [{ type: "text", text: userContent }];
     if (options?.images?.length) {
       for (const img of options.images) {
+        // Sanitize SVG uploads here — user-uploaded SVGs stay inline as
+        // `data:` URLs (we don't write them to R2), so this is the only
+        // place the sanitizer runs for them. `<img>`-loaded SVG is inert
+        // in browsers, but click-to-zoom navigates to the data URL which
+        // could execute scripts in older browsers or non-Chromium engines.
+        // Returns null for malformed/oversized SVGs — silently drop the
+        // bad part rather than fail the whole message.
+        const sanitized = sanitizeUserImage(img.data, img.mediaType);
+        if (sanitized === null) {
+          log("warn", "sanitizeUserImage rejected attachment", {
+            sessionId: this.sessionId(),
+            mediaType: img.mediaType,
+            bytes: img.data.length,
+          });
+          continue;
+        }
         // Pass raw base64 in the url field — the AI SDK's downloadAssets step
         // tries new URL(data) which throws for raw base64 (not a valid URL),
         // so it skips the download. convertToLanguageModelV3DataContent then
@@ -4137,7 +4153,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const filePart = {
           type: "file",
           mediaType: img.mediaType,
-          url: img.data,
+          url: sanitized,
         } satisfies FileUIPart;
         parts.push(filePart);
       }

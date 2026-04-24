@@ -190,6 +190,67 @@ describe("Multimodal image support", () => {
       });
       expect(res.status).toBe(200);
     });
+
+    it("sanitizes SVG attachments before storing them on the message", async () => {
+      // This is the end-to-end round-trip. Upload an SVG with a script tag,
+      // read the message back, assert the stored base64 decodes to a
+      // script-free SVG. Would have caught the claim-3 bypass.
+      const dirty = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><circle r="4"/></svg>';
+      const b64 = btoa(dirty);
+      const msgRes = await fetchJson(`/session/${sessionId}/message`, {
+        body: JSON.stringify({
+          content: "SVG with script",
+          images: [{ data: b64, mediaType: "image/svg+xml" }],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(msgRes.status).toBe(200);
+
+      const historyRes = await fetchJson(`/session/${sessionId}/messages`);
+      const { messages } = (await historyRes.json()) as {
+        messages: Array<{ role: string; content: string; attachments?: Array<{ mediaType: string; url: string }> }>;
+      };
+      const userMsg = messages.find((m) => m.role === "user" && m.content === "SVG with script");
+      expect(userMsg).toBeTruthy();
+      expect(userMsg!.attachments).toBeDefined();
+      expect(userMsg!.attachments).toHaveLength(1);
+      expect(userMsg!.attachments![0].mediaType).toBe("image/svg+xml");
+
+      // Decode the data URL and assert no <script> in the cleaned SVG.
+      const url = userMsg!.attachments![0].url;
+      expect(url).toMatch(/^data:image\/svg\+xml;base64,/);
+      const storedB64 = url.replace(/^data:image\/svg\+xml;base64,/, "");
+      const storedSvg = atob(storedB64);
+      expect(storedSvg).not.toContain("script");
+      expect(storedSvg).not.toContain("alert");
+      expect(storedSvg).toContain("<circle");
+    });
+
+    it("silently drops malformed SVG attachments", async () => {
+      // sanitizeUserImage returns null → filePart is skipped, message still
+      // succeeds. This prevents a malformed upload from nuking the whole
+      // message, which would be confusing UX.
+      const garbage = btoa("not valid svg at all, just html");
+      const msgRes = await fetchJson(`/session/${sessionId}/message`, {
+        body: JSON.stringify({
+          content: "SVG garbage",
+          images: [{ data: garbage, mediaType: "image/svg+xml" }],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(msgRes.status).toBe(200);
+
+      const historyRes = await fetchJson(`/session/${sessionId}/messages`);
+      const { messages } = (await historyRes.json()) as {
+        messages: Array<{ role: string; content: string; attachments?: unknown }>;
+      };
+      const userMsg = messages.find((m) => m.role === "user" && m.content === "SVG garbage");
+      expect(userMsg).toBeTruthy();
+      // No attachments — the malformed one was dropped, nothing else to persist.
+      expect(userMsg!.attachments).toBeUndefined();
+    });
   });
 
   describe("Message history", () => {

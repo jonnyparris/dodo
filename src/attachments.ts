@@ -43,41 +43,62 @@ const EXT_TO_MIME: Record<string, string> = {
 };
 
 /**
- * Minimal SVG sanitizer — strips script-execution vectors before we store
- * an SVG in R2. Belt-and-braces defense: the frontend always renders SVG
- * via `<img>` (which blocks script execution in SVG sources), and the
- * serving route sets CSP to block scripts even when the SVG is opened
- * directly. This sanitizer closes the third hole: tooling or future callers
- * that inline an SVG via `innerHTML` or `<use href>`.
+ * Minimal SVG sanitizer — strips script-execution vectors before an SVG is
+ * persisted.
+ *
+ * **Where this runs today:**
+ *   - `uploadAttachment()` (below) — the R2 path, used by tool-generated
+ *     SVGs (browser screenshots, future tools) and any future assistant
+ *     image generator that emits SVG. The R2 GET route also layers CSP.
+ *   - `sanitizeUserImage()` (below) — the user-upload path in
+ *     `src/coding-agent.ts`. User uploads stay inline as `data:` URLs
+ *     (no R2), so the sanitizer is the *only* defence at the bytes
+ *     level. Browsers still refuse to execute scripts in SVGs loaded via
+ *     `<img src>`, but click-to-zoom opens the `data:` URL directly —
+ *     that's the vector we care about.
  *
  * Strategy:
- *   - Drop `<script>` element subtrees wholesale.
- *   - Drop `<foreignObject>` subtrees (can host arbitrary HTML including
- *     scripts in some parsers).
- *   - Strip any attribute whose name starts with `on` (event handlers).
- *   - Strip `href`/`xlink:href` values pointing at `javascript:` or `data:`
- *     URLs that are not images.
+ *   - Drop `<script>`, `<foreignObject>`, `<iframe>`, `<object>`,
+ *     `<embed>`, `<link>`, `<style>`, `<animate>` subtrees wholesale.
+ *   - Drop self-closing variants of the same.
+ *   - Strip any attribute whose name starts with `on` (event handlers),
+ *     optionally namespaced like `xlink:onload`.
+ *   - Strip `javascript:` URLs from href/xlink:href/src.
+ *   - Strip external refs on `<use>` and `<image>` — SVG `<use>` can
+ *     dereference an external resource and some browsers historically
+ *     leaked cookies or exposed CSS to injected content. Keep same-document
+ *     fragment refs (`href="#foo"`).
+ *   - Loop until the input stops changing — non-greedy element replacement
+ *     can leave an outer `</script>` orphaned after stripping a nested
+ *     `<script><script>…</script></script>`.
  *
- * We operate on the raw text rather than parsing because Workers has no
- * DOM. The regexes are intentionally loose — we favour false positives
- * (stripping something harmless) over false negatives (missing an injection).
- * If a user needs richer SVGs, they can disable sanitization by uploading
- * as a generic file (not an image attachment).
+ * We operate on the raw text because Workers has no DOM. The regexes are
+ * intentionally loose — we favour false positives (stripping something
+ * harmless) over false negatives (missing an injection).
  */
-const SVG_MAX_BYTES = 512 * 1024; // 512KB — generous for diagrams, tight enough to limit parser abuse
+const SVG_MAX_BYTES = 512 * 1024; // 512KB — generous for diagrams, tight enough to bound regex cost
+const SANITIZE_MAX_PASSES = 4; // Loop bound; one extra pass after no-op is the signal to stop
 
 // Block-level elements we remove entirely (tag + content).
 const SVG_BLOCKED_ELEMENT_RE =
-  /<(script|foreignObject|iframe|object|embed|link|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
-// Self-closing variants of the above.
+  /<(script|foreignObject|iframe|object|embed|link|style|animate|set)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
+// Self-closing or unclosed variants of the above.
 const SVG_BLOCKED_SELFCLOSING_RE =
-  /<(script|foreignObject|iframe|object|embed|link|style)\b[^>]*\/?>/gi;
+  /<(script|foreignObject|iframe|object|embed|link|style|animate|set)\b[^>]*\/?>/gi;
+// Orphaned closing tags left after the non-greedy element replace eats the
+// inner pair of a nested `<script><script>…</script></script>`.
+const SVG_BLOCKED_ORPHAN_CLOSE_RE =
+  /<\/(script|foreignObject|iframe|object|embed|link|style|animate|set)\s*>/gi;
 // Event handlers (onload, onclick, onerror, …). Allow the attribute name to
-// be prefixed with a namespace like `xlink:` just in case.
+// be prefixed with a namespace like `xlink:`.
 const SVG_EVENT_ATTR_RE = /\s(?:[a-z]+:)?on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi;
 // javascript: URLs on href/xlink:href/src.
 const SVG_JS_URL_RE =
   /\s(?:xlink:)?(?:href|src)\s*=\s*(?:"(\s*javascript:[^"]*)"|'(\s*javascript:[^']*)'|(\s*javascript:[^\s>]+))/gi;
+// External href on `<use>` / `<image>` — allow same-document fragment refs
+// (`href="#foo"`) but strip any absolute or protocol-relative URL.
+const SVG_USE_EXTERNAL_RE =
+  /<(use|image)\b([^>]*?)\s(xlink:)?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
 
 export function isSvgMediaType(mediaType: string): boolean {
   return mediaType === "image/svg+xml";
@@ -93,16 +114,64 @@ export function sanitizeSvg(svg: string): string | null {
   // Require an <svg> root somewhere — rejects arbitrary HTML masquerading
   // as SVG. Case-insensitive because the parser is.
   if (!/<svg[\s>]/i.test(svg)) return null;
+
   let cleaned = svg;
-  // First pass: blocked elements with content.
-  cleaned = cleaned.replace(SVG_BLOCKED_ELEMENT_RE, "");
-  // Second pass: blocked elements self-closing or without closing tag.
-  cleaned = cleaned.replace(SVG_BLOCKED_SELFCLOSING_RE, "");
-  // Event handler attributes.
-  cleaned = cleaned.replace(SVG_EVENT_ATTR_RE, "");
-  // javascript: URLs.
+  let prev = "";
+  for (let i = 0; i < SANITIZE_MAX_PASSES && cleaned !== prev; i++) {
+    prev = cleaned;
+    cleaned = cleaned.replace(SVG_BLOCKED_ELEMENT_RE, "");
+    cleaned = cleaned.replace(SVG_BLOCKED_SELFCLOSING_RE, "");
+    cleaned = cleaned.replace(SVG_BLOCKED_ORPHAN_CLOSE_RE, "");
+    cleaned = cleaned.replace(SVG_EVENT_ATTR_RE, "");
+    cleaned = cleaned.replace(SVG_JS_URL_RE, "");
+    // External <use>/<image> href: keep fragment-only refs, strip everything else.
+    cleaned = cleaned.replace(SVG_USE_EXTERNAL_RE, (match, tag, pre, _xl, dq, sq, nq) => {
+      const value = dq ?? sq ?? nq ?? "";
+      if (value.startsWith("#")) return match; // fragment ref, keep
+      return `<${tag}${pre}`; // drop the href attribute entirely
+    });
+  }
+
+  // Final belt-and-braces: after SVG_USE_EXTERNAL_RE removal, re-run the
+  // javascript:-URL pass in case the removed attribute revealed another.
+  // One more pass is cheap (the loop above already converged).
   cleaned = cleaned.replace(SVG_JS_URL_RE, "");
+
   return cleaned;
+}
+
+/**
+ * Sanitize a user-uploaded image if it's an SVG. Accepts base64 data and
+ * returns base64 out. For non-SVG MIME types, the input is returned
+ * unchanged (other formats are binary and can't host scripts in a way
+ * that `<img>` will execute). Returns null if an SVG fails sanitization
+ * (malformed, oversized, or not a valid SVG document).
+ *
+ * This wrapper exists so the user-upload path in coding-agent.ts can run
+ * the sanitizer without having to know about base64 framing or the
+ * sanitize-vs-pass-through decision.
+ */
+export function sanitizeUserImage(
+  base64Data: string,
+  mediaType: string,
+): string | null {
+  if (!isSvgMediaType(mediaType)) return base64Data;
+  let bytes: Uint8Array;
+  try {
+    bytes = decodeBase64(base64Data);
+  } catch {
+    return null;
+  }
+  if (bytes.length > MAX_ATTACHMENT_BYTES) return null;
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  const cleaned = sanitizeSvg(text);
+  if (cleaned === null) return null;
+  // Re-encode the cleaned SVG to base64. btoa won't work for non-ASCII,
+  // so go through TextEncoder → bytes → binary-string → btoa.
+  const cleanedBytes = new TextEncoder().encode(cleaned);
+  let bin = "";
+  for (let i = 0; i < cleanedBytes.length; i++) bin += String.fromCharCode(cleanedBytes[i]);
+  return btoa(bin);
 }
 
 export interface AttachmentRef {

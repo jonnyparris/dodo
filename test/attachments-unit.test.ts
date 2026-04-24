@@ -8,6 +8,7 @@ import {
   isSvgMediaType,
   rewriteAttachmentsForClient,
   sanitizeSvg,
+  sanitizeUserImage,
 } from "../src/attachments";
 
 describe("attachments — URL helpers", () => {
@@ -167,11 +168,12 @@ describe("attachments — sanitizeSvg", () => {
     expect(clean).not.toContain("alert");
   });
 
-  it("leaves legitimate hrefs intact", () => {
-    const dirty = `<svg xmlns="http://www.w3.org/2000/svg"><a href="https://example.com"><circle r="4"/></a><image xlink:href="https://cdn.example/img.png"/></svg>`;
+  it("leaves legitimate hrefs on <a> intact", () => {
+    // <a href> is a link, not a resource reference — keep absolute URLs so
+    // users can embed diagrams that link out.
+    const dirty = `<svg xmlns="http://www.w3.org/2000/svg"><a href="https://example.com"><circle r="4"/></a></svg>`;
     const clean = sanitizeSvg(dirty)!;
     expect(clean).toContain('href="https://example.com"');
-    expect(clean).toContain('xlink:href="https://cdn.example/img.png"');
   });
 
   it("handles self-closing <script /> variants", () => {
@@ -189,5 +191,108 @@ describe("attachments — sanitizeSvg", () => {
     expect(clean).not.toMatch(/on[a-z]+\s*=/i);
     expect(clean).not.toMatch(/<script/i);
     expect(clean).not.toContain("alert");
+  });
+
+  it("strips <animate> and <set> elements (SMIL injection vectors)", () => {
+    // <animate attributeName="href" to="javascript:…"> is a classic bypass
+    // for href-targeting sanitizers — the attribute starts benign and
+    // becomes dangerous mid-animation.
+    const dirty = `<svg xmlns="http://www.w3.org/2000/svg"><a href="#safe"><animate attributeName="href" to="javascript:alert(1)"/><circle r="4"/></a><set attributeName="onload" to="alert(2)"/></svg>`;
+    const clean = sanitizeSvg(dirty)!;
+    expect(clean).not.toContain("animate");
+    expect(clean).not.toContain("<set");
+    expect(clean).not.toContain("javascript:");
+    expect(clean).not.toContain("alert");
+  });
+
+  it("handles nested same-tag scripts without leaving orphan close tags", () => {
+    // Non-greedy replace would otherwise leave `</script>` orphaned.
+    const dirty = `<svg xmlns="http://www.w3.org/2000/svg"><script><script>alert(1)</script></script><circle r="4"/></svg>`;
+    const clean = sanitizeSvg(dirty)!;
+    expect(clean).not.toContain("<script");
+    expect(clean).not.toContain("</script");
+    expect(clean).not.toContain("alert");
+    expect(clean).toContain("<circle");
+  });
+
+  it("strips external href on <use> (SSRF / data exfil vector)", () => {
+    // External <use> can fetch cross-origin SVG fragments. Browsers block
+    // most misuse, but the fetch itself reveals session activity to the
+    // target host.
+    const dirty = `<svg xmlns="http://www.w3.org/2000/svg"><use href="https://evil.example/x.svg#a"/><use xlink:href="//evil.example/y.svg#b"/><circle r="4"/></svg>`;
+    const clean = sanitizeSvg(dirty)!;
+    expect(clean).not.toContain("evil.example");
+    expect(clean).toContain("<circle");
+  });
+
+  it("preserves same-document fragment refs on <use>", () => {
+    // Fragment refs (`#foo`) resolve inside the SVG itself — always safe.
+    const dirty = `<svg xmlns="http://www.w3.org/2000/svg"><defs><g id="icon"><circle r="4"/></g></defs><use href="#icon"/></svg>`;
+    const clean = sanitizeSvg(dirty)!;
+    expect(clean).toContain('href="#icon"');
+  });
+
+  it("strips external href on <image> but keeps inline drawing", () => {
+    const dirty = `<svg xmlns="http://www.w3.org/2000/svg"><image xlink:href="https://cdn.example/pic.png"/><circle r="4"/></svg>`;
+    const clean = sanitizeSvg(dirty)!;
+    expect(clean).not.toContain("cdn.example");
+    expect(clean).toContain("<circle");
+  });
+
+  it("converges on pathological nested patterns within the pass bound", () => {
+    // Four levels of nesting — the loop should resolve this without a
+    // stack explosion or orphan tags.
+    const dirty = `<svg xmlns="http://www.w3.org/2000/svg"><script><script><script><script>a</script></script></script></script><circle r="4"/></svg>`;
+    const clean = sanitizeSvg(dirty)!;
+    expect(clean).not.toContain("script");
+    expect(clean).toContain("<circle");
+  });
+});
+
+describe("attachments — sanitizeUserImage", () => {
+  const toB64 = (s: string): string => {
+    const bytes = new TextEncoder().encode(s);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  };
+  const fromB64 = (b: string): string => {
+    const bin = atob(b);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  };
+
+  it("passes non-SVG images through unchanged", () => {
+    // A tiny valid PNG (1x1 transparent). Binary-to-binary — the function
+    // should not inspect the bytes.
+    const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+    expect(sanitizeUserImage(pngB64, "image/png")).toBe(pngB64);
+    expect(sanitizeUserImage(pngB64, "image/jpeg")).toBe(pngB64);
+    expect(sanitizeUserImage(pngB64, "image/webp")).toBe(pngB64);
+  });
+
+  it("sanitizes an SVG and returns valid base64 out", () => {
+    const raw = `<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><circle r="4"/></svg>`;
+    const result = sanitizeUserImage(toB64(raw), "image/svg+xml");
+    expect(result).not.toBeNull();
+    const decoded = fromB64(result!);
+    expect(decoded).not.toContain("script");
+    expect(decoded).toContain("<circle");
+  });
+
+  it("returns null for malformed SVG", () => {
+    expect(sanitizeUserImage(toB64("<html>not svg</html>"), "image/svg+xml")).toBeNull();
+  });
+
+  it("returns null for invalid base64", () => {
+    expect(sanitizeUserImage("not$valid$base64", "image/svg+xml")).toBeNull();
+  });
+
+  it("round-trips unicode content correctly", () => {
+    const raw = `<svg xmlns="http://www.w3.org/2000/svg"><text>café 日本語</text></svg>`;
+    const result = sanitizeUserImage(toB64(raw), "image/svg+xml");
+    expect(result).not.toBeNull();
+    expect(fromB64(result!)).toContain("café 日本語");
   });
 });
