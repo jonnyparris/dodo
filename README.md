@@ -70,7 +70,7 @@ One Worker, three Durable Object classes:
 | **UserControl** | One per user | Config, sessions, memory, tasks, encrypted secrets |
 | **CodingAgent** | One per session | Chat loop, workspace (files + git), sandbox, prompts |
 
-Plus R2 for large file and attachment storage, Browser Rendering for headless Chrome, a per-session Artifacts repo on GitHub for a durable record of workspace changes, and your choice of LLM gateway (OpenCode, AI Gateway, or Workers AI via AI Gateway).
+Plus R2 for large file and attachment storage, Browser Rendering for headless Chrome, a per-session [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/) repo (git-compatible, hosted at `artifacts.cloudflare.net`) for a durable record of workspace changes, and your choice of LLM gateway (OpenCode, AI Gateway, or Workers AI via AI Gateway).
 
 ---
 
@@ -265,7 +265,9 @@ Built-in support for dispatching work to worker sessions and shepherding it to a
 
 ### Artifacts
 
-Every Dodo session automatically gets its own GitHub repo fork -- an **Artifacts repo** -- and workspace changes flush to it at the end of each agent turn. Forked sessions fork the Artifacts repo too, so branch history is preserved. You get a reviewable git history of what the agent did, without waiting for the agent to remember to commit.
+Every Dodo session automatically gets its own [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/) repo -- a git-compatible repo hosted at `artifacts.cloudflare.net`, cloneable by any standard git client with a repo-scoped token. Workspace changes flush to it at the end of each agent turn. Forked sessions fork the Artifacts repo too, so branch history is preserved. You get a reviewable git history of what the agent did, without waiting for the agent to remember to commit.
+
+Note: this is **separate** from the auto-draft-PR feature on GitHub, which only applies to orchestrated dispatch runs (`dispatch_repo_prompt`) that target a user-configured GitHub repo. Artifacts repos are always per-session and always on Cloudflare.
 
 ---
 

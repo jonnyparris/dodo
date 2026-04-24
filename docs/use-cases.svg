@@ -148,8 +148,8 @@
       <text x="378" y="537" class="card-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Artifacts Repo</text>
       <rect x="332" y="554" width="266" height="60" rx="6" fill="#0f172a"/>
       <text x="342" y="572" fill="#f97316" font-family="monospace" font-size="9">Every session auto-gets its own</text>
-      <text x="342" y="586" fill="#f97316" font-family="monospace" font-size="9">GitHub repo. Workspace changes</text>
-      <text x="342" y="600" fill="#f97316" font-family="monospace" font-size="9">flush at end of each agent turn.</text>
+      <text x="342" y="586" fill="#f97316" font-family="monospace" font-size="9">Cloudflare git repo. Changes flush</text>
+      <text x="342" y="600" fill="#f97316" font-family="monospace" font-size="9">at the end of each agent turn.</text>
       <text x="332" y="634" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Reviewable git history of what the agent</text>
       <text x="332" y="650" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">did -- without waiting for it to commit.</text>
       <text x="332" y="676" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Forked sessions fork the Artifacts too.</text>

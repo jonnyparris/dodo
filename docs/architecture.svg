@@ -216,7 +216,7 @@
     <g filter="url(#s)">
       <rect x="685" y="165" width="170" height="60" rx="8" fill="#1e293b" stroke="url(#artifact)" stroke-width="1.5"/>
       <text x="770" y="184" text-anchor="middle" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="11" font-weight="600">Artifacts</text>
-      <text x="770" y="200" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="9">Per-session GitHub repo</text>
+      <text x="770" y="200" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="9">Per-session Cloudflare repo</text>
       <text x="770" y="215" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="9">(auto-fork on session fork)</text>
     </g>
   </a>

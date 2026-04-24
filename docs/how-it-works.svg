@@ -117,9 +117,9 @@
       <circle cx="685" cy="108" r="18" fill="url(#g4)"/>
       <text x="685" y="114" text-anchor="middle" fill="#fff" font-family="system-ui, sans-serif" font-size="14" font-weight="700">4</text>
       <text x="685" y="144" text-anchor="middle" class="step-title" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Results</text>
-      <text x="685" y="168" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Code committed,</text>
-      <text x="685" y="182" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">branch pushed, Artifacts</text>
-      <text x="685" y="196" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">flushed to GitHub.</text>
+      <text x="685" y="168" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Code committed, branch</text>
+      <text x="685" y="182" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">pushed, Artifacts flushed</text>
+      <text x="685" y="196" text-anchor="middle" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">to Cloudflare.</text>
 
       <rect x="617" y="216" width="136" height="90" rx="6" fill="#0f172a"/>
       <text x="685" y="236" text-anchor="middle" fill="#4ade80" font-family="system-ui, sans-serif" font-size="9">&#x2713; Bug fixed</text>
