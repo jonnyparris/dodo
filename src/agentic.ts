@@ -187,7 +187,7 @@ function middleTruncate(text: string, maxBytes: number): string {
  * The `code` field is left untouched — it's typically small, and we want the
  * model to be able to diff what it sent vs what came back.
  */
-function capCodemodeResult(result: unknown, maxBytes: number): unknown {
+export function capCodemodeResult(result: unknown, maxBytes: number): unknown {
   if (!result || typeof result !== "object") return result;
   const obj = result as { code?: unknown; result?: unknown; logs?: unknown };
   const out: Record<string, unknown> = { ...obj };
@@ -223,7 +223,7 @@ function capCodemodeResult(result: unknown, maxBytes: number): unknown {
  *   { code, result: { "items.0.name": "foo", "total_count": 42 }, logs? }
  * so the model sees exactly what it asked for, flat-keyed by path.
  */
-function projectCodemodeResult(result: unknown, paths: string[]): unknown {
+export function projectCodemodeResult(result: unknown, paths: string[]): unknown {
   if (!result || typeof result !== "object") return result;
   const obj = result as { code?: unknown; result?: unknown; logs?: unknown };
   if (obj.result === undefined) return result;
