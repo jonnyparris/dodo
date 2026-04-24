@@ -183,7 +183,7 @@ Dodo runs its own agentic loop rather than delegating to a framework. Each itera
 - **Doom loop detection** -- Identical tool calls 3x triggers a warning; 5x forces a hard break.
 - **Token budget management** -- 70% warn, 85% wrap-up, 95% hard stop.
 - **Context compaction** -- When the context gets too large, older messages are summarized to free space.
-- **Multi-phase continuation** -- When step limits are hit, context is compacted and the agent continues for up to 5 phases.
+- **Multi-phase continuation** -- When step limits are hit, context is compacted and the agent continues for up to 5 phases. A structured tool-call digest (not just tool names) is injected at each phase boundary so the agent knows exactly which calls have already been made and avoids repeating them.
 - **Overflow recovery** -- Emergency compaction on context-length errors.
 
 ### Explore subagent
