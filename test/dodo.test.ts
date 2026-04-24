@@ -142,6 +142,113 @@ describe("Dodo foundation", () => {
     expect(messages.messages[1].role).toBe("assistant");
   });
 
+  it("POST /api/mcp/start-auth is not publicly accessible", async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request(`${BASE_URL}/api/mcp/start-auth`, {
+      body: JSON.stringify({ mcpUrl: "https://browser.mcp.cloudflare.com/mcp" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    }), { ...(env as Env), DEV_MODE: "false" } as Env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).not.toBe(200);
+  });
+
+  it("/agents/* is not publicly accessible", async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request(`${BASE_URL}/agents/test`, { method: "GET" }), { ...(env as Env), DEV_MODE: "false" } as Env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).not.toBe(200);
+  });
+
+  it("POST /api/mcp/start-auth rejects invalid URLs and disallowed hosts", async () => {
+    // Missing mcpUrl
+    const r1 = await fetchJson("/api/mcp/start-auth", {
+      body: JSON.stringify({}),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(r1.status).toBe(400);
+
+    // Malformed URL
+    const r2 = await fetchJson("/api/mcp/start-auth", {
+      body: JSON.stringify({ mcpUrl: "not a url" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(r2.status).toBe(400);
+
+    // Non-http(s) protocol
+    const r3 = await fetchJson("/api/mcp/start-auth", {
+      body: JSON.stringify({ mcpUrl: "ftp://example.com/mcp" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(r3.status).toBe(400);
+
+    // Valid URL, but host not on the allowlist → 403
+    const r4 = await fetchJson("/api/mcp/start-auth", {
+      body: JSON.stringify({ mcpUrl: "https://attacker.example/mcp" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(r4.status).toBe(403);
+  });
+
+  it("user-scoped MCP token: create → use to authenticate /mcp → delete", async () => {
+    // Phase 4 integration: verify that a user creates a token, the token is
+    // indexed in SharedIndex (global lookup), /mcp accepts it, and delete
+    // removes it so subsequent use fails.
+
+    // 1. Create a user-scoped token (dev mode: userEmail defaults to local@test.com)
+    const createRes = await fetchJson("/api/user/mcp-tokens", {
+      body: JSON.stringify({ label: "test-token" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(createRes.status).toBeLessThan(300);
+    const { token } = (await createRes.json()) as { token: string; created_at: number };
+    expect(token).toMatch(/^dodo_[a-f0-9]+$/);
+
+    // 2. Use the token against /mcp — should succeed (200 from initialize)
+    const mcpHeaders = {
+      "content-type": "application/json",
+      "Authorization": `Bearer ${token}`,
+      "Accept": "application/json, text/event-stream",
+    };
+    const initResponse = await fetchJson("/mcp", {
+      body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1, params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } } }),
+      headers: mcpHeaders,
+      method: "POST",
+    });
+    expect(initResponse.status).toBe(200);
+
+    // 3. Delete the token
+    const deleteRes = await fetchJson(`/api/user/mcp-tokens/${encodeURIComponent(token)}`, { method: "DELETE" });
+    expect(deleteRes.status).toBeLessThan(300);
+
+    // 4. Using the deleted token should fail
+    const deletedResponse = await fetchJson("/mcp", {
+      body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 2, params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } } }),
+      headers: mcpHeaders,
+      method: "POST",
+    });
+    expect(deletedResponse.status).toBe(401);
+  });
+
+  it("bogus MCP tokens are rejected", async () => {
+    const headers = {
+      "content-type": "application/json",
+      "Authorization": "Bearer dodo_deadbeefdeadbeefdeadbeefdeadbeef",
+      "Accept": "application/json, text/event-stream",
+    };
+    const r = await fetchJson("/mcp", {
+      body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1, params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } } }),
+      headers,
+      method: "POST",
+    });
+    expect(r.status).toBe(401);
+  });
+
   it("allowlist write routes require admin", async () => {
     // POST /api/allowlist requires admin — non-admin gets 403
     const allowlistCreate = await fetchJson("/api/allowlist", {

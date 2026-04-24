@@ -466,6 +466,43 @@ export class SharedIndex extends DurableObject<Env> {
         return Response.json({ ok: true });
       }
 
+      // ─── MCP token index (global lookup for user-scoped dodo_* tokens) ───
+
+      if (request.method === "POST" && url.pathname === "/mcp-token-index") {
+        const body = (await request.json()) as { token: string; email: string };
+        if (!body.token || !body.email) {
+          return Response.json({ error: "token and email required" }, { status: 400 });
+        }
+        this.db.exec(
+          "INSERT OR REPLACE INTO mcp_token_index (token, email, created_at) VALUES (?, ?, ?)",
+          body.token,
+          body.email.trim().toLowerCase(),
+          nowEpoch(),
+        );
+        return Response.json({ ok: true });
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/mcp-token-index/")) {
+        const token = decodeURIComponent(url.pathname.slice("/mcp-token-index/".length));
+        if (!token) return Response.json({ email: null });
+        const row = this.db.one("SELECT email FROM mcp_token_index WHERE token = ?", token);
+        return Response.json({ email: row ? String(row.email) : null });
+      }
+
+      if (request.method === "DELETE" && url.pathname.startsWith("/mcp-token-index/")) {
+        const token = decodeURIComponent(url.pathname.slice("/mcp-token-index/".length));
+        this.db.exec("DELETE FROM mcp_token_index WHERE token = ?", token);
+        return Response.json({ ok: true });
+      }
+
+      // Bulk delete for a user (called when tokens are revoked in UserControl
+      // and when a user is removed from the allowlist).
+      if (request.method === "DELETE" && url.pathname.startsWith("/mcp-token-index-by-email/")) {
+        const email = decodeURIComponent(url.pathname.slice("/mcp-token-index-by-email/".length)).trim().toLowerCase();
+        this.db.exec("DELETE FROM mcp_token_index WHERE email = ?", email);
+        return Response.json({ ok: true });
+      }
+
       return new Response("Not Found", { status: 404 });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected request failure";
@@ -569,6 +606,20 @@ export class SharedIndex extends DurableObject<Env> {
       )
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_errors_created ON client_errors(created_at)");
+
+    // Global token → email pointer for user-scoped MCP tokens. The full
+    // token record (with label, timestamps) lives in the user's UserControl
+    // DO; this table only exists so /mcp can resolve a bearer token to an
+    // email without knowing which user to ask. Wiped per-user when tokens
+    // are revoked or the user is deleted.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS mcp_token_index (
+        token TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_mcp_token_index_email ON mcp_token_index(email)");
 
     // Phase 6: browser_enabled column (migration-safe)
     this.migrateAddBrowserEnabled();

@@ -9,16 +9,26 @@ import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
 import type { CodingAgent } from "./coding-agent";
 import type { Env, WorkerRunRecord } from "./types";
 
-// MCP uses the admin email for all operations since MCP is token-authenticated
-// (no CF Access identity available). In Phase 2, MCP can pass user context.
-function mcpUserEmail(env: Env): string {
+/**
+ * Resolve the MCP caller's email. Prefers an explicit userEmail (from a
+ * user-scoped dodo_* token validated upstream), falls back to ADMIN_EMAIL
+ * for service-mode callers using the shared DODO_MCP_TOKEN.
+ *
+ * When the fallback is taken we log a warning so operators can audit
+ * operations that get attributed to the admin. In production, review the
+ * log stream periodically to confirm the expected service-mode callers
+ * (CI etc.) are the only ones hitting this path.
+ */
+function mcpUserEmail(env: Env, userEmail?: string): string {
+  if (userEmail) return userEmail;
   const email = resolveAdminEmail(env);
   if (!email) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
+  console.warn("[mcp] Operation attributed to admin via service-mode fallback (no userEmail threaded).");
   return email;
 }
 
-async function userControlFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
-  const email = mcpUserEmail(env);
+async function userControlFetch(env: Env, path: string, init?: RequestInit, userEmail?: string): Promise<Response> {
+  const email = mcpUserEmail(env, userEmail);
   const stub = getUserControlStub(env, email);
   const headers = new Headers(init?.headers);
   headers.set("x-owner-email", email);
@@ -30,22 +40,23 @@ async function sharedIndexFetch(env: Env, path: string, init?: RequestInit): Pro
   return stub.fetch(`https://shared-index${path}`, init);
 }
 
-async function agentFetch(env: Env, sessionId: string, path: string, init?: RequestInit, depth = 0): Promise<Response> {
+async function agentFetch(env: Env, sessionId: string, path: string, init?: RequestInit, depth = 0, userEmail?: string): Promise<Response> {
   const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
+  const email = mcpUserEmail(env, userEmail);
   const headers = new Headers(init?.headers);
   headers.set("x-dodo-session-id", sessionId);
-  headers.set("x-owner-email", mcpUserEmail(env));
+  headers.set("x-owner-email", email);
   headers.set("x-dodo-mcp-depth", String(depth + 1));
 
   // Inject gateway config for message/prompt routes
   if (path === "/message" || path === "/prompt") {
-    const configRes = await userControlFetch(env, "/config");
+    const configRes = await userControlFetch(env, "/config", undefined, userEmail);
     const config = (await configRes.json()) as Record<string, string>;
     headers.set("x-dodo-gateway", config.activeGateway ?? "opencode");
     headers.set("x-dodo-model", config.model ?? "");
     headers.set("x-dodo-opencode-base-url", config.opencodeBaseURL ?? "");
     headers.set("x-dodo-ai-base-url", config.aiGatewayBaseURL ?? "");
-    headers.set("x-author-email", mcpUserEmail(env));
+    headers.set("x-author-email", email);
   }
 
   return agent.fetch(new Request(`https://coding-agent${path}`, { ...init, headers }));
@@ -55,8 +66,8 @@ async function readJson<T>(response: Response): Promise<T> {
   return await response.json() as T;
 }
 
-async function userJson<T>(env: Env, path: string, init?: RequestInit): Promise<T> {
-  const res = await userControlFetch(env, path, init);
+async function userJson<T>(env: Env, path: string, init?: RequestInit, userEmail?: string): Promise<T> {
+  const res = await userControlFetch(env, path, init, userEmail);
   const data = await readJson<T | { error?: string }>(res);
   if (!res.ok) {
     throw new Error((data as { error?: string }).error ?? `UserControl request failed (${res.status})`);
@@ -64,8 +75,8 @@ async function userJson<T>(env: Env, path: string, init?: RequestInit): Promise<
   return data as T;
 }
 
-async function agentJson<T>(env: Env, sessionId: string, path: string, init?: RequestInit, depth = 0): Promise<T> {
-  const res = await agentFetch(env, sessionId, path, init, depth);
+async function agentJson<T>(env: Env, sessionId: string, path: string, init?: RequestInit, depth = 0, userEmail?: string): Promise<T> {
+  const res = await agentFetch(env, sessionId, path, init, depth, userEmail);
   const data = await readJson<T | { error?: string }>(res);
   if (!res.ok) {
     throw new Error((data as { error?: string }).error ?? `Agent request failed (${res.status})`);
@@ -73,22 +84,22 @@ async function agentJson<T>(env: Env, sessionId: string, path: string, init?: Re
   return data as T;
 }
 
-async function patchSession(env: Env, sessionId: string, patch: { status?: string; title?: string | null }): Promise<void> {
+async function patchSession(env: Env, sessionId: string, patch: { status?: string; title?: string | null }, userEmail?: string): Promise<void> {
   await userJson(env, `/sessions/${encodeURIComponent(sessionId)}`, {
     body: JSON.stringify(patch),
     headers: { "content-type": "application/json" },
     method: "PATCH",
-  });
+  }, userEmail);
 }
 
-async function createSessionWithTitle(env: Env, title: string | null): Promise<{ id: string; title: string | null }> {
+async function createSessionWithTitle(env: Env, title: string | null, userEmail?: string): Promise<{ id: string; title: string | null }> {
   const id = crypto.randomUUID();
-  const email = mcpUserEmail(env);
+  const email = mcpUserEmail(env, userEmail);
   await userJson(env, "/sessions", {
     body: JSON.stringify({ id, title, ownerEmail: email, createdBy: email }),
     headers: { "content-type": "application/json" },
     method: "POST",
-  });
+  }, userEmail);
   return { id, title };
 }
 
@@ -327,7 +338,7 @@ async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: s
   return textResult(data);
 }
 
-export function createDodoMcpServer(env: Env, depth = 0): McpServer {
+export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): McpServer {
   const server = new McpServer({ name: "dodo", version: "0.4.0" });
 
   // --- Session tools ---
@@ -338,10 +349,8 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
 
   server.tool("create_session", "Create a new Dodo coding session", {}, async () => {
     const sessionId = crypto.randomUUID();
-    const email = mcpUserEmail(env);
-    const res = await userControlFetch(env, "/sessions", {
-      body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }),
-      headers: { "content-type": "application/json" },
+    const email = mcpUserEmail(env, userEmail);
+    const res = await userControlFetch(env, "/sessions", { body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }), headers: { "content-type": "application/json" },
       method: "POST",
     });
     const session = await res.json();
@@ -350,7 +359,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
 
   server.tool("get_session", "Get the state of a Dodo session", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
     // Verify the session exists in UserControl before querying the agent
-    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`);
+    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`, undefined, userEmail);
     if (!checkRes.ok) {
       return errorResult({ error: `Session '${sessionId}' not found. Run list_sessions to see available sessions.` });
     }
@@ -359,7 +368,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
 
   server.tool("delete_session", "Delete a Dodo session and its storage. The session can be restored within 5 minutes using restore_session.", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
     // Verify the session exists before deleting
-    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`);
+    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`, undefined, userEmail);
     if (!checkRes.ok) {
       return errorResult({ error: `Session '${sessionId}' not found. Run list_sessions to see available sessions.` });
     }
@@ -373,7 +382,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
   server.tool("bulk_delete_sessions", "Delete all sessions whose title starts with a given prefix. Skips sessions with running prompts.", {
     titlePrefix: z.string().min(3).describe("Delete all sessions whose title starts with this prefix"),
   }, async ({ titlePrefix }) => {
-    const listRes = await userControlFetch(env, "/sessions");
+    const listRes = await userControlFetch(env, "/sessions", undefined, userEmail);
     const { sessions } = (await listRes.json()) as { sessions: Array<{ id: string; title?: string; status?: string }> };
     const matching = sessions.filter((s) => s.title?.startsWith(titlePrefix));
     if (matching.length === 0) {
@@ -408,7 +417,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
   });
 
   server.tool("fork_session", "Fork a session (copy files + messages into a new session)", { sessionId: z.string().describe("Source session ID") }, async ({ sessionId }) => {
-    const email = mcpUserEmail(env);
+    const email = mcpUserEmail(env, userEmail);
     let newId: string;
     try {
       const forked = await forkSessionInternal(env, email, sessionId, null);
@@ -654,7 +663,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
       return textResult(run);
     }
 
-    const ownerEmail = mcpUserEmail(env);
+    const ownerEmail = mcpUserEmail(env, userEmail);
 
     try {
       // Resume a verify-gate poll if we're mid-check on a prior call.
@@ -1001,9 +1010,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     }
 
     // Create the config via UserControl directly (bypasses index.ts host allowlist)
-    const res = await userControlFetch(env, "/mcp-configs", {
-      body: JSON.stringify({ name, type: "http", url, headers: Object.keys(headers).length > 0 ? headers : undefined, enabled: true }),
-      headers: { "content-type": "application/json" },
+    const res = await userControlFetch(env, "/mcp-configs", { body: JSON.stringify({ name, type: "http", url, headers: Object.keys(headers).length > 0 ? headers : undefined, enabled: true }), headers: { "content-type": "application/json" },
       method: "POST",
     });
 
@@ -1076,7 +1083,7 @@ export function createDodoMcpServer(env: Env, depth = 0): McpServer {
     id: z.string().describe("Task ID"),
   }, async ({ id }) => {
     // Verify the task exists before deleting
-    const checkRes = await userControlFetch(env, `/tasks/${encodeURIComponent(id)}/check`);
+    const checkRes = await userControlFetch(env, `/tasks/${encodeURIComponent(id)}/check`, undefined, userEmail);
     if (!checkRes.ok) {
       return errorResult({ error: `Task '${id}' not found. Run list_tasks to see available tasks.` });
     }

@@ -12,6 +12,15 @@ import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env, TodoStore } from "./types";
 
 /** Options passed through from the coding agent into tool factories. */
+/** Metadata describing an OAuth-connected MCP tool federated from the per-user hub DO. */
+export interface OAuthToolInfo {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  serverId: string;
+  displayName?: string;
+}
+
 export interface BuildToolsOptions {
   authorEmail?: string;
   browserEnabled?: boolean;
@@ -19,6 +28,19 @@ export interface BuildToolsOptions {
   ownerId?: string;
   ownerEmail?: string;
   stateBackend?: StateBackend;
+  mcpGatekeepers?: McpGatekeeper[];
+  /**
+   * OAuth MCP tools pre-fetched from the per-user hub DO. Session DOs don't
+   * hold OAuth credentials locally — they pass the cached tool list here
+   * and route tool calls back through `oauthToolExec`.
+   */
+  oauthTools?: OAuthToolInfo[];
+  /**
+   * Tool-call executor for OAuth MCP tools. Must route through the per-user
+   * hub DO where the OAuth credentials live. Provided by CodingAgent as
+   * `this.callOAuthToolViaHub`.
+   */
+  oauthToolExec?: (serverId: string, name: string, args: unknown) => Promise<unknown>;
   /** Session ID — required to scope attachment R2 keys. */
   sessionId?: string;
   /**
@@ -787,8 +809,13 @@ const EXPLORE_SYSTEM_PROMPT = [
   "- Focus on answering the user's specific question, not cataloguing everything.",
 ].join("\n");
 
-/** Max steps for the explore subagent. */
-const EXPLORE_MAX_STEPS = 5;
+/** Max steps for the explore subagent.
+ *  Bumped from 5 to 12 after observing in the 2026-04-24 demo sessions
+ *  (`877cefcc`, `197cc126`, `fdad8393`) that 5 steps was routinely consumed
+ *  by tool-calling before the model got a chance to emit its final summary.
+ *  12 gives enough headroom for multi-grep/read investigations while still
+ *  capping a runaway loop. */
+const EXPLORE_MAX_STEPS = 12;
 
 /** Cheap model for the explore subagent, keyed by provider prefix.
  *  Falls back to the main model if no match (still works, just costs more). */
@@ -891,7 +918,11 @@ function buildSubagentTool(spec: {
           messages: [{ role: "user" as const, content: userMessage }],
           tools: spec.getTools(),
           stopWhen: stepCountIs(spec.maxSteps),
-          maxOutputTokens: 2000,
+          // Bumped from 2000 → 4000. The explore/task subagents frequently
+          // summarize 5-10 files' worth of findings; 2000 tokens was clipping
+          // the summary mid-sentence after the model ran its tool budget.
+          // 4000 still small enough to keep the subagent's turn compact.
+          maxOutputTokens: 4000,
           abortSignal: AbortSignal.timeout(spec.timeoutMs),
         });
 
@@ -900,12 +931,27 @@ function buildSubagentTool(spec: {
         const toolCalls = result.steps.flatMap((s) =>
           (s.toolCalls ?? []).map((tc) => tc.toolName),
         );
+        // Sum per-step usage into a single subagent cost line. Surfacing
+        // this matters for observability — "explore used 40k tokens" is a
+        // cost the parent can't see otherwise since the subagent's LLM
+        // calls don't touch the parent's message_metadata totals.
+        const totalInput = result.steps.reduce(
+          (sum, s) => sum + (s.usage?.inputTokens ?? 0),
+          0,
+        );
+        const totalOutput = result.steps.reduce(
+          (sum, s) => sum + (s.usage?.outputTokens ?? 0),
+          0,
+        );
+        const usageLine = totalInput > 0 || totalOutput > 0
+          ? `**Tokens:** ${totalInput} in / ${totalOutput} out | `
+          : "";
 
         return [
           `## ${spec.name} results (model: ${modelId})`,
-          `**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
+          `${usageLine}**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
           "",
-          summary || "(No output)",
+          summary || "(No output — subagent ran its tool budget without emitting a summary. Try a narrower query or a higher-capability model via the `model` arg.)",
         ].filter(Boolean).join("\n");
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -1286,14 +1332,25 @@ export function buildToolsForThink(
   workspace: Workspace,
   config: AppConfig,
   options?: BuildToolsOptions & {
+    agent?: { mcp?: unknown };
     mcpGatekeepers?: McpGatekeeper[];
   },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
+  const existingNames = new Set(Object.keys(tools));
 
   if (options?.mcpGatekeepers?.length) {
-    const mcpTools = buildMcpTools(options.mcpGatekeepers);
+    const mcpTools = buildMcpTools(options.mcpGatekeepers, existingNames);
     Object.assign(tools, mcpTools);
+    Object.keys(mcpTools).forEach((name) => existingNames.add(name));
+  }
+
+  // Phase 1 OAuth path: tools federated from the per-user hub DO. The tool
+  // list is pre-fetched; execute() routes back to the hub via the provided
+  // executor so OAuth credentials never leave that DO.
+  if (options?.oauthTools?.length && options.oauthToolExec) {
+    const oauthTools = buildOAuthMcpTools(options.oauthTools, options.oauthToolExec, existingNames);
+    Object.assign(tools, oauthTools);
   }
 
   return tools;
@@ -1306,7 +1363,7 @@ export function buildToolsForThink(
  * by the gatekeeper's listTools(). We use jsonSchema() passthrough for the
  * input schema since MCP tools define JSON Schema directly, not Zod.
  */
-function buildMcpTools(gatekeepers: McpGatekeeper[]): Record<string, AnyTool> {
+function buildMcpTools(gatekeepers: McpGatekeeper[], existingNames: Set<string>): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
   for (const gk of gatekeepers) {
@@ -1316,6 +1373,7 @@ function buildMcpTools(gatekeepers: McpGatekeeper[]): Record<string, AnyTool> {
     if (!cachedTools) continue;
 
     for (const mcpTool of cachedTools) {
+      if (existingNames.has(mcpTool.name) || tools[mcpTool.name]) continue;
       tools[mcpTool.name] = tool({
         description: mcpTool.description ?? `MCP tool: ${mcpTool.name}`,
         inputSchema: mcpTool.inputSchema
@@ -1340,4 +1398,64 @@ function buildMcpTools(gatekeepers: McpGatekeeper[]): Record<string, AnyTool> {
   return tools;
 }
 
+function slugifyToolNamespace(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "mcp-unnamed";
+}
 
+/**
+ * Build AI SDK tool() objects from the per-user OAuth hub's tool list.
+ *
+ * The tool list has already been fetched via RPC (`listOAuthTools`) from
+ * the per-user CodingAgent DO. `execute()` routes calls back to that hub
+ * via the provided executor (`callOAuthToolViaHub`), so OAuth credentials
+ * never leave the hub DO.
+ *
+ * Tool names are prefixed with a slug of the server's display name to
+ * avoid collisions across servers. Capped at 64 chars to satisfy AI SDK
+ * naming constraints. Collisions after truncation are logged.
+ */
+function buildOAuthMcpTools(
+  oauthTools: OAuthToolInfo[],
+  executor: (serverId: string, name: string, args: unknown) => Promise<unknown>,
+  existingNames: Set<string>,
+): Record<string, AnyTool> {
+  const tools: Record<string, AnyTool> = {};
+
+  for (const info of oauthTools) {
+    if (!info.name || !info.serverId) {
+      console.warn("[oauth-mcp] Skipping tool with missing name or serverId:", info);
+      continue;
+    }
+
+    const display = info.displayName ?? info.serverId;
+    const slug = slugifyToolNamespace(display);
+    const fullName = `${slug}__${info.name}`;
+    const prefixedName = fullName.length > 64 ? fullName.slice(0, 64) : fullName;
+
+    if (existingNames.has(prefixedName) || tools[prefixedName]) {
+      console.warn("[oauth-mcp] Skipping duplicate tool name:", { prefixedName, serverId: info.serverId, original: info.name });
+      continue;
+    }
+
+    tools[prefixedName] = tool({
+      description: info.description ?? `OAuth MCP tool: ${info.name}`,
+      inputSchema: info.inputSchema
+        ? jsonSchema(info.inputSchema)
+        : jsonSchema({ type: "object", properties: {} }),
+      execute: async (args: unknown) => {
+        try {
+          return await executor(info.serverId, info.name, args);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { error: `OAuth MCP tool call failed: ${msg}` };
+        }
+      },
+    });
+    existingNames.add(prefixedName);
+  }
+
+  return tools;
+}

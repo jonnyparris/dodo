@@ -89,6 +89,7 @@
     // AI Gateway unified API base URL — include /{account_id}/{gateway_id}/compat
     // so the OpenAI-compatible SDK hits /chat/completions correctly.
     "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1/4b430e167a301330d13a9bb42f3986a2/jp-gw/compat",
+    "WORKER_URL": "http://localhost:8787",
     "DODO_VERSION": "0.4.0"
   }
 }

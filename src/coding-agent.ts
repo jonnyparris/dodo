@@ -1,5 +1,5 @@
 import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
-import { type Connection, type ConnectionContext, type WSMessage } from "agents";
+import { type AgentNamespace, type Connection, type ConnectionContext, type WSMessage, getAgentByName } from "agents";
 import type { ArtifactsRepo } from "./artifacts-types";
 import { flushTurnToArtifacts } from "./artifacts-flush";
 import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
@@ -403,6 +403,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private _contextTruncated = false;
   /** Connected MCP gatekeepers, populated by connectMcpServers(). */
   private mcpGatekeepers: McpGatekeeper[] = [];
+  /**
+   * OAuth MCP tools federated from the per-user hub DO.
+   *
+   * Session DOs (keyed by sessionId) don't hold OAuth state — it lives in
+   * the user-keyed DO created by /api/mcp/start-auth. We pre-fetch the tool
+   * list once per `connectMcpServers()` call and cache it here so that the
+   * synchronous `getTools()` path can merge it into the session's toolset.
+   * Tool calls route back to the hub via `callOAuthTool` RPC.
+   */
+  private cachedOAuthTools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; serverId: string; displayName?: string }> = [];
   /** MCP recursion depth from incoming request, propagated to outbound MCP calls. */
   private mcpDepth = 0;
   /** AbortController for the currently running fiber prompt. Signalled by handleAbort(). */
@@ -621,6 +631,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const appConfig = this.getAppConfigFromThink();
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
     return buildToolsForThink(this.env, this.workspace, appConfig, {
+      agent: this,
+      oauthTools: this.cachedOAuthTools,
+      oauthToolExec: (serverId: string, name: string, args: unknown) => this.callOAuthToolViaHub(serverId, name, args),
       browserEnabled: this.readMetadata("browser_enabled") === "true",
       isAdminUser: isAdmin(ownerEmail ?? null, this.env),
       ownerId: this.resolveOwnerId(ownerEmail),
@@ -1943,6 +1956,24 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Initialize Think: creates SessionManager, loads existing sessions,
     // sets up protocol handlers, checks fibers if enabled.
     super.onStart();
+    this.mcp.configureOAuthCallback({
+      successRedirect: "/mcp-oauth-success",
+      errorRedirect: "/mcp-oauth-error",
+    });
+
+    // Arm the daily MCP-hygiene alarm if not already set. The alarm handler
+    // re-arms itself, so we only need to kick it off once per DO lifetime.
+    // Fire-and-forget — onStart() is sync per the Agents SDK contract.
+    this.ctx.waitUntil((async () => {
+      try {
+        const existing = await this.ctx.storage.getAlarm();
+        if (existing === null) {
+          await this.ctx.storage.setAlarm(Date.now() + 24 * 60 * 60 * 1000);
+        }
+      } catch (err) {
+        log("warn", "Failed to arm mcp-hygiene alarm", { err: err instanceof Error ? err.message : String(err) });
+      }
+    })());
 
     // Suppress Think's WebSocket chat protocol.
     // super.onStart() wraps onMessage via _setupProtocolHandlers() to intercept
@@ -2013,6 +2044,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    // Normalise the incoming owner email and reconcile if it's drifted from
+    // the stored owner_email metadata. This runs for every HTTP request into
+    // the DO (sessions *and* the per-user OAuth hub) so Access identity drift
+    // is caught before any MCP call.
+    const incomingEmail = (request.headers.get("x-owner-email") ?? request.headers.get("x-dodo-owner-email") ?? "")
+      .trim()
+      .toLowerCase();
+    if (incomingEmail) {
+      await this.reconcileOwnerIdentity(incomingEmail);
+    }
 
     try {
       if (request.method === "GET" && url.pathname === "/ws") {
@@ -4823,6 +4864,156 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
+   * Clear all MCP connections — SDK-managed OAuth servers and static gatekeepers.
+   */
+  async clearAllMcpConnections(): Promise<void> {
+    try {
+      const servers = this.getMcpServers().servers;
+      for (const id of Object.keys(servers)) {
+        try {
+          await this.mcp.removeServer(id);
+        } catch (err) {
+          log("warn", "Failed to remove OAuth MCP", { id, err: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    } catch (err) {
+      log("warn", "Failed to enumerate MCP servers", { err: err instanceof Error ? err.message : String(err) });
+    }
+    for (const gk of this.mcpGatekeepers) {
+      try {
+        gk.disconnect();
+      } catch (err) {
+        log("warn", "Failed to disconnect gatekeeper", { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    this.mcpGatekeepers = [];
+  }
+
+  /**
+   * Compare incoming Access email against stored owner_email metadata.
+   * On drift, clear MCPs, update the stored email, and reconnect.
+   */
+  async reconcileOwnerIdentity(incomingEmail: string | null | undefined): Promise<void> {
+    if (!incomingEmail) return;
+    const normalisedIncoming = incomingEmail.trim().toLowerCase();
+    if (!normalisedIncoming) return;
+    const stored = this.readMetadata("owner_email");
+    const normalisedStored = stored ? stored.trim().toLowerCase() : null;
+    if (normalisedStored && normalisedStored === normalisedIncoming) return;
+    log("info", "owner identity drift", { storedEmail: stored ?? null, incomingEmail: normalisedIncoming });
+    await this.clearAllMcpConnections();
+    this.writeMetadata("owner_email", normalisedIncoming);
+    await this.connectMcpServers();
+  }
+
+  async refreshMcpState(mcpId: string): Promise<void> {
+    const servers = this.getMcpServers();
+    const server = servers.servers[mcpId];
+    if (!server) throw new Error(`MCP server not found: ${mcpId}`);
+    const url = server.server_url;
+    const name = server.name ?? new URL(url).host;
+    await this.removeMcpServer(mcpId);
+    await this.addMcpServer(name, url, {
+      callbackHost: this.env.WORKER_URL,
+      callbackPath: "/agents",
+    });
+  }
+
+  /**
+   * RPC: list OAuth-connected MCP tools from this DO's `this.mcp` manager.
+   *
+   * Called from session DOs (keyed by sessionId) that want to federate the
+   * per-user OAuth hub's tools into their own `getTools()` result. The
+   * returned shape is deliberately serialisable for DO-to-DO RPC.
+   */
+  async listOAuthTools(): Promise<Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; serverId: string; displayName?: string }>> {
+    try {
+      const tools = this.mcp.listTools() as unknown;
+      const servers = this.getMcpServers().servers as Record<string, { name?: string; server_url?: string } | undefined>;
+      if (!Array.isArray(tools)) return [];
+      const result: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; serverId: string; displayName?: string }> = [];
+      for (const raw of tools) {
+        if (!raw || typeof raw !== "object") continue;
+        const t = raw as { name?: unknown; serverId?: unknown; description?: unknown; inputSchema?: unknown };
+        if (typeof t.name !== "string" || typeof t.serverId !== "string") continue;
+        const server = servers[t.serverId];
+        result.push({
+          name: t.name,
+          description: typeof t.description === "string" ? t.description : undefined,
+          inputSchema: (t.inputSchema && typeof t.inputSchema === "object") ? (t.inputSchema as Record<string, unknown>) : undefined,
+          serverId: t.serverId,
+          displayName: server?.name ?? (server?.server_url ? new URL(server.server_url).host : undefined),
+        });
+      }
+      return result;
+    } catch (err) {
+      log("warn", "listOAuthTools failed", { err: err instanceof Error ? err.message : String(err) });
+      return [];
+    }
+  }
+
+  /**
+   * RPC: invoke an OAuth-connected MCP tool.
+   *
+   * Session DOs call this instead of `this.mcp.callTool` so the OAuth
+   * credentials (which live only in the per-user hub DO) are applied.
+   */
+  async callOAuthTool(serverId: string, toolName: string, args: unknown): Promise<unknown> {
+    return this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
+  }
+
+  /**
+   * Fetch the current user's OAuth MCP tools from the per-user hub DO.
+   *
+   * Called during `connectMcpServers` for session DOs. No-op if this DO
+   * IS the hub (its name matches `owner_email`), since in that case
+   * `this.mcp.listTools()` is the authoritative source already.
+   */
+  private async loadOAuthToolsFromHub(ownerEmail: string): Promise<void> {
+    const normalisedEmail = ownerEmail.trim().toLowerCase();
+    // If this DO IS the hub (keyed by email, not sessionId), skip — callers
+    // will read `this.mcp.listTools()` directly.
+    const myName = this.name ?? "";
+    if (myName === normalisedEmail) {
+      this.cachedOAuthTools = await this.listOAuthTools();
+      return;
+    }
+
+    try {
+      const hubStub = await getAgentByName<Env, CodingAgent>(
+        this.env.CODING_AGENT as unknown as AgentNamespace<CodingAgent>,
+        normalisedEmail,
+      );
+      const tools = await hubStub.listOAuthTools();
+      this.cachedOAuthTools = tools;
+    } catch (err) {
+      log("warn", "loadOAuthToolsFromHub failed", { err: err instanceof Error ? err.message : String(err) });
+      this.cachedOAuthTools = [];
+    }
+  }
+
+  /**
+   * Call an OAuth MCP tool against the per-user hub DO.
+   *
+   * Used by the session DO's tool-executor to route `this.mcp.callTool`
+   * equivalents through the hub where the credentials live.
+   */
+  async callOAuthToolViaHub(serverId: string, toolName: string, args: unknown): Promise<unknown> {
+    const ownerEmail = (this.readMetadata("owner_email") ?? "").trim().toLowerCase();
+    if (!ownerEmail) throw new Error("No owner_email on this session; cannot route OAuth tool to hub");
+    const myName = this.name ?? "";
+    if (myName === ownerEmail) {
+      // We ARE the hub — call directly
+      return this.callOAuthTool(serverId, toolName, args);
+    }
+    const hubStub = await getAgentByName<Env, CodingAgent>(
+      this.env.CODING_AGENT as unknown as AgentNamespace<CodingAgent>,
+      ownerEmail,
+    );
+    return hubStub.callOAuthTool(serverId, toolName, args);
+  }
+
+  /**
    * Connect to enabled MCP servers for this session.
    *
    * Fetches the effective MCP configs from UserControl (respecting per-session
@@ -4866,6 +5057,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // Filter to enabled HTTP configs with URLs
       const enabled = configs.filter((c) => {
         if (!c.enabled || c.type !== "http" || !c.url) return false;
+        if (c.auth_type === "oauth") return false;
         if (c.id === "browser-rendering" && !browserEnabled) return false;
         return true;
       });
@@ -4909,9 +5101,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
 
       this.mcpGatekeepers = connected;
+
+      // Federate OAuth MCP tools from the per-user hub DO. Tools themselves
+      // live in the hub; session DOs only hold a cached list for synchronous
+      // getTools() reads and route callTool through `callOAuthToolViaHub`.
+      await this.loadOAuthToolsFromHub(ownerEmail);
     } catch (error) {
       console.warn("connectMcpServers failed:", error instanceof Error ? error.message : error);
     }
+  }
+
+  async alarm(): Promise<void> {
+    const ownerEmail = this.readMetadata("owner_email");
+    log("info", "mcp-revocation alarm fired", { ownerEmail: ownerEmail ?? null });
+    await this.ctx.storage.setAlarm(Date.now() + 24 * 60 * 60 * 1000);
   }
 
   private async readAppConfig(): Promise<AppConfig> {

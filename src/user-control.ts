@@ -73,6 +73,7 @@ const mcpConfigCreateSchema = z
   .object({
     name: z.string().min(1),
     type: z.enum(["http", "service-binding"]).default("http"),
+    auth_type: z.enum(["oauth", "static_headers"]).default("static_headers"),
     url: z.string().url().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     enabled: z.boolean().default(true),
@@ -83,6 +84,7 @@ const mcpConfigUpdateSchema = z
   .object({
     name: z.string().min(1).optional(),
     type: z.enum(["http", "service-binding"]).optional(),
+    auth_type: z.enum(["oauth", "static_headers"]).optional(),
     url: z.string().url().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     enabled: z.boolean().optional(),
@@ -197,7 +199,7 @@ export class UserControl extends DurableObject<Env> {
     this.db = new SqlHelper(ctx.storage.sql);
     ctx.blockConcurrencyWhile(async () => {
       this.initializeSchema();
-      this.seedDefaults();
+      await this.seedDefaults();
     });
   }
 
@@ -458,6 +460,27 @@ export class UserControl extends DurableObject<Env> {
         return Response.json({ deleted: true, id });
       }
 
+      if (request.method === "POST" && url.pathname === "/user-mcp-tokens") {
+        const { email, label } = await request.json() as { email: string; label?: string };
+        const result = await this.createUserMcpToken(email, label);
+        return Response.json(result);
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/user-mcp-tokens/lookup/")) {
+        const token = decodeURIComponent(url.pathname.slice("/user-mcp-tokens/lookup/".length));
+        const result = this.lookupUserMcpToken(token);
+        return Response.json(result);
+      }
+      if (request.method === "GET" && url.pathname === "/user-mcp-tokens") {
+        const email = request.headers.get("x-owner-email") ?? "";
+        return Response.json(this.listUserMcpTokens(email));
+      }
+      if (request.method === "DELETE" && url.pathname.match(/^\/user-mcp-tokens\/[^/]+$/)) {
+        const token = decodeURIComponent(url.pathname.slice("/user-mcp-tokens/".length));
+        const email = request.headers.get("x-owner-email") ?? "";
+        const ok = await this.deleteUserMcpToken(email, token);
+        return Response.json({ ok });
+      }
+
       if (request.method === "POST" && url.pathname.match(/^\/mcp-configs\/[^/]+\/test$/)) {
         const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
         const row = this.db.one("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
@@ -467,6 +490,26 @@ export class UserControl extends DurableObject<Env> {
         const gatekeeper = new HttpMcpGatekeeper(config);
         const result = await gatekeeper.testConnection();
         return Response.json(result);
+      }
+
+      if (request.method === "GET" && url.pathname === "/approved-mcps") {
+        return Response.json(this.listApprovedMcps());
+      }
+      if (request.method === "POST" && url.pathname === "/approved-mcps") {
+        const body = await request.json() as Parameters<UserControl["createApprovedMcp"]>[0];
+        this.createApprovedMcp(body);
+        return Response.json({ ok: true });
+      }
+      if (request.method === "PUT" && url.pathname.match(/^\/approved-mcps\/[^/]+$/)) {
+        const mcpUrl = decodeURIComponent(url.pathname.slice("/approved-mcps/".length));
+        const body = await request.json() as Parameters<UserControl["updateApprovedMcp"]>[1];
+        const ok = this.updateApprovedMcp(mcpUrl, body);
+        return Response.json({ ok });
+      }
+      if (request.method === "DELETE" && url.pathname.match(/^\/approved-mcps\/[^/]+$/)) {
+        const mcpUrl = decodeURIComponent(url.pathname.slice("/approved-mcps/".length));
+        const ok = this.softDeleteApprovedMcp(mcpUrl);
+        return Response.json({ ok });
       }
 
       // ─── Session MCP Overrides ───
@@ -684,12 +727,12 @@ export class UserControl extends DurableObject<Env> {
         const existing = this.db.one("SELECT id FROM mcp_configs WHERE id = 'browser-rendering'");
         if (existing) {
           this.db.exec(
-            "UPDATE mcp_configs SET url = ?, headers_json = ?, enabled = 1, updated_at = ? WHERE id = 'browser-rendering'",
+            "UPDATE mcp_configs SET url = ?, auth_type = 'static_headers', headers_json = ?, enabled = 1, updated_at = ? WHERE id = 'browser-rendering'",
             mcpUrl, headerKeys, now,
           );
         } else {
           this.db.exec(
-            "INSERT INTO mcp_configs (id, name, type, url, headers_json, enabled, created_at, updated_at) VALUES ('browser-rendering', 'Browser Rendering', 'http', ?, ?, 1, ?, ?)",
+            "INSERT INTO mcp_configs (id, name, type, auth_type, url, headers_json, enabled, created_at, updated_at) VALUES ('browser-rendering', 'Browser Rendering', 'http', 'static_headers', ?, ?, 1, ?, ?)",
             mcpUrl, headerKeys, now, now,
           );
         }
@@ -855,9 +898,32 @@ export class UserControl extends DurableObject<Env> {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         type TEXT NOT NULL DEFAULT 'http',
+        auth_type TEXT NOT NULL DEFAULT 'static_headers',
         url TEXT,
         headers_json TEXT,
         enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    try {
+      this.db.exec("ALTER TABLE mcp_configs ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'static_headers'");
+    } catch {
+      // Column already exists.
+    }
+    this.db.exec("UPDATE mcp_configs SET auth_type = 'static_headers' WHERE auth_type IS NULL OR auth_type = ''");
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS approved_mcps (
+        mcp_url TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        description TEXT,
+        setup_guide TEXT,
+        known_hosts TEXT,
+        auth_type TEXT NOT NULL DEFAULT 'static_headers',
+        status TEXT NOT NULL DEFAULT 'enabled',
+        is_deleted INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )
@@ -900,6 +966,17 @@ export class UserControl extends DurableObject<Env> {
       "CREATE INDEX IF NOT EXISTS idx_scheduled_sessions_next_run ON scheduled_sessions(next_run_epoch) WHERE next_run_epoch IS NOT NULL",
     );
 
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS user_mcp_tokens (
+        token TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        label TEXT,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER
+      )
+    `);
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_email ON user_mcp_tokens (email)");
+
     // TTL cleanup: remove fork snapshots older than 1 hour
     const oneHourAgo = nowEpoch() - 3600;
     this.db.exec("DELETE FROM fork_snapshots WHERE created_at < ?", oneHourAgo);
@@ -907,7 +984,7 @@ export class UserControl extends DurableObject<Env> {
     this.db.exec("DELETE FROM failure_snapshots WHERE created_at < ?", nowEpoch() - 604800);
   }
 
-  private seedDefaults(): void {
+  private async seedDefaults(): Promise<void> {
     const now = nowEpoch();
     const defaults: AppConfig = {
       activeGateway: "opencode",
@@ -920,6 +997,27 @@ export class UserControl extends DurableObject<Env> {
 
     for (const [key, value] of Object.entries(defaults)) {
       this.db.exec("INSERT OR IGNORE INTO user_config (key, value, updated_at) VALUES (?, ?, ?)", key, String(value), now);
+    }
+
+    const existingCount = this.db.one("SELECT COUNT(*) AS n FROM approved_mcps WHERE is_deleted = 0");
+    if (Number(existingCount?.n ?? 0) === 0) {
+      const { MCP_CATALOG } = await import("./mcp-catalog");
+      const seedNow = Date.now();
+      for (const entry of MCP_CATALOG) {
+        this.db.exec(
+          `INSERT INTO approved_mcps (mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status, is_deleted, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'enabled', 0, ?, ?)`,
+          entry.url,
+          entry.id,
+          entry.name,
+          entry.description ?? null,
+          entry.setupGuide ?? null,
+          JSON.stringify(entry.knownHosts ?? []),
+          entry.auth_type ?? "static_headers",
+          seedNow,
+          seedNow,
+        );
+      }
     }
   }
 
@@ -1314,14 +1412,14 @@ export class UserControl extends DurableObject<Env> {
    * Create an MCP config, storing headers as encrypted secrets.
    * The mcp_configs table stores only header key names (not values).
    */
-  private async createMcpConfigEncrypted(input: { name: string; type: string; url?: string; headers?: Record<string, string>; enabled: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
+  private async createMcpConfigEncrypted(input: { name: string; type: string; auth_type: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
     const id = crypto.randomUUID();
     const now = nowEpoch();
     const headerKeys = input.headers ? Object.keys(input.headers) : [];
 
     this.db.exec(
-      "INSERT INTO mcp_configs (id, name, type, url, headers_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      id, input.name, input.type, input.url ?? null, headerKeys.length > 0 ? JSON.stringify(headerKeys) : null, input.enabled ? 1 : 0, now, now,
+      "INSERT INTO mcp_configs (id, name, type, auth_type, url, headers_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id, input.name, input.type, input.auth_type, input.url ?? null, headerKeys.length > 0 ? JSON.stringify(headerKeys) : null, input.enabled ? 1 : 0, now, now,
     );
 
     // Store each header value as an encrypted secret
@@ -1338,7 +1436,7 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Update an MCP config, replacing encrypted header secrets if new headers provided.
    */
-  private async updateMcpConfigEncrypted(id: string, patch: { name?: string; type?: string; url?: string; headers?: Record<string, string>; enabled?: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
+  private async updateMcpConfigEncrypted(id: string, patch: { name?: string; type?: string; auth_type?: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled?: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
     const current = this.getMcpConfigSafe(id);
     const now = nowEpoch();
 
@@ -1358,9 +1456,10 @@ export class UserControl extends DurableObject<Env> {
     }
 
     this.db.exec(
-      "UPDATE mcp_configs SET name = ?, type = ?, url = ?, headers_json = ?, enabled = ?, updated_at = ? WHERE id = ?",
+      "UPDATE mcp_configs SET name = ?, type = ?, auth_type = ?, url = ?, headers_json = ?, enabled = ?, updated_at = ? WHERE id = ?",
       patch.name ?? current.name,
       patch.type ?? current.type,
+      patch.auth_type ?? current.auth_type,
       patch.url ?? current.url ?? null,
       headerKeys.length > 0 ? JSON.stringify(headerKeys) : null,
       (patch.enabled !== undefined ? patch.enabled : current.enabled) ? 1 : 0,
@@ -1397,7 +1496,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private getMcpConfigSafe(id: string): McpGatekeeperConfig & { headerKeys?: string[] } {
-    const row = this.db.one("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
+    const row = this.db.one("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
     if (!row) throw new Error(`MCP config ${id} not found`);
     return this.mapMcpConfigRowSafe(row);
   }
@@ -1406,8 +1505,167 @@ export class UserControl extends DurableObject<Env> {
    * List MCP configs for display. Returns header key names but not values.
    */
   private listMcpConfigsSafe(): Array<McpGatekeeperConfig & { headerKeys?: string[] }> {
-    return this.db.all("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")
+    return this.db.all("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")
       .map((row) => this.mapMcpConfigRowSafe(row));
+  }
+
+  public async createUserMcpToken(email: string, label?: string): Promise<{ token: string; created_at: number }> {
+    const token = `dodo_${crypto.randomUUID().replace(/-/g, "")}`;
+    const normalisedEmail = email.trim().toLowerCase();
+    const now = Date.now();
+    this.db.exec(
+      "INSERT INTO user_mcp_tokens (token, email, label, created_at, last_used_at) VALUES (?, ?, ?, ?, NULL)",
+      token, normalisedEmail, label ?? null, now,
+    );
+    // Sync to SharedIndex so /mcp can look the token up without knowing
+    // which user's DO to ask. Best-effort — if the index write fails, the
+    // token can still be authenticated via the fallback DODO_MCP_TOKEN, but
+    // user-scoped auth will not work for this token.
+    try {
+      const sharedIndex = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
+      await sharedIndex.fetch("https://shared-index/mcp-token-index", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token, email: normalisedEmail }),
+      });
+    } catch (err) {
+      console.warn("[user-control] Failed to sync token to SharedIndex:", err);
+    }
+    return { token, created_at: now };
+  }
+
+  public lookupUserMcpToken(token: string): { email: string; label: string | null; created_at: number } | null {
+    const row = this.db.one("SELECT email, label, created_at FROM user_mcp_tokens WHERE token = ?", token);
+    if (!row) return null;
+    this.db.exec("UPDATE user_mcp_tokens SET last_used_at = ? WHERE token = ?", Date.now(), token);
+    return {
+      email: String(row.email),
+      label: row.label as string | null,
+      created_at: Number(row.created_at),
+    };
+  }
+
+  public listUserMcpTokens(email: string): Array<{ token_prefix: string; label: string | null; created_at: number; last_used_at: number | null }> {
+    const rows = this.db.all(
+      "SELECT token, label, created_at, last_used_at FROM user_mcp_tokens WHERE email = ? ORDER BY created_at DESC",
+      email.trim().toLowerCase(),
+    );
+    return rows.map((r) => ({
+      token_prefix: String(r.token).slice(0, 12) + "…",
+      label: r.label as string | null,
+      created_at: Number(r.created_at),
+      last_used_at: r.last_used_at === null ? null : Number(r.last_used_at),
+    }));
+  }
+
+  public async deleteUserMcpToken(email: string, token: string): Promise<boolean> {
+    const existing = this.db.one("SELECT email FROM user_mcp_tokens WHERE token = ?", token);
+    if (!existing) return false;
+    const normalisedEmail = email.trim().toLowerCase();
+    if (String(existing.email).trim().toLowerCase() !== normalisedEmail) return false;
+    this.db.exec("DELETE FROM user_mcp_tokens WHERE token = ?", token);
+    // Remove the pointer from the global index too
+    try {
+      const sharedIndex = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
+      await sharedIndex.fetch(`https://shared-index/mcp-token-index/${encodeURIComponent(token)}`, { method: "DELETE" });
+    } catch (err) {
+      console.warn("[user-control] Failed to delete token from SharedIndex:", err);
+    }
+    return true;
+  }
+
+  public listApprovedMcps(): Array<{
+    mcp_url: string;
+    id: string;
+    display_name: string;
+    description: string | null;
+    setup_guide: string | null;
+    known_hosts: string[];
+    auth_type: "oauth" | "static_headers";
+    status: "enabled" | "disabled";
+  }> {
+    const rows = this.db.all(
+      "SELECT mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status FROM approved_mcps WHERE is_deleted = 0 ORDER BY display_name ASC",
+    );
+    return rows.map((r) => ({
+      mcp_url: String(r.mcp_url),
+      id: String(r.id),
+      display_name: String(r.display_name),
+      description: r.description as string | null,
+      setup_guide: r.setup_guide as string | null,
+      known_hosts: JSON.parse(String(r.known_hosts ?? "[]")),
+      auth_type: r.auth_type as "oauth" | "static_headers",
+      status: r.status as "enabled" | "disabled",
+    }));
+  }
+
+  public createApprovedMcp(entry: {
+    mcp_url: string;
+    id: string;
+    display_name: string;
+    description?: string;
+    setup_guide?: string;
+    known_hosts?: string[];
+    auth_type?: "oauth" | "static_headers";
+    status?: "enabled" | "disabled";
+  }): void {
+    const now = Date.now();
+    const existing = this.db.one("SELECT mcp_url, is_deleted FROM approved_mcps WHERE mcp_url = ?", entry.mcp_url);
+    if (existing) {
+      this.db.exec(
+        `UPDATE approved_mcps
+         SET id = ?, display_name = ?, description = ?, setup_guide = ?, known_hosts = ?, auth_type = ?, status = ?, is_deleted = 0, updated_at = ?
+         WHERE mcp_url = ?`,
+        entry.id,
+        entry.display_name,
+        entry.description ?? null,
+        entry.setup_guide ?? null,
+        JSON.stringify(entry.known_hosts ?? []),
+        entry.auth_type ?? "static_headers",
+        entry.status ?? "enabled",
+        now,
+        entry.mcp_url,
+      );
+      return;
+    }
+    this.db.exec(
+      `INSERT INTO approved_mcps (mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status, is_deleted, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      entry.mcp_url,
+      entry.id,
+      entry.display_name,
+      entry.description ?? null,
+      entry.setup_guide ?? null,
+      JSON.stringify(entry.known_hosts ?? []),
+      entry.auth_type ?? "static_headers",
+      entry.status ?? "enabled",
+      now,
+      now,
+    );
+  }
+
+  public updateApprovedMcp(mcp_url: string, updates: { display_name?: string; description?: string; setup_guide?: string; status?: "enabled" | "disabled" }): boolean {
+    const existing = this.db.one("SELECT mcp_url FROM approved_mcps WHERE mcp_url = ? AND is_deleted = 0", mcp_url);
+    if (!existing) return false;
+    const setClauses: string[] = [];
+    const values: unknown[] = [];
+    if (updates.display_name !== undefined) { setClauses.push("display_name = ?"); values.push(updates.display_name); }
+    if (updates.description !== undefined) { setClauses.push("description = ?"); values.push(updates.description); }
+    if (updates.setup_guide !== undefined) { setClauses.push("setup_guide = ?"); values.push(updates.setup_guide); }
+    if (updates.status !== undefined) { setClauses.push("status = ?"); values.push(updates.status); }
+    if (setClauses.length === 0) return true;
+    setClauses.push("updated_at = ?");
+    values.push(Date.now());
+    values.push(mcp_url);
+    this.db.exec(`UPDATE approved_mcps SET ${setClauses.join(", ")} WHERE mcp_url = ?`, ...values);
+    return true;
+  }
+
+  public softDeleteApprovedMcp(mcp_url: string): boolean {
+    const existing = this.db.one("SELECT mcp_url FROM approved_mcps WHERE mcp_url = ? AND is_deleted = 0", mcp_url);
+    if (!existing) return false;
+    this.db.exec("UPDATE approved_mcps SET is_deleted = 1, updated_at = ? WHERE mcp_url = ?", Date.now(), mcp_url);
+    return true;
   }
 
   private hasKeyEnvelope(): boolean {
@@ -1438,6 +1696,7 @@ export class UserControl extends DurableObject<Env> {
       id: String(row.id),
       name: String(row.name),
       type: String(row.type) as "http" | "service-binding",
+      auth_type: row.auth_type === "oauth" ? "oauth" : "static_headers",
       url: row.url === null ? undefined : String(row.url),
       headers: undefined, // Never expose header values in listing
       headerKeys,
@@ -1465,6 +1724,7 @@ export class UserControl extends DurableObject<Env> {
       id: String(row.id),
       name: String(row.name),
       type: String(row.type) as "http" | "service-binding",
+      auth_type: row.auth_type === "oauth" ? "oauth" : "static_headers",
       url: row.url === null ? undefined : String(row.url),
       headers: undefined,
       headerKeys,
