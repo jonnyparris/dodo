@@ -60,14 +60,14 @@ Create a scheduled new-session job.
 }
 ```
 
-**Minimums** (rejected at create time):
+**Minimums and bounds** (rejected at create time):
 
-| Field              | Minimum              |
-|--------------------|----------------------|
-| `delayInSeconds`   | 1 (max 90 days)      |
-| `date`             | must be in the future|
-| `intervalSeconds`  | 300 (5 minutes)      |
-| `cron` gap         | next-3-match gap ≥ 300s |
+| Field              | Rule                                |
+|--------------------|-------------------------------------|
+| `delayInSeconds`   | ≥ 1, ≤ 90 days                      |
+| `date`             | must be in the future, ≤ 90 days out|
+| `intervalSeconds`  | ≥ 300 (5 minutes)                   |
+| `cron` gap         | next-3-match gap ≥ 300s             |
 
 **Fork source permission:** if `source: "fork"`, the caller must have
 write access on the source session at create time. Fork sources are
@@ -126,9 +126,14 @@ underlying cause of the stall (e.g. restoring a deleted fork source).
 
 ## Firing semantics
 
-- **Rate-limit.** Each fire counts against the owner's prompt limiter
-  (60 prompts/hour). Rate-limited fires defer `next_run_epoch` by the
-  limiter's `retryAfter` — they don't count as failures.
+- **Rate-limit.** 60 fires per owner per hour, enforced by a **separate**
+  in-memory limiter on each UserControl DO. This is NOT shared with the
+  interactive prompt limiter in `src/index.ts` — the effective combined
+  cap from a single user is 120 prompts/hour (60 interactive + 60
+  scheduled). The window also resets when the DO hibernates and
+  rehydrates (~10 min idle), so this is best-effort abuse prevention
+  rather than a hard quota. Rate-limited fires defer `next_run_epoch`
+  by the limiter's `retryAfter` — they don't count as failures.
 - **Session creation** happens locally in the owning DO to avoid
   DO-to-self deadlock:
   - `fresh` → register a new row in the local `sessions` table with
@@ -167,6 +172,12 @@ Each fire emits a `scheduled_session_fired` event on the user's
 { "type": "scheduled_session_fired", "id": "...", "ok": true,  "lastSessionId": "..." }
 { "type": "scheduled_session_fired", "id": "...", "ok": false, "error": "rate_limited" }
 ```
+
+**Events are ephemeral.** If no client is connected to `/api/events`
+when a schedule fires, the event is lost — there's no buffer, no replay,
+and no catch-up on reconnect. Clients that need guaranteed delivery
+should poll `GET /api/scheduled-sessions/:id` and watch `lastRunAt` /
+`lastSessionId` instead.
 
 ## Constraints explicitly **not** supported (yet)
 

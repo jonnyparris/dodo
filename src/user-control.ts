@@ -147,6 +147,7 @@ const scheduleShapeSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("scheduled"),
+    // Range bound is enforced in createScheduledSession (needs current time)
     date: z.string().datetime(),
   }),
   z.object({
@@ -188,10 +189,22 @@ export class UserControl extends DurableObject<Env> {
   private readonly db: SqlHelper;
   /** SSE clients for user-level events (session list changes, etc.) */
   private readonly sseClients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
-  /** Per-DO rate limiter for scheduled-session fires. Owner-scoped so
-   *  each user has an independent budget. Lives in memory — that's
-   *  acceptable because the alarm handler is the sole consumer and the
-   *  DO isolate only rehydrates rate windows as fires happen. */
+  /**
+   * Rate limiter for scheduled-session fires.
+   *
+   * Semantics (documented honestly — audit finding #19/#27):
+   * - This is SEPARATE from the interactive `promptLimiter` in src/index.ts.
+   *   A user can consume their 60/hr interactive budget AND fire up to
+   *   60 scheduled sessions per hour on top. The effective upper bound
+   *   on prompts originating from a single user is ~120/hr.
+   * - The window is in-memory on this DO instance. When the DO hibernates
+   *   (~10 min idle) and rehydrates, the window resets to zero. This is
+   *   best-effort abuse prevention, not a hard quota.
+   *
+   * If future abuse requires a true shared / durable budget, migrate this
+   * to SharedIndex with an atomic DO counter. Not worth the complexity
+   * until we see the abuse pattern in practice.
+   */
   private readonly scheduledFireLimiter = new RateLimiter();
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -1949,6 +1962,9 @@ export class UserControl extends DurableObject<Env> {
       if (!Number.isFinite(parsed) || parsed <= now) {
         throw new Error("scheduled date must be in the future");
       }
+      if (parsed - now > MAX_DELAY_SECONDS) {
+        throw new Error(`scheduled date must be within ${MAX_DELAY_SECONDS / 86400} days`);
+      }
       targetEpoch = parsed;
       nextRunEpoch = parsed;
     } else if (schedule.type === "cron") {
@@ -2110,13 +2126,13 @@ export class UserControl extends DurableObject<Env> {
 
   /**
    * Alarm handler for scheduled sessions. Fires any overdue rows in
-   * batches of ALARM_BATCH_SIZE. Further overdue rows get a near-immediate
-   * follow-up alarm.
+   * batches of ALARM_BATCH_SIZE. If more rows remain overdue after the
+   * batch, re-arm for ~1s later; otherwise arm to the next future fire.
    *
-   * The input gate serialises alarm() with fetch() handlers, so mutations
-   * here don't race with /scheduled-sessions POST/DELETE. Individual row
-   * processing re-reads under blockConcurrencyWhile so a DELETE mid-alarm
-   * is safe.
+   * The DO input gate serialises alarm() with fetch handlers, so a
+   * concurrent DELETE can't interleave between rows. The per-iteration
+   * row re-read guards against an earlier iteration in THIS same alarm
+   * having mutated the row (e.g. a dependency row deleted mid-batch).
    */
   async alarm(): Promise<void> {
     const ALARM_BATCH_SIZE = 10;
@@ -2180,8 +2196,9 @@ export class UserControl extends DurableObject<Env> {
       return;
     }
 
-    // Rate-limit check — matches the interactive prompt route's limits
-    // (60 prompts per user per hour).
+    // Rate-limit check. 60 fires per owner per hour — matches the interactive
+    // limit *shape* but is a separate in-memory budget (see scheduledFireLimiter
+    // field comment). Effective cap is 120/hr combined: interactive + scheduled.
     const rl = this.scheduledFireLimiter.check(`prompt:${ownerEmail}`, 60, 60 * 60 * 1000);
     if (!rl.allowed) {
       const retryAfter = rl.retryAfter ?? 60;
