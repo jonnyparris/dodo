@@ -26,6 +26,10 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
 - Do not introduce container- or VM-specific assumptions.
 - All Think imports route through `src/think-adapter.ts` — never import `@cloudflare/think` directly elsewhere.
 
+## Deploying
+
+**Deploys are manual.** Run `npm run deploy` locally after merging to `main`. Workers Builds CI is disabled because the `"experimental"` compat flag (required by `@cloudflare/think` and the Agents SDK `subAgent()` facet API) blocks non-local deploys by design — see [issue #46](https://github.com/jonnyparris/dodo/issues/46). When Think graduates out of experimental, this can be re-enabled.
+
 ## Git Discipline — Worktrees Required
 
 **Never commit directly to `main`.** Multiple agents may work on this repo concurrently. All changes must go through feature branches.

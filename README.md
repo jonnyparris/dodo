@@ -327,6 +327,14 @@ npm run typecheck    # Type check
 npm run deploy       # Build + deploy
 ```
 
+### Deploying
+
+Deploys are **manual**: run `npm run deploy` from a workstation authenticated to your Cloudflare account.
+
+Workers Builds CI was intentionally disabled because Dodo uses the `"experimental"` compatibility flag (required by `@cloudflare/think` and the Agents SDK `subAgent()` facet API). The `experimental` flag is designed to block non-local deploys — local `wrangler deploy` currently works, but the Workers Builds service enforces the policy and rejects every automated deploy. See [issue #46](https://github.com/jonnyparris/dodo/issues/46) for the full diagnosis.
+
+When `@cloudflare/think` graduates out of experimental, the flag can be removed and Workers Builds re-enabled.
+
 ## Contributing
 
 Contributions welcome. Open an issue first for anything non-trivial.
