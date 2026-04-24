@@ -285,18 +285,4 @@ export interface ScheduledSessionRecord {
   createdBy: string;
 }
 
-export type CreateScheduledSessionRequest =
-  (
-    | { type: "delayed"; delayInSeconds: number }
-    | { type: "scheduled"; date: string }
-    | { type: "cron"; cron: string }
-    | { type: "interval"; intervalSeconds: number }
-  )
-  & (
-    | { source: "fresh"; title?: string }
-    | { source: "fork"; sourceSessionId: string; title?: string }
-  )
-  & {
-    description: string;
-    prompt: string;
-  };
+

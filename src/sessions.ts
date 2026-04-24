@@ -1,16 +1,22 @@
 /**
  * Session lifecycle helpers.
  *
- * Extracted from src/index.ts and src/mcp.ts so they can be called from any
- * context (Hono route, UserControl alarm, MCP tool) without duplicating the
- * DO-hopping logic.
+ * Extracted from src/index.ts and src/mcp.ts so the snapshot → register →
+ * import → cleanup pipeline has a single source of truth.
  *
- * No Hono / no Request context required — callers just pass env + owner email.
+ * No Hono / no Request context required — callers pass env + owner email.
+ *
+ * Note: `UserControl.alarm()` deliberately does NOT call these helpers.
+ * From inside a UserControl DO, calling `getUserControlStub(env, email).fetch(...)`
+ * targets the same DO we're already executing in, which deadlocks under the
+ * input gate. Alarm code writes directly to the local DB via
+ * `registerScheduledFreshSession` / `forkScheduledSession` on the DO class
+ * instead.
  */
 
 import { getAgentByName } from "agents";
 import { getUserControlStub } from "./auth";
-import type { AppConfig, Env } from "./types";
+import type { Env } from "./types";
 
 /** Thrown by `forkSessionInternal` when the source session is gone. */
 export class SourceSessionMissingError extends Error {
@@ -30,32 +36,6 @@ async function userControlFetch(
   const headers = new Headers(init?.headers);
   headers.set("x-owner-email", ownerEmail);
   return stub.fetch(`https://user-control${path}`, { ...init, headers });
-}
-
-/**
- * Create a fresh, empty session registered to `ownerEmail`.
- *
- * Mirrors the `POST /session` code path in src/index.ts minus delegation /
- * account-permissions / stats-increment — callers that need those can add
- * them. Used by the scheduled-session alarm path where we already know the
- * owner and delegation isn't relevant.
- */
-export async function createFreshSessionInternal(
-  env: Env,
-  ownerEmail: string,
-  title: string | null,
-): Promise<{ id: string }> {
-  const id = crypto.randomUUID();
-  const res = await userControlFetch(env, ownerEmail, "/sessions", {
-    body: JSON.stringify({ id, title, ownerEmail, createdBy: ownerEmail }),
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Failed to register session: ${res.status} ${text}`);
-  }
-  return { id };
 }
 
 /**
@@ -151,52 +131,4 @@ export async function forkSessionInternal(
   }
 
   return { id: sessionId, sourceId: sourceSessionId };
-}
-
-/**
- * Dispatch a prompt to an existing session's CodingAgent.
- *
- * Reads the owner's current config for model/gateway (matching interactive
- * prompt behaviour — the model you get is the model set on the account when
- * the prompt runs, not when it was scheduled).
- *
- * The authorEmail defaults to ownerEmail but callers (e.g. the scheduled-
- * session alarm) can pass a sentinel like "scheduled-session" to distinguish
- * automated dispatches from user prompts in logs and message metadata.
- */
-export async function dispatchPromptInternal(
-  env: Env,
-  sessionId: string,
-  ownerEmail: string,
-  prompt: string,
-  opts?: { authorEmail?: string; config?: AppConfig },
-): Promise<Response> {
-  const config = opts?.config ?? (await readConfigInternal(env, ownerEmail));
-  const authorEmail = opts?.authorEmail ?? ownerEmail;
-
-  const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
-  return agent.fetch(
-    new Request(`https://coding-agent/prompt`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-dodo-session-id": sessionId,
-        "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-        "x-dodo-gateway": config.activeGateway,
-        "x-dodo-model": config.model,
-        "x-dodo-opencode-base-url": config.opencodeBaseURL,
-        "x-author-email": authorEmail,
-        "x-owner-email": ownerEmail,
-      },
-      body: JSON.stringify({ content: prompt }),
-    }),
-  );
-}
-
-async function readConfigInternal(env: Env, ownerEmail: string): Promise<AppConfig> {
-  const res = await userControlFetch(env, ownerEmail, "/config");
-  if (!res.ok) {
-    throw new Error(`Failed to read config for ${ownerEmail}: ${res.status}`);
-  }
-  return (await res.json()) as AppConfig;
 }
