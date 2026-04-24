@@ -809,8 +809,13 @@ const EXPLORE_SYSTEM_PROMPT = [
   "- Focus on answering the user's specific question, not cataloguing everything.",
 ].join("\n");
 
-/** Max steps for the explore subagent. */
-const EXPLORE_MAX_STEPS = 5;
+/** Max steps for the explore subagent.
+ *  Bumped from 5 to 12 after observing in the 2026-04-24 demo sessions
+ *  (`877cefcc`, `197cc126`, `fdad8393`) that 5 steps was routinely consumed
+ *  by tool-calling before the model got a chance to emit its final summary.
+ *  12 gives enough headroom for multi-grep/read investigations while still
+ *  capping a runaway loop. */
+const EXPLORE_MAX_STEPS = 12;
 
 /** Cheap model for the explore subagent, keyed by provider prefix.
  *  Falls back to the main model if no match (still works, just costs more). */
@@ -913,7 +918,11 @@ function buildSubagentTool(spec: {
           messages: [{ role: "user" as const, content: userMessage }],
           tools: spec.getTools(),
           stopWhen: stepCountIs(spec.maxSteps),
-          maxOutputTokens: 2000,
+          // Bumped from 2000 → 4000. The explore/task subagents frequently
+          // summarize 5-10 files' worth of findings; 2000 tokens was clipping
+          // the summary mid-sentence after the model ran its tool budget.
+          // 4000 still small enough to keep the subagent's turn compact.
+          maxOutputTokens: 4000,
           abortSignal: AbortSignal.timeout(spec.timeoutMs),
         });
 
@@ -922,12 +931,27 @@ function buildSubagentTool(spec: {
         const toolCalls = result.steps.flatMap((s) =>
           (s.toolCalls ?? []).map((tc) => tc.toolName),
         );
+        // Sum per-step usage into a single subagent cost line. Surfacing
+        // this matters for observability — "explore used 40k tokens" is a
+        // cost the parent can't see otherwise since the subagent's LLM
+        // calls don't touch the parent's message_metadata totals.
+        const totalInput = result.steps.reduce(
+          (sum, s) => sum + (s.usage?.inputTokens ?? 0),
+          0,
+        );
+        const totalOutput = result.steps.reduce(
+          (sum, s) => sum + (s.usage?.outputTokens ?? 0),
+          0,
+        );
+        const usageLine = totalInput > 0 || totalOutput > 0
+          ? `**Tokens:** ${totalInput} in / ${totalOutput} out | `
+          : "";
 
         return [
           `## ${spec.name} results (model: ${modelId})`,
-          `**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
+          `${usageLine}**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
           "",
-          summary || "(No output)",
+          summary || "(No output — subagent ran its tool budget without emitting a summary. Try a narrower query or a higher-capability model via the `model` arg.)",
         ].filter(Boolean).join("\n");
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
