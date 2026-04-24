@@ -3,7 +3,7 @@
   "name": "dodo",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-10",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "experimental"],
   "durable_objects": {
     "bindings": [
       { "name": "CODING_AGENT", "class_name": "CodingAgent" },
@@ -31,6 +31,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["UserControl", "SharedIndex"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["ExploreAgent", "TaskAgent"]
     }
   ],
   "r2_buckets": [

@@ -49,6 +49,10 @@ export interface DodoConfig {
   exploreModel?: string;
   /** Default model for the `task` subagent. See AppConfig for details. */
   taskModel?: string;
+  /** Explore-subagent dispatch mode (inprocess | facet). See AppConfig. */
+  exploreMode?: "inprocess" | "facet";
+  /** Task-subagent dispatch mode (inprocess | facet). See AppConfig. */
+  taskMode?: "inprocess" | "facet";
 }
 
 /** Sidecar metadata for each Think message — Dodo-specific fields. */

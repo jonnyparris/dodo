@@ -990,6 +990,8 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     systemPromptPrefix: z.string().optional().describe("Personal preamble prepended to the system prompt. Pass empty string to clear."),
     exploreModel: z.string().optional().describe("Default model for the `explore` subagent. Leave unset to use the env default (Kimi K2.6). Pass empty string to clear and fall back to the built-in heuristic."),
     taskModel: z.string().optional().describe("Default model for the `task` subagent. Leave unset to use the env default (Haiku 4.5). Pass empty string to clear and fall back to the built-in heuristic."),
+    exploreMode: z.enum(["inprocess", "facet"]).optional().describe("Where the `explore` subagent runs. `inprocess` (default) = blocking generateText call in the parent turn. `facet` = delegates to a separately-addressable Durable Object facet on the same machine; unlocks parallel explore fan-out."),
+    taskMode: z.enum(["inprocess", "facet"]).optional().describe("Where the `task` subagent runs. Same semantics as `exploreMode`. Paired with phase-4 scratch-workspace support for isolated experiments."),
   }, async (params) =>
     jsonFetch(env, "user", "/config", {
       init: { body: JSON.stringify(params), headers: { "content-type": "application/json" }, method: "PUT" },

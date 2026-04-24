@@ -89,6 +89,25 @@ export interface AppConfig {
   exploreModel?: string;
   /** Same as exploreModel but for the generic `task` subagent. */
   taskModel?: string;
+  /**
+   * Where explore subagent work runs.
+   *
+   * - `"inprocess"` (default): today's path — a blocking `generateText()`
+   *   call inside the parent's turn, tools share the parent's workspace.
+   * - `"facet"`: delegates to `ExploreAgent`, a separately-addressable
+   *   Durable Object (facet) on the same machine. Unlocks parallel
+   *   explore fan-out (phase 3) and lets long explores run without
+   *   parking the parent's turn against the step budget.
+   *
+   * Both modes produce the same output shape. Default stays `"inprocess"`
+   * so a config-level rollback is a no-op toggle.
+   */
+  exploreMode?: "inprocess" | "facet";
+  /**
+   * Where task subagent work runs — see `exploreMode` for semantics.
+   * Paired with phase-4 scratch-workspace support.
+   */
+  taskMode?: "inprocess" | "facet";
 }
 
 export interface AccessIdentity {
@@ -140,6 +159,10 @@ export interface UpdateConfigRequest {
   exploreModel?: string;
   /** Pass empty string to clear. Must be a valid model ID if set. */
   taskModel?: string;
+  /** Override explore-subagent dispatch mode. See AppConfig.exploreMode. */
+  exploreMode?: "inprocess" | "facet";
+  /** Override task-subagent dispatch mode. See AppConfig.taskMode. */
+  taskMode?: "inprocess" | "facet";
 }
 
 export interface SessionIndexRecord {

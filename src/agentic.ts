@@ -54,6 +54,41 @@ export interface BuildToolsOptions {
    * `todo_add` / `todo_update` / `todo_list` / `todo_clear` tools.
    */
   todoStore?: TodoStore;
+  /**
+   * Parent CodingAgent reference — used when `config.exploreMode` or
+   * `config.taskMode` is `"facet"` so the explore / task tools can
+   * delegate to `runExploreFacet` / `runTaskFacet`. Typed loosely here
+   * to avoid a circular type import — the concrete type is `CodingAgent`.
+   */
+  parentAgent?: {
+    runExploreFacet: (
+      name: string,
+      opts: { q: string; scope?: string; model?: string },
+    ) => Promise<{
+      ok: true;
+      facetName: string;
+      summary: string;
+      tokenInput: number;
+      tokenOutput: number;
+    }>;
+    runTaskFacet: (
+      name: string,
+      opts: {
+        prompt: string;
+        scope?: string;
+        model?: string;
+        workspaceMode?: "shared" | "scratch";
+      },
+    ) => Promise<{
+      ok: true;
+      facetName: string;
+      summary: string;
+      workspaceMode: "shared" | "scratch";
+      tokenInput: number;
+      tokenOutput: number;
+      scratchWrites?: string[];
+    }>;
+  };
 }
 
 // ─── Tool Output Caps (OpenCode Pattern #1) ───
@@ -97,7 +132,7 @@ const CODEMODE_LOGS_MAX_BYTES = 4_000;
  * Each tool's execute function is intercepted: the result is serialized,
  * checked against its cap, and truncated with an actionable hint if exceeded.
  */
-function capToolOutputs(tools: Record<string, AnyTool>): Record<string, AnyTool> {
+export function capToolOutputs(tools: Record<string, AnyTool>): Record<string, AnyTool> {
   const wrapped: Record<string, AnyTool> = {};
   for (const [name, t] of Object.entries(tools)) {
     const caps = TOOL_OUTPUT_CAPS[name];
@@ -797,7 +832,7 @@ function buildGitTools(
 // context window. Returns a compact summary (~500-1000 tokens) instead of
 // raw file contents (~5000-20000 tokens), saving 5-20× tokens per search.
 
-const EXPLORE_SYSTEM_PROMPT = [
+export const EXPLORE_SYSTEM_PROMPT = [
   "You are a search assistant. Your job is to find files and code relevant to the user's query.",
   "",
   "## Rules",
@@ -815,7 +850,7 @@ const EXPLORE_SYSTEM_PROMPT = [
  *  by tool-calling before the model got a chance to emit its final summary.
  *  12 gives enough headroom for multi-grep/read investigations while still
  *  capping a runaway loop. */
-const EXPLORE_MAX_STEPS = 12;
+export const EXPLORE_MAX_STEPS = 12;
 
 /** Cheap model for the explore subagent, keyed by provider prefix.
  *  Falls back to the main model if no match (still works, just costs more). */
@@ -825,7 +860,7 @@ const EXPLORE_MODELS: Record<string, string> = {
   "google/": "google/gemini-2.5-flash",
   "deepseek/": "deepseek/deepseek-chat",
 };
-function getExploreModel(mainModel: string): string {
+export function getExploreModel(mainModel: string): string {
   for (const [prefix, model] of Object.entries(EXPLORE_MODELS)) {
     if (mainModel.startsWith(prefix)) return model;
   }
@@ -833,15 +868,18 @@ function getExploreModel(mainModel: string): string {
 }
 
 /** Timeout for the explore subagent (ms). Prevents indefinite blocking. */
-const EXPLORE_TIMEOUT_MS = 60_000;
+export const EXPLORE_TIMEOUT_MS = 60_000;
 
 /** Max steps for the generic task subagent (slightly higher than explore). */
-const TASK_MAX_STEPS = 15;
+export const TASK_MAX_STEPS = 15;
 
-/** Timeout for the generic task subagent (ms). */
-const TASK_TIMEOUT_MS = 180_000;
+/** Timeout for the generic task subagent (ms).
+ *  Raised to 600s when the task runs inside a facet — the facet has its
+ *  own DO request lifetime and isn't bound by the parent's turn budget. */
+export const TASK_TIMEOUT_MS = 180_000;
+export const TASK_FACET_TIMEOUT_MS = 600_000;
 
-const TASK_SYSTEM_PROMPT = [
+export const TASK_SYSTEM_PROMPT = [
   "You are a focused subagent dispatched by the main Dodo agent to handle one bounded task.",
   "",
   "## Rules",
@@ -973,8 +1011,115 @@ function buildExploreTool(
   workspace: Workspace,
   config: AppConfig,
   env: Env,
+  parentAgent?: BuildToolsOptions["parentAgent"],
 ): AnyTool {
-  // Build read-only workspace tools for the explore subagent
+  // Branch on `config.exploreMode`:
+  //
+  //   - "facet"     → delegate to the parent CodingAgent's
+  //                   `runExploreFacet`, which spins up an ExploreAgent
+  //                   facet DO and returns the same formatted summary.
+  //                   The parent's turn is still blocked on `await`, but
+  //                   the LLM turns happen in a separate DO (separate
+  //                   context window, no shared step budget).
+  //   - "inprocess" → today's path: `generateText` inside the tool's
+  //                   own execute, tools share the parent's workspace
+  //                   directly. Default — easy to roll back.
+  //
+  // Both paths return the same `## Explore results` shape so the caller
+  // model sees identical output.
+  if (config.exploreMode === "facet" && parentAgent) {
+    return tool({
+      description: [
+        "Search the workspace for files and code matching a query (or multiple queries).",
+        "Runs autonomous search agents (facets) that use grep, find, list, and read to explore",
+        "the codebase, then return compact summaries of findings (file paths, line numbers, key observations).",
+        "Much more token-efficient than reading files directly for open-ended searches.",
+        "Pass `query` for a single search, or `queries` (array) to fan out N parallel searches in one tool call —",
+        "the facet-mode backend runs them concurrently, cutting wall time roughly N× when searches are independent.",
+        "Use when you need to find where something is defined, locate files matching a pattern,",
+        "or understand how a feature is implemented across multiple files.",
+      ].join(" "),
+      inputSchema: zodSchema(z.object({
+        query: z.string().min(1).optional().describe(
+          "A single search query — use this OR `queries`, not both. E.g. 'Find all files that handle CSS escaping' or 'Where is the database connection pool configured?'",
+        ),
+        queries: z.array(z.string().min(1)).min(1).max(5).optional().describe(
+          "Array of independent search queries to fan out in parallel (facet mode only; falls back to sequential in inprocess mode). Max 5 per call. Results are concatenated with a `## Query N: <q>` header per entry.",
+        ),
+        scope: z.string().optional().describe(
+          "Optional directory to scope the search to (e.g. 'src/' or 'lib/utils'). Applied to every query.",
+        ),
+        model: z.string().optional().describe(
+          "Optional model override for this call (e.g. '@cf/moonshotai/kimi-k2.6', 'anthropic/claude-haiku-4-5'). Leave unset to use the session default.",
+        ),
+      })),
+      execute: async (args: Record<string, unknown>) => {
+        const scope = typeof args.scope === "string" ? args.scope : undefined;
+        const model = typeof args.model === "string" ? args.model : undefined;
+
+        // Normalize input → list of queries. Accept either form; reject
+        // the "both" case to avoid the model passing contradictory args.
+        const rawQueries = Array.isArray(args.queries)
+          ? args.queries.filter((q): q is string => typeof q === "string" && q.trim().length > 0)
+          : [];
+        const rawQuery = typeof args.query === "string" ? args.query.trim() : "";
+
+        if (rawQueries.length === 0 && rawQuery.length === 0) {
+          return "Explore requires `query` (string) or `queries` (non-empty array).";
+        }
+        if (rawQueries.length > 0 && rawQuery.length > 0) {
+          return "Explore received both `query` and `queries` — pick one.";
+        }
+
+        const queries = rawQueries.length > 0 ? rawQueries : [rawQuery];
+
+        // Single query: keep the existing single-summary output shape so
+        // the model's tool-handling code doesn't need to care about the
+        // fan-out wrapper when only one query came in.
+        if (queries.length === 1) {
+          try {
+            const result = await parentAgent.runExploreFacet("pool-explore-0", {
+              q: queries[0], scope, model,
+            });
+            return result.summary;
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            return `Explore failed (facet mode): ${msg}`;
+          }
+        }
+
+        // Parallel fan-out: spawn N facets by pool index and Promise.all
+        // them. Order of the returned summaries matches the input order
+        // so the model can reliably cross-reference "Query 1" etc.
+        const settled = await Promise.allSettled(
+          queries.map((q, idx) =>
+            parentAgent.runExploreFacet(`pool-explore-${idx}`, { q, scope, model }),
+          ),
+        );
+
+        const blocks: string[] = [
+          `# Parallel explore — ${queries.length} queries in parallel`,
+          "",
+        ];
+        for (let i = 0; i < settled.length; i++) {
+          const q = queries[i];
+          const outcome = settled[i];
+          blocks.push(`## Query ${i + 1}: ${q}`, "");
+          if (outcome.status === "fulfilled") {
+            blocks.push(outcome.value.summary, "");
+          } else {
+            const reason = outcome.reason instanceof Error
+              ? outcome.reason.message
+              : String(outcome.reason);
+            blocks.push(`(query ${i + 1} failed: ${reason})`, "");
+          }
+        }
+        return blocks.join("\n").trimEnd();
+      },
+    });
+  }
+
+  // Build read-only workspace tools for the explore subagent (in-process path).
   const allWsTools = createWorkspaceTools(workspace);
   const readOnlyTools = capToolOutputs({
     read: allWsTools.read,
@@ -983,27 +1128,18 @@ function buildExploreTool(
     grep: allWsTools.grep,
   });
 
-  return buildSubagentTool({
+  // Underlying single-query subagent tool. Wrapped below to accept
+  // `queries` (array) as a sibling to `query` — in-process mode cannot
+  // parallelise (generateText blocks its caller), so multi-query
+  // requests run sequentially and the result header flags that.
+  const singleQueryTool = buildSubagentTool({
     name: "Explore",
-    description: [
-      "Search the workspace for files and code matching a query.",
-      "Runs an autonomous search agent that uses grep, find, list, and read to explore the codebase,",
-      "then returns a compact summary of findings (file paths, line numbers, key observations).",
-      "Much more token-efficient than reading files directly for open-ended searches.",
-      "Use this when you need to find where something is defined, locate files matching a pattern,",
-      "or understand how a feature is implemented across multiple files.",
-    ].join(" "),
+    description: "internal — wrapped below",
     systemPrompt: EXPLORE_SYSTEM_PROMPT,
     inputSchema: zodSchema(z.object({
-      query: z.string().min(1).describe(
-        "What to search for — be specific. E.g. 'Find all files that handle CSS escaping' or 'Where is the database connection pool configured?'",
-      ),
-      scope: z.string().optional().describe(
-        "Optional directory to scope the search to (e.g. 'src/' or 'lib/utils'). Omit to search the entire workspace.",
-      ),
-      model: z.string().optional().describe(
-        "Optional model override for this call (e.g. '@cf/moonshotai/kimi-k2.6', 'anthropic/claude-haiku-4-5'). Leave unset to use the session default (configured via PUT /config exploreModel, defaults to Kimi K2.6).",
-      ),
+      query: z.string().min(1),
+      scope: z.string().optional(),
+      model: z.string().optional(),
     })),
     getUserMessage: (args) => {
       const query = String(args.query ?? "");
@@ -1016,6 +1152,74 @@ function buildExploreTool(
     maxSteps: EXPLORE_MAX_STEPS,
     timeoutMs: EXPLORE_TIMEOUT_MS,
     sessionDefaultModel: config.exploreModel,
+  });
+
+  const singleExec = (singleQueryTool as AnyTool).execute as (args: Record<string, unknown>) => Promise<unknown>;
+
+  return tool({
+    description: [
+      "Search the workspace for files and code matching a query (or multiple queries).",
+      "Runs an autonomous search agent that uses grep, find, list, and read to explore the codebase,",
+      "then returns a compact summary of findings (file paths, line numbers, key observations).",
+      "Much more token-efficient than reading files directly for open-ended searches.",
+      "Pass `query` for a single search, or `queries` (array) to run N searches in one tool call.",
+      "NOTE: in in-process mode multi-query runs sequentially; switch to `exploreMode=facet` for parallel fan-out.",
+      "Use when you need to find where something is defined, locate files matching a pattern,",
+      "or understand how a feature is implemented across multiple files.",
+    ].join(" "),
+    inputSchema: zodSchema(z.object({
+      query: z.string().min(1).optional().describe(
+        "A single search query — use this OR `queries`, not both. E.g. 'Find all files that handle CSS escaping' or 'Where is the database connection pool configured?'",
+      ),
+      queries: z.array(z.string().min(1)).min(1).max(5).optional().describe(
+        "Array of search queries. In in-process mode these run sequentially; in facet mode they fan out in parallel. Max 5.",
+      ),
+      scope: z.string().optional().describe(
+        "Optional directory to scope the search to (e.g. 'src/' or 'lib/utils'). Applied to every query.",
+      ),
+      model: z.string().optional().describe(
+        "Optional model override for this call. Leave unset to use the session default.",
+      ),
+    })),
+    execute: async (args: Record<string, unknown>) => {
+      const scope = typeof args.scope === "string" ? args.scope : undefined;
+      const model = typeof args.model === "string" ? args.model : undefined;
+      const rawQueries = Array.isArray(args.queries)
+        ? args.queries.filter((q): q is string => typeof q === "string" && q.trim().length > 0)
+        : [];
+      const rawQuery = typeof args.query === "string" ? args.query.trim() : "";
+
+      if (rawQueries.length === 0 && rawQuery.length === 0) {
+        return "Explore requires `query` (string) or `queries` (non-empty array).";
+      }
+      if (rawQueries.length > 0 && rawQuery.length > 0) {
+        return "Explore received both `query` and `queries` — pick one.";
+      }
+
+      const queries = rawQueries.length > 0 ? rawQueries : [rawQuery];
+
+      if (queries.length === 1) {
+        return singleExec({ query: queries[0], scope, model });
+      }
+
+      // In-process fan-out is sequential by construction. Flagged in the
+      // header so the parent model knows latency scales N×.
+      const blocks: string[] = [
+        `# Sequential explore — ${queries.length} queries (in-process mode; switch exploreMode=facet for parallel)`,
+        "",
+      ];
+      for (let i = 0; i < queries.length; i++) {
+        blocks.push(`## Query ${i + 1}: ${queries[i]}`, "");
+        try {
+          const result = await singleExec({ query: queries[i], scope, model });
+          blocks.push(typeof result === "string" ? result : JSON.stringify(result), "");
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          blocks.push(`(query ${i + 1} failed: ${msg})`, "");
+        }
+      }
+      return blocks.join("\n").trimEnd();
+    },
   });
 }
 
@@ -1032,10 +1236,73 @@ function buildTaskTool(
   workspace: Workspace,
   config: AppConfig,
   env: Env,
+  parentAgent?: BuildToolsOptions["parentAgent"],
 ): AnyTool {
-  // Read-write tool subset — mutating tools included so the task can edit
-  // files, but no git tools (we don't want a subagent pushing branches)
-  // and no codemode (too broad — the main agent should own that).
+  // Facet branch — delegate to the parent's runTaskFacet which spins up
+  // a TaskAgent facet DO. Supports a new `workspaceMode` arg that the
+  // in-process path can't offer (the in-process subagent always shares
+  // the parent's workspace).
+  if (config.taskMode === "facet" && parentAgent) {
+    return tool({
+      description: [
+        "Delegate a focused, bounded sub-task to a TaskAgent facet with its own context window.",
+        "The facet gets workspace tools (read, list, find, grep, write, edit) and returns a compact summary.",
+        "Use for multi-step sub-tasks that would otherwise eat the main conversation's step budget and context:",
+        "'update all imports of X to Y', 'review these 6 files and list bugs', 'rename MyClass to TheirClass everywhere'.",
+        "",
+        "workspaceMode:",
+        "  - 'shared' (default) — facet writes land directly in the main workspace",
+        "  - 'scratch' — facet writes go to a scratch workspace; call applyFromScratch to merge back",
+        "",
+        "Do NOT use for one-shot operations (just call the tool directly) or anything requiring git/codemode/browser.",
+      ].join("\n"),
+      inputSchema: zodSchema(z.object({
+        prompt: z.string().min(1).describe(
+          "The task to perform. Be specific and self-contained — the facet has no access to your conversation. Include file paths, names, and acceptance criteria.",
+        ),
+        scope: z.string().optional().describe(
+          "Optional directory to scope the task to (e.g. 'src/'). Hint only.",
+        ),
+        model: z.string().optional().describe(
+          "Optional model override for this call. Leave unset to use the session default.",
+        ),
+        workspaceMode: z.enum(["shared", "scratch"]).optional().describe(
+          "Workspace isolation. 'shared' (default) writes to the main workspace. 'scratch' writes to an isolated workspace you can merge back via applyFromScratch. Use 'scratch' for reversible experiments.",
+        ),
+      })),
+      execute: async (args: Record<string, unknown>) => {
+        const workspaceMode = args.workspaceMode === "scratch" ? "scratch" : "shared";
+        try {
+          const result = await parentAgent.runTaskFacet("pool-task-0", {
+            prompt: String(args.prompt ?? ""),
+            scope: typeof args.scope === "string" ? args.scope : undefined,
+            model: typeof args.model === "string" ? args.model : undefined,
+            workspaceMode,
+          });
+          if (result.workspaceMode === "scratch" && result.scratchWrites?.length) {
+            return [
+              result.summary,
+              "",
+              `**Scratch writes (${result.scratchWrites.length} files):**`,
+              ...result.scratchWrites.map((p) => `- ${p}`),
+              "",
+              "Writes landed in an isolated scratch workspace — the main workspace is unchanged.",
+              `To merge a subset back into the main workspace, ask the user to \`POST /session/<id>/facets/${result.facetName}/apply\` with \`{ "paths": [...] }\`.`,
+              "Or — if the caller has already confirmed — the parent can call `applyTaskScratch(facetName, paths)` directly via RPC.",
+            ].join("\n");
+          }
+          return result.summary;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return `Task failed (facet mode): ${msg}`;
+        }
+      },
+    });
+  }
+
+  // In-process branch (default) — unchanged from before phase 4. Workspace
+  // is always shared; workspaceMode arg is silently ignored here since
+  // in-process has no scratch implementation.
   const allWsTools = createWorkspaceTools(workspace);
   const taskTools = capToolOutputs({
     read: allWsTools.read,
@@ -1054,6 +1321,7 @@ function buildTaskTool(
       "Use for multi-step sub-tasks that would otherwise eat the main conversation's step budget and context:",
       "'update all imports of X to Y', 'review these 6 files and list bugs', 'rename MyClass to TheirClass everywhere'.",
       "Do NOT use for one-shot operations (just call the tool directly) or anything requiring git/codemode/browser.",
+      "NOTE: in-process mode always shares the main workspace. Switch to taskMode=facet to enable scratch workspaces.",
     ].join(" "),
     systemPrompt: TASK_SYSTEM_PROMPT,
     inputSchema: zodSchema(z.object({
@@ -1287,13 +1555,16 @@ function buildTools(
   // Git tools — always available as top-level tools
   Object.assign(tools, gitTools);
 
-  // Explore tool — search subagent for token-efficient codebase discovery
-  tools.explore = buildExploreTool(workspace, config, env);
+  // Explore tool — search subagent for token-efficient codebase discovery.
+  // When `config.exploreMode === "facet"`, the tool delegates to an
+  // ExploreAgent facet DO; see `buildExploreTool` for the branch.
+  tools.explore = buildExploreTool(workspace, config, env, options?.parentAgent);
 
   // Task tool — generic subagent for bounded sub-tasks. Keeps the main
   // conversation's step budget free when a chunk of work can be safely
-  // delegated to a fresh context window.
-  tools.task = buildTaskTool(workspace, config, env);
+  // delegated to a fresh context window. When `config.taskMode === "facet"`,
+  // delegates to a TaskAgent facet DO and unlocks scratch-workspace mode.
+  tools.task = buildTaskTool(workspace, config, env, options?.parentAgent);
 
   // Todo tools — durable checklist backed by per-session SQLite. Helps the
   // model stay oriented across long multi-step tasks and compactions.

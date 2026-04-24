@@ -5,6 +5,8 @@ import { flushTurnToArtifacts } from "./artifacts-flush";
 import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
+import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
+import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
 import type { AttachmentRef } from "./attachments";
 import { rewriteAttachmentsForClient, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
@@ -372,6 +374,17 @@ function normalizePath(path: string): string {
   return `/${resolved.join("/")}`;
 }
 
+/**
+ * Thrown when a caller references a facet name that has no run history
+ * on this session. Maps to HTTP 404 at the request boundary.
+ */
+export class FacetNotFoundError extends Error {
+  constructor(public readonly facetName: string) {
+    super(`facet not found: ${facetName}`);
+    this.name = "FacetNotFoundError";
+  }
+}
+
 export class CodingAgent extends Think<Env, DodoConfig> {
   initialState: SessionState = {
     activePromptId: null,
@@ -632,6 +645,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
     return buildToolsForThink(this.env, this.workspace, appConfig, {
       agent: this,
+      // Parent reference for facet-mode explore/task tools.
+      // Typed loosely on the agentic side to avoid a circular import.
+      parentAgent: this,
       oauthTools: this.cachedOAuthTools,
       oauthToolExec: (serverId: string, name: string, args: unknown) => this.callOAuthToolViaHub(serverId, name, args),
       browserEnabled: this.readMetadata("browser_enabled") === "true",
@@ -1581,6 +1597,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         systemPromptPrefix: config.systemPromptPrefix,
         exploreModel: config.exploreModel,
         taskModel: config.taskModel,
+        exploreMode: config.exploreMode ?? "inprocess",
+        taskMode: config.taskMode ?? "inprocess",
       };
     }
     return {
@@ -1592,6 +1610,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       opencodeBaseURL: this.env.OPENCODE_BASE_URL,
       exploreModel: this.env.DEFAULT_EXPLORE_MODEL,
       taskModel: this.env.DEFAULT_TASK_MODEL,
+      exploreMode: "inprocess",
+      taskMode: "inprocess",
     };
   }
 
@@ -2166,6 +2186,66 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return await this.handleDeleteCron(url.pathname.split("/").at(-1) ?? "");
       }
 
+      // Phase 5 — facet transcripts surface. Two read-only endpoints
+      // backing the `GET /session/:id/facets` /
+      // `GET /session/:id/facets/:facetName/transcript` HTTP routes.
+      if (request.method === "GET" && url.pathname === "/facets") {
+        const limit = Number(url.searchParams.get("limit") ?? 50);
+        return Response.json({ runs: await this.listFacetRuns(limit) });
+      }
+
+      if (url.pathname.startsWith("/facets/")) {
+        const parts = url.pathname.split("/").filter(Boolean);
+        // GET /facets/<facetName>/transcript
+        if (request.method === "GET" && parts.length === 3 && parts[2] === "transcript") {
+          const facetName = decodeURIComponent(parts[1]);
+          const transcript = await this.getFacetTranscript(facetName);
+          if (!transcript) {
+            return Response.json({ error: "facet not found" }, { status: 404 });
+          }
+          return Response.json(transcript);
+        }
+        // POST /facets/<facetName>/apply — merge scratch writes back
+        // into the parent workspace. Body: { paths: string[] }.
+        if (request.method === "POST" && parts.length === 3 && parts[2] === "apply") {
+          const facetName = decodeURIComponent(parts[1]);
+          let body: { paths?: unknown };
+          try {
+            body = (await request.json()) as { paths?: unknown };
+          } catch {
+            return Response.json({ error: "invalid JSON body" }, { status: 400 });
+          }
+          if (!Array.isArray(body.paths) || !body.paths.every((p) => typeof p === "string")) {
+            return Response.json(
+              { error: "body.paths must be an array of strings" },
+              { status: 400 },
+            );
+          }
+          const paths = body.paths as string[];
+          if (paths.length === 0) {
+            return Response.json(
+              { error: "body.paths must be non-empty" },
+              { status: 400 },
+            );
+          }
+          if (paths.length > 500) {
+            return Response.json(
+              { error: "body.paths too large (max 500 per call)" },
+              { status: 400 },
+            );
+          }
+          try {
+            const result = await this.applyTaskScratch(facetName, paths);
+            return Response.json(result);
+          } catch (err) {
+            if (err instanceof FacetNotFoundError) {
+              return Response.json({ error: "facet not found" }, { status: 404 });
+            }
+            throw err;
+          }
+        }
+      }
+
       if (request.method === "GET" && url.pathname === "/snapshot") {
         return Response.json(await this.exportSnapshot());
       }
@@ -2629,9 +2709,33 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
+    // Phase 5 — facet run index. Tracks every ExploreAgent / TaskAgent
+    // invocation on this session so `GET /session/:id/facets` can
+    // enumerate recent facet runs and deep-link into their transcripts.
+    //
+    // One row per run; facet transcripts themselves live in the facet
+    // DO's own SQLite (see ExploreAgent.getTranscript / TaskAgent.getTranscript).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS facet_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        facet_type TEXT NOT NULL CHECK(facet_type IN ('explore','task')),
+        facet_name TEXT NOT NULL,
+        input TEXT NOT NULL,
+        summary_preview TEXT,
+        token_input INTEGER NOT NULL DEFAULT 0,
+        token_output INTEGER NOT NULL DEFAULT 0,
+        workspace_mode TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        status TEXT NOT NULL CHECK(status IN ('running','completed','failed'))
+      )
+    `);
+
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_session_todos_status ON session_todos(status)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_started ON facet_runs(started_at DESC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_name ON facet_runs(facet_name)");
   }
 
   /**
@@ -5145,6 +5249,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // the next prompt without needing a session recreate.
       exploreModel: appConfig.exploreModel,
       taskModel: appConfig.taskModel,
+      // Dispatch-mode flags propagate via DodoConfig so getTools() sees
+      // the latest value on the next prompt without a session restart.
+      exploreMode: appConfig.exploreMode ?? "inprocess",
+      taskMode: appConfig.taskMode ?? "inprocess",
     };
     this.configure(dodoConfig);
 
@@ -5176,6 +5284,337 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private resolveOwnerId(ownerEmail?: string): string | undefined {
     if (!ownerEmail) return undefined;
     return this.env.USER_CONTROL.idFromName(ownerEmail).toString();
+  }
+
+  /**
+   * Invoke an ExploreAgent facet by pool name. Thin wrapper around
+   * `this.subAgent(ExploreAgent, name).query(opts)` so tests (and the
+   * explore tool) can exercise the facet round-trip without needing a
+   * protected-method escape hatch. Requires the `"experimental"` compat
+   * flag — the SDK throws without it.
+   *
+   * Passes the parent's sessionId so the facet can call back via
+   * `facetReadFile` / `facetReadDir` / `facetGlob` to read the parent
+   * workspace ("shared" workspace mode).
+   */
+  /**
+   * Explore-facet dispatch: auto-fills the parent session context
+   * (sessionId + AppConfig) so the facet can proxy workspace reads back
+   * and use the session's provider / model selection. Called from
+   * `buildExploreTool` when `config.exploreMode === "facet"` and from
+   * the HTTP surface (via facet transcript routes).
+   */
+  async runExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
+    const stub = await this.subAgent(ExploreAgent, name);
+    const parentSessionId = opts.parentSessionId ?? this.sessionId();
+    const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
+
+    const runId = this.insertFacetRun({
+      facetType: "explore",
+      facetName: name,
+      input: opts.q,
+      workspaceMode: null,
+    });
+
+    try {
+      const result = await stub.query({ ...opts, parentSessionId, parentConfig });
+      this.completeFacetRun(runId, result.summary, { input: result.tokenInput, output: result.tokenOutput });
+      return result;
+    } catch (err) {
+      this.failFacetRun(runId, err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  }
+
+  private insertFacetRun(opts: { facetType: "explore" | "task"; facetName: string; input: string; workspaceMode: string | null }): number {
+    const now = nowEpoch();
+    const rows = this.db.all(
+      `INSERT INTO facet_runs (facet_type, facet_name, input, workspace_mode, started_at, status)
+       VALUES (?, ?, ?, ?, ?, 'running')
+       RETURNING id`,
+      opts.facetType, opts.facetName, opts.input, opts.workspaceMode, now,
+    ) as Array<{ id: number }>;
+    return Number(rows[0]?.id ?? 0);
+  }
+
+  private completeFacetRun(runId: number, summary: string, tokens: { input: number; output: number }): void {
+    const preview = summary.length > 500 ? `${summary.slice(0, 500)}…` : summary;
+    this.db.exec(
+      "UPDATE facet_runs SET status = 'completed', summary_preview = ?, token_input = ?, token_output = ?, finished_at = ? WHERE id = ?",
+      preview, tokens.input, tokens.output, nowEpoch(), runId,
+    );
+  }
+
+  private failFacetRun(runId: number, error: string): void {
+    this.db.exec(
+      "UPDATE facet_runs SET status = 'failed', summary_preview = ?, finished_at = ? WHERE id = ?",
+      `(failed) ${error.slice(0, 400)}`, nowEpoch(), runId,
+    );
+  }
+
+  // ─── Facet workspace RPCs ───
+  //
+  // Facets (ExploreAgent, TaskAgent) get their own Durable Object and so
+  // their own SqlStorage. To let a facet share the parent session's
+  // workspace — the "shared" workspace mode — the facet proxies reads back
+  // to the parent via these four narrow RPC methods. Writes are not
+  // exposed: explore is read-only, and task/scratch uses a facet-local
+  // Workspace instead (phase 4).
+
+  /** Read a file from the parent workspace. Returns null if missing. */
+  async facetReadFile(path: string): Promise<string | null> {
+    return this.workspace.readFile(path);
+  }
+
+  /** Stat a file/dir in the parent workspace. Matches Workspace.stat(). */
+  async facetStat(path: string): Promise<{ path: string; name: string; type: "file" | "directory" | "symlink"; mimeType: string; size: number; createdAt: number; updatedAt: number; target?: string } | null> {
+    const stat = await this.workspace.stat(path);
+    return stat ?? null;
+  }
+
+  /** Read a directory in the parent workspace. */
+  async facetReadDir(path: string, opts?: { limit?: number; offset?: number }): Promise<Array<{ path: string; name: string; type: "file" | "directory" | "symlink"; mimeType: string; size: number; createdAt: number; updatedAt: number; target?: string }>> {
+    return this.workspace.readDir(path, opts);
+  }
+
+  /** Glob the parent workspace. Used by the find and grep subtools. */
+  async facetGlob(pattern: string): Promise<Array<{ path: string; name: string; type: "file" | "directory" | "symlink"; mimeType: string; size: number; createdAt: number; updatedAt: number; target?: string }>> {
+    return this.workspace.glob(pattern);
+  }
+
+  /**
+   * Write a file into the parent workspace. Used by shared-mode task
+   * facets and by `applyFromScratch` when a scratch task merges files
+   * back. Only invoked via facet RPC — the main agent writes through
+   * `this.workspace` directly.
+   */
+  async facetWriteFile(path: string, content: string): Promise<void> {
+    await this.workspace.writeFile(path, content);
+  }
+
+  /**
+   * Real task-facet dispatch. Mirrors runExploreFacet with the added
+   * responsibility of scheduling a 24h cleanup alarm on the parent
+   * when the task runs in scratch mode — facets can't self-schedule
+   * (the Agents SDK throws on setAlarm inside a facet), so the parent
+   * owns that side of the lifecycle.
+   */
+  async runTaskFacet(name: string, opts: TaskInvokeOpts): Promise<TaskInvokeResult> {
+    const stub = await this.subAgent(TaskAgent, name);
+    const parentSessionId = opts.parentSessionId ?? this.sessionId();
+    const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
+
+    const runId = this.insertFacetRun({
+      facetType: "task",
+      facetName: name,
+      input: opts.prompt,
+      workspaceMode: opts.workspaceMode ?? "shared",
+    });
+
+    let result: TaskInvokeResult;
+    try {
+      result = await stub.task({ ...opts, parentSessionId, parentConfig });
+      this.completeFacetRun(runId, result.summary, { input: result.tokenInput, output: result.tokenOutput });
+    } catch (err) {
+      this.failFacetRun(runId, err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+
+    // Schedule a 24h cleanup only for scratch runs — shared runs don't
+    // own any out-of-band R2 state.
+    if (result.workspaceMode === "scratch") {
+      // 24 hours in seconds. Think's `this.schedule(seconds, method, payload)`
+      // writes a row to cron_jobs and triggers an alarm at the wall time.
+      try {
+        await this.schedule(24 * 60 * 60, "cleanupScratchFacet", {
+          facetName: name,
+          parentSessionId,
+        });
+      } catch (err) {
+        // Swallow scheduling errors — the task itself succeeded.
+        // If the alarm never fires, the scratch prefix is orphaned
+        // but harmless (it's under the user's own R2 bucket and the
+        // lifecycle rule on `attachments/` does not cover
+        // `workspace/<sid>/scratch/`). A future housekeeping cron
+        // could sweep orphaned scratch prefixes if needed — flagged
+        // as a TODO, not a blocker.
+        log("warn", "Failed to schedule scratch cleanup", { facetName: name, err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * List recent facet runs on this session. Most-recent first.
+   * Backs `GET /session/:id/facets`.
+   */
+  async listFacetRuns(limit: number = 50): Promise<Array<{
+    id: number;
+    facetType: "explore" | "task";
+    facetName: string;
+    input: string;
+    summaryPreview: string | null;
+    workspaceMode: string | null;
+    tokenInput: number;
+    tokenOutput: number;
+    startedAt: string;
+    finishedAt: string | null;
+    status: "running" | "completed" | "failed";
+  }>> {
+    const rows = this.db.all(
+      `SELECT id, facet_type as facetType, facet_name as facetName, input,
+              summary_preview as summaryPreview, workspace_mode as workspaceMode,
+              token_input as tokenInput, token_output as tokenOutput,
+              started_at as startedAt, finished_at as finishedAt, status
+       FROM facet_runs
+       ORDER BY started_at DESC
+       LIMIT ?`,
+      Math.min(Math.max(limit, 1), 200),
+    ) as Array<{
+      id: number;
+      facetType: "explore" | "task";
+      facetName: string;
+      input: string;
+      summaryPreview: string | null;
+      workspaceMode: string | null;
+      tokenInput: number;
+      tokenOutput: number;
+      startedAt: number;
+      finishedAt: number | null;
+      status: "running" | "completed" | "failed";
+    }>;
+    return rows.map((r) => ({
+      ...r,
+      startedAt: epochToIso(r.startedAt),
+      finishedAt: r.finishedAt ? epochToIso(r.finishedAt) : null,
+    }));
+  }
+
+  /**
+   * Fetch a facet's transcript (full message log) by name. Tries
+   * ExploreAgent first, then TaskAgent — matches whichever class
+   * owns the named facet. Returns null if the facet was never
+   * instantiated on this session.
+   */
+  async getFacetTranscript(facetName: string): Promise<{ facetType: "explore" | "task"; messages: Array<Record<string, unknown>> } | null> {
+    // Look the name up in the facet_runs table to figure out which
+    // facet class to ask. Falls back to trying explore first if we
+    // can't resolve the type locally — idempotent.
+    const row = this.db.all(
+      "SELECT facet_type as facetType FROM facet_runs WHERE facet_name = ? ORDER BY started_at DESC LIMIT 1",
+      facetName,
+    ) as Array<{ facetType: "explore" | "task" }>;
+
+    if (row.length === 0) return null;
+
+    const facetType = row[0].facetType;
+    try {
+      if (facetType === "explore") {
+        const stub = await this.subAgent(ExploreAgent, facetName);
+        const transcript = await stub.getTranscript();
+        return { facetType, messages: transcript };
+      } else {
+        const stub = await this.subAgent(TaskAgent, facetName);
+        const transcript = await stub.getTranscript();
+        return { facetType, messages: transcript };
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Test-only: thin pass-through to the facet's scratch-write helper
+   * so unit tests can drive scratch writes without running the model.
+   * Not surfaced on any public HTTP route. Parent owns the facet name
+   * → facet stub resolution so tests don't have to know the facet SDK
+   * plumbing.
+   *
+   * Also inserts a synthetic completed `facet_runs` row so the
+   * production-grade `facetExists` gate used by `applyTaskScratch` and
+   * `getFacetTranscript` sees this facet as legitimate. A real task()
+   * run would create this row via `insertFacetRun` — tests that skip
+   * the model have to recreate that state to stay realistic.
+   */
+  async testWriteScratchFile(facetName: string, parentSessionId: string, path: string, content: string): Promise<{ ok: true }> {
+    if (!this.facetExists(facetName, "task")) {
+      const runId = this.insertFacetRun({
+        facetType: "task",
+        facetName,
+        input: "(test-seeded scratch write)",
+        workspaceMode: "scratch",
+      });
+      this.completeFacetRun(runId, "(test-seeded)", { input: 0, output: 0 });
+    }
+    const stub = await this.subAgent(TaskAgent, facetName);
+    return stub.writeScratchForTest(parentSessionId, path, content);
+  }
+
+  /**
+   * Check whether a facet with this name has ever actually run on this
+   * session. Used to 404 apply/transcript requests for arbitrary names
+   * — without this gate, `this.subAgent(TaskAgent, anyName)` would
+   * create a fresh DO on demand, letting any authenticated caller spawn
+   * unbounded empty facet DOs (billable storage, log noise) by looping
+   * random names through the apply route.
+   */
+  private facetExists(facetName: string, facetType?: "explore" | "task"): boolean {
+    const rows = facetType
+      ? this.db.all(
+          "SELECT 1 as hit FROM facet_runs WHERE facet_name = ? AND facet_type = ? LIMIT 1",
+          facetName, facetType,
+        )
+      : this.db.all(
+          "SELECT 1 as hit FROM facet_runs WHERE facet_name = ? LIMIT 1",
+          facetName,
+        );
+    return rows.length > 0;
+  }
+
+  /**
+   * Merge a subset of a scratch-mode task facet's writes back into the
+   * parent workspace. Backs the `POST /session/:id/facets/:name/apply`
+   * HTTP route AND the model-facing tool that surfaces scratch writes.
+   *
+   * Idempotent — re-applying the same paths overwrites with the latest
+   * scratch content. Paths not present in the scratch-writes index
+   * come back in the `skipped` array with a reason.
+   *
+   * Throws if the facet name has no run history on this session —
+   * prevents spawning an empty facet DO via an unknown name.
+   */
+  async applyTaskScratch(facetName: string, paths: string[]): Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }> {
+    if (!this.facetExists(facetName, "task")) {
+      throw new FacetNotFoundError(facetName);
+    }
+    const stub = await this.subAgent(TaskAgent, facetName);
+    return stub.applyFromScratch(paths);
+  }
+
+  /** Test-only alias — kept for backwards compat with older tests. */
+  async testApplyFromScratch(facetName: string, paths: string[]): Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }> {
+    return this.applyTaskScratch(facetName, paths);
+  }
+
+  /**
+   * Scheduled callback for scratch workspace cleanup. Invoked 24h
+   * after a scratch task completes (see runTaskFacet). Deletes the
+   * R2 prefix via the facet itself, then removes the facet's DO
+   * storage entirely.
+   */
+  async cleanupScratchFacet(payload: { facetName: string; parentSessionId: string }): Promise<void> {
+    try {
+      const stub = await this.subAgent(TaskAgent, payload.facetName);
+      await stub.cleanupScratch(payload.parentSessionId);
+    } catch (err) {
+      log("warn", "Scratch cleanup R2 sweep failed", { facetName: payload.facetName, err: err instanceof Error ? err.message : String(err) });
+    }
+    try {
+      this.deleteSubAgent(TaskAgent, payload.facetName);
+    } catch (err) {
+      log("warn", "deleteSubAgent failed during scratch cleanup", { facetName: payload.facetName, err: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   private async destroyStorage(): Promise<void> {

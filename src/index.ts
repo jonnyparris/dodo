@@ -5,6 +5,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { AuthError, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, resolveAdminEmail, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
+import { ExploreAgent } from "./explore-agent";
+import { TaskAgent } from "./task-agent";
 import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
@@ -1569,6 +1571,46 @@ app.get("/session/:id/debug/compaction", async (c) => {
 
 
 
+// ─── Facet transcripts (Phase 5) ───
+//
+// Read-only surface for inspecting ExploreAgent / TaskAgent runs on a
+// session. `GET /facets` lists recent runs; `/facets/:name/transcript`
+// returns the full message log from the named facet. No write paths —
+// facet transcripts are immutable by construction.
+
+app.get("/session/:id/facets", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/facets${new URL(c.req.raw.url).search}`);
+});
+
+app.get("/session/:id/facets/:facetName/transcript", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(
+    c.req.raw,
+    c.env,
+    c.req.param("id"),
+    `/facets/${encodeURIComponent(c.req.param("facetName"))}/transcript`,
+  );
+});
+
+// Merge scratch-mode task facet writes back into the main workspace.
+// Body: { paths: string[] }. Requires write permission — this mutates
+// the parent workspace. The facet validates each path against its own
+// scratch-writes index and returns { applied, skipped } so the caller
+// can see which files made it through.
+app.post("/session/:id/facets/:facetName/apply", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(
+    c.req.raw,
+    c.env,
+    c.req.param("id"),
+    `/facets/${encodeURIComponent(c.req.param("facetName"))}/apply`,
+  );
+});
+
 app.get("/session/:id/messages", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;
@@ -2006,7 +2048,7 @@ app.get("/api/admin/account-permissions", adminGuard as never, async (c) => {
   return proxyToSharedIndex(c.env, `/account-permissions?owner=${encodeURIComponent(owner)}`);
 });
 
-export { AllowlistOutbound, CodingAgent, SharedIndex, UserControl };
+export { AllowlistOutbound, CodingAgent, ExploreAgent, SharedIndex, TaskAgent, UserControl };
 
 export default {
   fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {
