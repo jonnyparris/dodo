@@ -9,7 +9,7 @@ import { createBrowserTools } from "./browser/tools";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
-import type { AppConfig, Env } from "./types";
+import type { AppConfig, Env, TodoStore } from "./types";
 
 /** Options passed through from the coding agent into tool factories. */
 export interface BuildToolsOptions {
@@ -27,6 +27,11 @@ export interface BuildToolsOptions {
    * before the assistant message finishes persisting.
    */
   onToolAttachments?: (toolCallId: string, attachments: AttachmentRef[]) => void;
+  /**
+   * Stable read/write surface for session-scoped todos. Backs the
+   * `todo_add` / `todo_update` / `todo_list` / `todo_clear` tools.
+   */
+  todoStore?: TodoStore;
 }
 
 // ─── Tool Output Caps (OpenCode Pattern #1) ───
@@ -751,6 +756,84 @@ function getExploreModel(mainModel: string): string {
 /** Timeout for the explore subagent (ms). Prevents indefinite blocking. */
 const EXPLORE_TIMEOUT_MS = 60_000;
 
+/** Max steps for the generic task subagent (slightly higher than explore). */
+const TASK_MAX_STEPS = 15;
+
+/** Timeout for the generic task subagent (ms). */
+const TASK_TIMEOUT_MS = 180_000;
+
+const TASK_SYSTEM_PROMPT = [
+  "You are a focused subagent dispatched by the main Dodo agent to handle one bounded task.",
+  "",
+  "## Rules",
+  "- You have a subset of the main agent's tools. Use them to complete the task and ONLY the task.",
+  "- Do not ask clarifying questions — make a best-effort attempt with the info given.",
+  "- Return a compact text summary when done. Include: what you did, paths/line numbers touched, test results if any.",
+  "- Do NOT dump large tool outputs into your final message — summarize in 5-15 lines.",
+  "- If you hit your step budget without finishing, report what was done and what remains. Your caller will retry.",
+].join("\n");
+
+/**
+ * Build a subagent tool with a configurable name, description, system prompt,
+ * tool subset, and step/timeout budgets. Both `explore` and `task` are
+ * instances of this — `explore` is a pre-configured read-only search
+ * subagent; `task` is a general-purpose delegate with a tighter time budget
+ * per call but more steps.
+ */
+function buildSubagentTool(spec: {
+  name: string;
+  description: string;
+  systemPrompt: string;
+  inputSchema: AnyTool;
+  getUserMessage: (args: Record<string, unknown>) => string;
+  getTools: () => Record<string, AnyTool>;
+  config: AppConfig;
+  env: Env;
+  maxSteps: number;
+  timeoutMs: number;
+  /** If true, prefer the cheap/fast model for this subagent. */
+  useCheapModel: boolean;
+}): AnyTool {
+  return tool({
+    description: spec.description,
+    inputSchema: spec.inputSchema,
+    execute: async (args: Record<string, unknown>) => {
+      const provider = buildProvider(spec.config, spec.env);
+      const modelId = spec.useCheapModel ? getExploreModel(spec.config.model) : spec.config.model;
+      const model = provider.chatModel(modelId);
+      const userMessage = spec.getUserMessage(args);
+
+      try {
+        const result = await generateText({
+          model,
+          system: spec.systemPrompt,
+          messages: [{ role: "user" as const, content: userMessage }],
+          tools: spec.getTools(),
+          stopWhen: stepCountIs(spec.maxSteps),
+          maxOutputTokens: 2000,
+          abortSignal: AbortSignal.timeout(spec.timeoutMs),
+        });
+
+        const summary = result.text;
+        const steps = result.steps.length;
+        const toolCalls = result.steps.flatMap((s) =>
+          (s.toolCalls ?? []).map((tc) => tc.toolName),
+        );
+
+        return [
+          `## ${spec.name} results`,
+          `**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
+          "",
+          summary || "(No output)",
+        ].filter(Boolean).join("\n");
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return `${spec.name} failed (model: ${modelId}): ${msg}`;
+      }
+    },
+  });
+}
+
 /**
  * Build the explore tool — spawns a search-only subagent via generateText().
  *
@@ -773,7 +856,8 @@ function buildExploreTool(
     grep: allWsTools.grep,
   });
 
-  return tool({
+  return buildSubagentTool({
+    name: "Explore",
     description: [
       "Search the workspace for files and code matching a query.",
       "Runs an autonomous search agent that uses grep, find, list, and read to explore the codebase,",
@@ -782,6 +866,7 @@ function buildExploreTool(
       "Use this when you need to find where something is defined, locate files matching a pattern,",
       "or understand how a feature is implemented across multiple files.",
     ].join(" "),
+    systemPrompt: EXPLORE_SYSTEM_PROMPT,
     inputSchema: zodSchema(z.object({
       query: z.string().min(1).describe(
         "What to search for — be specific. E.g. 'Find all files that handle CSS escaping' or 'Where is the database connection pool configured?'",
@@ -790,45 +875,154 @@ function buildExploreTool(
         "Optional directory to scope the search to (e.g. 'src/' or 'lib/utils'). Omit to search the entire workspace.",
       ),
     })),
-    execute: async ({ query, scope }: { query: string; scope?: string }) => {
-      const provider = buildProvider(config, env);
-      const exploreModelId = getExploreModel(config.model);
-      const model = provider.chatModel(exploreModelId);
-
-      const scopeHint = scope ? `\n\nSearch scope: ${scope}` : "";
-      const userMessage = `${query}${scopeHint}`;
-
-      try {
-        const result = await generateText({
-          model,
-          system: EXPLORE_SYSTEM_PROMPT,
-          messages: [{ role: "user" as const, content: userMessage }],
-          tools: readOnlyTools,
-          stopWhen: stepCountIs(EXPLORE_MAX_STEPS),
-          maxOutputTokens: 2000,
-          abortSignal: AbortSignal.timeout(EXPLORE_TIMEOUT_MS),
-        });
-
-        const summary = result.text;
-        const steps = result.steps.length;
-        const toolCalls = result.steps.flatMap(s =>
-          (s.toolCalls ?? []).map(tc => tc.toolName),
-        );
-
-        // Return structured result for the main agent
-        return [
-          `## Explore results for: ${query}`,
-          scope ? `**Scope:** ${scope}` : "",
-          `**Search steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
-          "",
-          summary || "(No results found)",
-        ].filter(Boolean).join("\n");
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        return `Explore failed: model: ${exploreModelId}. ${msg}. Try searching directly with grep.`;
-      }
+    getUserMessage: (args) => {
+      const query = String(args.query ?? "");
+      const scope = args.scope ? String(args.scope) : null;
+      return scope ? `${query}\n\nSearch scope: ${scope}` : query;
     },
+    getTools: () => readOnlyTools,
+    config,
+    env,
+    maxSteps: EXPLORE_MAX_STEPS,
+    timeoutMs: EXPLORE_TIMEOUT_MS,
+    useCheapModel: true,
   });
+}
+
+/**
+ * Build the generic `task` subagent — delegates a bounded unit of work to a
+ * fresh generateText() call with a caller-configurable tool subset.
+ *
+ * Use cases: "update all imports from X to Y", "run the tests and
+ * report failures", "review this file for dead code". Keeps the main
+ * agent's context clean — only the sub-agent's final text summary lands
+ * in the main conversation.
+ */
+function buildTaskTool(
+  workspace: Workspace,
+  config: AppConfig,
+  env: Env,
+): AnyTool {
+  // Read-write tool subset — mutating tools included so the task can edit
+  // files, but no git tools (we don't want a subagent pushing branches)
+  // and no codemode (too broad — the main agent should own that).
+  const allWsTools = createWorkspaceTools(workspace);
+  const taskTools = capToolOutputs({
+    read: allWsTools.read,
+    list: allWsTools.list,
+    find: allWsTools.find,
+    grep: allWsTools.grep,
+    write: allWsTools.write,
+    edit: allWsTools.edit,
+  });
+
+  return buildSubagentTool({
+    name: "Task",
+    description: [
+      "Delegate a focused, bounded sub-task to a subagent with its own context window.",
+      "The subagent gets workspace tools (read, list, find, grep, write, edit) and returns a compact summary.",
+      "Use for multi-step sub-tasks that would otherwise eat the main conversation's step budget and context:",
+      "'update all imports of X to Y', 'review these 6 files and list bugs', 'rename MyClass to TheirClass everywhere'.",
+      "Do NOT use for one-shot operations (just call the tool directly) or anything requiring git/codemode/browser.",
+    ].join(" "),
+    systemPrompt: TASK_SYSTEM_PROMPT,
+    inputSchema: zodSchema(z.object({
+      prompt: z.string().min(1).describe(
+        "The task to perform. Be specific and self-contained — the subagent has no access to your conversation. Include file paths, names, and acceptance criteria.",
+      ),
+      scope: z.string().optional().describe(
+        "Optional directory to scope the task to (e.g. 'src/'). Hint only — the subagent can still read outside this path.",
+      ),
+    })),
+    getUserMessage: (args) => {
+      const prompt = String(args.prompt ?? "");
+      const scope = args.scope ? String(args.scope) : null;
+      return scope ? `${prompt}\n\nScope hint: ${scope}` : prompt;
+    },
+    getTools: () => taskTools,
+    config,
+    env,
+    maxSteps: TASK_MAX_STEPS,
+    timeoutMs: TASK_TIMEOUT_MS,
+    useCheapModel: true,
+  });
+}
+
+/**
+ * Build the todo tool family. Backed by a per-session store injected from
+ * the CodingAgent DO. Exposes four small operations the model can use to
+ * maintain a persistent, durable checklist across compactions.
+ *
+ * Why a tool (not a convention): Anthropic models in particular tend to
+ * repeat themselves after a compaction summary, and a hallucinated todo
+ * list drifts. A durable list the model can query each turn collapses that
+ * failure mode.
+ */
+function buildTodoTools(store: TodoStore): Record<string, AnyTool> {
+  const priorityEnum = z.enum(["low", "medium", "high"]);
+  const statusEnum = z.enum(["pending", "in_progress", "completed", "cancelled"]);
+
+  return {
+    todo_list: tool({
+      description: [
+        "List all todos for the current session with their status and priority.",
+        "Use at the start of a multi-step task and after every few steps to re-orient.",
+        "Empty list is fine — most short tasks don't need todos.",
+      ].join(" "),
+      inputSchema: zodSchema(z.object({}).strict()),
+      execute: async () => {
+        const items = store.list();
+        if (items.length === 0) {
+          return { items: [], hint: "No todos. Use todo_add to create one for multi-step work." };
+        }
+        return { items };
+      },
+    }),
+
+    todo_add: tool({
+      description: [
+        "Append a todo to the session checklist. Use for tasks that take 3+ steps,",
+        "branch into sub-tasks, or have distinct user-visible deliverables.",
+        "Do NOT use for trivial single-step actions.",
+      ].join(" "),
+      inputSchema: zodSchema(z.object({
+        content: z.string().min(1).max(500).describe("Short description, imperative voice (\"Fix X\", not \"Fixed X\")"),
+        priority: priorityEnum.optional().describe("low | medium (default) | high"),
+      })),
+      execute: async ({ content, priority }) => {
+        store.add(content, priority);
+        return { ok: true, items: store.list() };
+      },
+    }),
+
+    todo_update: tool({
+      description: [
+        "Update an existing todo by id. Use to mark pending → in_progress → completed,",
+        "or to cancel a todo that's no longer relevant. Only ONE todo should be",
+        "in_progress at a time.",
+      ].join(" "),
+      inputSchema: zodSchema(z.object({
+        id: z.number().int().positive().describe("Todo id from todo_list"),
+        status: statusEnum.optional(),
+        content: z.string().min(1).max(500).optional(),
+        priority: priorityEnum.optional(),
+      })),
+      execute: async ({ id, status, content, priority }) => {
+        const ok = store.update(id, { status, content, priority });
+        if (!ok) return { error: `No todo with id ${id}` };
+        return { ok: true, items: store.list() };
+      },
+    }),
+
+    todo_clear: tool({
+      description: "Clear all todos for the current session. Use sparingly — typically only at the end of a large task when the list is stale.",
+      inputSchema: zodSchema(z.object({}).strict()),
+      execute: async () => {
+        store.clear();
+        return { ok: true, items: [] };
+      },
+    }),
+  };
 }
 
 function buildTools(
@@ -944,6 +1138,17 @@ function buildTools(
   // Explore tool — search subagent for token-efficient codebase discovery
   tools.explore = buildExploreTool(workspace, config, env);
 
+  // Task tool — generic subagent for bounded sub-tasks. Keeps the main
+  // conversation's step budget free when a chunk of work can be safely
+  // delegated to a fresh context window.
+  tools.task = buildTaskTool(workspace, config, env);
+
+  // Todo tools — durable checklist backed by per-session SQLite. Helps the
+  // model stay oriented across long multi-step tasks and compactions.
+  if (options?.todoStore) {
+    Object.assign(tools, buildTodoTools(options.todoStore));
+  }
+
   // Browser tools — full CDP access via code-mode pattern.
   // Two tools: browser_search (query the ~1.7MB CDP spec server-side) and
   // browser_execute (run CDP commands against a live headless Chrome session).
@@ -974,7 +1179,9 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: BuildToolsOptions & { mcpGatekeepers?: McpGatekeeper[] },
+  options?: BuildToolsOptions & {
+    mcpGatekeepers?: McpGatekeeper[];
+  },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
 

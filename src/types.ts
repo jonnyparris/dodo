@@ -45,6 +45,23 @@ export interface Env {
   OPENCODE_GATEWAY_TOKEN?: string;
 }
 
+export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+export type TodoPriority = "low" | "medium" | "high";
+
+export interface TodoItem {
+  id: number;
+  content: string;
+  status: TodoStatus;
+  priority: TodoPriority;
+}
+
+export interface TodoStore {
+  list: () => TodoItem[];
+  add: (content: string, priority?: TodoPriority) => void;
+  update: (id: number, patch: { status?: TodoStatus; content?: string; priority?: TodoPriority }) => boolean;
+  clear: () => void;
+}
+
 export interface AppConfig {
   activeGateway: "opencode" | "ai-gateway";
   aiGatewayBaseURL: string;

@@ -32,7 +32,7 @@ import {
   chatRecordToUIMessage,
 } from "./think-adapter";
 import type { SnapshotV2 } from "./think-adapter";
-import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
+import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, TodoPriority, TodoStatus, TodoStore, WorkspaceEntry } from "./types";
 import { FALLBACK_MODELS, WORKERS_AI_MODELS, FLUX_IMAGE_MODEL, FLUX_IMAGE_MEDIA_TYPE, FLUX_MAX_PROMPT_LENGTH, extractGeneratePrompt } from "./shared-index";
 
 /**
@@ -68,17 +68,60 @@ const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
 const CLEARED_MARKER = "[Old tool result content cleared]";
 
 /**
- * Rough token estimate for a single ModelMessage.
+ * Content-aware tokens-per-char ratios derived from Anthropic tokenizer
+ * measurements. The flat `len/3.5` heuristic under-counts code and
+ * tool-result JSON by 15-25 % because those payloads have dense punctuation
+ * and no word structure to benefit from BPE merges.
  *
- * Uses ~3.5 chars per token, which lands within 10-20% of real tokenizer
- * counts for mixed English / code / JSON payloads. The same heuristic is
- * used inside assembleContext() for cutoff decisions — keep them in sync.
+ * These numbers come from sampling Anthropic's tokenizer against
+ * representative Dodo traffic (code files, tool outputs, chat messages).
+ * Keep conservative — safer to over-estimate than to trip the context
+ * limit mid-step.
+ */
+const CHARS_PER_TOKEN_PROSE = 4.0;
+const CHARS_PER_TOKEN_CODE = 2.9;
+const CHARS_PER_TOKEN_JSON = 2.6;
+const CHARS_PER_TOKEN_DEFAULT = 3.3;
+
+/**
+ * Heuristically classify a string and return its chars-per-token ratio.
+ * Cheap: one pass over a small prefix.
+ */
+function charsPerTokenFor(sample: string): number {
+  if (sample.length === 0) return CHARS_PER_TOKEN_DEFAULT;
+  // Cap the sample — we only need a signal, not full-text analysis
+  const head = sample.length > 2048 ? sample.slice(0, 2048) : sample;
+  const punctCount = (head.match(/[{}[\]":,;=<>()]/g) ?? []).length;
+  const braceCount = (head.match(/[{}[\]]/g) ?? []).length;
+  const wordCount = (head.match(/[A-Za-z]{3,}/g) ?? []).length;
+  const totalChars = head.length;
+
+  // JSON-dominated: lots of quote/brace/colon punctuation relative to chars
+  if (braceCount >= 3 && punctCount / totalChars > 0.1) return CHARS_PER_TOKEN_JSON;
+  // Code-ish: dense punctuation plus enough word tokens to suggest
+  // identifiers rather than natural prose
+  if (punctCount / totalChars > 0.08 && wordCount >= 5) return CHARS_PER_TOKEN_CODE;
+  // Prose: many multi-character words, sparse punctuation
+  if (wordCount > totalChars / 30 && punctCount / totalChars < 0.05) return CHARS_PER_TOKEN_PROSE;
+  return CHARS_PER_TOKEN_DEFAULT;
+}
+
+/**
+ * Token estimate for a single ModelMessage. Content-aware: picks a
+ * chars-per-token ratio based on whether the serialized message looks
+ * like JSON, code, prose, or mixed.
  *
- * Cheap enough to call on every message each step; the JSON.stringify cost
- * is dwarfed by the LLM call that follows.
+ * The estimate is used by the autocompaction guard (trigger at 60% of
+ * budget), the pre-step budget check, and the compaction cutoff walk. All
+ * three prefer over-estimates — a false-positive compaction is cheap, a
+ * false-negative "just squeeze it in" is a 429.
+ *
+ * Cheap enough to call on every message each step.
  */
 export function estimateMessageTokens(msg: ModelMessage): number {
-  return Math.ceil(JSON.stringify(msg).length / 3.5);
+  const serialized = JSON.stringify(msg);
+  const cpt = charsPerTokenFor(serialized);
+  return Math.ceil(serialized.length / cpt);
 }
 
 /**
@@ -169,7 +212,8 @@ const SYSTEM_PROMPT = [
   "When the user asks you to build or modify code:",
   "",
   "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task.",
-  "2. **Use `explore` for ALL codebase discovery.** CRITICAL: when you need to find where something is defined, understand how a feature works, or locate relevant files — you MUST use the `explore` tool. Do NOT use `read`, `list`, `find`, or `grep` for open-ended exploration. `explore` runs a search agent in a separate context window and returns a compact summary. Using direct tools for discovery will exhaust your context budget before you can make any edits.",
+  "2. **Plan multi-step tasks with todos.** For any task with 3+ distinct steps or branches, use `todo_add` at the start to lay out the plan, `todo_update` to mark progress, and `todo_list` to re-orient after compactions. Skip for trivial single-step work. Only ONE todo should be `in_progress` at a time.",
+  "3. **Use `explore` for ALL codebase discovery.** CRITICAL: when you need to find where something is defined, understand how a feature works, or locate relevant files — you MUST use the `explore` tool. Do NOT use `read`, `list`, `find`, or `grep` for open-ended exploration. `explore` runs a search agent in a separate context window and returns a compact summary. Using direct tools for discovery will exhaust your context budget before you can make any edits.",
   "",
   "   Examples of when to use `explore`:",
   "   - 'Where is the config schema defined?' → `explore`",
@@ -181,12 +225,12 @@ const SYSTEM_PROMPT = [
   "   - You need to make an edit → `edit`",
   "   - You need to search for a specific string → `grep`",
   "",
-  "3. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
-  "4. **Plan, then edit.** State your plan in one short paragraph, then execute. Don't narrate each step.",
-  "5. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
-  "6. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
-  "7. **Delete unused code.** No commented-out code, no `_unused` renames.",
-  "8. **Be security-conscious.** Never commit secrets or credentials.",
+  "4. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
+  "5. **Plan, then edit.** State your plan in one short paragraph, then execute. Don't narrate each step.",
+  "6. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
+  "7. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
+  "8. **Delete unused code.** No commented-out code, no `_unused` renames.",
+  "9. **Be security-conscious.** Never commit secrets or credentials.",
   "",
   "## Workspace tools",
   "",
@@ -195,12 +239,17 @@ const SYSTEM_PROMPT = [
   "| Tool | Purpose | Key params |",
   "|------|---------|------------|",
   "| **explore** | Search agent for codebase discovery (compact summary) | `query`, `scope` |",
+  "| **task** | Delegate a bounded sub-task to a fresh subagent (read+write workspace tools) | `prompt`, `scope?` |",
   "| **read** | Read file contents | `path`, `offset`, `limit` (line numbers) |",
   "| **write** | Create or overwrite a file | `path`, `content` |",
   "| **edit** | Find-and-replace (unique match) | `path`, `old_string`, `new_string` |",
   "| **replace_all** | Replace ALL occurrences of a string | `path`, `old_string`, `new_string` |",
   "| **grep** | Search file contents by regex | `query`, `include` (glob filter) |",
   "| **delete** | Remove a file or directory | `path`, `recursive` |",
+  "| **todo_list** | List session todos with status and priority | — |",
+  "| **todo_add** | Append a todo | `content`, `priority?` |",
+  "| **todo_update** | Update todo `status`, `content`, or `priority` | `id`, `status?`, ... |",
+  "| **todo_clear** | Clear all todos | — |",
   "",
   "### Token budget",
   "",
@@ -567,6 +616,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       },
       stateBackend: this.stateBackend,
       mcpGatekeepers: this.mcpGatekeepers,
+      todoStore: this.todoStore(),
     });
   }
 
@@ -2425,8 +2475,88 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
+    // Per-session todo list — backs the `todo_*` tools. Scoped to the
+    // session so no cross-session leakage. Persisted through compaction
+    // (which summarizes messages, not this table) so the model always
+    // has a stable checklist to refer to after context summaries.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS session_todos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','in_progress','completed','cancelled')),
+        priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_session_todos_status ON session_todos(status)");
+  }
+
+  /**
+   * Expose a stable read/write surface to the `todo_*` tools in agentic.ts
+   * without coupling them to the DO internals. Each method is a small,
+   * synchronous SQL operation — no async bookkeeping needed.
+   */
+  private todoStore(): TodoStore {
+    return {
+      list: () => {
+        const rows = this.db.all(
+          "SELECT id, content, status, priority, created_at, updated_at FROM session_todos ORDER BY id ASC",
+        );
+        return rows.map((r) => ({
+          id: Number(r.id),
+          content: String(r.content),
+          status: r.status as TodoStatus,
+          priority: r.priority as TodoPriority,
+        }));
+      },
+      add: (content, priority) => {
+        const now = nowEpoch();
+        this.db.exec(
+          "INSERT INTO session_todos (content, status, priority, created_at, updated_at) VALUES (?, 'pending', ?, ?, ?)",
+          content,
+          priority ?? "medium",
+          now,
+          now,
+        );
+      },
+      update: (id, patch) => {
+        const now = nowEpoch();
+        const existing = this.db.one("SELECT id FROM session_todos WHERE id = ?", id);
+        if (!existing) return false;
+        if (patch.status) {
+          this.db.exec(
+            "UPDATE session_todos SET status = ?, updated_at = ? WHERE id = ?",
+            patch.status,
+            now,
+            id,
+          );
+        }
+        if (patch.content) {
+          this.db.exec(
+            "UPDATE session_todos SET content = ?, updated_at = ? WHERE id = ?",
+            patch.content,
+            now,
+            id,
+          );
+        }
+        if (patch.priority) {
+          this.db.exec(
+            "UPDATE session_todos SET priority = ?, updated_at = ? WHERE id = ?",
+            patch.priority,
+            now,
+            id,
+          );
+        }
+        return true;
+      },
+      clear: () => {
+        this.db.exec("DELETE FROM session_todos");
+      },
+    };
   }
 
   private async handleListFiles(url: URL): Promise<Response> {
