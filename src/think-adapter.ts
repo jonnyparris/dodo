@@ -45,6 +45,10 @@ export interface DodoConfig {
    * endpoint. Empty/undefined = no prefix.
    */
   systemPromptPrefix?: string;
+  /** Default model for the `explore` subagent. See AppConfig for details. */
+  exploreModel?: string;
+  /** Default model for the `task` subagent. See AppConfig for details. */
+  taskModel?: string;
 }
 
 /** Sidecar metadata for each Think message — Dodo-specific fields. */

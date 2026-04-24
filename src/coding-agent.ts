@@ -1565,6 +1565,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         gitAuthorName: config.gitAuthorName,
         model: config.model,
         opencodeBaseURL: config.opencodeBaseURL,
+        systemPromptPrefix: config.systemPromptPrefix,
+        exploreModel: config.exploreModel,
+        taskModel: config.taskModel,
       };
     }
     return {
@@ -1574,6 +1577,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
       model: this.env.DEFAULT_MODEL,
       opencodeBaseURL: this.env.OPENCODE_BASE_URL,
+      exploreModel: this.env.DEFAULT_EXPLORE_MODEL,
+      taskModel: this.env.DEFAULT_TASK_MODEL,
     };
   }
 
@@ -4933,6 +4938,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // Always pull the latest prefix from UserControl so config changes
       // take effect on the next prompt without requiring a session restart.
       systemPromptPrefix: appConfig.systemPromptPrefix,
+      // Same for subagent models — changes at the user level propagate to
+      // the next prompt without needing a session recreate.
+      exploreModel: appConfig.exploreModel,
+      taskModel: appConfig.taskModel,
     };
     this.configure(dodoConfig);
 

@@ -28,6 +28,10 @@ const updateConfigSchema = z
     opencodeBaseURL: z.string().url().optional(),
     /** User preamble for the system prompt. Pass empty string to clear. */
     systemPromptPrefix: z.string().max(4_000).optional(),
+    /** Default model for the `explore` subagent. Pass empty string to clear and fall back to heuristic. */
+    exploreModel: z.string().max(200).optional(),
+    /** Default model for the `task` subagent. Pass empty string to clear and fall back to heuristic. */
+    taskModel: z.string().max(200).optional(),
   })
   .strict();
 
@@ -812,6 +816,12 @@ export class UserControl extends DurableObject<Env> {
       model: get("model") ?? this.env.DEFAULT_MODEL,
       opencodeBaseURL: get("opencodeBaseURL") ?? this.env.OPENCODE_BASE_URL,
       systemPromptPrefix: get("systemPromptPrefix"),
+      // Fall back to the env defaults, then undefined (heuristic path).
+      // DEFAULT_EXPLORE_MODEL ships as Kimi K2.6 in wrangler.jsonc —
+      // investigate/search work is the subagent's primary use case, and
+      // Kimi is the best-value fit per the 2026-04-24 model comparison.
+      exploreModel: get("exploreModel") ?? this.env.DEFAULT_EXPLORE_MODEL,
+      taskModel: get("taskModel") ?? this.env.DEFAULT_TASK_MODEL,
     };
   }
 

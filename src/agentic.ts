@@ -408,8 +408,37 @@ export function resolveWireModelId(modelId: string, activeGateway: "opencode" | 
   return modelId;
 }
 
+/**
+ * Pick the right gateway for a given model ID.
+ *
+ *  - `@cf/*` (Workers AI) → always ai-gateway
+ *  - Everything else → respect whatever `config.activeGateway` says
+ *
+ * This lets a subagent run on a Workers AI model (e.g. Kimi K2.6) even if
+ * the main session uses the opencode gateway. Without this, asking Kimi
+ * to do explore work from an opencode-gateway session would fail because
+ * the provider baseURL would be wrong.
+ */
+function resolveGatewayForModel(
+  modelId: string,
+  mainGateway: "opencode" | "ai-gateway",
+): "opencode" | "ai-gateway" {
+  if (modelId.startsWith("@cf/")) return "ai-gateway";
+  return mainGateway;
+}
+
 export function buildProvider(config: AppConfig, env: Env) {
-  const isOpencode = config.activeGateway === "opencode";
+  return buildProviderForModel(config.model, config, env);
+}
+
+/**
+ * Build a provider for a specific model — picks the right gateway and
+ * base URL even if that differs from the session's main gateway. Used by
+ * subagents that run on a cheaper/different model than the main session.
+ */
+export function buildProviderForModel(modelId: string, config: AppConfig, env: Env) {
+  const effectiveGateway = resolveGatewayForModel(modelId, config.activeGateway);
+  const isOpencode = effectiveGateway === "opencode";
   const baseURL = isOpencode
     ? `${trimBaseUrl(config.opencodeBaseURL)}`
     : `${trimBaseUrl(config.aiGatewayBaseURL)}`;
@@ -434,14 +463,17 @@ export function buildProvider(config: AppConfig, env: Env) {
     baseURL,
     headers,
     includeUsage: true,
-    name: config.activeGateway,
+    name: effectiveGateway,
     transformRequestBody: addAnthropicCacheMarkers,
   });
 
   // Wrap `chatModel` / `languageModel` / the callable provider so callers can pass
   // the user-facing id (e.g. `@cf/moonshotai/kimi-k2.6`) and we translate it to the
   // wire format (`workers-ai/@cf/moonshotai/kimi-k2.6`) exactly once, at the edge.
-  const translate = (modelId: string) => resolveWireModelId(modelId, config.activeGateway);
+  // Use the *effective* gateway (the one we actually picked for this provider)
+  // so @cf/* models don't trip resolveWireModelId's activeGateway check when
+  // the main session is on opencode but the subagent wants Workers AI.
+  const translate = (m: string) => resolveWireModelId(m, effectiveGateway);
   const originalChatModel = provider.chatModel.bind(provider);
   const originalLanguageModel = provider.languageModel.bind(provider);
 
@@ -794,6 +826,35 @@ const TASK_SYSTEM_PROMPT = [
 ].join("\n");
 
 /**
+ * Pick the model a subagent should use.
+ *
+ * Precedence:
+ *   1. Per-call override — `args.model` on the tool call
+ *   2. Per-session default — `config.exploreModel` / `config.taskModel`
+ *      (sourced from DodoConfig, ultimately from the env defaults
+ *       DEFAULT_EXPLORE_MODEL / DEFAULT_TASK_MODEL on wrangler.jsonc)
+ *   3. Built-in heuristic — `getExploreModel(config.model)` which picks a
+ *      cheap model by provider family, falling back to the main model itself
+ *
+ * Each level is only used if the one above is unset/blank, so users can
+ * configure globally but still override on a hot path.
+ */
+export function resolveSubagentModel(
+  args: Record<string, unknown>,
+  sessionDefault: string | undefined,
+  mainModel: string,
+): string {
+  const rawArgModel = args.model;
+  if (typeof rawArgModel === "string" && rawArgModel.trim().length > 0) {
+    return rawArgModel.trim();
+  }
+  if (typeof sessionDefault === "string" && sessionDefault.trim().length > 0) {
+    return sessionDefault.trim();
+  }
+  return getExploreModel(mainModel);
+}
+
+/**
  * Build a subagent tool with a configurable name, description, system prompt,
  * tool subset, and step/timeout budgets. Both `explore` and `task` are
  * instances of this — `explore` is a pre-configured read-only search
@@ -811,15 +872,15 @@ function buildSubagentTool(spec: {
   env: Env;
   maxSteps: number;
   timeoutMs: number;
-  /** If true, prefer the cheap/fast model for this subagent. */
-  useCheapModel: boolean;
+  /** Per-session default for this subagent's model (from AppConfig). */
+  sessionDefaultModel: string | undefined;
 }): AnyTool {
   return tool({
     description: spec.description,
     inputSchema: spec.inputSchema,
     execute: async (args: Record<string, unknown>) => {
-      const provider = buildProvider(spec.config, spec.env);
-      const modelId = spec.useCheapModel ? getExploreModel(spec.config.model) : spec.config.model;
+      const modelId = resolveSubagentModel(args, spec.sessionDefaultModel, spec.config.model);
+      const provider = buildProviderForModel(modelId, spec.config, spec.env);
       const model = provider.chatModel(modelId);
       const userMessage = spec.getUserMessage(args);
 
@@ -841,7 +902,7 @@ function buildSubagentTool(spec: {
         );
 
         return [
-          `## ${spec.name} results`,
+          `## ${spec.name} results (model: ${modelId})`,
           `**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
           "",
           summary || "(No output)",
@@ -894,6 +955,9 @@ function buildExploreTool(
       scope: z.string().optional().describe(
         "Optional directory to scope the search to (e.g. 'src/' or 'lib/utils'). Omit to search the entire workspace.",
       ),
+      model: z.string().optional().describe(
+        "Optional model override for this call (e.g. '@cf/moonshotai/kimi-k2.6', 'anthropic/claude-haiku-4-5'). Leave unset to use the session default (configured via PUT /config exploreModel, defaults to Kimi K2.6).",
+      ),
     })),
     getUserMessage: (args) => {
       const query = String(args.query ?? "");
@@ -905,7 +969,7 @@ function buildExploreTool(
     env,
     maxSteps: EXPLORE_MAX_STEPS,
     timeoutMs: EXPLORE_TIMEOUT_MS,
-    useCheapModel: true,
+    sessionDefaultModel: config.exploreModel,
   });
 }
 
@@ -953,6 +1017,9 @@ function buildTaskTool(
       scope: z.string().optional().describe(
         "Optional directory to scope the task to (e.g. 'src/'). Hint only — the subagent can still read outside this path.",
       ),
+      model: z.string().optional().describe(
+        "Optional model override for this call (e.g. 'anthropic/claude-haiku-4-5', '@cf/moonshotai/kimi-k2.6'). Leave unset to use the session default (configured via PUT /config taskModel, defaults to Haiku 4.5).",
+      ),
     })),
     getUserMessage: (args) => {
       const prompt = String(args.prompt ?? "");
@@ -964,7 +1031,7 @@ function buildTaskTool(
     env,
     maxSteps: TASK_MAX_STEPS,
     timeoutMs: TASK_TIMEOUT_MS,
-    useCheapModel: true,
+    sessionDefaultModel: config.taskModel,
   });
 }
 
