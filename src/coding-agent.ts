@@ -2183,16 +2183,48 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return Response.json({ runs: await this.listFacetRuns(limit) });
       }
 
-      if (request.method === "GET" && url.pathname.startsWith("/facets/")) {
+      if (url.pathname.startsWith("/facets/")) {
         const parts = url.pathname.split("/").filter(Boolean);
-        // /facets/<facetName>/transcript
-        if (parts.length === 3 && parts[2] === "transcript") {
+        // GET /facets/<facetName>/transcript
+        if (request.method === "GET" && parts.length === 3 && parts[2] === "transcript") {
           const facetName = decodeURIComponent(parts[1]);
           const transcript = await this.getFacetTranscript(facetName);
           if (!transcript) {
             return Response.json({ error: "facet not found" }, { status: 404 });
           }
           return Response.json(transcript);
+        }
+        // POST /facets/<facetName>/apply — merge scratch writes back
+        // into the parent workspace. Body: { paths: string[] }.
+        if (request.method === "POST" && parts.length === 3 && parts[2] === "apply") {
+          const facetName = decodeURIComponent(parts[1]);
+          let body: { paths?: unknown };
+          try {
+            body = (await request.json()) as { paths?: unknown };
+          } catch {
+            return Response.json({ error: "invalid JSON body" }, { status: 400 });
+          }
+          if (!Array.isArray(body.paths) || !body.paths.every((p) => typeof p === "string")) {
+            return Response.json(
+              { error: "body.paths must be an array of strings" },
+              { status: 400 },
+            );
+          }
+          const paths = body.paths as string[];
+          if (paths.length === 0) {
+            return Response.json(
+              { error: "body.paths must be non-empty" },
+              { status: 400 },
+            );
+          }
+          if (paths.length > 500) {
+            return Response.json(
+              { error: "body.paths too large (max 500 per call)" },
+              { status: 400 },
+            );
+          }
+          const result = await this.applyTaskScratch(facetName, paths);
+          return Response.json(result);
         }
       }
 
@@ -5247,20 +5279,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * `facetReadFile` / `facetReadDir` / `facetGlob` to read the parent
    * workspace ("shared" workspace mode).
    */
-  async invokeExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
-    // Raw passthrough — opts flow verbatim. Used by the scaffold test
-    // and by anything that wants to control parent-session context
-    // itself. Production explore goes through `runExploreFacet` which
-    // auto-wires the parent session id + config.
-    const stub = await this.subAgent(ExploreAgent, name);
-    return stub.query(opts);
-  }
-
   /**
-   * Real explore-facet dispatch: auto-fills the parent session context
+   * Explore-facet dispatch: auto-fills the parent session context
    * (sessionId + AppConfig) so the facet can proxy workspace reads back
    * and use the session's provider / model selection. Called from
-   * `buildExploreTool` when `config.exploreMode === "facet"`.
+   * `buildExploreTool` when `config.exploreMode === "facet"` and from
+   * the HTTP surface (via facet transcript routes).
    */
   async runExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
     const stub = await this.subAgent(ExploreAgent, name);
@@ -5276,7 +5300,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     try {
       const result = await stub.query({ ...opts, parentSessionId, parentConfig });
-      this.completeFacetRun(runId, result.summary);
+      this.completeFacetRun(runId, result.summary, { input: result.tokenInput, output: result.tokenOutput });
       return result;
     } catch (err) {
       this.failFacetRun(runId, err instanceof Error ? err.message : String(err));
@@ -5295,11 +5319,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return Number(rows[0]?.id ?? 0);
   }
 
-  private completeFacetRun(runId: number, summary: string): void {
+  private completeFacetRun(runId: number, summary: string, tokens: { input: number; output: number }): void {
     const preview = summary.length > 500 ? `${summary.slice(0, 500)}…` : summary;
     this.db.exec(
-      "UPDATE facet_runs SET status = 'completed', summary_preview = ?, finished_at = ? WHERE id = ?",
-      preview, nowEpoch(), runId,
+      "UPDATE facet_runs SET status = 'completed', summary_preview = ?, token_input = ?, token_output = ?, finished_at = ? WHERE id = ?",
+      preview, tokens.input, tokens.output, nowEpoch(), runId,
     );
   }
 
@@ -5372,7 +5396,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     let result: TaskInvokeResult;
     try {
       result = await stub.task({ ...opts, parentSessionId, parentConfig });
-      this.completeFacetRun(runId, result.summary);
+      this.completeFacetRun(runId, result.summary, { input: result.tokenInput, output: result.tokenOutput });
     } catch (err) {
       this.failFacetRun(runId, err instanceof Error ? err.message : String(err));
       throw err;
@@ -5389,8 +5413,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           parentSessionId,
         });
       } catch (err) {
-        // Don't fail the task over a scheduling hiccup; the lazy
-        // cleanup path (on next task in the facet) still protects us.
+        // Swallow scheduling errors — the task itself succeeded.
+        // If the alarm never fires, the scratch prefix is orphaned
+        // but harmless (it's under the user's own R2 bucket and the
+        // lifecycle rule on `attachments/` does not cover
+        // `workspace/<sid>/scratch/`). A future housekeeping cron
+        // could sweep orphaned scratch prefixes if needed — flagged
+        // as a TODO, not a blocker.
         log("warn", "Failed to schedule scratch cleanup", { facetName: name, err: err instanceof Error ? err.message : String(err) });
       }
     }
@@ -5409,6 +5438,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     input: string;
     summaryPreview: string | null;
     workspaceMode: string | null;
+    tokenInput: number;
+    tokenOutput: number;
     startedAt: string;
     finishedAt: string | null;
     status: "running" | "completed" | "failed";
@@ -5416,6 +5447,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const rows = this.db.all(
       `SELECT id, facet_type as facetType, facet_name as facetName, input,
               summary_preview as summaryPreview, workspace_mode as workspaceMode,
+              token_input as tokenInput, token_output as tokenOutput,
               started_at as startedAt, finished_at as finishedAt, status
        FROM facet_runs
        ORDER BY started_at DESC
@@ -5428,6 +5460,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       input: string;
       summaryPreview: string | null;
       workspaceMode: string | null;
+      tokenInput: number;
+      tokenOutput: number;
       startedAt: number;
       finishedAt: number | null;
       status: "running" | "completed" | "failed";
@@ -5484,10 +5518,23 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return stub.writeScratchForTest(parentSessionId, path, content);
   }
 
-  /** Test-only: drive applyFromScratch on a named facet. */
-  async testApplyFromScratch(facetName: string, paths: string[]): Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }> {
+  /**
+   * Merge a subset of a scratch-mode task facet's writes back into the
+   * parent workspace. Backs the `POST /session/:id/facets/:name/apply`
+   * HTTP route AND the model-facing tool that surfaces scratch writes.
+   *
+   * Idempotent — re-applying the same paths overwrites with the latest
+   * scratch content. Paths not present in the scratch-writes index
+   * come back in the `skipped` array with a reason.
+   */
+  async applyTaskScratch(facetName: string, paths: string[]): Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }> {
     const stub = await this.subAgent(TaskAgent, facetName);
     return stub.applyFromScratch(paths);
+  }
+
+  /** Test-only alias — kept for backwards compat with older tests. */
+  async testApplyFromScratch(facetName: string, paths: string[]): Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }> {
+    return this.applyTaskScratch(facetName, paths);
   }
 
   /**
@@ -5508,14 +5555,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     } catch (err) {
       log("warn", "deleteSubAgent failed during scratch cleanup", { facetName: payload.facetName, err: err instanceof Error ? err.message : String(err) });
     }
-  }
-
-  /**
-   * Invoke a TaskAgent facet by pool name. Mirrors invokeExploreFacet.
-   */
-  async invokeTaskFacet(name: string, opts: TaskInvokeOpts): Promise<TaskInvokeResult> {
-    const stub = await this.subAgent(TaskAgent, name);
-    return stub.task(opts);
   }
 
   private async destroyStorage(): Promise<void> {

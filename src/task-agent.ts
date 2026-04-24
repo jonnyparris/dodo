@@ -15,7 +15,6 @@ import {
   resolveSubagentModel,
   TASK_SYSTEM_PROMPT,
   TASK_MAX_STEPS,
-  TASK_TIMEOUT_MS,
   TASK_FACET_TIMEOUT_MS,
 } from "./agentic";
 import type { AppConfig, Env } from "./types";
@@ -72,6 +71,10 @@ export interface TaskInvokeResult {
   summary: string;
   /** Workspace mode the task actually ran in. */
   workspaceMode: "shared" | "scratch";
+  /** Total input tokens consumed by this facet run (all steps summed). */
+  tokenInput: number;
+  /** Total output tokens emitted by this facet run. */
+  tokenOutput: number;
   /**
    * In scratch mode: list of paths the facet wrote under its scratch
    * workspace. Parent can pass a subset of these back through
@@ -101,21 +104,27 @@ type ParentStub = Pick<
 
 export class TaskAgent extends Agent<Env> {
   /**
-   * Track writes made during a scratch run so `applyFromScratch()` can
-   * validate requested paths. Cleared at the start of each task.
-   */
-  private scratchWrites: Set<string> = new Set();
-  /**
    * Cache the scratch Workspace — the @cloudflare/shell Workspace
    * constructor registers the namespace on the SqlBackend, and
    * registering the same namespace twice throws. Re-using one instance
    * per facet lifetime sidesteps that.
    */
   private _scratchWorkspace: Workspace | null = null;
-  private transcriptInitialized = false;
+  private schemaInitialized = false;
 
-  private ensureTranscriptTable(): void {
-    if (this.transcriptInitialized) return;
+  /**
+   * Create both the transcript table and the scratch-writes index.
+   *
+   * The scratch-writes table is the durable replacement for what used
+   * to be an in-memory `Set<string>` — DO eviction between `task()` and
+   * a later `applyFromScratch()` would wipe the set, causing every
+   * merge-back request to be rejected as "not among the files written".
+   * Persisting to SQL (same ctx.storage.sql that holds assistant_messages)
+   * keeps the write list stable across evictions for the whole scratch
+   * lifetime, until the 24h alarm fires.
+   */
+  private ensureSchema(): void {
+    if (this.schemaInitialized) return;
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS assistant_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,7 +137,52 @@ export class TaskAgent extends Agent<Env> {
         created_at INTEGER NOT NULL
       )
     `);
-    this.transcriptInitialized = true;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS scratch_writes (
+        path TEXT PRIMARY KEY,
+        written_at INTEGER NOT NULL
+      )
+    `);
+    this.schemaInitialized = true;
+  }
+
+  /** Back-compat name — other call sites still reference this. */
+  private ensureTranscriptTable(): void {
+    this.ensureSchema();
+  }
+
+  /** Record a scratch write so applyFromScratch can validate it later. */
+  private recordScratchWrite(path: string): void {
+    this.ensureSchema();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO scratch_writes (path, written_at) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET written_at = excluded.written_at",
+      path, Date.now(),
+    );
+  }
+
+  /** Return every recorded scratch write path. */
+  private listScratchWrites(): string[] {
+    this.ensureSchema();
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT path FROM scratch_writes ORDER BY written_at ASC"
+    ).toArray() as Array<{ path: string }>;
+    return rows.map((r) => r.path);
+  }
+
+  /** Check whether a specific path was written during a scratch run. */
+  private hasScratchWrite(path: string): boolean {
+    this.ensureSchema();
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT 1 as hit FROM scratch_writes WHERE path = ? LIMIT 1",
+      path,
+    ).toArray();
+    return rows.length > 0;
+  }
+
+  /** Wipe the scratch-writes index — called by cleanupScratch. */
+  private clearScratchWrites(): void {
+    this.ensureSchema();
+    this.ctx.storage.sql.exec("DELETE FROM scratch_writes");
   }
 
   private recordTranscript(role: string, content: string, extras: { model?: string; workspaceMode?: string; tokenInput?: number; tokenOutput?: number } = {}): void {
@@ -155,15 +209,10 @@ export class TaskAgent extends Agent<Env> {
    * Run a task. Phase 4 real implementation.
    */
   async task(opts: TaskInvokeOpts): Promise<TaskInvokeResult> {
-    // Placeholder path — preserved so the phase-1 scaffold test keeps
-    // passing without needing every piece of parent context.
     if (!opts.parentSessionId || !opts.parentConfig) {
-      return {
-        ok: true,
-        facetName: this.name,
-        summary: `## Task results (placeholder)\n\nFacet ${this.name} reached without parent session context. Phase 1 scaffold mode.`,
-        workspaceMode: opts.workspaceMode ?? "shared",
-      };
+      throw new Error(
+        "TaskAgent.task() requires parentSessionId and parentConfig. Callers should go through CodingAgent.runTaskFacet() which auto-fills them.",
+      );
     }
 
     const config = opts.parentConfig;
@@ -179,7 +228,11 @@ export class TaskAgent extends Agent<Env> {
       parentSessionId,
     )) as unknown as ParentStub;
 
-    this.scratchWrites = new Set();
+    // Scratch writes accumulate across multiple task() calls on the
+    // same pooled facet until cleanup fires — do NOT clear them here.
+    // applyFromScratch needs every write ever made in this scratch
+    // lifetime to be eligible for merge-back.
+    this.ensureSchema();
 
     // Build the task tool set. Shared mode proxies everything through
     // the parent so all writes hit the parent workspace. Scratch mode
@@ -193,7 +246,11 @@ export class TaskAgent extends Agent<Env> {
 
     this.recordTranscript("user", userMessage, { model: modelId, workspaceMode });
 
-    const timeoutMs = workspaceMode === "scratch" ? TASK_FACET_TIMEOUT_MS : TASK_TIMEOUT_MS;
+    // Facets always get the extended timeout regardless of workspace
+    // mode — the point of moving task into a facet DO is to escape the
+    // parent's turn budget, and a 180s ceiling defeats that. In-process
+    // mode keeps the 180s TASK_TIMEOUT_MS (see buildTaskTool).
+    const timeoutMs = TASK_FACET_TIMEOUT_MS;
 
     try {
       const result = await generateText({
@@ -237,7 +294,9 @@ export class TaskAgent extends Agent<Env> {
         facetName: this.name,
         summary: formatted,
         workspaceMode,
-        scratchWrites: workspaceMode === "scratch" ? Array.from(this.scratchWrites) : undefined,
+        tokenInput: totalInput,
+        tokenOutput: totalOutput,
+        scratchWrites: workspaceMode === "scratch" ? this.listScratchWrites() : undefined,
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -248,18 +307,25 @@ export class TaskAgent extends Agent<Env> {
         facetName: this.name,
         summary: failureSummary,
         workspaceMode,
+        tokenInput: 0,
+        tokenOutput: 0,
       };
     }
   }
 
   /**
    * Copy the named files from this facet's scratch workspace back into
-   * the parent session's workspace. Only files that were actually
-   * written during the preceding `task()` call are eligible; requests
-   * for other paths are skipped and reported in the result.
+   * the parent session's workspace. Only files previously written
+   * during a scratch run (tracked in the `scratch_writes` SQL table)
+   * are eligible; requests for other paths are skipped and reported
+   * in the result.
    *
-   * No-op when the facet has never run a scratch task (scratchWrites is
-   * empty) or when the facet has no scratch workspace instantiated.
+   * Survives DO eviction: the scratch writes index is SQL-backed, not
+   * in-memory. A merge-back request minutes or hours after the task
+   * ran still works correctly.
+   *
+   * No-op when the facet has never run a scratch task or when the
+   * facet has no scratch workspace instantiated.
    */
   async applyFromScratch(paths: string[]): Promise<ApplyFromScratchResult> {
     const applied: string[] = [];
@@ -281,8 +347,8 @@ export class TaskAgent extends Agent<Env> {
     )) as unknown as ParentStub;
 
     for (const path of paths) {
-      if (!this.scratchWrites.has(path)) {
-        skipped.push({ path, reason: "not among the files the facet wrote during the preceding task" });
+      if (!this.hasScratchWrite(path)) {
+        skipped.push({ path, reason: "not among the files the facet wrote during scratch runs" });
         continue;
       }
       const content = await scratch.readFile(path);
@@ -387,7 +453,7 @@ export class TaskAgent extends Agent<Env> {
 
     const writeToScratch = async (path: string, content: string): Promise<void> => {
       await scratch.writeFile(path, content);
-      this.scratchWrites.add(path);
+      this.recordScratchWrite(path);
     };
 
     return capToolOutputs({
@@ -492,7 +558,7 @@ export class TaskAgent extends Agent<Env> {
   async writeScratchForTest(parentSessionId: string, path: string, content: string): Promise<{ ok: true }> {
     const scratch = this.openScratchWorkspace(parentSessionId);
     await scratch.writeFile(path, content);
-    this.scratchWrites.add(path);
+    this.recordScratchWrite(path);
     return { ok: true };
   }
 
@@ -527,7 +593,7 @@ export class TaskAgent extends Agent<Env> {
       cursor = listed.truncated ? listed.cursor : undefined;
       if (!cursor) break;
     }
-    this.scratchWrites = new Set();
+    this.clearScratchWrites();
     return { deleted };
   }
 }

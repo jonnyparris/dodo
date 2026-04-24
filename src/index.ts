@@ -1595,6 +1595,22 @@ app.get("/session/:id/facets/:facetName/transcript", async (c) => {
   );
 });
 
+// Merge scratch-mode task facet writes back into the main workspace.
+// Body: { paths: string[] }. Requires write permission — this mutates
+// the parent workspace. The facet validates each path against its own
+// scratch-writes index and returns { applied, skipped } so the caller
+// can see which files made it through.
+app.post("/session/:id/facets/:facetName/apply", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(
+    c.req.raw,
+    c.env,
+    c.req.param("id"),
+    `/facets/${encodeURIComponent(c.req.param("facetName"))}/apply`,
+  );
+});
+
 app.get("/session/:id/messages", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;

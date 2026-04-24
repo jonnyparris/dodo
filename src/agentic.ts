@@ -64,7 +64,13 @@ export interface BuildToolsOptions {
     runExploreFacet: (
       name: string,
       opts: { q: string; scope?: string; model?: string },
-    ) => Promise<{ ok: true; facetName: string; summary: string }>;
+    ) => Promise<{
+      ok: true;
+      facetName: string;
+      summary: string;
+      tokenInput: number;
+      tokenOutput: number;
+    }>;
     runTaskFacet: (
       name: string,
       opts: {
@@ -78,6 +84,8 @@ export interface BuildToolsOptions {
       facetName: string;
       summary: string;
       workspaceMode: "shared" | "scratch";
+      tokenInput: number;
+      tokenOutput: number;
       scratchWrites?: string[];
     }>;
   };
@@ -1278,7 +1286,9 @@ function buildTaskTool(
               `**Scratch writes (${result.scratchWrites.length} files):**`,
               ...result.scratchWrites.map((p) => `- ${p}`),
               "",
-              "Call the task facet's applyFromScratch RPC with any subset of these paths to merge them into the main workspace.",
+              "Writes landed in an isolated scratch workspace — the main workspace is unchanged.",
+              `To merge a subset back into the main workspace, ask the user to \`POST /session/<id>/facets/${result.facetName}/apply\` with \`{ "paths": [...] }\`.`,
+              "Or — if the caller has already confirmed — the parent can call `applyTaskScratch(facetName, paths)` directly via RPC.",
             ].join("\n");
           }
           return result.summary;

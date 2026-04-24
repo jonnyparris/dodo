@@ -70,6 +70,10 @@ export interface ExploreQueryResult {
    * what the parent explore tool returns to the main model verbatim.
    */
   summary: string;
+  /** Total input tokens consumed by this facet run (all steps summed). */
+  tokenInput: number;
+  /** Total output tokens emitted by this facet run. */
+  tokenOutput: number;
 }
 
 /**
@@ -139,15 +143,10 @@ export class ExploreAgent extends Agent<Env> {
    *   can drop it straight into the parent's tool message.
    */
   async query(opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
-    // If no parent session context, fall back to the placeholder. This
-    // keeps the phase-1 scaffold test green and gives a deterministic
-    // signal when the facet is invoked without proper plumbing.
     if (!opts.parentSessionId || !opts.parentConfig) {
-      return {
-        ok: true,
-        facetName: this.name,
-        summary: `## Explore results (placeholder)\n\nFacet ${this.name} reached without parent session context (parentSessionId or parentConfig missing). Phase 1 scaffold mode.`,
-      };
+      throw new Error(
+        "ExploreAgent.query() requires parentSessionId and parentConfig. Callers should go through CodingAgent.runExploreFacet() which auto-fills them.",
+      );
     }
 
     const config = opts.parentConfig;
@@ -240,7 +239,13 @@ export class ExploreAgent extends Agent<Env> {
         tokenOutput: totalOutput,
       });
 
-      return { ok: true, facetName: this.name, summary: formatted };
+      return {
+        ok: true,
+        facetName: this.name,
+        summary: formatted,
+        tokenInput: totalInput,
+        tokenOutput: totalOutput,
+      };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       const failureSummary = `Explore failed (model: ${modelId}) [facet: ${this.name}]: ${msg}`;
@@ -249,6 +254,8 @@ export class ExploreAgent extends Agent<Env> {
         ok: true,
         facetName: this.name,
         summary: failureSummary,
+        tokenInput: 0,
+        tokenOutput: 0,
       };
     }
   }

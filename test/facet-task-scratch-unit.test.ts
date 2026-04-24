@@ -144,4 +144,70 @@ describe("TaskAgent — scratch workspace isolation", () => {
     const bogusView = await parent.facetReadFile("/never-written.txt");
     expect(bogusView).toBeNull();
   });
+
+  it("scratch writes survive DO eviction — SQL-backed, not in-memory", async () => {
+    // This test exercises the real applyFromScratch path *without* a
+    // preceding `task()` call on the same facet (which in the in-memory
+    // implementation would have populated scratchWrites just before
+    // the assertion ran). The write goes in via writeScratchForTest
+    // (which now records into SQL), and the merge-back operates against
+    // a fresh stub lookup — simulating the "applyFromScratch minutes
+    // later" flow.
+    const { getAgentByName } = await import("agents");
+    const testEnv = env as Env;
+    const sessionId = `task-scratch-durable-${crypto.randomUUID()}`;
+
+    const parent = await getAgentByName(testEnv.CODING_AGENT as never, sessionId) as unknown as {
+      testWriteScratchFile: (facetName: string, parentSessionId: string, path: string, content: string) => Promise<{ ok: true }>;
+      applyTaskScratch: (facetName: string, paths: string[]) => Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }>;
+      facetReadFile: (path: string) => Promise<string | null>;
+    };
+
+    // Write only — no task() call. Old in-memory impl would have an
+    // empty scratchWrites here because writes only happen via the
+    // real write tool during task().
+    await parent.testWriteScratchFile("pool-task-durable", sessionId, "/durable.txt", "persisted content");
+
+    // Apply via the production RPC (same path as the HTTP route).
+    const res = await parent.applyTaskScratch("pool-task-durable", ["/durable.txt"]);
+    expect(res.applied).toContain("/durable.txt");
+
+    const parentView = await parent.facetReadFile("/durable.txt");
+    expect(parentView).toBe("persisted content");
+  });
+
+  it("cleanupScratchFacet wipes scratch R2 prefix and scratch-writes index", async () => {
+    const { getAgentByName } = await import("agents");
+    const testEnv = env as Env;
+    const sessionId = `task-scratch-cleanup-${crypto.randomUUID()}`;
+
+    const parent = await getAgentByName(testEnv.CODING_AGENT as never, sessionId) as unknown as {
+      testWriteScratchFile: (facetName: string, parentSessionId: string, path: string, content: string) => Promise<{ ok: true }>;
+      applyTaskScratch: (facetName: string, paths: string[]) => Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }>;
+      cleanupScratchFacet: (payload: { facetName: string; parentSessionId: string }) => Promise<void>;
+    };
+
+    // Seed the scratch workspace with a file so cleanup has something
+    // to sweep.
+    await parent.testWriteScratchFile("pool-task-cleanup", sessionId, "/doomed.txt", "goodbye world");
+
+    // Verify it's actually there before cleanup (merge-back should
+    // succeed — sanity-checks the scratch write actually landed).
+    const preCheck = await parent.applyTaskScratch("pool-task-cleanup", ["/doomed.txt"]);
+    expect(preCheck.applied).toContain("/doomed.txt");
+
+    // Fire the scheduled cleanup callback directly — no way to wind
+    // the clock forward 24h inside the vitest-pool-workers runtime,
+    // so we invoke the handler with the same payload `this.schedule`
+    // would pass at alarm fire time.
+    await parent.cleanupScratchFacet({ facetName: "pool-task-cleanup", parentSessionId: sessionId });
+
+    // After cleanup: applyTaskScratch should skip the path because
+    // the scratch_writes index was wiped. (The R2 prefix was also
+    // cleaned, but the SQL-level skip is the first-line proof — we
+    // don't need to unwrap R2 internals from the test.)
+    const postCheck = await parent.applyTaskScratch("pool-task-cleanup", ["/doomed.txt"]);
+    expect(postCheck.applied).toHaveLength(0);
+    expect(postCheck.skipped.some((s) => s.path === "/doomed.txt")).toBe(true);
+  });
 });

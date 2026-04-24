@@ -90,7 +90,7 @@ describe("Facet transcripts — HTTP surface", () => {
 
     const response = await fetchJson(`/session/${sessionId}/facets`);
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { runs: Array<{ facetType: string; facetName: string; input: string; status: string }> };
+    const body = (await response.json()) as { runs: Array<{ facetType: string; facetName: string; input: string; status: string; tokenInput: number; tokenOutput: number }> };
 
     expect(body.runs.length).toBeGreaterThanOrEqual(1);
     const run = body.runs.find((r) => r.facetName === "pool-explore-0");
@@ -98,6 +98,15 @@ describe("Facet transcripts — HTTP surface", () => {
     expect(run!.facetType).toBe("explore");
     expect(run!.input).toContain("transcript-test-query-xyz");
     expect(run!.status).toBe("completed");
+    // Token counters are surfaced to the parent (mock model returns
+    // inputTokens: 1, outputTokens: 1 per step; explore can run multiple
+    // steps before hitting stopWhen). Verify non-zero and numeric so
+    // the columns aren't dead default-0 values.
+    const typedRun = run! as typeof run & { tokenInput: number; tokenOutput: number };
+    expect(typeof typedRun.tokenInput).toBe("number");
+    expect(typeof typedRun.tokenOutput).toBe("number");
+    expect(typedRun.tokenInput).toBeGreaterThan(0);
+    expect(typedRun.tokenOutput).toBeGreaterThan(0);
   });
 
   it("GET /session/:id/facets/:name/transcript returns the facet's message log", async () => {
@@ -131,5 +140,58 @@ describe("Facet transcripts — HTTP surface", () => {
 
     const response = await fetchJson(`/session/${sessionId}/facets/does-not-exist/transcript`);
     expect(response.status).toBe(404);
+  });
+
+  it("POST /session/:id/facets/:name/apply merges scratch writes back", async () => {
+    const sessionId = await createSession();
+    const { getAgentByName } = await import("agents");
+    const testEnv = env as Env;
+    const parent = await getAgentByName(testEnv.CODING_AGENT as never, sessionId) as unknown as {
+      testWriteScratchFile: (facetName: string, parentSessionId: string, path: string, content: string) => Promise<{ ok: true }>;
+      facetReadFile: (path: string) => Promise<string | null>;
+    };
+
+    // Seed a scratch write on a known-named facet, then hit the HTTP
+    // apply route to merge a subset back. This is the end-to-end path
+    // the task tool's output refers to.
+    await parent.testWriteScratchFile("pool-task-apply-http", sessionId, "/from-http.txt", "hello via POST");
+
+    const response = await fetchJson(
+      `/session/${sessionId}/facets/pool-task-apply-http/apply`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paths: ["/from-http.txt", "/never-written.txt"] }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { applied: string[]; skipped: Array<{ path: string }> };
+    expect(body.applied).toContain("/from-http.txt");
+    expect(body.skipped.some((s) => s.path === "/never-written.txt")).toBe(true);
+
+    const parentView = await parent.facetReadFile("/from-http.txt");
+    expect(parentView).toBe("hello via POST");
+  });
+
+  it("POST /facets/:name/apply rejects missing or invalid body", async () => {
+    const sessionId = await createSession();
+
+    const noBody = await fetchJson(`/session/${sessionId}/facets/any-name/apply`, { method: "POST" });
+    expect(noBody.status).toBe(400);
+
+    const emptyArray = await fetchJson(`/session/${sessionId}/facets/any-name/apply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paths: [] }),
+    });
+    expect(emptyArray.status).toBe(400);
+
+    const wrongType = await fetchJson(`/session/${sessionId}/facets/any-name/apply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paths: "not an array" }),
+    });
+    expect(wrongType.status).toBe(400);
   });
 });
