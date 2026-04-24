@@ -17,6 +17,7 @@ import {
   wrapDEK,
 } from "./crypto";
 import { HttpMcpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
+import { log } from "./logger";
 import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
 import { sendRunNotification } from "./notify";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
@@ -43,6 +44,14 @@ const MIN_INTERVAL_SECONDS = 300;
 const MAX_DELAY_SECONDS = 90 * 86400;
 /** Maximum concurrent scheduled-session rows per user. */
 const MAX_SCHEDULES_PER_USER = 50;
+
+// ─── Idle-session cleanup constants ───
+/** Sessions with no prompts that have been idle longer than this get soft-deleted. */
+const IDLE_SESSION_TTL_SECONDS = 600; // 10 minutes
+/** How often the DO alarm re-runs the idle sweep. */
+const IDLE_SWEEP_INTERVAL_SECONDS = 300; // 5 minutes
+/** Max sessions examined per sweep — bounds cross-DO fan-out. */
+const IDLE_SWEEP_BATCH_SIZE = 25;
 
 const updateConfigSchema = z
   .object({
@@ -226,6 +235,10 @@ export class UserControl extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => {
       this.initializeSchema();
       await this.seedDefaults();
+      // Arm the alarm on DO activation so existing idle sessions get
+      // swept even if no new work arrives. Cheap no-op when there are
+      // no idle sessions and no pending schedules.
+      await this.rearmAlarm();
     });
   }
 
@@ -1155,6 +1168,10 @@ export class UserControl extends DurableObject<Env> {
       now,
       now,
     );
+    // A fresh idle session is eligible for the idle-sweep in ~10min.
+    // Fire-and-forget — rearmAlarm only touches DO storage, which is
+    // serialised by the input gate.
+    void this.rearmAlarm();
     return this.getSession(id);
   }
 
@@ -2129,25 +2146,50 @@ export class UserControl extends DurableObject<Env> {
   }
 
   /**
-   * Set the DO alarm to fire at the minimum next_run_epoch across all rows.
-   * Clears the alarm when there are no pending schedules.
+   * Set the DO alarm to fire at the earliest pending work:
+   *   - next scheduled-session fire (min next_run_epoch)
+   *   - next idle-session sweep (if any idle sessions exist)
+   * Clears the alarm when neither bucket has pending work.
    */
-  private async rearmScheduledSessionAlarm(): Promise<void> {
-    const next = this.db.one(
+  private async rearmAlarm(): Promise<void> {
+    const candidates: number[] = [];
+
+    const nextSched = this.db.one(
       "SELECT MIN(next_run_epoch) AS t FROM scheduled_sessions WHERE next_run_epoch IS NOT NULL",
     );
-    if (next?.t == null) {
+    if (nextSched?.t != null) {
+      candidates.push(Number(nextSched.t) * 1000);
+    }
+
+    // Only keep the idle sweep armed while there are idle sessions to
+    // watch. Empty userbases shouldn't pay for periodic wake-ups.
+    const idle = this.db.one(
+      "SELECT 1 AS has FROM sessions WHERE status = 'idle' LIMIT 1",
+    );
+    if (idle?.has != null) {
+      candidates.push(Date.now() + IDLE_SWEEP_INTERVAL_SECONDS * 1000);
+    }
+
+    if (candidates.length === 0) {
       await this.ctx.storage.deleteAlarm();
       return;
     }
-    const fireAtMs = Number(next.t) * 1000;
-    this.ctx.storage.setAlarm(fireAtMs);
+    this.ctx.storage.setAlarm(Math.min(...candidates));
   }
 
   /**
-   * Alarm handler for scheduled sessions. Fires any overdue rows in
-   * batches of ALARM_BATCH_SIZE. If more rows remain overdue after the
-   * batch, re-arm for ~1s later; otherwise arm to the next future fire.
+   * Back-compat shim — older call sites used `rearmScheduledSessionAlarm`
+   * before the alarm grew an idle-sweep leg. The two are now equivalent.
+   */
+  private async rearmScheduledSessionAlarm(): Promise<void> {
+    await this.rearmAlarm();
+  }
+
+  /**
+   * Alarm handler. Serves two buckets of work:
+   *   1. Scheduled-session fires (overdue rows in scheduled_sessions).
+   *   2. Idle-session sweep — soft-deletes sessions with no prompts that
+   *      have been idle for more than IDLE_SESSION_TTL_SECONDS.
    *
    * The DO input gate serialises alarm() with fetch handlers, so a
    * concurrent DELETE can't interleave between rows. The per-iteration
@@ -2186,7 +2228,79 @@ export class UserControl extends DurableObject<Env> {
       this.ctx.storage.setAlarm(Date.now() + 1000);
       return;
     }
-    await this.rearmScheduledSessionAlarm();
+
+    // Idle-session sweep runs on every alarm fire once the scheduled
+    // bucket is drained. Cheap when there's nothing idle (SQL-only) and
+    // bounded by IDLE_SWEEP_BATCH_SIZE when there is.
+    await this.sweepIdleSessions();
+
+    await this.rearmAlarm();
+  }
+
+  /**
+   * Soft-delete sessions that have been idle for at least
+   * IDLE_SESSION_TTL_SECONDS *and* never received a prompt. The "no
+   * prompts" check requires a per-session cross-DO call to the
+   * CodingAgent, so we bound the batch size to keep wake-ups cheap.
+   *
+   * The sweep intentionally skips sessions already in the `deleted`
+   * bucket (those are purged on listSessions) and anything in `running`
+   * (an in-flight prompt bumps status beyond `idle`).
+   */
+  private async sweepIdleSessions(): Promise<void> {
+    const cutoff = nowEpoch() - IDLE_SESSION_TTL_SECONDS;
+    const candidates = this.db.all(
+      "SELECT id FROM sessions WHERE status = 'idle' AND updated_at < ? ORDER BY updated_at ASC LIMIT ?",
+      cutoff,
+      IDLE_SWEEP_BATCH_SIZE,
+    );
+
+    for (const row of candidates) {
+      const sessionId = String(row.id);
+      let promptCount: number;
+      try {
+        promptCount = await this.countSessionPrompts(sessionId);
+      } catch (err) {
+        // If the CodingAgent DO is unreachable, leave the session alone —
+        // better to retry next sweep than to delete blindly.
+        log("warn", "idle-sweep: failed to count prompts", {
+          sessionId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+
+      if (promptCount > 0) continue;
+
+      // Reuse the same soft-delete primitive as the manual DELETE path
+      // so the 5-min recovery window behaves identically.
+      const deleteExpiry = nowEpoch() + 300;
+      this.db.exec(
+        "UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?",
+        deleteExpiry,
+        nowEpoch(),
+        sessionId,
+      );
+      this.emitUserEvent({ type: "sessions_changed", reason: "deleted", sessionId });
+      log("info", "idle-sweep: soft-deleted empty idle session", { sessionId });
+    }
+  }
+
+  /**
+   * Ask a session's CodingAgent DO how many prompts it holds. Uses the
+   * lightweight /prompts/count endpoint — a GET of /prompts would
+   * serialise the whole list, which can be 100s of rows.
+   */
+  private async countSessionPrompts(sessionId: string): Promise<number> {
+    const agent = await getAgentByName(this.env.CODING_AGENT as never, sessionId);
+    const res = await agent.fetch(
+      new Request("https://coding-agent/prompts/count", { method: "GET" }),
+    );
+    if (!res.ok) {
+      throw new Error(`prompt count fetch failed: ${res.status}`);
+    }
+    const body = (await res.json()) as { count?: number };
+    return Number(body.count ?? 0);
   }
 
   /**

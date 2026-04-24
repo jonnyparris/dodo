@@ -2163,6 +2163,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return Response.json({ prompts: this.listPrompts() });
       }
 
+      if (request.method === "GET" && url.pathname === "/prompts/count") {
+        // Lightweight count endpoint used by the UserControl idle-session
+        // sweep. Full /prompts would serialise the whole list.
+        const row = this.db.one("SELECT COUNT(*) AS n FROM prompts");
+        return Response.json({ count: Number(row?.n ?? 0) });
+      }
+
       if (request.method === "GET" && url.pathname === "/prompt-queue") {
         return Response.json(this.readQueueState());
       }
