@@ -9,7 +9,7 @@ import { createBrowserTools } from "./browser/tools";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
-import type { AppConfig, Env } from "./types";
+import type { AppConfig, Env, TodoStore } from "./types";
 
 /** Options passed through from the coding agent into tool factories. */
 /** Metadata describing an OAuth-connected MCP tool federated from the per-user hub DO. */
@@ -49,6 +49,11 @@ export interface BuildToolsOptions {
    * before the assistant message finishes persisting.
    */
   onToolAttachments?: (toolCallId: string, attachments: AttachmentRef[]) => void;
+  /**
+   * Stable read/write surface for session-scoped todos. Backs the
+   * `todo_add` / `todo_update` / `todo_list` / `todo_clear` tools.
+   */
+  todoStore?: TodoStore;
 }
 
 // ─── Tool Output Caps (OpenCode Pattern #1) ───
@@ -73,8 +78,19 @@ const TOOL_OUTPUT_CAPS: Record<string, { maxLines?: number; maxBytes?: number; m
                                 // Think caps at 2000 lines but that's ~60k tokens — too
                                 // much for discovery. 200 lines is enough for a preview;
                                 // the truncation hint tells the model to use offset/limit.
+  // codemode — 32 KB soft cap. codemode lets the model call arbitrary JS
+  // including fetch() against external APIs; without a cap, a single
+  // GitHub-API-style response can burn 200k+ input tokens. Enforced in
+  // capCodemodeResult() below because codemode's result shape is
+  // `{ code, result, logs? }` rather than the generic shapes handled by
+  // capResult(). Pairs with the `select` schema projection (described in
+  // the tool's prompt) so the model can pre-narrow before output hits here.
+  codemode: { maxBytes: 32_000 },
   // write, edit, delete — already produce small output, no cap needed
 };
+
+/** Max bytes for a codemode `logs` field; kept separate from result. */
+const CODEMODE_LOGS_MAX_BYTES = 4_000;
 
 /**
  * Wrap a tool set to enforce per-tool output caps.
@@ -164,6 +180,110 @@ function capResult(
   return result;
 }
 
+/**
+ * Middle-truncate a string to fit within a byte budget. Keeps head and tail
+ * so both the shape of the value and its end (often the most recent /
+ * interesting data) are preserved. Produces a `[... truncated N bytes ...]`
+ * hint in the middle.
+ */
+function middleTruncate(text: string, maxBytes: number): string {
+  if (text.length <= maxBytes) return text;
+  // Leave room for the truncation marker
+  const marker = "\n[... truncated %d bytes. Pass `select` to codemode to project only the fields you need. ...]\n";
+  const overhead = marker.length + 12; // room for %d replacement
+  const headBudget = Math.floor((maxBytes - overhead) * 0.6);
+  const tailBudget = Math.floor((maxBytes - overhead) * 0.4);
+  if (headBudget <= 0 || tailBudget <= 0) return text.slice(0, maxBytes);
+  const head = text.slice(0, headBudget);
+  const tail = text.slice(-tailBudget);
+  const dropped = text.length - headBudget - tailBudget;
+  return `${head}${marker.replace("%d", String(dropped))}${tail}`;
+}
+
+/**
+ * Cap a codemode tool result. Handles the `{ code, result, logs? }` shape
+ * returned by `createExecuteTool`. The `result` field is whatever the
+ * sandboxed JS returned (often a fetched JSON blob); it's serialized and
+ * middle-truncated against `maxBytes`. `logs` is trimmed separately.
+ *
+ * The `code` field is left untouched — it's typically small, and we want the
+ * model to be able to diff what it sent vs what came back.
+ */
+export function capCodemodeResult(result: unknown, maxBytes: number): unknown {
+  if (!result || typeof result !== "object") return result;
+  const obj = result as { code?: unknown; result?: unknown; logs?: unknown };
+  const out: Record<string, unknown> = { ...obj };
+
+  if (obj.result !== undefined) {
+    let serialized: string;
+    try {
+      serialized = typeof obj.result === "string" ? obj.result : JSON.stringify(obj.result);
+    } catch {
+      serialized = String(obj.result);
+    }
+    if (serialized.length > maxBytes) {
+      out.result = middleTruncate(serialized, maxBytes);
+      out._truncated = `codemode result exceeded ${maxBytes} bytes (was ${serialized.length}). Result was serialized to string and middle-truncated. Use \`select\` to return only the fields you need.`;
+    }
+  }
+
+  if (typeof obj.logs === "string" && obj.logs.length > CODEMODE_LOGS_MAX_BYTES) {
+    out.logs = middleTruncate(obj.logs, CODEMODE_LOGS_MAX_BYTES);
+  }
+
+  return out;
+}
+
+/**
+ * Project a codemode result to the caller-provided dot-paths.
+ *
+ * Only the `result` field of the returned object is projected — `code`,
+ * `logs`, and any other fields are left alone. Supports numeric indices
+ * in paths (e.g. `items.0.name`). Missing paths are silently skipped.
+ *
+ * Returns a new object shaped like:
+ *   { code, result: { "items.0.name": "foo", "total_count": 42 }, logs? }
+ * so the model sees exactly what it asked for, flat-keyed by path.
+ */
+export function projectCodemodeResult(result: unknown, paths: string[]): unknown {
+  if (!result || typeof result !== "object") return result;
+  const obj = result as { code?: unknown; result?: unknown; logs?: unknown };
+  if (obj.result === undefined) return result;
+
+  const projected: Record<string, unknown> = {};
+  for (const path of paths) {
+    const value = getByPath(obj.result, path);
+    if (value !== undefined) projected[path] = value;
+  }
+
+  return {
+    ...obj,
+    result: projected,
+    _projected_paths: paths,
+  };
+}
+
+/** Walk a dot-path through a value. `items.0.name` handles arrays. */
+function getByPath(value: unknown, path: string): unknown {
+  const parts = path.split(".");
+  let current: unknown = value;
+  for (const part of parts) {
+    if (current === null || current === undefined) return undefined;
+    if (Array.isArray(current)) {
+      const idx = Number(part);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= current.length) return undefined;
+      current = current[idx];
+      continue;
+    }
+    if (typeof current === "object") {
+      current = (current as Record<string, unknown>)[part];
+      continue;
+    }
+    return undefined;
+  }
+  return current;
+}
+
 /** Truncate text by line count and byte size, keeping the head. */
 function capText(text: string, maxLines: number, maxBytes: number): string {
   const lines = text.split("\n");
@@ -184,6 +304,114 @@ function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
 
+/**
+ * Add Anthropic prompt-caching cache_control markers to an OpenAI-compatible
+ * request body. Invoked by @ai-sdk/openai-compatible as transformRequestBody,
+ * so this runs once per outbound request (per call to streamText / generateText).
+ *
+ * Strategy — place markers at the boundaries Anthropic expects:
+ *   1. System prompt   → cache (static per session after turn 1)
+ *   2. Tool definitions → cache (stable per session)
+ *   3. Last user message → cache (reuses cached context on retries)
+ *
+ * Anthropic allows up to 4 cache_control markers per request. We use 3 to
+ * leave one spare for future extensions (e.g. caching a compaction summary).
+ *
+ * The OpenAI-compatible wire format allows system to be a string; when
+ * routed to Anthropic the gateway re-shapes it. We upgrade to the Anthropic
+ * array-of-content-blocks shape at the wire level — most gateways that route
+ * to Anthropic pass this through unchanged; those that don't strip the
+ * cache_control field silently (no error).
+ *
+ * All modifications are idempotent: if cache_control markers already exist,
+ * we leave them alone.
+ */
+export function addAnthropicCacheMarkers(body: Record<string, unknown>): Record<string, unknown> {
+  // No-op for non-Anthropic requests. The transform is installed on every
+  // provider instance so calls that override the session model (e.g. the
+  // compaction step pinned to claude-haiku-4-5) get caching too. Detect
+  // Anthropic by checking the outbound model field — it's already been
+  // translated to the wire format (e.g. "anthropic/claude-opus-4-7") by
+  // the time transformRequestBody runs.
+  const modelId = typeof body.model === "string" ? body.model : "";
+  if (!modelId.startsWith("anthropic/") && !modelId.startsWith("claude-")) {
+    return body;
+  }
+
+  // Shallow clone so we don't mutate the caller's object
+  const out: Record<string, unknown> = { ...body };
+
+  // 1. System prompt — upgrade string → array with cache_control
+  if (typeof out.system === "string" && out.system.length > 0) {
+    out.system = [
+      { type: "text", text: out.system, cache_control: { type: "ephemeral" } },
+    ];
+  } else if (Array.isArray(out.system) && out.system.length > 0) {
+    // Already array form — mark the last block if none has cache_control yet
+    const hasMarker = out.system.some(
+      (block) => block && typeof block === "object" && "cache_control" in (block as object),
+    );
+    if (!hasMarker) {
+      const last = out.system[out.system.length - 1];
+      if (last && typeof last === "object") {
+        out.system = [
+          ...out.system.slice(0, -1),
+          { ...(last as object), cache_control: { type: "ephemeral" } },
+        ];
+      }
+    }
+  }
+
+  // 2. Tools — attach cache_control to the last tool definition so the
+  //    whole tool-schema block is cached. Tools are stable per session, so
+  //    this produces a reliable cache hit on every subsequent step.
+  if (Array.isArray(out.tools) && out.tools.length > 0) {
+    const tools = out.tools as unknown[];
+    const hasMarker = tools.some(
+      (t) => t && typeof t === "object" && "cache_control" in (t as object),
+    );
+    if (!hasMarker) {
+      const lastIdx = tools.length - 1;
+      const last = tools[lastIdx];
+      if (last && typeof last === "object") {
+        out.tools = [
+          ...tools.slice(0, lastIdx),
+          { ...(last as object), cache_control: { type: "ephemeral" } },
+        ];
+      }
+    }
+  }
+
+  // 3. Last user message — place a cache marker so that between-step
+  //    reruns can reuse the cached input. Conservative: only upgrade if
+  //    the content is a string (don't touch multimodal arrays to avoid
+  //    accidentally breaking image-bearing messages).
+  if (Array.isArray(out.messages) && out.messages.length > 0) {
+    const messages = out.messages as Array<Record<string, unknown>>;
+    // Walk from the end to find the last user message
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg?.role !== "user") continue;
+      if (typeof msg.content === "string" && msg.content.length > 0) {
+        const updated: Record<string, unknown> = {
+          ...msg,
+          content: [
+            {
+              type: "text",
+              text: msg.content,
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        };
+        out.messages = [...messages.slice(0, i), updated, ...messages.slice(i + 1)];
+      }
+      break;
+    }
+  }
+
+  return out;
+}
+
 /** Some model IDs need rewriting before they're sent to the upstream gateway.
  *  - Workers AI models (`@cf/…`) need the `workers-ai/` prefix per AI Gateway
  *    unified-API docs: https://developers.cloudflare.com/ai-gateway/chat-completion/
@@ -202,8 +430,37 @@ export function resolveWireModelId(modelId: string, activeGateway: "opencode" | 
   return modelId;
 }
 
+/**
+ * Pick the right gateway for a given model ID.
+ *
+ *  - `@cf/*` (Workers AI) → always ai-gateway
+ *  - Everything else → respect whatever `config.activeGateway` says
+ *
+ * This lets a subagent run on a Workers AI model (e.g. Kimi K2.6) even if
+ * the main session uses the opencode gateway. Without this, asking Kimi
+ * to do explore work from an opencode-gateway session would fail because
+ * the provider baseURL would be wrong.
+ */
+function resolveGatewayForModel(
+  modelId: string,
+  mainGateway: "opencode" | "ai-gateway",
+): "opencode" | "ai-gateway" {
+  if (modelId.startsWith("@cf/")) return "ai-gateway";
+  return mainGateway;
+}
+
 export function buildProvider(config: AppConfig, env: Env) {
-  const isOpencode = config.activeGateway === "opencode";
+  return buildProviderForModel(config.model, config, env);
+}
+
+/**
+ * Build a provider for a specific model — picks the right gateway and
+ * base URL even if that differs from the session's main gateway. Used by
+ * subagents that run on a cheaper/different model than the main session.
+ */
+export function buildProviderForModel(modelId: string, config: AppConfig, env: Env) {
+  const effectiveGateway = resolveGatewayForModel(modelId, config.activeGateway);
+  const isOpencode = effectiveGateway === "opencode";
   const baseURL = isOpencode
     ? `${trimBaseUrl(config.opencodeBaseURL)}`
     : `${trimBaseUrl(config.aiGatewayBaseURL)}`;
@@ -217,17 +474,28 @@ export function buildProvider(config: AppConfig, env: Env) {
         "x-api-key": env.AI_GATEWAY_KEY ?? "",
       };
 
+  // Anthropic prompt caching. The transform checks the outbound model per
+  // request and only acts when the wire-format model ID starts with
+  // "anthropic/" (or "claude-"). Always installing it ensures we still get
+  // caching on calls that use a different model than the session default —
+  // most importantly the compaction step, which hardcodes
+  // anthropic/claude-haiku-4-5 regardless of the session model.
+  // For non-Anthropic requests the transform is a no-op.
   const provider = createOpenAICompatible({
     baseURL,
     headers,
     includeUsage: true,
-    name: config.activeGateway,
+    name: effectiveGateway,
+    transformRequestBody: addAnthropicCacheMarkers,
   });
 
   // Wrap `chatModel` / `languageModel` / the callable provider so callers can pass
   // the user-facing id (e.g. `@cf/moonshotai/kimi-k2.6`) and we translate it to the
   // wire format (`workers-ai/@cf/moonshotai/kimi-k2.6`) exactly once, at the edge.
-  const translate = (modelId: string) => resolveWireModelId(modelId, config.activeGateway);
+  // Use the *effective* gateway (the one we actually picked for this provider)
+  // so @cf/* models don't trip resolveWireModelId's activeGateway check when
+  // the main session is on opencode but the subagent wants Workers AI.
+  const translate = (m: string) => resolveWireModelId(m, effectiveGateway);
   const originalChatModel = provider.chatModel.bind(provider);
   const originalLanguageModel = provider.languageModel.bind(provider);
 
@@ -248,6 +516,16 @@ export function buildProvider(config: AppConfig, env: Env) {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyTool = any;
 
+/**
+ * Default git_clone depth. Bumped from 1 to 20 after observing repeated
+ * "what's new in this repo?" failures where a depth=1 clone gave the model
+ * only the most recent commit, so it either gave up or triggered extra
+ * tool calls to get more history. 20 commits covers almost all "recent
+ * changes" style questions without materially inflating clone size.
+ * Agents can still pass depth=1 for tree-only or depth=0 for full history.
+ */
+const DEFAULT_CLONE_DEPTH = 20;
+
 function buildGitTools(
   env: Env,
   workspace: Workspace,
@@ -261,18 +539,18 @@ function buildGitTools(
 
   return {
     git_clone_known: tool({
-      description: "Clone a built-in known repository by id. Use this instead of free-form URLs when possible.",
+      description: "Clone a built-in known repository by id. Use this instead of free-form URLs when possible. Default depth is 20 commits — enough for most 'what's new / recent changes' investigations without downloading the full history. Pass depth=0 for full history or depth=1 when you only need the current tree.",
       inputSchema: zodSchema(z.object({
         repoId: z.enum(knownRepoIds as ["dodo"]).describe("Known repo id"),
         dir: z.string().optional().describe("Target directory (defaults to repo's standard dir)"),
         branch: z.string().optional().describe("Branch to clone (defaults to repo default branch)"),
-        depth: z.number().optional().describe("Clone depth. Default: 1. Use 0 for full history."),
+        depth: z.number().optional().describe("Clone depth in commits. Default: 20 (covers most 'what changed recently' questions). Use 1 for tree-only, 0 for full history."),
       })),
       execute: async ({ repoId, dir, branch, depth }) => {
         const repo = getKnownRepo(repoId);
         const targetDir = dir ?? repo.dir;
         const token = await resolveRemoteToken({ dir: targetDir, env, git, ownerEmail, url: repo.url });
-        const cloneDepth = depth === 0 ? undefined : (depth ?? 1);
+        const cloneDepth = depth === 0 ? undefined : (depth ?? DEFAULT_CLONE_DEPTH);
         return git.clone({
           branch: branch ?? repo.defaultBranch,
           depth: cloneDepth,
@@ -285,17 +563,17 @@ function buildGitTools(
     }),
 
     git_clone: tool({
-      description: "Clone a git repo into the workspace. Auth is automatic for GitHub/GitLab. Clones are shallow (depth 1) by default. Pass depth 0 for full history.",
+      description: "Clone a git repo into the workspace. Auth is automatic for GitHub/GitLab. Default depth is 20 commits — enough for 'what's new / recent changes / since commit X' style investigations without paying for full history. Pass depth=1 for tree-only (cheapest, no log context) or depth=0 for full history.",
       inputSchema: zodSchema(z.object({
         url: z.string().describe("Git repo URL (e.g. https://github.com/owner/repo)"),
         dir: z.string().optional().describe("Target directory (default: repo name)"),
         branch: z.string().optional().describe("Branch to clone"),
-        depth: z.number().optional().describe("Clone depth. Default: 1 (shallow). Use 0 for full history."),
+        depth: z.number().optional().describe("Clone depth in commits. Default: 20. Use 1 for tree-only, 0 for full history."),
       })),
       execute: async ({ url, dir, branch, depth }) => {
         const token = await resolveRemoteToken({ dir, env, git, url, ownerEmail });
-        // depth 0 = full history (pass undefined to isomorphic-git), undefined = shallow default of 1
-        const cloneDepth = depth === 0 ? undefined : (depth ?? 1);
+        // depth 0 = full history (pass undefined to isomorphic-git), undefined = default depth
+        const cloneDepth = depth === 0 ? undefined : (depth ?? DEFAULT_CLONE_DEPTH);
         return git.clone({ branch, depth: cloneDepth, dir, singleBranch: true, token, url });
       },
     }),
@@ -552,6 +830,113 @@ function getExploreModel(mainModel: string): string {
 /** Timeout for the explore subagent (ms). Prevents indefinite blocking. */
 const EXPLORE_TIMEOUT_MS = 60_000;
 
+/** Max steps for the generic task subagent (slightly higher than explore). */
+const TASK_MAX_STEPS = 15;
+
+/** Timeout for the generic task subagent (ms). */
+const TASK_TIMEOUT_MS = 180_000;
+
+const TASK_SYSTEM_PROMPT = [
+  "You are a focused subagent dispatched by the main Dodo agent to handle one bounded task.",
+  "",
+  "## Rules",
+  "- You have a subset of the main agent's tools. Use them to complete the task and ONLY the task.",
+  "- Do not ask clarifying questions — make a best-effort attempt with the info given.",
+  "- Return a compact text summary when done. Include: what you did, paths/line numbers touched, test results if any.",
+  "- Do NOT dump large tool outputs into your final message — summarize in 5-15 lines.",
+  "- If you hit your step budget without finishing, report what was done and what remains. Your caller will retry.",
+].join("\n");
+
+/**
+ * Pick the model a subagent should use.
+ *
+ * Precedence:
+ *   1. Per-call override — `args.model` on the tool call
+ *   2. Per-session default — `config.exploreModel` / `config.taskModel`
+ *      (sourced from DodoConfig, ultimately from the env defaults
+ *       DEFAULT_EXPLORE_MODEL / DEFAULT_TASK_MODEL on wrangler.jsonc)
+ *   3. Built-in heuristic — `getExploreModel(config.model)` which picks a
+ *      cheap model by provider family, falling back to the main model itself
+ *
+ * Each level is only used if the one above is unset/blank, so users can
+ * configure globally but still override on a hot path.
+ */
+export function resolveSubagentModel(
+  args: Record<string, unknown>,
+  sessionDefault: string | undefined,
+  mainModel: string,
+): string {
+  const rawArgModel = args.model;
+  if (typeof rawArgModel === "string" && rawArgModel.trim().length > 0) {
+    return rawArgModel.trim();
+  }
+  if (typeof sessionDefault === "string" && sessionDefault.trim().length > 0) {
+    return sessionDefault.trim();
+  }
+  return getExploreModel(mainModel);
+}
+
+/**
+ * Build a subagent tool with a configurable name, description, system prompt,
+ * tool subset, and step/timeout budgets. Both `explore` and `task` are
+ * instances of this — `explore` is a pre-configured read-only search
+ * subagent; `task` is a general-purpose delegate with a tighter time budget
+ * per call but more steps.
+ */
+function buildSubagentTool(spec: {
+  name: string;
+  description: string;
+  systemPrompt: string;
+  inputSchema: AnyTool;
+  getUserMessage: (args: Record<string, unknown>) => string;
+  getTools: () => Record<string, AnyTool>;
+  config: AppConfig;
+  env: Env;
+  maxSteps: number;
+  timeoutMs: number;
+  /** Per-session default for this subagent's model (from AppConfig). */
+  sessionDefaultModel: string | undefined;
+}): AnyTool {
+  return tool({
+    description: spec.description,
+    inputSchema: spec.inputSchema,
+    execute: async (args: Record<string, unknown>) => {
+      const modelId = resolveSubagentModel(args, spec.sessionDefaultModel, spec.config.model);
+      const provider = buildProviderForModel(modelId, spec.config, spec.env);
+      const model = provider.chatModel(modelId);
+      const userMessage = spec.getUserMessage(args);
+
+      try {
+        const result = await generateText({
+          model,
+          system: spec.systemPrompt,
+          messages: [{ role: "user" as const, content: userMessage }],
+          tools: spec.getTools(),
+          stopWhen: stepCountIs(spec.maxSteps),
+          maxOutputTokens: 2000,
+          abortSignal: AbortSignal.timeout(spec.timeoutMs),
+        });
+
+        const summary = result.text;
+        const steps = result.steps.length;
+        const toolCalls = result.steps.flatMap((s) =>
+          (s.toolCalls ?? []).map((tc) => tc.toolName),
+        );
+
+        return [
+          `## ${spec.name} results (model: ${modelId})`,
+          `**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
+          "",
+          summary || "(No output)",
+        ].filter(Boolean).join("\n");
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return `${spec.name} failed (model: ${modelId}): ${msg}`;
+      }
+    },
+  });
+}
+
 /**
  * Build the explore tool — spawns a search-only subagent via generateText().
  *
@@ -574,7 +959,8 @@ function buildExploreTool(
     grep: allWsTools.grep,
   });
 
-  return tool({
+  return buildSubagentTool({
+    name: "Explore",
     description: [
       "Search the workspace for files and code matching a query.",
       "Runs an autonomous search agent that uses grep, find, list, and read to explore the codebase,",
@@ -583,6 +969,7 @@ function buildExploreTool(
       "Use this when you need to find where something is defined, locate files matching a pattern,",
       "or understand how a feature is implemented across multiple files.",
     ].join(" "),
+    systemPrompt: EXPLORE_SYSTEM_PROMPT,
     inputSchema: zodSchema(z.object({
       query: z.string().min(1).describe(
         "What to search for — be specific. E.g. 'Find all files that handle CSS escaping' or 'Where is the database connection pool configured?'",
@@ -590,46 +977,161 @@ function buildExploreTool(
       scope: z.string().optional().describe(
         "Optional directory to scope the search to (e.g. 'src/' or 'lib/utils'). Omit to search the entire workspace.",
       ),
+      model: z.string().optional().describe(
+        "Optional model override for this call (e.g. '@cf/moonshotai/kimi-k2.6', 'anthropic/claude-haiku-4-5'). Leave unset to use the session default (configured via PUT /config exploreModel, defaults to Kimi K2.6).",
+      ),
     })),
-    execute: async ({ query, scope }: { query: string; scope?: string }) => {
-      const provider = buildProvider(config, env);
-      const exploreModelId = getExploreModel(config.model);
-      const model = provider.chatModel(exploreModelId);
-
-      const scopeHint = scope ? `\n\nSearch scope: ${scope}` : "";
-      const userMessage = `${query}${scopeHint}`;
-
-      try {
-        const result = await generateText({
-          model,
-          system: EXPLORE_SYSTEM_PROMPT,
-          messages: [{ role: "user" as const, content: userMessage }],
-          tools: readOnlyTools,
-          stopWhen: stepCountIs(EXPLORE_MAX_STEPS),
-          maxOutputTokens: 2000,
-          abortSignal: AbortSignal.timeout(EXPLORE_TIMEOUT_MS),
-        });
-
-        const summary = result.text;
-        const steps = result.steps.length;
-        const toolCalls = result.steps.flatMap(s =>
-          (s.toolCalls ?? []).map(tc => tc.toolName),
-        );
-
-        // Return structured result for the main agent
-        return [
-          `## Explore results for: ${query}`,
-          scope ? `**Scope:** ${scope}` : "",
-          `**Search steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
-          "",
-          summary || "(No results found)",
-        ].filter(Boolean).join("\n");
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        return `Explore failed: model: ${exploreModelId}. ${msg}. Try searching directly with grep.`;
-      }
+    getUserMessage: (args) => {
+      const query = String(args.query ?? "");
+      const scope = args.scope ? String(args.scope) : null;
+      return scope ? `${query}\n\nSearch scope: ${scope}` : query;
     },
+    getTools: () => readOnlyTools,
+    config,
+    env,
+    maxSteps: EXPLORE_MAX_STEPS,
+    timeoutMs: EXPLORE_TIMEOUT_MS,
+    sessionDefaultModel: config.exploreModel,
   });
+}
+
+/**
+ * Build the generic `task` subagent — delegates a bounded unit of work to a
+ * fresh generateText() call with a caller-configurable tool subset.
+ *
+ * Use cases: "update all imports from X to Y", "run the tests and
+ * report failures", "review this file for dead code". Keeps the main
+ * agent's context clean — only the sub-agent's final text summary lands
+ * in the main conversation.
+ */
+function buildTaskTool(
+  workspace: Workspace,
+  config: AppConfig,
+  env: Env,
+): AnyTool {
+  // Read-write tool subset — mutating tools included so the task can edit
+  // files, but no git tools (we don't want a subagent pushing branches)
+  // and no codemode (too broad — the main agent should own that).
+  const allWsTools = createWorkspaceTools(workspace);
+  const taskTools = capToolOutputs({
+    read: allWsTools.read,
+    list: allWsTools.list,
+    find: allWsTools.find,
+    grep: allWsTools.grep,
+    write: allWsTools.write,
+    edit: allWsTools.edit,
+  });
+
+  return buildSubagentTool({
+    name: "Task",
+    description: [
+      "Delegate a focused, bounded sub-task to a subagent with its own context window.",
+      "The subagent gets workspace tools (read, list, find, grep, write, edit) and returns a compact summary.",
+      "Use for multi-step sub-tasks that would otherwise eat the main conversation's step budget and context:",
+      "'update all imports of X to Y', 'review these 6 files and list bugs', 'rename MyClass to TheirClass everywhere'.",
+      "Do NOT use for one-shot operations (just call the tool directly) or anything requiring git/codemode/browser.",
+    ].join(" "),
+    systemPrompt: TASK_SYSTEM_PROMPT,
+    inputSchema: zodSchema(z.object({
+      prompt: z.string().min(1).describe(
+        "The task to perform. Be specific and self-contained — the subagent has no access to your conversation. Include file paths, names, and acceptance criteria.",
+      ),
+      scope: z.string().optional().describe(
+        "Optional directory to scope the task to (e.g. 'src/'). Hint only — the subagent can still read outside this path.",
+      ),
+      model: z.string().optional().describe(
+        "Optional model override for this call (e.g. 'anthropic/claude-haiku-4-5', '@cf/moonshotai/kimi-k2.6'). Leave unset to use the session default (configured via PUT /config taskModel, defaults to Haiku 4.5).",
+      ),
+    })),
+    getUserMessage: (args) => {
+      const prompt = String(args.prompt ?? "");
+      const scope = args.scope ? String(args.scope) : null;
+      return scope ? `${prompt}\n\nScope hint: ${scope}` : prompt;
+    },
+    getTools: () => taskTools,
+    config,
+    env,
+    maxSteps: TASK_MAX_STEPS,
+    timeoutMs: TASK_TIMEOUT_MS,
+    sessionDefaultModel: config.taskModel,
+  });
+}
+
+/**
+ * Build the todo tool family. Backed by a per-session store injected from
+ * the CodingAgent DO. Exposes four small operations the model can use to
+ * maintain a persistent, durable checklist across compactions.
+ *
+ * Why a tool (not a convention): Anthropic models in particular tend to
+ * repeat themselves after a compaction summary, and a hallucinated todo
+ * list drifts. A durable list the model can query each turn collapses that
+ * failure mode.
+ */
+function buildTodoTools(store: TodoStore): Record<string, AnyTool> {
+  const priorityEnum = z.enum(["low", "medium", "high"]);
+  const statusEnum = z.enum(["pending", "in_progress", "completed", "cancelled"]);
+
+  return {
+    todo_list: tool({
+      description: [
+        "List all todos for the current session with their status and priority.",
+        "Use at the start of a multi-step task and after every few steps to re-orient.",
+        "Empty list is fine — most short tasks don't need todos.",
+      ].join(" "),
+      inputSchema: zodSchema(z.object({}).strict()),
+      execute: async () => {
+        const items = store.list();
+        if (items.length === 0) {
+          return { items: [], hint: "No todos. Use todo_add to create one for multi-step work." };
+        }
+        return { items };
+      },
+    }),
+
+    todo_add: tool({
+      description: [
+        "Append a todo to the session checklist. Use for tasks that take 3+ steps,",
+        "branch into sub-tasks, or have distinct user-visible deliverables.",
+        "Do NOT use for trivial single-step actions.",
+      ].join(" "),
+      inputSchema: zodSchema(z.object({
+        content: z.string().min(1).max(500).describe("Short description, imperative voice (\"Fix X\", not \"Fixed X\")"),
+        priority: priorityEnum.optional().describe("low | medium (default) | high"),
+      })),
+      execute: async ({ content, priority }) => {
+        store.add(content, priority);
+        return { ok: true, items: store.list() };
+      },
+    }),
+
+    todo_update: tool({
+      description: [
+        "Update an existing todo by id. Use to mark pending → in_progress → completed,",
+        "or to cancel a todo that's no longer relevant. Only ONE todo should be",
+        "in_progress at a time.",
+      ].join(" "),
+      inputSchema: zodSchema(z.object({
+        id: z.number().int().positive().describe("Todo id from todo_list"),
+        status: statusEnum.optional(),
+        content: z.string().min(1).max(500).optional(),
+        priority: priorityEnum.optional(),
+      })),
+      execute: async ({ id, status, content, priority }) => {
+        const ok = store.update(id, { status, content, priority });
+        if (!ok) return { error: `No todo with id ${id}` };
+        return { ok: true, items: store.list() };
+      },
+    }),
+
+    todo_clear: tool({
+      description: "Clear all todos for the current session. Use sparingly — typically only at the end of a large task when the list is stale.",
+      inputSchema: zodSchema(z.object({}).strict()),
+      execute: async () => {
+        store.clear();
+        return { ok: true, items: [] };
+      },
+    }),
+  };
 }
 
 function buildTools(
@@ -646,7 +1148,7 @@ function buildTools(
   if (env.LOADER) {
     const outbound = env.OUTBOUND ?? null;
 
-    tools.codemode = createExecuteTool({
+    const codemodeTool = createExecuteTool({
       tools: workspaceTools,
       state: options?.stateBackend,
       loader: env.LOADER,
@@ -656,6 +1158,76 @@ function buildTools(
         { name: "git", tools: gitTools },
       ],
     });
+
+    // Wrap codemode's execute to enforce an output cap and support
+    // schema projection. Without this, a single `await fetch(...)` against
+    // a large API in codemode can one-shot the input-token budget before
+    // any downstream safeguard can react (see dodo session 56a7a597).
+    const caps = TOOL_OUTPUT_CAPS.codemode ?? { maxBytes: 32_000 };
+    const maxBytes = caps.maxBytes ?? 32_000;
+
+    const originalExecute = (codemodeTool as AnyTool).execute as
+      | ((args: unknown, ...rest: unknown[]) => Promise<unknown>)
+      | undefined;
+
+    if (originalExecute) {
+      // Replace codemode's inputSchema with one that includes the `select`
+      // field. Must be done at the schema level — AI SDK strips unknown
+      // keys during Zod validation (and adds additionalProperties:false to
+      // the schema sent to the model), so putting `select` only in the
+      // description would mean the model never emits it and even if it did,
+      // it'd be dropped before reaching our wrapped execute.
+      const extendedInputSchema = zodSchema(
+        z.object({
+          code: z.string().describe("JavaScript async arrow function to execute"),
+          select: z
+            .array(z.string())
+            .optional()
+            .describe(
+              "Optional dot-paths to project from the execution result (e.g. [\"items.0.name\", \"total_count\"]). Applied before the 32 KB cap — use for narrow API responses to avoid wasting context on unused fields.",
+            ),
+        }),
+      );
+
+      tools.codemode = {
+        ...codemodeTool,
+        // Extend the tool's description so the model knows about `select`.
+        description: [
+          (codemodeTool as AnyTool).description ?? "",
+          "",
+          "Output is capped at 32 KB. For large API responses, pass `select` — an array of dot-paths",
+          "(e.g. [\"items.0.name\", \"total_count\"]) — and the result is projected to those fields",
+          "before being returned. This saves context for the full multi-step loop.",
+        ].filter(Boolean).join("\n"),
+        inputSchema: extendedInputSchema,
+        execute: async (args: unknown, ...rest: unknown[]) => {
+          // Extract + strip the `select` field before forwarding to the
+          // underlying executor (which doesn't know about it).
+          let select: string[] | undefined;
+          if (args && typeof args === "object") {
+            const a = args as { select?: unknown };
+            if (Array.isArray(a.select) && a.select.every((s) => typeof s === "string")) {
+              select = a.select as string[];
+            }
+          }
+          const cleanArgs = args && typeof args === "object"
+            ? (() => {
+                const { select: _discard, ...rest } = args as { select?: unknown };
+                return rest;
+              })()
+            : args;
+
+          const result = await originalExecute(cleanArgs, ...rest);
+
+          // Schema projection — apply BEFORE size cap so the projected result
+          // is what counts against the budget.
+          const projected = select ? projectCodemodeResult(result, select) : result;
+          return capCodemodeResult(projected, maxBytes);
+        },
+      } as AnyTool;
+    } else {
+      tools.codemode = codemodeTool;
+    }
   }
 
   // Workspace tools — available as top-level tools alongside codemode.
@@ -694,6 +1266,17 @@ function buildTools(
   // Explore tool — search subagent for token-efficient codebase discovery
   tools.explore = buildExploreTool(workspace, config, env);
 
+  // Task tool — generic subagent for bounded sub-tasks. Keeps the main
+  // conversation's step budget free when a chunk of work can be safely
+  // delegated to a fresh context window.
+  tools.task = buildTaskTool(workspace, config, env);
+
+  // Todo tools — durable checklist backed by per-session SQLite. Helps the
+  // model stay oriented across long multi-step tasks and compactions.
+  if (options?.todoStore) {
+    Object.assign(tools, buildTodoTools(options.todoStore));
+  }
+
   // Browser tools — full CDP access via code-mode pattern.
   // Two tools: browser_search (query the ~1.7MB CDP spec server-side) and
   // browser_execute (run CDP commands against a live headless Chrome session).
@@ -724,7 +1307,10 @@ export function buildToolsForThink(
   env: Env,
   workspace: Workspace,
   config: AppConfig,
-  options?: BuildToolsOptions & { agent?: { mcp?: unknown } },
+  options?: BuildToolsOptions & {
+    agent?: { mcp?: unknown };
+    mcpGatekeepers?: McpGatekeeper[];
+  },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
   const existingNames = new Set(Object.keys(tools));

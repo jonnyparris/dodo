@@ -138,7 +138,7 @@ The system prompt lives in `src/coding-agent.ts` as `const SYSTEM_PROMPT`. It's 
 |---------|---------|
 | Identity | "You are Dodo" — establishes the agent's name and platform |
 | Tone and style | Concise, markdown, no emojis, prefer edits over new files |
-| Doing tasks | Read-before-write, plan multi-step work, stay focused, delete dead code, security awareness |
+| Doing tasks | Todo discipline: explicit lists of task shapes that always need todos (cloned-repo work, multi-file edits, review/audit/investigate tasks) vs. shapes that can skip them; post-compaction `todo_list` re-grounding hint; when to delegate with `task` |
 | Workspace tools | Documents read_file, write_file, search_files, replace_in_file |
 | Code execution | Documents codemode: sandboxed JS, fetch with auto-auth, 30s timeout |
 | Git | Documents all git tools, auto-auth for GitHub/GitLab |

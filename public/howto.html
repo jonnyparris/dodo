@@ -52,6 +52,7 @@
       <ul>
         <li><a href="#first-session">Create Your First Session</a></li>
         <li><a href="#clone-repo">Clone a GitHub Repo</a></li>
+        <li><a href="#generate-image">Generate an Image</a></li>
         <li><a href="#fork-session">Fork a Session for Experiments</a></li>
         <li><a href="#schedule-task">Schedule a Recurring Task</a></li>
         <li><a href="#connect-mcp">Connect an MCP Server</a></li>
@@ -80,6 +81,17 @@
 </code></pre>
     <p>Once the clone finishes, ask the agent to inspect files, run tests, or start making changes inside that workspace.</p>
     <div class="callout"><p>Warning: Set the token first if you plan to clone or push private repositories. Missing credentials usually show up as git auth errors.</p></div>
+
+    <h2 id="generate-image">Generate an Image</h2>
+    <h3>Create pictures without leaving the chat</h3>
+    <p>Type <code>/</code> in the chat input to open the slash-command menu, pick <code>/generate</code>, then describe the image you want. Press <kbd>Enter</kbd>. Dodo sends the prompt to Workers AI FLUX-1-schnell and renders the image inline in a few seconds.</p>
+    <pre><code>/generate a cyberpunk cat wearing sunglasses, neon city background
+</code></pre>
+    <p>No LLM is involved — the slash command routes straight to the image model. That means the image is cheap, fast, and doesn't consume your chat model's context window.</p>
+    <p>From an MCP client, call <code>generate_image</code> directly with a session ID and a prompt. Sending a regular chat message whose content starts with <code>/generate</code> works too; the server detects and reroutes it.</p>
+    <pre><code>generate_image({ sessionId: "session_123", prompt: "a steampunk dodo bird" })
+</code></pre>
+    <div class="callout"><p>Limits: prompts up to 2048 characters, 30 images per hour and 100 per day per user. Requires the <code>AI</code> binding in <code>wrangler.jsonc</code> — paid Workers plans include it.</p></div>
 
     <h2 id="fork-session">Fork a Session for Experiments</h2>
     <h3>Try risky changes without touching the original session</h3>

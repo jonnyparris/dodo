@@ -4,6 +4,7 @@ import type { SharedIndex } from "./shared-index";
 import type { UserControl } from "./user-control";
 
 export interface Env {
+  AI: Ai;
   AI_GATEWAY_BASE_URL: string;
   AI_GATEWAY_DEFAULT_MODEL?: string;
   AI_GATEWAY_KEY?: string;
@@ -14,6 +15,11 @@ export interface Env {
   CF_ACCESS_AUD?: string;
   CF_ACCESS_TEAM_DOMAIN?: string;
   DEFAULT_MODEL: string;
+  /** Default model for the `explore` subagent. When unset, falls back to
+   *  the getExploreModel() heuristic (cheap model by provider family). */
+  DEFAULT_EXPLORE_MODEL?: string;
+  /** Default model for the `task` subagent. Same fallback semantics. */
+  DEFAULT_TASK_MODEL?: string;
   DODO_MCP_TOKEN?: string;
   DODO_COMMIT?: string;
   DODO_VERSION?: string;
@@ -45,6 +51,23 @@ export interface Env {
   OPENCODE_GATEWAY_TOKEN?: string;
 }
 
+export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+export type TodoPriority = "low" | "medium" | "high";
+
+export interface TodoItem {
+  id: number;
+  content: string;
+  status: TodoStatus;
+  priority: TodoPriority;
+}
+
+export interface TodoStore {
+  list: () => TodoItem[];
+  add: (content: string, priority?: TodoPriority) => void;
+  update: (id: number, patch: { status?: TodoStatus; content?: string; priority?: TodoPriority }) => boolean;
+  clear: () => void;
+}
+
 export interface AppConfig {
   activeGateway: "opencode" | "ai-gateway";
   aiGatewayBaseURL: string;
@@ -52,6 +75,20 @@ export interface AppConfig {
   gitAuthorName: string;
   model: string;
   opencodeBaseURL: string;
+  /** Optional user preamble prepended to the system prompt every session. */
+  systemPromptPrefix?: string;
+  /**
+   * Default model used by the `explore` subagent when the model doesn't
+   * pass an explicit `model` arg. Leave unset to use the built-in
+   * getExploreModel() heuristic (cheap model by provider family), which
+   * falls back to Kimi K2.6 for unfamiliar providers. Mixing providers is
+   * supported — e.g. main model anthropic/claude-opus-4-7, explore model
+   * @cf/moonshotai/kimi-k2.6. The subagent's gateway is auto-selected
+   * from the model ID (@cf/* → ai-gateway, everything else → opencode).
+   */
+  exploreModel?: string;
+  /** Same as exploreModel but for the generic `task` subagent. */
+  taskModel?: string;
 }
 
 export interface AccessIdentity {
@@ -97,6 +134,12 @@ export interface UpdateConfigRequest {
   gitAuthorName?: string;
   model?: string;
   opencodeBaseURL?: string;
+  /** Pass empty string to clear. Capped server-side at 4 KB. */
+  systemPromptPrefix?: string;
+  /** Pass empty string to clear. Must be a valid model ID if set. */
+  exploreModel?: string;
+  /** Pass empty string to clear. Must be a valid model ID if set. */
+  taskModel?: string;
 }
 
 export interface SessionIndexRecord {

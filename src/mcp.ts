@@ -839,6 +839,17 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     }),
   );
 
+  server.tool("generate_image", "Generate an image with Workers AI FLUX-1-schnell and post it to the session. Bypasses the chat LLM — routes straight to the image model.", {
+    sessionId: z.string().describe("Session ID"),
+    prompt: z.string().min(1).max(2048).describe("Text prompt describing the image (1-2048 chars)"),
+  }, async ({ sessionId, prompt }) =>
+    jsonFetch(env, "agent", "/generate", {
+      sessionId,
+      depth,
+      init: { body: JSON.stringify({ content: prompt }), headers: { "content-type": "application/json" }, method: "POST" },
+    }),
+  );
+
   server.tool("abort_prompt", "Abort a running async prompt", {
     sessionId: z.string().describe("Session ID"),
   }, async ({ sessionId }) =>
@@ -971,9 +982,16 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     jsonFetch(env, "user", "/config"),
   );
 
-  server.tool("update_config", "Update Dodo's LLM gateway, model, or git author config", {
+  server.tool("update_config", "Update Dodo's LLM gateway, model, git author, or subagent model config", {
     model: z.string().optional().describe("Model ID"),
     activeGateway: z.enum(["opencode", "ai-gateway"]).optional().describe("LLM gateway"),
+    opencodeBaseURL: z.string().url().optional().describe("OpenCode gateway base URL override. Leave unset to use the worker's env default."),
+    aiGatewayBaseURL: z.string().url().optional().describe("AI Gateway base URL override. Leave unset to use the worker's env default."),
+    gitAuthorEmail: z.string().email().optional().describe("Git author email"),
+    gitAuthorName: z.string().optional().describe("Git author name"),
+    systemPromptPrefix: z.string().optional().describe("Personal preamble prepended to the system prompt. Pass empty string to clear."),
+    exploreModel: z.string().optional().describe("Default model for the `explore` subagent. Leave unset to use the env default (Kimi K2.6). Pass empty string to clear and fall back to the built-in heuristic."),
+    taskModel: z.string().optional().describe("Default model for the `task` subagent. Leave unset to use the env default (Haiku 4.5). Pass empty string to clear and fall back to the built-in heuristic."),
   }, async (params) =>
     jsonFetch(env, "user", "/config", {
       init: { body: JSON.stringify(params), headers: { "content-type": "application/json" }, method: "PUT" },

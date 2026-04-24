@@ -111,11 +111,106 @@ applyTheme(getTheme());
 
 // === Multi-line input handling ===
 function handleInputKeydown(event){
+  // Slash command menu captures Arrow/Enter/Escape when it's visible — when
+  // the user is picking a command we don't want Enter to send an incomplete
+  // message.
+  if(handleSlashMenuKeydown(event))return;
   if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}
 }
 function autoResizeInput(el){
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,160)+'px';
+}
+
+// === Slash command autocomplete ===
+// Keep definitions in one list so adding a new command means one edit here.
+const SLASH_COMMANDS=[
+  {cmd:"/generate",desc:"Generate an image with FLUX-1-schnell",template:"/generate "},
+];
+let slashMenuActive=-1;
+let slashMenuVisible=false;
+
+function updateSlashMenu(){
+  const input=$("msg-input");
+  const menu=$("slash-menu");
+  if(!input||!menu)return;
+  const value=input.value;
+  // Only surface suggestions when the textarea starts with `/` and the user
+  // hasn't yet typed the space that ends the command token. Matching
+  // anywhere else would pop the menu mid-sentence which is just noise.
+  const match=value.match(/^(\/\w*)$/);
+  if(!match){hideSlashMenu();return}
+  const typed=match[1].toLowerCase();
+  const matches=SLASH_COMMANDS.filter(c=>c.cmd.startsWith(typed));
+  if(!matches.length){hideSlashMenu();return}
+  slashMenuActive=0;
+  renderSlashMenu(matches);
+}
+
+function renderSlashMenu(matches){
+  const menu=$("slash-menu");
+  menu.innerHTML=matches.map((c,i)=>{
+    const active=i===slashMenuActive?" active":"";
+    return `<div class="slash-menu-item${active}" role="option" data-cmd="${esc(c.cmd)}" onmousedown="event.preventDefault();pickSlashCommand('${esc(c.cmd)}')"><span class="cmd">${esc(c.cmd)}</span><span class="desc">${esc(c.desc)}</span></div>`;
+  }).join("")+`<div class="slash-menu-hint">Tab or Enter to complete \u00b7 Esc to dismiss</div>`;
+  menu.hidden=false;
+  slashMenuVisible=true;
+  menu._matches=matches;
+}
+
+function hideSlashMenu(){
+  const menu=$("slash-menu");
+  if(!menu)return;
+  menu.hidden=true;
+  menu.innerHTML="";
+  menu._matches=null;
+  slashMenuVisible=false;
+  slashMenuActive=-1;
+}
+
+function pickSlashCommand(cmd){
+  const input=$("msg-input");
+  const command=SLASH_COMMANDS.find(c=>c.cmd===cmd);
+  input.value=command?.template||(cmd+" ");
+  autoResizeInput(input);
+  hideSlashMenu();
+  input.focus();
+  // Place the caret at the end so the user can immediately type the prompt
+  const end=input.value.length;
+  input.setSelectionRange(end,end);
+}
+
+// Return true when the keystroke was absorbed by the slash menu so the
+// caller skips its normal handling (e.g. Enter-to-send).
+function handleSlashMenuKeydown(event){
+  if(!slashMenuVisible)return false;
+  const menu=$("slash-menu");
+  const matches=menu?._matches||[];
+  if(!matches.length)return false;
+  if(event.key==="ArrowDown"){
+    event.preventDefault();
+    slashMenuActive=(slashMenuActive+1)%matches.length;
+    renderSlashMenu(matches);
+    return true;
+  }
+  if(event.key==="ArrowUp"){
+    event.preventDefault();
+    slashMenuActive=(slashMenuActive-1+matches.length)%matches.length;
+    renderSlashMenu(matches);
+    return true;
+  }
+  if(event.key==="Enter"||event.key==="Tab"){
+    event.preventDefault();
+    const picked=matches[slashMenuActive]||matches[0];
+    if(picked)pickSlashCommand(picked.cmd);
+    return true;
+  }
+  if(event.key==="Escape"){
+    event.preventDefault();
+    hideSlashMenu();
+    return true;
+  }
+  return false;
 }
 
 // === API helpers ===

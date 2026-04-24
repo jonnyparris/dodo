@@ -63,6 +63,9 @@
   "assets": {
     "directory": "./public"
   },
+  "ai": {
+    "binding": "AI"
+  },
   "secrets": {
     "required": ["ADMIN_EMAIL"]
   },
@@ -71,6 +74,17 @@
     // Default model used when a new session is created with activeGateway=ai-gateway.
     // Workers AI models (`@cf/…`) are only routable via AI Gateway.
     "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
+    // Default model for the `explore` / `task` subagents. Kimi K2.6 is the
+    // best-value choice per the 2026-04-24 model comparison (bundled pricing,
+    // 262k ctx, stayed under budget on the same prompt that blew Opus/Sonnet
+    // past 400 %). Auto-routed via AI Gateway regardless of main session's
+    // gateway — see buildProviderForModel in src/agentic.ts. Agents can
+    // override per call with the `model` arg on the tool.
+    "DEFAULT_EXPLORE_MODEL": "@cf/moonshotai/kimi-k2.6",
+    // Default `task` subagent model. Haiku 4.5 — needs to edit files, so a
+    // stronger instruction-follower than Kimi is worth the small cost bump.
+    // Users can override to any model via PUT /config taskModel=...
+    "DEFAULT_TASK_MODEL": "anthropic/claude-haiku-4-5",
     "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
     // AI Gateway unified API base URL — include /{account_id}/{gateway_id}/compat
     // so the OpenAI-compatible SDK hits /chat/completions correctly.

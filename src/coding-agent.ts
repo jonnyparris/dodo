@@ -32,8 +32,8 @@ import {
   chatRecordToUIMessage,
 } from "./think-adapter";
 import type { SnapshotV2 } from "./think-adapter";
-import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, WorkspaceEntry } from "./types";
-import { FALLBACK_MODELS, WORKERS_AI_MODELS } from "./shared-index";
+import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, TodoPriority, TodoStatus, TodoStore, WorkspaceEntry } from "./types";
+import { FALLBACK_MODELS, WORKERS_AI_MODELS, FLUX_IMAGE_MODEL, FLUX_IMAGE_MEDIA_TYPE, FLUX_MAX_PROMPT_LENGTH, extractGeneratePrompt } from "./shared-index";
 
 /**
  * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
@@ -68,17 +68,60 @@ const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
 const CLEARED_MARKER = "[Old tool result content cleared]";
 
 /**
- * Rough token estimate for a single ModelMessage.
+ * Content-aware tokens-per-char ratios derived from Anthropic tokenizer
+ * measurements. The flat `len/3.5` heuristic under-counts code and
+ * tool-result JSON by 15-25 % because those payloads have dense punctuation
+ * and no word structure to benefit from BPE merges.
  *
- * Uses ~3.5 chars per token, which lands within 10-20% of real tokenizer
- * counts for mixed English / code / JSON payloads. The same heuristic is
- * used inside assembleContext() for cutoff decisions — keep them in sync.
+ * These numbers come from sampling Anthropic's tokenizer against
+ * representative Dodo traffic (code files, tool outputs, chat messages).
+ * Keep conservative — safer to over-estimate than to trip the context
+ * limit mid-step.
+ */
+const CHARS_PER_TOKEN_PROSE = 4.0;
+const CHARS_PER_TOKEN_CODE = 2.9;
+const CHARS_PER_TOKEN_JSON = 2.6;
+const CHARS_PER_TOKEN_DEFAULT = 3.3;
+
+/**
+ * Heuristically classify a string and return its chars-per-token ratio.
+ * Cheap: one pass over a small prefix.
+ */
+function charsPerTokenFor(sample: string): number {
+  if (sample.length === 0) return CHARS_PER_TOKEN_DEFAULT;
+  // Cap the sample — we only need a signal, not full-text analysis
+  const head = sample.length > 2048 ? sample.slice(0, 2048) : sample;
+  const punctCount = (head.match(/[{}[\]":,;=<>()]/g) ?? []).length;
+  const braceCount = (head.match(/[{}[\]]/g) ?? []).length;
+  const wordCount = (head.match(/[A-Za-z]{3,}/g) ?? []).length;
+  const totalChars = head.length;
+
+  // JSON-dominated: lots of quote/brace/colon punctuation relative to chars
+  if (braceCount >= 3 && punctCount / totalChars > 0.1) return CHARS_PER_TOKEN_JSON;
+  // Code-ish: dense punctuation plus enough word tokens to suggest
+  // identifiers rather than natural prose
+  if (punctCount / totalChars > 0.08 && wordCount >= 5) return CHARS_PER_TOKEN_CODE;
+  // Prose: many multi-character words, sparse punctuation
+  if (wordCount > totalChars / 30 && punctCount / totalChars < 0.05) return CHARS_PER_TOKEN_PROSE;
+  return CHARS_PER_TOKEN_DEFAULT;
+}
+
+/**
+ * Token estimate for a single ModelMessage. Content-aware: picks a
+ * chars-per-token ratio based on whether the serialized message looks
+ * like JSON, code, prose, or mixed.
  *
- * Cheap enough to call on every message each step; the JSON.stringify cost
- * is dwarfed by the LLM call that follows.
+ * The estimate is used by the autocompaction guard (trigger at 60% of
+ * budget), the pre-step budget check, and the compaction cutoff walk. All
+ * three prefer over-estimates — a false-positive compaction is cheap, a
+ * false-negative "just squeeze it in" is a 429.
+ *
+ * Cheap enough to call on every message each step.
  */
 export function estimateMessageTokens(msg: ModelMessage): number {
-  return Math.ceil(JSON.stringify(msg).length / 3.5);
+  const serialized = JSON.stringify(msg);
+  const cpt = charsPerTokenFor(serialized);
+  return Math.ceil(serialized.length / cpt);
 }
 
 /**
@@ -117,6 +160,10 @@ const imageAttachmentSchema = z.object({
 const sendMessageSchema = z.object({
   content: z.string().trim().min(1),
   images: z.array(imageAttachmentSchema).max(MAX_IMAGES_PER_MESSAGE).optional(),
+}).strict();
+/** /generate schema — FLUX-1-schnell rejects >2048 chars, so enforce at the edge. */
+const generateImageSchema = z.object({
+  content: z.string().trim().min(1).max(FLUX_MAX_PROMPT_LENGTH),
 }).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
 const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
@@ -162,10 +209,40 @@ const SYSTEM_PROMPT = [
   "",
   "## Doing tasks",
   "",
-  "When the user asks you to build or modify code:",
+  "**Default to planning with todos.** For any request where you're not sure you can finish in one tool call, call `todo_add` first, lay out the steps, then work through them with `todo_update`. Todos survive context compaction — they're the single most reliable way to preserve your plan across long sessions.",
+  "",
+  "**Requests that ALWAYS need todos** (even if they seem simple):",
+  "",
+  "- Anything involving a cloned repo (\"what's new in X?\", \"review commits since Y\", \"check the README against recent changes\")",
+  "- Multi-file work (\"update imports across src/\", \"rename X to Y\", \"add tests for Z\")",
+  "- Investigate-then-report tasks (\"find all usages\", \"summarise what changed\", \"audit for Z\")",
+  "- Any task with the words \"review\", \"investigate\", \"check\", \"audit\", \"update docs\", \"compare\"",
+  "",
+  "**Requests that can skip todos:**",
+  "",
+  "- A single tool call (\"read this file\", \"show git status\", \"fix this typo on line 42\")",
+  "- Direct factual questions that don't need tool use",
+  "",
+  "### How to use todos mid-task",
+  "",
+  "- You complete a step → `todo_update` to mark it `completed` before moving on. One `in_progress` at a time.",
+  "- A step turns out bigger than expected → `todo_add` the subtasks.",
+  "- Context is getting dense (many tool results accumulated) → call `todo_list` to re-ground yourself before the next action. This is especially important after an auto-continuation — the summary won't list your todos, so `todo_list` is how you remember the plan.",
+  "",
+  "### Delegate bounded work with `task`",
+  "",
+  "For sub-jobs that will take 3+ of your own steps and don't need the full conversation context, call `task` with a self-contained prompt. The subagent runs in its own context window and returns a compact summary. Use cases:",
+  "",
+  "- \"review these 6 files and report any dead code\" → `task`",
+  "- \"update all imports of X to Y across src/\" → `task`",
+  "- \"run the test suite and summarise failures\" → `task`",
+  "",
+  "Don't use `task` for a single lookup (just call the tool) or for anything the main conversation needs to see in detail.",
+  "",
+  "### Standing rules",
   "",
   "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task.",
-  "2. **Use `explore` for ALL codebase discovery.** CRITICAL: when you need to find where something is defined, understand how a feature works, or locate relevant files — you MUST use the `explore` tool. Do NOT use `read`, `list`, `find`, or `grep` for open-ended exploration. `explore` runs a search agent in a separate context window and returns a compact summary. Using direct tools for discovery will exhaust your context budget before you can make any edits.",
+  "2. **Use `explore` for ALL codebase discovery.** When you need to find where something is defined, understand how a feature works, or locate relevant files — use `explore`. Do NOT use `read`, `list`, `find`, or `grep` for open-ended exploration. `explore` runs a search agent in a separate context window and returns a compact summary. Using direct tools for discovery will exhaust your context budget before you can make any edits.",
   "",
   "   Examples of when to use `explore`:",
   "   - 'Where is the config schema defined?' → `explore`",
@@ -178,7 +255,7 @@ const SYSTEM_PROMPT = [
   "   - You need to search for a specific string → `grep`",
   "",
   "3. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
-  "4. **Plan, then edit.** State your plan in one short paragraph, then execute. Don't narrate each step.",
+  "4. **Plan, then edit.** State your plan in one short paragraph (or a todo list, preferred), then execute. Don't narrate each step.",
   "5. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
   "6. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
   "7. **Delete unused code.** No commented-out code, no `_unused` renames.",
@@ -191,12 +268,17 @@ const SYSTEM_PROMPT = [
   "| Tool | Purpose | Key params |",
   "|------|---------|------------|",
   "| **explore** | Search agent for codebase discovery (compact summary) | `query`, `scope` |",
+  "| **task** | Delegate a bounded sub-task to a fresh subagent (read+write workspace tools) | `prompt`, `scope?` |",
   "| **read** | Read file contents | `path`, `offset`, `limit` (line numbers) |",
   "| **write** | Create or overwrite a file | `path`, `content` |",
   "| **edit** | Find-and-replace (unique match) | `path`, `old_string`, `new_string` |",
   "| **replace_all** | Replace ALL occurrences of a string | `path`, `old_string`, `new_string` |",
   "| **grep** | Search file contents by regex | `query`, `include` (glob filter) |",
   "| **delete** | Remove a file or directory | `path`, `recursive` |",
+  "| **todo_list** | List session todos with status and priority | — |",
+  "| **todo_add** | Append a todo | `content`, `priority?` |",
+  "| **todo_update** | Update todo `status`, `content`, or `priority` | `id`, `status?`, ... |",
+  "| **todo_clear** | Clear all todos | — |",
   "",
   "### Token budget",
   "",
@@ -221,6 +303,16 @@ const SYSTEM_PROMPT = [
   "git_branch, git_checkout, git_diff, git_log, git_verify_remote_branch.",
   "Authentication for GitHub and GitLab is automatic — you do NOT need tokens.",
   "",
+  "### Clone depth — pick the right one up front",
+  "",
+  "`git_clone` / `git_clone_known` default to **depth 20 commits**. That's the right choice for most tasks. Override when the task signals otherwise:",
+  "",
+  "- User asks \"what's new / recent changes / since commit X / review the latest updates\" → stick with default 20 (or pass `depth: 50` if they mention a period longer than ~2 weeks).",
+  "- User wants blame / full history / bisect → pass `depth: 0` for full history.",
+  "- User just wants to read or edit the current tree (no log-reading needed) → pass `depth: 1` to save bandwidth.",
+  "",
+  "Never clone twice. If `git_log` returns fewer commits than you need, deepen the existing clone with a second `git_clone` to the same `dir` — do NOT re-clone from scratch to a new directory.",
+  "",
   "### Git safety rules",
   "",
   "- Always run git_status before committing.",
@@ -228,6 +320,7 @@ const SYSTEM_PROMPT = [
   "- Write clear, concise commit messages that explain *why*.",
   "- Never force-push unless the user explicitly asks.",
   "- Prefer `git_clone_known` for built-in repos. Use `git_push_checked` with an explicit branch ref.",
+  "- **Diagnostic vs imperative phrasing.** If the user asks \"what should we update / what's changed / what do you think\" — that's a DIAGNOSTIC question. Propose changes but do NOT apply them or commit without explicit instruction (\"update it\", \"apply the fix\", \"yes please do\"). When in doubt, ask.",
   "",
   "## Working with errors",
   "",
@@ -325,6 +418,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /** AbortController for the currently running fiber prompt. Signalled by handleAbort(). */
   private _fiberAbortController: AbortController | null = null;
   /**
+   * Cached project-instructions content (AGENTS.md / CLAUDE.md) loaded from
+   * the workspace. Warmed by `warmProjectInstructions()` at the top of
+   * `onChatMessage()`, consumed synchronously by `getSystemPrompt()`.
+   *
+   * `null` = not yet found. We retry the search each turn until something
+   * is found (which matters for sessions where the user clones a repo on
+   * turn 1 — the AGENTS.md only exists after the clone lands). Once found,
+   * the result is stable for the session (prompt-cache friendly).
+   */
+  private _projectInstructions: string | null = null;
+  /**
    * Per-tool-call attachment references captured during streaming. Populated
    * by the `onToolAttachments` callback threaded into `buildToolsForThink`.
    * Cleared per chat turn in `runThinkChat` so attachments from one prompt
@@ -401,11 +505,95 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (this.messages.length <= 1) {
       const summary = this.getWorkspaceSummary();
       if (summary) {
-        return `${prompt}\n\n## Current workspace\n\n${summary}`;
+        prompt = `${prompt}\n\n## Current workspace\n\n${summary}`;
       }
     }
 
+    // Inject project instructions (AGENTS.md / CLAUDE.md) if loaded.
+    // Warmed by `warmProjectInstructions()` in onChatMessage before this
+    // call, so it's safe to read synchronously. Included on every turn so
+    // compaction summaries don't lose project-specific rules.
+    if (this._projectInstructions) {
+      prompt = `${prompt}\n\n## Project instructions\n\n${this._projectInstructions}`;
+    }
+
+    // Prepend user-customisable prefix (systemPromptPrefix in DodoConfig).
+    // Placed at the very top so user rules take precedence over the default
+    // Dodo prompt when models resolve conflicts.
+    const config = this.getConfig();
+    const prefix = config?.systemPromptPrefix?.trim();
+    if (prefix) {
+      prompt = `${prefix}\n\n---\n\n${prompt}`;
+    }
+
     return prompt;
+  }
+
+  /**
+   * Load project-local agent instructions from the workspace and cache
+   * them on this instance. Called from onChatMessage() before
+   * getSystemPrompt() so the sync accessor can see them.
+   *
+   * Searches (in order) for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`,
+   * `.rules` at the workspace root and the first direct subdirectory (git
+   * clones typically land under `/<repo-name>/`). First match wins. Content
+   * is capped at 6 KB with a middle-truncation notice.
+   *
+   * Idempotent: once attempted (success or miss), won't re-run. Stable
+   * system prompt is friendlier to Anthropic prompt caching.
+   */
+  private async warmProjectInstructions(): Promise<void> {
+    // Skip only if we've already FOUND instructions. If a previous turn
+    // searched an empty workspace and found nothing, retry — the user may
+    // have since cloned a repo. Without this, `git_clone` on turn 1 means
+    // turn 2+ never sees the project's AGENTS.md.
+    if (this._projectInstructions) return;
+
+    const MAX_BYTES = 6_000;
+    const candidates = ["AGENTS.md", "CLAUDE.md"];
+
+    // Build search paths: workspace root + first-level subdirs (common for clones)
+    const searchPaths: string[] = [];
+    for (const name of candidates) {
+      searchPaths.push(`/${name}`);
+    }
+    // Add first-level subdir candidates — most clones land under /<repo>/
+    try {
+      const entries = await this.workspace.readDir("/");
+      for (const entry of entries) {
+        // FileInfo: { name, type: 'file' | 'directory' | 'symlink', ... }
+        if (entry.type === "directory" && entry.name && !entry.name.startsWith(".")) {
+          for (const candidate of candidates) {
+            searchPaths.push(`/${entry.name}/${candidate}`);
+          }
+        }
+      }
+    } catch {
+      // readDir throws if the workspace's SQL tables aren't ready — skip
+      // subdir search and try root-only paths. Not a real error.
+    }
+
+    for (const path of searchPaths) {
+      // Workspace.readFile returns Promise<string | null> — null on miss,
+      // not a throw. No try/catch needed for the normal not-found case.
+      const content = await this.workspace.readFile(path);
+      if (typeof content !== "string" || content.length === 0) continue;
+
+      let trimmed = content.trim();
+      if (trimmed.length > MAX_BYTES) {
+        const head = trimmed.slice(0, Math.floor(MAX_BYTES * 0.7));
+        const tail = trimmed.slice(-Math.floor(MAX_BYTES * 0.2));
+        trimmed = `${head}\n\n[... truncated ${content.length - head.length - tail.length} bytes of ${path} ...]\n\n${tail}`;
+      }
+
+      this._projectInstructions = `Loaded from \`${path}\`:\n\n${trimmed}`;
+      log("info", "project-instructions-loaded", {
+        sessionId: this.sessionId(),
+        path,
+        bytes: trimmed.length,
+      });
+      return;
+    }
   }
 
   /**
@@ -481,6 +669,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       },
       stateBackend: this.stateBackend,
       mcpGatekeepers: this.mcpGatekeepers,
+      todoStore: this.todoStore(),
     });
   }
 
@@ -503,6 +692,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   override async onChatMessage(options?: ChatMessageOptions): Promise<StreamableResult> {
     this._lastUsage = null;
+
+    // Warm project instructions (AGENTS.md / CLAUDE.md) before getSystemPrompt()
+    // reads them. Idempotent — only loads once per session.
+    await this.warmProjectInstructions();
 
     const baseTools = this.getTools();
     const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
@@ -1067,19 +1260,50 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               const droppedToolNames = new Set<string>();
               const discoveredFiles = new Set<string>();
               const assistantTexts: string[] = [];
+              // Compact record of each dropped tool call: `name(sanitized-args)`.
+              // Previously we only preserved distinct tool *names* plus any
+              // `input.path`, which meant after compaction the model lost
+              // specifics like 'git_clone was called with {url, depth: 30,
+              // dir: /dodo}' and just saw 'git_clone was used'. It then
+              // re-cloned. This cost us ~200k tokens across phases in the
+              // repeatable session-6d85ea02 / 1243c636 failure. Capping each
+              // entry at 160 chars and the whole list at 2 KB keeps the
+              // digest small even for 30+ tool calls.
+              const toolCallDigest: string[] = [];
+              const MAX_TOOL_CALL_ENTRY_CHARS = 160;
+              const MAX_TOOL_CALL_DIGEST_CHARS = 2_000;
 
               for (const msg of droppedMsgs) {
                 if (typeof msg.content === "object" && Array.isArray(msg.content)) {
                   for (const part of msg.content) {
                     if (part && typeof part === "object" && "type" in part) {
                       if (part.type === "tool-call" && "toolName" in part) {
-                        droppedToolNames.add(String(part.toolName));
-                        // Extract file paths from tool-call arguments
+                        const toolName = String(part.toolName);
+                        droppedToolNames.add(toolName);
                         if ("input" in part && part.input && typeof part.input === "object") {
                           const input = part.input as Record<string, unknown>;
                           if (typeof input.path === "string" && input.path.length > 1) {
                             discoveredFiles.add(input.path);
                           }
+                          // Sanitize + cap the input for the tool-call digest.
+                          // Strip long string fields (content / code / old_string /
+                          // new_string) before serializing so a single write
+                          // doesn't eat the whole budget.
+                          const sanitized: Record<string, unknown> = {};
+                          for (const [k, v] of Object.entries(input)) {
+                            if (typeof v === "string" && v.length > 80) {
+                              sanitized[k] = `<${v.length}-char ${k}>`;
+                            } else {
+                              sanitized[k] = v;
+                            }
+                          }
+                          let entry = `${toolName}(${JSON.stringify(sanitized)})`;
+                          if (entry.length > MAX_TOOL_CALL_ENTRY_CHARS) {
+                            entry = entry.slice(0, MAX_TOOL_CALL_ENTRY_CHARS - 3) + "...";
+                          }
+                          toolCallDigest.push(entry);
+                        } else {
+                          toolCallDigest.push(`${toolName}()`);
                         }
                       }
                       // Extract the model's text output (findings, plans, decisions)
@@ -1092,10 +1316,28 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 }
               }
 
+              // Tail-trim tool-call digest so the most recent calls survive.
+              // Older calls are less relevant — the model has likely acted on them.
+              let toolCallList = toolCallDigest.join("\n");
+              if (toolCallList.length > MAX_TOOL_CALL_DIGEST_CHARS) {
+                let bytes = 0;
+                const kept: string[] = [];
+                for (let i = toolCallDigest.length - 1; i >= 0; i--) {
+                  const entry = toolCallDigest[i];
+                  if (bytes + entry.length + 1 > MAX_TOOL_CALL_DIGEST_CHARS) break;
+                  kept.unshift(entry);
+                  bytes += entry.length + 1;
+                }
+                toolCallList = `[...older tool calls elided...]\n${kept.join("\n")}`;
+              }
+
               // Build a summary that preserves the model's key findings
               const toolsSummary = [...droppedToolNames].join(", ") || "none";
               const filesList = discoveredFiles.size > 0
                 ? "\n\nFiles discovered in previous phases:\n" + [...discoveredFiles].join("\n")
+                : "";
+              const callsList = toolCallList.length > 0
+                ? "\n\nTool calls already made in previous phases (DO NOT repeat these):\n" + toolCallList
                 : "";
               const findingsDigest = assistantTexts.length > 0
                 ? "\n\nKey findings from previous phases:\n" + assistantTexts.join("\n").slice(-1500)
@@ -1103,7 +1345,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
               const summaryInjection: ModelMessage = {
                 role: "system" as const,
-                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${toolsSummary}. The task is not yet complete. Do NOT re-explore files you already found — use the file paths and findings below to continue making edits.${filesList}${findingsDigest}]`,
+                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${toolsSummary}. The task is not yet complete. Do NOT re-explore files you already found and do NOT repeat tool calls already made — use the file paths, tool-call history, and findings below to continue making edits.${callsList}${filesList}${findingsDigest}]`,
               };
 
               messages = [firstMsg, summaryInjection, ...recentMsgs];
@@ -1112,8 +1354,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 originalCount: messages.length + droppedCount,
                 keptCount: messages.length,
                 droppedTools: [...droppedToolNames],
+                droppedToolCalls: toolCallDigest.length,
                 discoveredFiles: discoveredFiles.size,
                 findingsLength: findingsDigest.length,
+                toolCallDigestLength: toolCallList.length,
               });
             }
 
@@ -1334,6 +1578,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         gitAuthorName: config.gitAuthorName,
         model: config.model,
         opencodeBaseURL: config.opencodeBaseURL,
+        systemPromptPrefix: config.systemPromptPrefix,
+        exploreModel: config.exploreModel,
+        taskModel: config.taskModel,
       };
     }
     return {
@@ -1343,6 +1590,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
       model: this.env.DEFAULT_MODEL,
       opencodeBaseURL: this.env.OPENCODE_BASE_URL,
+      exploreModel: this.env.DEFAULT_EXPLORE_MODEL,
+      taskModel: this.env.DEFAULT_TASK_MODEL,
     };
   }
 
@@ -1546,10 +1795,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
 
-    const estimateTokens = (msg: ModelMessage): number => {
-      const s = JSON.stringify(msg);
-      return Math.ceil(s.length / 3.5);
-    };
+    // Use the top-of-file estimateMessageTokens which is content-aware
+    // (separate chars-per-token ratios for prose / code / JSON / default).
+    // Prior versions had a shadow `estimateTokens` here using a flat 3.5
+    // ratio — that under-counted code/JSON by 15-25% and let oversized
+    // messages slip past the cutoff walk below.
+    const estimateTokens = estimateMessageTokens;
 
     // ─── Protect compaction summaries from being dropped ───
     // The compaction summary (injected above or by Think's getHistory) MUST survive
@@ -2033,6 +2284,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return await this.handlePrompt(request);
       }
 
+      if (request.method === "POST" && url.pathname === "/generate") {
+        return await this.handleGenerate(request);
+      }
+
       if (request.method === "POST" && url.pathname === "/abort") {
         return await this.handleAbort();
       }
@@ -2359,8 +2614,88 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
+    // Per-session todo list — backs the `todo_*` tools. Scoped to the
+    // session so no cross-session leakage. Persisted through compaction
+    // (which summarizes messages, not this table) so the model always
+    // has a stable checklist to refer to after context summaries.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS session_todos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','in_progress','completed','cancelled')),
+        priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_session_todos_status ON session_todos(status)");
+  }
+
+  /**
+   * Expose a stable read/write surface to the `todo_*` tools in agentic.ts
+   * without coupling them to the DO internals. Each method is a small,
+   * synchronous SQL operation — no async bookkeeping needed.
+   */
+  private todoStore(): TodoStore {
+    return {
+      list: () => {
+        const rows = this.db.all(
+          "SELECT id, content, status, priority, created_at, updated_at FROM session_todos ORDER BY id ASC",
+        );
+        return rows.map((r) => ({
+          id: Number(r.id),
+          content: String(r.content),
+          status: r.status as TodoStatus,
+          priority: r.priority as TodoPriority,
+        }));
+      },
+      add: (content, priority) => {
+        const now = nowEpoch();
+        this.db.exec(
+          "INSERT INTO session_todos (content, status, priority, created_at, updated_at) VALUES (?, 'pending', ?, ?, ?)",
+          content,
+          priority ?? "medium",
+          now,
+          now,
+        );
+      },
+      update: (id, patch) => {
+        const now = nowEpoch();
+        const existing = this.db.one("SELECT id FROM session_todos WHERE id = ?", id);
+        if (!existing) return false;
+        if (patch.status) {
+          this.db.exec(
+            "UPDATE session_todos SET status = ?, updated_at = ? WHERE id = ?",
+            patch.status,
+            now,
+            id,
+          );
+        }
+        if (patch.content) {
+          this.db.exec(
+            "UPDATE session_todos SET content = ?, updated_at = ? WHERE id = ?",
+            patch.content,
+            now,
+            id,
+          );
+        }
+        if (patch.priority) {
+          this.db.exec(
+            "UPDATE session_todos SET priority = ?, updated_at = ? WHERE id = ?",
+            patch.priority,
+            now,
+            id,
+          );
+        }
+        return true;
+      },
+      clear: () => {
+        this.db.exec("DELETE FROM session_todos");
+      },
+    };
   }
 
   private async handleListFiles(url: URL): Promise<Response> {
@@ -2892,6 +3227,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
     this.ensureMetadata(sessionId, ownerEmail);
 
+    // Server-side slash command routing so /generate works from every entry
+    // point (browser UI, MCP tools, webhooks) — not just the client JS. We do
+    // this before the active-prompt check because `runImageGeneration` has its
+    // own 409 handling for that case.
+    const imagePrompt = extractGeneratePrompt(input.content);
+    if (imagePrompt) {
+      this.ensureThinkConfig(request);
+      return this.runImageGeneration({
+        prompt: imagePrompt,
+        sessionId,
+        authorEmail,
+        ownerEmail,
+      });
+    }
+
     // handleMessage is synchronous — callers (MCP, external integrations) expect the
     // assistant response in the HTTP reply. Queuing would lose the response. Keep 409.
     if (this.readMetadata("active_prompt_id")) {
@@ -2952,6 +3302,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.ensureMetadata(sessionId, ownerEmail);
     this.ensureThinkConfig(request);
 
+    // Server-side slash routing — /generate works the same whether it comes
+    // from the browser UI, an MCP `send_prompt` call, a webhook, etc. Image
+    // uploads alongside /generate are ignored (FLUX-1-schnell is text-to-image
+    // only; multi-reference inputs are FLUX.2).
+    const imagePrompt = extractGeneratePrompt(input.content);
+    if (imagePrompt) {
+      return this.runImageGeneration({
+        prompt: imagePrompt,
+        sessionId,
+        authorEmail,
+        ownerEmail,
+      });
+    }
+
     // If a prompt is already running, queue this one
     if (this.readMetadata("active_prompt_id")) {
       return this.enqueuePrompt(input.content, authorEmail);
@@ -2979,6 +3343,228 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.setPromptFiberId(promptId, fiberId);
 
     return Response.json({ promptId, status: "queued" }, { status: 202 });
+  }
+
+  private async handleGenerate(request: Request): Promise<Response> {
+    const input = generateImageSchema.parse(await request.json());
+    const sessionId = this.requireSessionId(request);
+    const authorEmail = request.headers.get("x-author-email");
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.ensureMetadata(sessionId, ownerEmail);
+    this.ensureThinkConfig(request);
+    return this.runImageGeneration({
+      prompt: input.content,
+      sessionId,
+      authorEmail,
+      ownerEmail,
+    });
+  }
+
+  /** Shared image-generation core. Invoked by `handleGenerate` (dedicated
+   *  endpoint) and by `handleMessage`/`handlePrompt` when they detect a
+   *  `/generate` slash command in the chat content. Returns a Response so
+   *  callers can bubble errors and status codes without double-wrapping. */
+  private async runImageGeneration(opts: {
+    prompt: string;
+    sessionId: string;
+    authorEmail: string | null;
+    ownerEmail: string | null;
+  }): Promise<Response> {
+    if (opts.prompt.length > FLUX_MAX_PROMPT_LENGTH) {
+      return Response.json({ error: `Prompt exceeds ${FLUX_MAX_PROMPT_LENGTH} characters` }, { status: 400 });
+    }
+
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) {
+      return Response.json({ error: "No Think session" }, { status: 500 });
+    }
+
+    // Reject when another prompt is already running so we don't corrupt
+    // `active_prompt_id` or dequeue another user's queued prompt on finish.
+    // Matches `handleMessage`'s 409 behaviour — /generate is synchronous so
+    // queueing would lose the response anyway.
+    if (this.readMetadata("active_prompt_id")) {
+      return Response.json({ error: "A prompt is already running" }, { status: 409 });
+    }
+
+    const promptId = crypto.randomUUID();
+    const title = this.readMetadata("title") ?? (opts.prompt.length > 72 ? opts.prompt.slice(0, 72) + "…" : opts.prompt);
+
+    this.writeMetadata("title", title);
+    this.writeMetadata("active_prompt_id", promptId);
+    this.writeMetadata("status", "running");
+    this.insertPrompt(promptId, opts.prompt, "queued", opts.authorEmail);
+    await this.syncSessionIndex({ status: "running", title });
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+
+    try {
+      // 1. Persist user prompt message
+      const userMsgId = this.persistGenerateUserMessage(thinkSessionId, opts.prompt, opts.authorEmail);
+
+      // 2. Generate image via Workers AI. Pass a random seed so repeat
+      //    invocations of the same prompt don't collapse to identical output.
+      const raw = await this.env.AI.run(FLUX_IMAGE_MODEL, {
+        prompt: opts.prompt,
+        seed: Math.floor(Math.random() * 1_000_000),
+      });
+      // Defensive parsing — type assertions would silently break if the
+      // Workers AI response shape ever drifts (it already has for FLUX.2).
+      if (!raw || typeof raw !== "object" || typeof (raw as { image?: unknown }).image !== "string" || !(raw as { image: string }).image) {
+        throw new Error("FLUX returned unexpected response shape");
+      }
+      const imageData = (raw as { image: string }).image;
+
+      // 3. Persist assistant message with the generated image
+      const assistantResult = await this.persistGeneratedImageMessage({
+        thinkSessionId,
+        sessionId: opts.sessionId,
+        prompt: opts.prompt,
+        imageData,
+        ownerEmail: opts.ownerEmail ?? undefined,
+      });
+
+      await this.finishPrompt(promptId, { resultMessageId: assistantResult.messageId, status: "completed" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+
+      return Response.json({
+        message: assistantResult.record,
+        promptId,
+        status: "completed",
+        userMsgId,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Image generation failed";
+      this.emitEvent({ data: { message }, type: "error_message" });
+      await this.finishPrompt(promptId, { error: message, status: "failed" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      return Response.json({ error: message }, { status: 502 });
+    }
+  }
+
+  /** Persist the user's /generate prompt as a regular text message and emit a
+   *  `message` SSE event so the UI renders it identically to a chat prompt. */
+  private persistGenerateUserMessage(thinkSessionId: string, content: string, authorEmail: string | null): string {
+    const userMsgId = crypto.randomUUID();
+    const userMsg: UIMessage = {
+      id: userMsgId,
+      role: "user",
+      parts: [{ type: "text", text: content }],
+    };
+    this.sessions.append(thinkSessionId, userMsg);
+    this.insertMessageMetadata({
+      messageId: userMsgId,
+      authorEmail: authorEmail ?? null,
+      model: null,
+      provider: null,
+      tokenInput: 0,
+      tokenOutput: 0,
+    });
+    const userRecord = uiMessageToChatRecord(userMsg, {
+      messageId: userMsgId,
+      authorEmail: authorEmail ?? null,
+      model: null,
+      provider: null,
+      tokenInput: 0,
+      tokenOutput: 0,
+      createdAt: nowEpoch(),
+    });
+    this.emitEvent({ data: userRecord, type: "message" });
+    return userMsgId;
+  }
+
+  /** Upload the FLUX-generated image to R2 and persist it as an assistant
+   *  message. If R2 is unavailable the message falls back to an inline data
+   *  URL so the user still sees the image rather than a silent stub — this
+   *  matches the design contract in `src/attachments.ts`. */
+  private async persistGeneratedImageMessage(opts: {
+    thinkSessionId: string;
+    sessionId: string;
+    prompt: string;
+    imageData: string;
+    ownerEmail: string | undefined;
+  }): Promise<{ messageId: string; record: ChatMessageRecord }> {
+    const assistantMsgId = crypto.randomUUID();
+    const mediaType = FLUX_IMAGE_MEDIA_TYPE;
+
+    const attachmentRef = await uploadAttachment(this.env, {
+      sessionId: opts.sessionId,
+      messageId: assistantMsgId,
+      mediaType,
+      data: opts.imageData,
+      source: "assistant",
+      ownerEmail: opts.ownerEmail,
+    });
+
+    // Short, non-verbose caption — the image carries the meaning. Truncate the
+    // prompt so a 2000-char prompt doesn't dominate the bubble.
+    const preview = opts.prompt.length > 80 ? `${opts.prompt.slice(0, 80).trimEnd()}…` : opts.prompt;
+    const assistantParts: UIMessage["parts"] = [
+      { type: "text", text: `🎨 ${preview}` },
+    ];
+    // Prefer the R2-backed URL; fall back to an inline data URL when R2 is
+    // unavailable so the UI still renders something useful in local dev.
+    const imageUrl = attachmentRef?.url ?? `data:${mediaType};base64,${opts.imageData}`;
+    assistantParts.push({
+      type: "file",
+      mediaType,
+      url: imageUrl,
+    } as FileUIPart);
+
+    const assistantMsg: UIMessage = {
+      id: assistantMsgId,
+      role: "assistant",
+      parts: assistantParts,
+    };
+    this.sessions.append(opts.thinkSessionId, assistantMsg);
+    this.insertMessageMetadata({
+      messageId: assistantMsgId,
+      authorEmail: null,
+      model: FLUX_IMAGE_MODEL,
+      provider: "Workers AI",
+      tokenInput: 0,
+      tokenOutput: 0,
+    });
+
+    if (attachmentRef) {
+      this.insertMessageAttachment({
+        messageId: assistantMsgId,
+        mediaType,
+        url: attachmentRef.url,
+        size: attachmentRef.size,
+        source: "assistant",
+      });
+    } else {
+      log("warn", "persistGeneratedImageMessage: R2 unavailable, falling back to inline data URL", {
+        sessionId: opts.sessionId,
+      });
+    }
+
+    const record = uiMessageToChatRecord(assistantMsg, {
+      messageId: assistantMsgId,
+      authorEmail: null,
+      model: FLUX_IMAGE_MODEL,
+      provider: "Workers AI",
+      tokenInput: 0,
+      tokenOutput: 0,
+      createdAt: nowEpoch(),
+    });
+
+    this.emitEvent({ data: record, type: "message" });
+    if (attachmentRef) {
+      this.emitEvent({
+        data: {
+          messageId: assistantMsgId,
+          attachments: rewriteAttachmentsForClient([
+            { mediaType: attachmentRef.mediaType, url: attachmentRef.url, size: attachmentRef.size },
+          ]),
+        },
+        type: "message_attachments",
+      });
+    }
+
+    return { messageId: assistantMsgId, record };
   }
 
   private async handleAbort(): Promise<Response> {
@@ -4552,6 +5138,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       model: existing?.model ?? appConfig.model,
       opencodeBaseURL: existing?.opencodeBaseURL ?? appConfig.opencodeBaseURL,
       aiGatewayBaseURL: existing?.aiGatewayBaseURL ?? appConfig.aiGatewayBaseURL,
+      // Always pull the latest prefix from UserControl so config changes
+      // take effect on the next prompt without requiring a session restart.
+      systemPromptPrefix: appConfig.systemPromptPrefix,
+      // Same for subagent models — changes at the user level propagate to
+      // the next prompt without needing a session recreate.
+      exploreModel: appConfig.exploreModel,
+      taskModel: appConfig.taskModel,
     };
     this.configure(dodoConfig);
 
