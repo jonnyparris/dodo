@@ -118,6 +118,7 @@ const SAFE_IMAGE_MEDIA_TYPES = new Set([
   "image/jpeg",
   "image/gif",
   "image/webp",
+  "image/svg+xml",
 ]);
 
 /**

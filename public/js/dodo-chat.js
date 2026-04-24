@@ -569,7 +569,7 @@ function sendTypingStop(){
 const _pendingImages=[];
 const MAX_IMAGE_SIZE=3*1024*1024; // 3MB raw — pairs with ~4MB base64 on the backend
 const MAX_IMAGES=5;
-const ALLOWED_IMAGE_TYPES=new Set(["image/png","image/jpeg","image/gif","image/webp"]);
+const ALLOWED_IMAGE_TYPES=new Set(["image/png","image/jpeg","image/gif","image/webp","image/svg+xml"]);
 
 function handleImagePaste(event){
   const items=event.clipboardData?.items;
@@ -587,7 +587,7 @@ function handleImagePaste(event){
 function handleFileSelect(input){
   for(const file of input.files){
     if(ALLOWED_IMAGE_TYPES.has(file.type))addImageFile(file);
-    else toast(`${file.type} not supported. Use PNG, JPEG, GIF, or WebP.`,"warning");
+    else toast(`${file.type} not supported. Use PNG, JPEG, GIF, WebP, or SVG.`,"warning");
   }
   input.value="";
 }

@@ -177,6 +177,7 @@
     .msg.assistant th,.msg.assistant td{border:1px solid var(--line);padding:6px 10px;text-align:left}
     .msg.assistant th{background:var(--recessed);font-weight:600;color:var(--text-strong)}
     .msg.assistant img{max-width:100%;height:auto;border-radius:var(--radius);margin:8px 0}
+    .msg.assistant svg{max-width:100%;height:auto;margin:8px 0}
     .msg.assistant a{color:var(--text-link);text-decoration:none}
     .msg.assistant a:hover{text-decoration:underline}
     .msg.assistant hr{border:none;border-top:1px solid var(--line);margin:12px 0}
@@ -632,7 +633,7 @@
         <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash command suggestions" hidden></div>
         <textarea id="msg-input" rows="1" placeholder="Ask Dodo to build something..." onkeydown="handleInputKeydown(event)" oninput="autoResizeInput(this);sendTypingStart();updateSlashMenu()" onpaste="handleImagePaste(event)" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)" onblur="setTimeout(hideSlashMenu,150)" aria-label="Message input" aria-autocomplete="list" aria-controls="slash-menu"></textarea>
         <div class="input-actions">
-          <input type="file" id="image-file-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple style="display:none" onchange="handleFileSelect(this)"/>
+          <input type="file" id="image-file-input" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml" multiple style="display:none" onchange="handleFileSelect(this)"/>
           <button class="ghost" onclick="$('image-file-input').click()" title="Attach image" aria-label="Attach image"><i class="ph ph-paperclip"></i></button>
           <button class="sending" id="send-btn" onclick="handleSendBtn()" aria-label="Send message"><i class="ph ph-paper-plane-right"></i></button>
         </div>
