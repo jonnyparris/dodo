@@ -413,8 +413,24 @@ function updateTokenSummary(state){
   const ti=state.totalTokenInput??0,to=state.totalTokenOutput??0;
   const pct=state.contextUsagePercent??0;
   const budget=state.contextBudget??0;
+  const mc=state.messageCount??0;
   const el=$("token-summary");
-  if(!ti&&!to){el.textContent='';el.title='';return}
+  // Sessions that never called an LLM (e.g. /generate image-only sessions)
+  // have zero token totals. Show the model ID and message count instead of
+  // going blank — otherwise the topnav looks broken for those sessions.
+  if(!ti&&!to){
+    if(mc>0&&state.model){
+      el.textContent=`${state.model} · ${mc} message${mc===1?'':'s'}`;
+      el.title=`No LLM tokens consumed in this session (likely image-gen or idle).\nModel: ${state.model}`;
+      el.style.color='var(--text-subtle)';
+    } else {
+      el.textContent='';
+      el.title='';
+    }
+    const banner=$("context-warning");
+    if(banner)banner.style.display="none";
+    return;
+  }
   // Color code by context usage
   let color='var(--text-subtle)';
   if(pct>80)color='#e74c3c';
