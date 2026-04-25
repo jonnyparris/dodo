@@ -3,7 +3,7 @@ import { z } from "zod";
 import { resolveAdminEmail } from "./auth";
 import { hashShareToken } from "./share";
 import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
-import type { AllowlistEntry, Env } from "./types";
+import type { AllowlistEntry, Env, SeedRecord } from "./types";
 
 function normalizeHostname(hostname: string): string {
   return hostname.trim().toLowerCase();
@@ -518,6 +518,81 @@ export class SharedIndex extends DurableObject<Env> {
         return Response.json({ ok: true });
       }
 
+      // ─── Seed session registry (global, admin-owned) ───
+      //
+      // Maps {repoId, baseBranch} → an admin-owned session that has the repo
+      // already cloned. Subsequent runs across all users fork that session
+      // instead of cloning fresh. Admin-only, manual-cleanup-only — the
+      // registry never auto-evicts.
+
+      if (request.method === "GET" && url.pathname === "/seeds") {
+        return Response.json({ seeds: this.listSeeds() });
+      }
+
+      // Get-or-create: idempotent. Returns the existing seed if one already
+      // exists for {repoId, baseBranch}, otherwise inserts a new row.
+      if (request.method === "POST" && url.pathname === "/seeds") {
+        const body = z.object({
+          repoId: z.string().min(1),
+          baseBranch: z.string().min(1),
+          sessionId: z.string().min(1),
+          ownerEmail: z.string().email(),
+          repoUrl: z.string().min(1),
+          repoDir: z.string().min(1),
+        }).strict().parse(await request.json());
+
+        const existing = this.getSeed(body.repoId, body.baseBranch);
+        if (existing) return Response.json({ seed: existing, created: false });
+
+        const now = nowEpoch();
+        this.db.exec(
+          `INSERT INTO seed_sessions (repo_id, base_branch, session_id, owner_email, repo_url, repo_dir, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          body.repoId,
+          body.baseBranch,
+          body.sessionId,
+          body.ownerEmail,
+          body.repoUrl,
+          body.repoDir,
+          now,
+          now,
+        );
+        return Response.json({ seed: this.getSeed(body.repoId, body.baseBranch), created: true }, { status: 201 });
+      }
+
+      if (request.method === "GET" && url.pathname.match(/^\/seeds\/[^/]+\/[^/]+$/)) {
+        const parts = url.pathname.split("/");
+        const repoId = decodeURIComponent(parts[2]);
+        const baseBranch = decodeURIComponent(parts[3]);
+        const seed = this.getSeed(repoId, baseBranch);
+        if (!seed) return Response.json({ error: "Seed not found" }, { status: 404 });
+        return Response.json({ seed });
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/seeds\/[^/]+\/[^/]+$/)) {
+        const parts = url.pathname.split("/");
+        const repoId = decodeURIComponent(parts[2]);
+        const baseBranch = decodeURIComponent(parts[3]);
+        const before = this.getSeed(repoId, baseBranch);
+        this.db.exec("DELETE FROM seed_sessions WHERE repo_id = ? AND base_branch = ?", repoId, baseBranch);
+        return Response.json({ deleted: true, repoId, baseBranch, seed: before });
+      }
+
+      // Bump updated_at — used after a refresh (git pull) so the admin UI
+      // shows when the seed was last verified current.
+      if (request.method === "POST" && url.pathname.match(/^\/seeds\/[^/]+\/[^/]+\/touch$/)) {
+        const parts = url.pathname.split("/");
+        const repoId = decodeURIComponent(parts[2]);
+        const baseBranch = decodeURIComponent(parts[3]);
+        this.db.exec(
+          "UPDATE seed_sessions SET updated_at = ? WHERE repo_id = ? AND base_branch = ?",
+          nowEpoch(),
+          repoId,
+          baseBranch,
+        );
+        return Response.json({ touched: true, seed: this.getSeed(repoId, baseBranch) });
+      }
+
       return new Response("Not Found", { status: 404 });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected request failure";
@@ -636,8 +711,56 @@ export class SharedIndex extends DurableObject<Env> {
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_mcp_token_index_email ON mcp_token_index(email)");
 
+    // Global seed-session registry. Maps a known repo + base branch to an
+    // admin-owned session that already has the repo cloned. Other users
+    // fork that session instead of cloning from scratch, saving tokens and
+    // wall time. Manual-cleanup-only — never auto-evicted.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS seed_sessions (
+        repo_id TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        owner_email TEXT NOT NULL,
+        repo_url TEXT NOT NULL,
+        repo_dir TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, base_branch)
+      )
+    `);
+
     // Phase 6: browser_enabled column (migration-safe)
     this.migrateAddBrowserEnabled();
+  }
+
+  // ─── Seed session registry ───
+
+  private getSeed(repoId: string, baseBranch: string): SeedRecord | null {
+    const row = this.db.one(
+      "SELECT repo_id, base_branch, session_id, owner_email, repo_url, repo_dir, created_at, updated_at FROM seed_sessions WHERE repo_id = ? AND base_branch = ?",
+      repoId,
+      baseBranch,
+    );
+    return row ? this.mapSeedRow(row) : null;
+  }
+
+  private listSeeds(): SeedRecord[] {
+    return this.db
+      .all("SELECT repo_id, base_branch, session_id, owner_email, repo_url, repo_dir, created_at, updated_at FROM seed_sessions ORDER BY repo_id ASC, base_branch ASC")
+      .map((row) => this.mapSeedRow(row));
+  }
+
+  private mapSeedRow(row: SqlRow): SeedRecord {
+    return {
+      repoId: String(row.repo_id),
+      baseBranch: String(row.base_branch),
+      sessionId: String(row.session_id),
+      ownerEmail: String(row.owner_email),
+      repoUrl: String(row.repo_url),
+      repoDir: String(row.repo_dir),
+      createdAt: epochToIso(row.created_at),
+      updatedAt: epochToIso(row.updated_at),
+    };
   }
 
   private migrateAddBrowserEnabled(): void {

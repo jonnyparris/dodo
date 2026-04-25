@@ -174,6 +174,14 @@ export interface SessionIndexRecord {
   status: string;
   title: string | null;
   updatedAt: string;
+  /**
+   * Session classification. `'user'` is the default — a regular interactive
+   * session that shows up in the sidebar and is subject to idle cleanup.
+   * `'seed'` is an admin-owned warm clone used as a fork source for
+   * `getOrCreateSeedSession` / `forkSeedSession`. Seeds are hidden from the
+   * regular `/sessions` listing and exempt from idle cleanup.
+   */
+  kind: "user" | "seed";
 }
 
 export interface SessionEvent {
@@ -253,6 +261,26 @@ export interface WorkspaceEntry {
 export interface AllowlistEntry {
   createdAt: string;
   hostname: string;
+}
+
+/**
+ * A row in the global seed-session registry. Each entry points at an
+ * admin-owned session that has the repo cloned at HEAD of `baseBranch`,
+ * so subsequent runs can fork it instead of running `git clone`.
+ *
+ * Created and refreshed manually via the admin UI / MCP — never
+ * auto-evicted, since the cost of a stale clone is far lower than the
+ * cost of the next user paying clone time and tokens for nothing.
+ */
+export interface SeedRecord {
+  repoId: string;
+  baseBranch: string;
+  sessionId: string;
+  ownerEmail: string;
+  repoUrl: string;
+  repoDir: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface MemoryEntry {

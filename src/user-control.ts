@@ -293,7 +293,16 @@ export class UserControl extends DurableObject<Env> {
       // ─── Sessions ───
 
       if (request.method === "GET" && url.pathname === "/sessions") {
-        return Response.json({ sessions: this.listSessions() });
+        // includeSeeds=1 returns admin seed sessions in the list as well.
+        // Default omits them so the user-facing UI stays clean.
+        const includeSeeds = url.searchParams.get("includeSeeds") === "1";
+        return Response.json({ sessions: this.listSessions(includeSeeds) });
+      }
+
+      // Seeds-only listing for the admin UI. Cheaper than asking clients
+      // to filter the includeSeeds=1 result.
+      if (request.method === "GET" && url.pathname === "/seed-sessions") {
+        return Response.json({ sessions: this.listSeedSessions() });
       }
 
       if (request.method === "POST" && url.pathname === "/sessions") {
@@ -302,8 +311,9 @@ export class UserControl extends DurableObject<Env> {
           title: z.string().nullable().optional(),
           ownerEmail: z.string().email(),
           createdBy: z.string().email(),
+          kind: z.enum(["user", "seed"]).optional(),
         }).parse(await request.json());
-        const session = this.registerSession(body.id, body.title ?? null, body.ownerEmail, body.createdBy);
+        const session = this.registerSession(body.id, body.title ?? null, body.ownerEmail, body.createdBy, body.kind ?? "user");
         this.emitUserEvent({ type: "sessions_changed", reason: "created", sessionId: body.id });
         return Response.json(session, { status: 201 });
       }
@@ -855,13 +865,22 @@ export class UserControl extends DurableObject<Env> {
         created_by TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
-        deleted_at INTEGER
+        deleted_at INTEGER,
+        kind TEXT NOT NULL DEFAULT 'user'
       )
     `);
 
     // Add deleted_at column if missing (migration for existing DBs)
     try {
       this.db.exec("ALTER TABLE sessions ADD COLUMN deleted_at INTEGER");
+    } catch { /* column already exists */ }
+
+    // Add kind column for seed-session caching. 'user' is a normal user
+    // session shown in the sidebar and subject to idle cleanup. 'seed' is
+    // an admin-owned warm-clone used as a fork source — hidden from the
+    // session list and exempt from idle cleanup. (audit follow-up: seed cache)
+    try {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'");
     } catch { /* column already exists */ }
 
     this.db.exec(`
@@ -1205,16 +1224,17 @@ export class UserControl extends DurableObject<Env> {
 
   // ─── Sessions ───
 
-  private registerSession(id: string, title: string | null, ownerEmail: string, createdBy: string): SessionIndexRecord {
+  private registerSession(id: string, title: string | null, ownerEmail: string, createdBy: string, kind: "user" | "seed" = "user"): SessionIndexRecord {
     const now = nowEpoch();
     this.db.exec(
-      "INSERT INTO sessions (id, title, status, owner_email, created_by, created_at, updated_at) VALUES (?, ?, 'idle', ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+      "INSERT INTO sessions (id, title, status, owner_email, created_by, created_at, updated_at, kind) VALUES (?, ?, 'idle', ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
       id,
       title,
       ownerEmail,
       createdBy,
       now,
       now,
+      kind,
     );
     // A fresh idle session is eligible for the idle-sweep in ~10min.
     // Fire-and-forget — rearmAlarm only touches DO storage, which is
@@ -1232,16 +1252,26 @@ export class UserControl extends DurableObject<Env> {
     return this.getSession(id);
   }
 
-  private listSessions(): SessionIndexRecord[] {
+  private listSessions(includeSeeds = false): SessionIndexRecord[] {
     // Purge expired soft-deleted sessions
     this.db.exec("DELETE FROM sessions WHERE status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at < ?", nowEpoch());
-    // Exclude soft-deleted sessions from listing
-    return this.db.all("SELECT id, title, status, owner_email, created_by, created_at, updated_at FROM sessions WHERE status != 'deleted' ORDER BY updated_at DESC")
+    // Seed sessions are admin-owned warm clones; they live in the same
+    // table so the existing fork-by-snapshot pipeline keeps working, but
+    // we hide them from the regular list so they don't clog up the user
+    // sidebar. Callers that need them (admin UI, seed registry lookup)
+    // pass includeSeeds=true.
+    const kindFilter = includeSeeds ? "" : " AND kind != 'seed'";
+    return this.db.all(`SELECT id, title, status, owner_email, created_by, created_at, updated_at, kind FROM sessions WHERE status != 'deleted'${kindFilter} ORDER BY updated_at DESC`)
+      .map((row) => this.mapSessionRow(row));
+  }
+
+  private listSeedSessions(): SessionIndexRecord[] {
+    return this.db.all("SELECT id, title, status, owner_email, created_by, created_at, updated_at, kind FROM sessions WHERE kind = 'seed' AND status != 'deleted' ORDER BY updated_at DESC")
       .map((row) => this.mapSessionRow(row));
   }
 
   private getSession(id: string): SessionIndexRecord {
-    const row = this.db.one("SELECT id, title, status, owner_email, created_by, created_at, updated_at FROM sessions WHERE id = ?", id);
+    const row = this.db.one("SELECT id, title, status, owner_email, created_by, created_at, updated_at, kind FROM sessions WHERE id = ?", id);
     if (!row) throw new Error(`Session ${id} not found`);
     return this.mapSessionRow(row);
   }
@@ -1256,6 +1286,7 @@ export class UserControl extends DurableObject<Env> {
       status: String(row.status),
       title: rawTitle,
       updatedAt: epochToIso(row.updated_at),
+      kind: row.kind === undefined || row.kind === null ? "user" : String(row.kind) as "user" | "seed",
     };
   }
 
@@ -2370,8 +2401,12 @@ export class UserControl extends DurableObject<Env> {
    */
   private async sweepIdleSessions(): Promise<void> {
     const cutoff = nowEpoch() - IDLE_SESSION_TTL_SECONDS;
+    // Seed sessions (admin-owned warm clones) are exempt from idle
+    // cleanup — they intentionally have no prompts and exist precisely
+    // so they outlive a normal idle window. Cleaning them up would
+    // defeat the cache.
     const candidates = this.db.all(
-      "SELECT id FROM sessions WHERE status = 'idle' AND updated_at < ? ORDER BY updated_at ASC LIMIT ?",
+      "SELECT id FROM sessions WHERE status = 'idle' AND kind != 'seed' AND updated_at < ? ORDER BY updated_at ASC LIMIT ?",
       cutoff,
       IDLE_SWEEP_BATCH_SIZE,
     );

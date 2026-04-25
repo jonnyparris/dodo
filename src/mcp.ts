@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
 import { canonicalizeEmail, getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
+import { log } from "./logger";
 import { messageLimiter, promptLimiter } from "./rate-limiters";
 import { createDraftPrForRun, createGithubRepo } from "./github-pr";
 import { pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-actions";
@@ -279,36 +280,84 @@ async function captureFailureSnapshot(env: Env, runId: string, sessionId: string
   return createFailureSnapshot(env, runId, { diff, log, messages, prompts, repoDir, sessionId, snapshot, status });
 }
 
-async function getOrCreateSeedSession(env: Env, repoId: string, baseBranch: string, depth: number): Promise<{ repoDir: string; repoUrl: string; sessionId: string; title: string }> {
+/**
+ * Get the global seed session for a known repo + base branch, creating it
+ * if missing. Seeds are admin-owned, hidden from the user-facing session
+ * list (kind='seed'), exempt from idle cleanup, and shared across all
+ * users. Subsequent calls return the same `sessionId` so callers can fork
+ * it instead of cloning fresh.
+ *
+ * The registry lives in SharedIndex, the seed session itself lives in the
+ * admin's UserControl DO. This split keeps the cache global without
+ * needing a separate DO for seed storage.
+ */
+async function getOrCreateSeedSession(env: Env, repoId: string, baseBranch: string, depth: number): Promise<{ ownerEmail: string; repoDir: string; repoUrl: string; sessionId: string; title: string }> {
   const repo = getKnownRepo(repoId);
   const title = `[Seed:${repo.id}@${baseBranch}]`;
-  const existing = await userJson<{ sessions: Array<{ id: string; title?: string | null }> }>(env, "/sessions");
-  const found = existing.sessions.find((session) => session.title === title);
-  if (found) {
-    return { repoDir: repo.dir, repoUrl: repo.url, sessionId: found.id, title };
+  const adminEmail = resolveAdminEmail(env);
+  if (!adminEmail) {
+    throw new Error("Seed cache requires ADMIN_EMAIL to be set; cannot allocate an owner for the seed session");
   }
 
-  const seed = await createSessionWithTitle(env, title);
-  await agentJson(env, seed.id, "/git/clone", {
+  // 1. Check the global registry. If a seed already exists for this
+  //    {repoId, baseBranch}, return it without touching git.
+  const existingRes = await sharedIndexFetch(env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}`);
+  if (existingRes.ok) {
+    const { seed } = await existingRes.json() as { seed: { sessionId: string; ownerEmail: string; repoDir: string; repoUrl: string } };
+    return { ownerEmail: seed.ownerEmail, repoDir: seed.repoDir, repoUrl: seed.repoUrl, sessionId: seed.sessionId, title };
+  }
+
+  // 2. Cold path. Create the seed session under the admin's UserControl
+  //    so all users can fork from it. Mark kind='seed' so it's hidden
+  //    from the session list and exempt from idle cleanup.
+  const sessionId = crypto.randomUUID();
+  await userJson(env, "/sessions", {
+    body: JSON.stringify({ id: sessionId, title, ownerEmail: adminEmail, createdBy: adminEmail, kind: "seed" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }, adminEmail);
+
+  // 3. Clone the repo into the seed workspace.
+  await agentJson(env, sessionId, "/git/clone", {
     body: JSON.stringify({ branch: baseBranch, dir: repo.dir, url: repo.url }),
     headers: { "content-type": "application/json" },
     method: "POST",
-  }, depth);
-  return { repoDir: repo.dir, repoUrl: repo.url, sessionId: seed.id, title };
-}
+  }, depth, adminEmail);
 
-async function forkSeedSession(env: Env, sourceSessionId: string, title: string, depth: number): Promise<{ sessionId: string }> {
-  const snapshotRes = await agentFetch(env, sourceSessionId, "/snapshot", undefined, depth);
-  const snapshot = await snapshotRes.text();
-  const snapshotStore = await userJson<{ id: string }>(env, "/fork-snapshots", {
-    body: snapshot,
+  // 4. Register the seed in the global index so the next caller hits the
+  //    warm path. POST /seeds is idempotent — concurrent cold-path callers
+  //    converge on whichever session won the insert race; the loser's
+  //    session leaks but is harmless (an empty extra clone we'll never
+  //    address). We accept that on the assumption that race is rare and
+  //    the cost of de-duplicating distributed inserts isn't worth it.
+  await sharedIndexFetch(env, "/seeds", {
+    body: JSON.stringify({
+      repoId,
+      baseBranch,
+      sessionId,
+      ownerEmail: adminEmail,
+      repoUrl: repo.url,
+      repoDir: repo.dir,
+    }),
     headers: { "content-type": "application/json" },
     method: "POST",
   });
-  const created = await createSessionWithTitle(env, title);
-  await agentJson(env, created.id, `/snapshot/import?snapshotId=${encodeURIComponent(snapshotStore.id)}`, { method: "POST" }, depth);
-  await userJson(env, `/fork-snapshots/${encodeURIComponent(snapshotStore.id)}`, { method: "DELETE" });
-  return { sessionId: created.id };
+
+  return { ownerEmail: adminEmail, repoDir: repo.dir, repoUrl: repo.url, sessionId, title };
+}
+
+/**
+ * Fork the seed into a new worker session owned by the caller. Uses
+ * `forkSessionInternal` so the existence check hits the seed's owner
+ * (the admin) rather than the caller, who doesn't own the seed.
+ */
+async function forkSeedSession(env: Env, sourceSessionId: string, sourceOwnerEmail: string, title: string, depth: number, callerEmail?: string): Promise<{ sessionId: string }> {
+  const callerCanonical = mcpUserEmail(env, callerEmail);
+  const { id } = await forkSessionInternal(env, callerCanonical, sourceSessionId, title, sourceOwnerEmail);
+  void depth; // depth threading is preserved for future use; the current
+              // forkSessionInternal path doesn't need it because the
+              // fan-out happens via forkSnapshots, not nested MCP calls.
+  return { sessionId: id };
 }
 
 async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, branch: string, baseBranch: string, depth: number): Promise<void> {
@@ -319,13 +368,57 @@ async function prepareRepoBranch(env: Env, sessionId: string, repoDir: string, b
     method: "POST",
   }, depth).catch(() => undefined);
 
-  // Create the feature branch using checkout. Since we clone fresh (not fork),
-  // there are no remote tracking refs to conflict with.
+  // Create the feature branch using checkout with force. Works whether we
+  // arrived here from a fresh clone (no conflicting refs) or from a forked
+  // seed (force overwrites any stale ref state).
   await agentJson(env, sessionId, "/git/checkout", {
     body: JSON.stringify({ branch, dir: repoDir, force: true }),
     headers: { "content-type": "application/json" },
     method: "POST",
   }, depth);
+}
+
+/**
+ * Acquire a worker session with the repo already checked out at
+ * `baseBranch`. Tries the seed cache first (fast: fork from the global
+ * admin-owned seed), falls back to a fresh clone if anything goes wrong
+ * — wrong env, fork import error, transient SharedIndex failure, etc.
+ *
+ * Honours the `DISABLE_SEED_CACHE` env var as a kill switch so we can
+ * roll back to fresh-clone behaviour without redeploying.
+ */
+async function acquireRepoSession(env: Env, repo: { id: string; defaultBranch: string; dir: string; url: string }, baseBranch: string, title: string, depth: number, callerEmail?: string): Promise<{ sessionId: string; viaCache: boolean; reason?: string }> {
+  // Safety belt: when stacking on a non-default base branch we want a
+  // deeper history than the seed has (the seed is a shallow clone of
+  // the default branch). Skip the cache for those callers — a fresh
+  // clone with depth=20 is the correct path.
+  const isStacked = baseBranch !== repo.defaultBranch;
+  const seedCacheDisabled = (env as unknown as { DISABLE_SEED_CACHE?: string }).DISABLE_SEED_CACHE === "1";
+  if (isStacked || seedCacheDisabled) {
+    return acquireFreshClone(env, repo, baseBranch, title, depth, callerEmail, isStacked ? "stacked-base-branch" : "seed-cache-disabled");
+  }
+
+  try {
+    const seed = await getOrCreateSeedSession(env, repo.id, baseBranch, depth);
+    const fork = await forkSeedSession(env, seed.sessionId, seed.ownerEmail, title, depth, callerEmail);
+    return { sessionId: fork.sessionId, viaCache: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log("warn", "seed-cache: falling back to fresh clone", { error: message, repoId: repo.id, baseBranch });
+    return acquireFreshClone(env, repo, baseBranch, title, depth, callerEmail, `seed-cache-error:${message.slice(0, 80)}`);
+  }
+}
+
+async function acquireFreshClone(env: Env, repo: { defaultBranch: string; dir: string; url: string }, baseBranch: string, title: string, depth: number, callerEmail: string | undefined, reason: string): Promise<{ sessionId: string; viaCache: false; reason: string }> {
+  const worker = await createSessionWithTitle(env, title, callerEmail);
+  const isStacked = baseBranch !== repo.defaultBranch;
+  const cloneDepth = isStacked ? 20 : 1;
+  await agentJson(env, worker.id, "/git/clone", {
+    body: JSON.stringify({ branch: baseBranch, depth: cloneDepth, dir: repo.dir, url: repo.url }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }, depth, callerEmail);
+  return { sessionId: worker.id, viaCache: false, reason };
 }
 
 /**
@@ -570,7 +663,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     textResult({ repos: listKnownRepos() }),
   );
 
-  server.tool("get_or_create_seed_session", "Get or create a seed session for a known repo. The seed session clones the repo once, then later runs can fork it instead of cloning repeatedly.", {
+  server.tool("get_or_create_seed_session", "Get or create a seed session for a known repo. The seed session clones the repo once and is shared globally, then later runs can fork it instead of cloning repeatedly.", {
     repoId: z.string().describe("Known repo id (for example: dodo)"),
     baseBranch: z.string().default("main").describe("Base branch to keep in the seed session"),
   }, async ({ repoId, baseBranch }) => {
@@ -578,11 +671,16 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     return textResult(seed);
   });
 
-  server.tool("fork_seed_session", "Fork a seed session into a new worker session with the repo already present.", {
+  server.tool("fork_seed_session", "Fork a seed session into a new worker session with the repo already present. The seed is admin-owned; the forked session belongs to the caller.", {
     seedSessionId: z.string().describe("Seed session id"),
+    seedOwnerEmail: z.string().email().optional().describe("Owner of the seed session. Defaults to the admin email — only override when forking a non-admin seed."),
     title: z.string().min(1).describe("New worker session title"),
-  }, async ({ seedSessionId, title }) => {
-    const forked = await forkSeedSession(env, seedSessionId, title, depth);
+  }, async ({ seedSessionId, seedOwnerEmail, title }) => {
+    const owner = seedOwnerEmail ?? resolveAdminEmail(env);
+    if (!owner) {
+      throw new Error("Cannot fork seed: no admin email configured and no seedOwnerEmail provided");
+    }
+    const forked = await forkSeedSession(env, seedSessionId, owner, title, depth, userEmail);
     return textResult(forked);
   });
 
@@ -705,7 +803,19 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     })).min(1).describe("Deterministic text edits to apply in order"),
   }, async ({ repoId, title, branch, baseBranch, commitMessage, expectedFiles, edits }) => {
     const repo = getKnownRepo(repoId);
-    const worker = await createSessionWithTitle(env, title);
+    // Acquire a worker session with the repo already at HEAD of baseBranch.
+    // Uses the global seed cache when available, falls back to fresh clone
+    // on any error so the orchestrator never blocks on cache misses.
+    const acquireStart = Date.now();
+    const acquired = await acquireRepoSession(env, repo, baseBranch, title, depth, userEmail);
+    log("info", "run_repo_edits: repo session acquired", {
+      repoId: repo.id,
+      baseBranch,
+      sessionId: acquired.sessionId,
+      viaCache: acquired.viaCache,
+      reason: acquired.reason,
+      ms: Date.now() - acquireStart,
+    });
     const run = await createWorkerRun(env, {
       baseBranch,
       branch,
@@ -715,28 +825,19 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
       repoDir: repo.dir,
       repoId: repo.id,
       repoUrl: repo.url,
-      sessionId: worker.id,
-      status: "session_created",
+      sessionId: acquired.sessionId,
+      status: "repo_ready",
       strategy: "deterministic",
       title,
     });
+    const workerSessionId = acquired.sessionId;
 
     try {
-      // Clone fresh (avoids fork binary corruption issues). Deeper clone when
-      // stacking on a non-default base so later `git log` calls see the stack.
-      const isStacked = baseBranch !== repo.defaultBranch;
-      const cloneDepth = isStacked ? 20 : 1;
-      await agentJson(env, worker.id, "/git/clone", {
-        body: JSON.stringify({ branch: baseBranch, depth: cloneDepth, dir: repo.dir, url: repo.url }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      }, depth);
-      await updateWorkerRun(env, String(run.id), { status: "repo_ready" });
-      await prepareRepoBranch(env, worker.id, repo.dir, branch, baseBranch, depth);
+      await prepareRepoBranch(env, workerSessionId, repo.dir, branch, baseBranch, depth);
       await updateWorkerRun(env, String(run.id), { status: "branch_created" });
 
       for (const edit of edits) {
-        await agentJson(env, worker.id, `/file?path=${encodeURIComponent(edit.path)}`, {
+        await agentJson(env, workerSessionId, `/file?path=${encodeURIComponent(edit.path)}`, {
           body: JSON.stringify({ replacement: edit.replacement, search: edit.search }),
           headers: { "content-type": "application/json" },
           method: "PATCH",
@@ -744,7 +845,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
       }
       await updateWorkerRun(env, String(run.id), { status: "edit_applied" });
 
-      const status = await agentJson<{ entries?: unknown[] }>(env, worker.id, `/git/status?dir=${encodeURIComponent(repo.dir)}`, undefined, depth);
+      const status = await agentJson<{ entries?: unknown[] }>(env, workerSessionId, `/git/status?dir=${encodeURIComponent(repo.dir)}`, undefined, depth);
       if (!Array.isArray(status.entries) || status.entries.length === 0) {
         throw new Error("No changed files detected after applying deterministic edits");
       }
@@ -753,32 +854,32 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
       const repoPrefix = repo.dir.endsWith("/") ? repo.dir : `${repo.dir}/`;
       for (const file of Array.from(new Set(edits.map((edit) => edit.path)))) {
         const relPath = file.startsWith(repoPrefix) ? file.slice(repoPrefix.length) : file;
-        await agentJson(env, worker.id, "/git/add", {
+        await agentJson(env, workerSessionId, "/git/add", {
           body: JSON.stringify({ dir: repo.dir, filepath: relPath }),
           headers: { "content-type": "application/json" },
           method: "POST",
         }, depth);
       }
 
-      await agentJson(env, worker.id, "/git/commit", {
+      await agentJson(env, workerSessionId, "/git/commit", {
         body: JSON.stringify({ dir: repo.dir, message: commitMessage }),
         headers: { "content-type": "application/json" },
         method: "POST",
       }, depth);
       await updateWorkerRun(env, String(run.id), { status: "commit_created" });
 
-      const push = await agentJson<Record<string, unknown>>(env, worker.id, "/git/push-checked", {
+      const push = await agentJson<Record<string, unknown>>(env, workerSessionId, "/git/push-checked", {
         body: JSON.stringify({ baseRef: baseBranch, dir: repo.dir, expectedFiles, ref: branch }),
         headers: { "content-type": "application/json" },
         method: "POST",
       }, depth);
       await updateWorkerRun(env, String(run.id), { status: "done", verification: push });
-      return textResult({ run, sessionId: worker.id, verification: push });
+      return textResult({ run, sessionId: workerSessionId, verification: push });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failure = await captureFailureSnapshot(env, String(run.id), worker.id, repo.dir, depth);
+      const failure = await captureFailureSnapshot(env, String(run.id), workerSessionId, repo.dir, depth);
       await updateWorkerRun(env, String(run.id), { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
-      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: worker.id });
+      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: workerSessionId });
     }
   });
 
@@ -799,7 +900,18 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     const limited = checkPromptBudget(mcpUserEmail(env, userEmail));
     if (limited) return limited;
     const repo = getKnownRepo(repoId);
-    const worker = await createSessionWithTitle(env, title);
+    // Acquire a worker session with the repo at HEAD of baseBranch — seed
+    // cache when available, fresh clone fallback otherwise.
+    const acquireStart = Date.now();
+    const acquired = await acquireRepoSession(env, repo, baseBranch, title, depth, userEmail);
+    log("info", "dispatch_repo_prompt: repo session acquired", {
+      repoId: repo.id,
+      baseBranch,
+      sessionId: acquired.sessionId,
+      viaCache: acquired.viaCache,
+      reason: acquired.reason,
+      ms: Date.now() - acquireStart,
+    });
     const run = await createWorkerRun(env, {
       baseBranch,
       branch,
@@ -809,26 +921,16 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
       repoDir: repo.dir,
       repoId: repo.id,
       repoUrl: repo.url,
-      sessionId: worker.id,
-      status: "session_created",
+      sessionId: acquired.sessionId,
+      status: "repo_ready",
       strategy: "agent",
       title,
       verifyWorkflow: verifyWorkflow ?? null,
     });
+    const workerSessionId = acquired.sessionId;
 
     try {
-      // Clone fresh. When stacking on a non-default base branch, fetch more
-      // history so the LLM can `git log` the existing stack without needing
-      // to pull or fetch (both of which fail under singleBranch+shallow).
-      const isStacked = baseBranch !== repo.defaultBranch;
-      const cloneDepth = isStacked ? 20 : 1;
-      await agentJson(env, worker.id, "/git/clone", {
-        body: JSON.stringify({ branch: baseBranch, depth: cloneDepth, dir: repo.dir, url: repo.url }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      }, depth);
-      await updateWorkerRun(env, String(run.id), { status: "repo_ready" });
-      await prepareRepoBranch(env, worker.id, repo.dir, branch, baseBranch, depth);
+      await prepareRepoBranch(env, workerSessionId, repo.dir, branch, baseBranch, depth);
       await updateWorkerRun(env, String(run.id), { status: "branch_created" });
 
       const content = [
@@ -842,18 +944,18 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
         prompt,
       ].join("\n\n");
 
-      const promptRes = await agentJson<Record<string, unknown>>(env, worker.id, "/prompt", {
+      const promptRes = await agentJson<Record<string, unknown>>(env, workerSessionId, "/prompt", {
         body: JSON.stringify({ content }),
         headers: { "content-type": "application/json" },
         method: "POST",
       }, depth);
       await updateWorkerRun(env, String(run.id), { status: "prompt_running" });
-      return textResult({ prompt: promptRes, run, sessionId: worker.id });
+      return textResult({ prompt: promptRes, run, sessionId: workerSessionId });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failure = await captureFailureSnapshot(env, String(run.id), worker.id, repo.dir, depth);
+      const failure = await captureFailureSnapshot(env, String(run.id), workerSessionId, repo.dir, depth);
       await updateWorkerRun(env, String(run.id), { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
-      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: worker.id });
+      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: workerSessionId });
     }
   });
 

@@ -535,6 +535,17 @@ app.get("/howto", async (c) => {
   return new Response("How-to guides not available", { status: 404 });
 });
 
+// Admin-only seed cache page. The static HTML is served unconditionally —
+// the API calls behind it are gated by `adminGuard`, so non-admins see
+// 403 errors when the page tries to load data. We don't gate the page
+// itself because the static asset has no sensitive content.
+app.get("/admin/seeds", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-seeds.html", c.req.url), c.req.raw));
+  }
+  return new Response("Seed cache admin page not available", { status: 404 });
+});
+
 // ─── Admin routes (admin only) ───
 
 const adminGuard = async (c: { get: (key: string) => unknown; env: Env; json: (data: unknown, status?: number) => Response }, next: () => Promise<void>): Promise<Response | void> => {
@@ -643,6 +654,69 @@ app.get("/api/admin/sessions", adminGuard as never, async (c) => {
   // Sort by updatedAt descending
   allSessions.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
   return c.json({ sessions: allSessions });
+});
+
+// ─── Admin: seed-session cache ───
+//
+// The seed cache holds admin-owned warm clones of known repos so user
+// runs can fork instead of cloning fresh. Cleanup is manual: seeds never
+// auto-expire. The admin UI (/admin/seeds.html) drives these endpoints.
+
+app.get("/api/admin/seeds", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/seeds"),
+);
+
+app.delete("/api/admin/seeds/:repoId/:baseBranch", adminGuard as never, async (c) => {
+  const repoId = c.req.param("repoId");
+  const baseBranch = c.req.param("baseBranch");
+  // Look up the seed first so we know which UserControl + session to
+  // delete the underlying clone from. Without this the registry row
+  // disappears but the seed session lingers forever.
+  const seedRes = await proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}`);
+  if (seedRes.ok) {
+    const { seed } = (await seedRes.json()) as { seed: { sessionId: string; ownerEmail: string } };
+    try {
+      await proxyToUserControl(c.env, seed.ownerEmail, `/sessions/${encodeURIComponent(seed.sessionId)}`, { method: "DELETE" });
+    } catch (err) {
+      // Underlying session deletion is best-effort. Failures here leave
+      // an orphan session row, but the registry will be cleared so the
+      // next call cold-clones a new seed instead of reusing the stale one.
+      log("warn", "admin: failed to delete seed session", {
+        repoId, baseBranch, sessionId: seed.sessionId, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}`, { method: "DELETE" });
+});
+
+app.post("/api/admin/seeds/:repoId/:baseBranch/refresh", adminGuard as never, async (c) => {
+  const repoId = c.req.param("repoId");
+  const baseBranch = c.req.param("baseBranch");
+  const seedRes = await proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}`);
+  if (!seedRes.ok) {
+    return c.json({ error: "Seed not found", repoId, baseBranch }, 404);
+  }
+  const { seed } = (await seedRes.json()) as { seed: { sessionId: string; ownerEmail: string; repoDir: string } };
+  // Run `git pull` on the seed so subsequent forks pick up upstream
+  // changes. Failures bubble back to the admin UI as a 500 — usually
+  // means upstream is unreachable or the seed's clone is wedged.
+  const agent = await getAgentByName(c.env.CODING_AGENT as never, seed.sessionId);
+  const pullRes = await agent.fetch(new Request("https://coding-agent/git/pull", {
+    body: JSON.stringify({ dir: seed.repoDir, ref: baseBranch, remote: "origin" }),
+    headers: {
+      "content-type": "application/json",
+      "x-dodo-session-id": seed.sessionId,
+      "x-owner-email": seed.ownerEmail,
+    },
+    method: "POST",
+  }));
+  if (!pullRes.ok) {
+    const text = await pullRes.text().catch(() => "");
+    return c.json({ error: `Refresh failed: ${pullRes.status} ${text.slice(0, 200)}`, repoId, baseBranch }, 500);
+  }
+  await proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}/touch`, { method: "POST" });
+  const refreshed = await proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}`);
+  return new Response(refreshed.body, { status: refreshed.status, headers: refreshed.headers });
 });
 
 // ─── User config (per-user via UserControl) ───
