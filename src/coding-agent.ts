@@ -324,6 +324,8 @@ const SYSTEM_PROMPT = [
   "- Write clear, concise commit messages that explain *why*.",
   "- Never force-push unless the user explicitly asks.",
   "- Prefer `git_clone_known` for built-in repos. Use `git_push_checked` with an explicit branch ref.",
+  "- **You are running in a sandboxed clone — never use `git worktree`.** The workspace IS the clone; there is no parent directory to share with and no concurrent agent to collide with. Repo AGENTS.md files written for local opencode-CLI use sometimes mention worktrees — that guidance does not apply to you. Branch directly off `main` with `git_checkout` and push the branch with `git_push_checked`.",
+  "- **Open the PR before you reply.** When the user asks for a PR, your final message should contain the compare/PR URL. Push the branch, then construct `https://github.com/<owner>/<repo>/compare/<base>...<branch>?expand=1` and include it. Don't make the user ask \"where's the PR?\" — that's a workflow failure.",
   "- **Diagnostic vs imperative phrasing.** If the user asks \"what should we update / what's changed / what do you think\" — that's a DIAGNOSTIC question. Propose changes but do NOT apply them or commit without explicit instruction (\"update it\", \"apply the fix\", \"yes please do\"). When in doubt, ask.",
   "",
   "## Working with errors",

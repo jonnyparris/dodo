@@ -30,11 +30,27 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
 
 **Deploys are manual.** Run `npm run deploy` locally after merging to `main`. Workers Builds CI is disabled because the `"experimental"` compat flag (required by `@cloudflare/think` and the Agents SDK `subAgent()` facet API) blocks non-local deploys by design — see [issue #46](https://github.com/jonnyparris/dodo/issues/46). When Think graduates out of experimental, this can be re-enabled.
 
-## Git Discipline — Worktrees Required
+## Git Discipline — Pick the Workflow That Matches Your Runtime
 
-**Never commit directly to `main`.** Multiple agents may work on this repo concurrently. All changes must go through feature branches.
+**Never commit directly to `main`.** All changes go through feature branches. The exact mechanics differ depending on where you're running.
 
-### Workflow
+### If you're a Dodo session (sandboxed clone in a Durable Object)
+
+This is the case when the agent reading this file is running inside Dodo itself — the workspace is an ephemeral clone in a session DO, you have `git_*` tools (not a shell), and there is no `~/dev/dodo` parent checkout to share with.
+
+**Do not use `git worktree`.** It has no meaning here — there's nothing to share with, no concurrent local agents to collide with, and no `..` parent dir. The session's clone *is* the workspace.
+
+Workflow:
+
+1. After cloning, create a branch directly: `git_branch` then `git_checkout`, or `git_checkout` with a `new` flag. Branch off `main`.
+2. Make changes. Stage specific files. Commit with a clear message.
+3. Push with `git_push_checked` — pass an explicit branch ref, never push to `main`.
+4. **Open the draft PR before replying to the user.** If you have a `dodo_dispatch_repo_prompt`-style tool that opens the PR for you, use it. Otherwise construct the GitHub compare URL (`https://github.com/<owner>/<repo>/compare/main...<branch>?expand=1`) and include it in your final message. The user should never have to ask "where's the PR?" — that's a workflow failure.
+5. Branch naming: `fix/sse-serialization`, `feat/per-user-auth`, `docs/update-readme`, `chore/<scope>`.
+
+### If you're running locally via OpenCode CLI in `~/dev/dodo`
+
+This is the case when the agent reading this file is running on a developer laptop, has shell access, and shares `~/dev/dodo` with potentially-concurrent agents. Use the worktree workflow:
 
 1. **Create a worktree branch** before making any changes:
    ```bash
@@ -49,13 +65,11 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
    git branch -d <branch-name>
    ```
 
-### Why
+### Why the split
 
-Without worktrees, concurrent agents create divergent histories on `main` that require merge commits and conflict resolution. This has already caused confusing commit graphs and near-loss of work.
+Without worktrees in the local case, concurrent agents create divergent histories on `main` that require merge commits and conflict resolution. This has already caused confusing commit graphs and near-loss of work.
 
-### Branch Naming
-
-Use descriptive branch names: `fix/sse-serialization`, `feat/per-user-auth`, `docs/update-readme`. Prefix with `fix/`, `feat/`, `docs/`, or `chore/`.
+In the Dodo-session case, worktrees solve a problem that doesn't exist — there's no shared checkout. Trying to use them wastes turns and confuses the agent (it tried, the tool didn't exist, then it improvised badly).
 
 ## File Map
 
