@@ -366,11 +366,11 @@ npm run deploy       # Build + deploy
 
 ### Deploying
 
-Deploys are **manual**: run `npm run deploy` from a workstation authenticated to your Cloudflare account.
+**Push to `main` auto-deploys** via Workers Builds. The trigger runs `npm run build` then `npx wrangler deploy`.
 
-Workers Builds CI was intentionally disabled because Dodo uses the `"experimental"` compatibility flag (required by `@cloudflare/think` and the Agents SDK `subAgent()` facet API). The `experimental` flag is designed to block non-local deploys — local `wrangler deploy` currently works, but the Workers Builds service enforces the policy and rejects every automated deploy. See [issue #46](https://github.com/jonnyparris/dodo/issues/46) for the full diagnosis.
+The `experimental` compatibility flag (required by `@cloudflare/think` and the Agents SDK `subAgent()` facet API) is fine for `wrangler deploy` — only the stricter `wrangler versions upload` rejects it (code 10021). Preview deploys for non-`main` branches are intentionally not configured because they would use `versions upload` and fail. PR validation runs via [dodo-verify.yml](.github/workflows/dodo-verify.yml) (typecheck + test).
 
-When `@cloudflare/think` graduates out of experimental, the flag can be removed and Workers Builds re-enabled.
+Manual deploy still works: `npm run deploy` from a workstation authenticated to your Cloudflare account. See [issue #46](https://github.com/jonnyparris/dodo/issues/46) for the diagnosis history.
 
 ## Contributing
 

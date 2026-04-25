@@ -28,7 +28,11 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
 
 ## Deploying
 
-**Deploys are manual.** Run `npm run deploy` locally after merging to `main`. Workers Builds CI is disabled because the `"experimental"` compat flag (required by `@cloudflare/think` and the Agents SDK `subAgent()` facet API) blocks non-local deploys by design — see [issue #46](https://github.com/jonnyparris/dodo/issues/46). When Think graduates out of experimental, this can be re-enabled.
+**Auto-deploy on push to `main`** via Workers Builds. Trigger runs `npm run build` then `npx wrangler deploy`.
+
+The `experimental` compat flag is fine here — only `wrangler versions upload` rejects it (code 10021), not `wrangler deploy`. Preview/non-production triggers are intentionally not configured for this reason. PR validation runs via `.github/workflows/dodo-verify.yml` (typecheck + test), no preview deploy.
+
+Manual deploy still works: `npm run deploy` from a workstation authenticated to your Cloudflare account.
 
 ## Git Discipline — Pick the Workflow That Matches Your Runtime
 
