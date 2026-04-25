@@ -19,6 +19,7 @@
  *   - Signed URLs would leak past the 30-day window and need key rotation.
  */
 
+import { bytesToBase64Chunked } from "./crypto";
 import type { Env } from "./types";
 
 const ATTACHMENT_URL_SCHEME = "dodo-attachment://";
@@ -90,8 +91,10 @@ const SVG_BLOCKED_SELFCLOSING_RE =
 const SVG_BLOCKED_ORPHAN_CLOSE_RE =
   /<\/(script|foreignObject|iframe|object|embed|link|style|animate|set)\s*>/gi;
 // Event handlers (onload, onclick, onerror, …). Allow the attribute name to
-// be prefixed with a namespace like `xlink:`.
-const SVG_EVENT_ATTR_RE = /\s(?:[a-z]+:)?on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi;
+// be prefixed with a namespace like `xlink:`. The leading character class
+// is `[\s/]` so we also catch self-closing-style boundaries like
+// `<use/onload=…>` that some parsers tolerate. (audit finding M14)
+const SVG_EVENT_ATTR_RE = /[\s/](?:[a-z]+:)?on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi;
 // javascript: URLs on href/xlink:href/src.
 const SVG_JS_URL_RE =
   /\s(?:xlink:)?(?:href|src)\s*=\s*(?:"(\s*javascript:[^"]*)"|'(\s*javascript:[^']*)'|(\s*javascript:[^\s>]+))/gi;
@@ -166,12 +169,11 @@ export function sanitizeUserImage(
   const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
   const cleaned = sanitizeSvg(text);
   if (cleaned === null) return null;
-  // Re-encode the cleaned SVG to base64. btoa won't work for non-ASCII,
-  // so go through TextEncoder → bytes → binary-string → btoa.
-  const cleanedBytes = new TextEncoder().encode(cleaned);
-  let bin = "";
-  for (let i = 0; i < cleanedBytes.length; i++) bin += String.fromCharCode(cleanedBytes[i]);
-  return btoa(bin);
+  // Re-encode the cleaned SVG to base64. Chunked encoder is safe at any
+  // size — SVG_MAX_BYTES is 512 KB which the spread form would tolerate
+  // but the explicit chunked path keeps the codebase consistent.
+  // (audit finding H9)
+  return bytesToBase64Chunked(new TextEncoder().encode(cleaned));
 }
 
 export interface AttachmentRef {

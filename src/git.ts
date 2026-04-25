@@ -14,10 +14,42 @@ function hostFromUrl(url: string): string {
   }
 }
 
+// Known provider hostnames. Substring matching (e.g. host.includes("github.com"))
+// would treat hostile hostnames like `evil-github.com.attacker.example` as
+// GitHub and ship a user's token to the attacker. Use exact + subdomain
+// matching instead. (audit finding H7)
+const GITHUB_HOSTS = new Set([
+  "github.com",
+  "api.github.com",
+  "raw.githubusercontent.com",
+  "objects.githubusercontent.com",
+]);
+
+const GITLAB_HOSTS = new Set([
+  "gitlab.com",
+  "gitlab.cfdata.org",
+]);
+
+function isGitHubHost(host: string): boolean {
+  if (GITHUB_HOSTS.has(host)) return true;
+  for (const known of GITHUB_HOSTS) {
+    if (host.endsWith(`.${known}`)) return true;
+  }
+  return false;
+}
+
+function isGitLabHost(host: string): boolean {
+  if (GITLAB_HOSTS.has(host)) return true;
+  for (const known of GITLAB_HOSTS) {
+    if (host.endsWith(`.${known}`)) return true;
+  }
+  return false;
+}
+
 /** Map a git remote URL hostname to the secret key name in UserControl. */
 function secretKeyForHost(host: string): string | null {
-  if (host.includes("github.com")) return "github_token";
-  if (host.includes("gitlab")) return "gitlab_token";
+  if (isGitHubHost(host)) return "github_token";
+  if (isGitLabHost(host)) return "gitlab_token";
   return null;
 }
 
@@ -56,8 +88,8 @@ async function fetchUserToken(secretKey: string, env: Env, ownerEmail?: string):
 
 function chooseTokenForUrl(url: string, env: Env): string | undefined {
   const host = hostFromUrl(url);
-  if (host.includes("github.com")) return env.GITHUB_TOKEN;
-  if (host.includes("gitlab")) return env.GITLAB_TOKEN;
+  if (isGitHubHost(host)) return env.GITHUB_TOKEN;
+  if (isGitLabHost(host)) return env.GITLAB_TOKEN;
   return undefined;
 }
 
@@ -295,9 +327,18 @@ export async function verifyRemoteBranch(input: {
   });
 }
 
-export function defaultAuthor(config: AppConfig) {
+/**
+ * Build the git commit author identity.
+ *
+ * Prefers an explicit `authorOverride` (typically the request's
+ * `x-author-email` so guests on a shared session commit as themselves
+ * rather than as the session owner). Falls back to the session config
+ * when no override is supplied. (audit finding M10)
+ */
+export function defaultAuthor(config: AppConfig, authorOverride?: string | null) {
+  const trimmed = typeof authorOverride === "string" ? authorOverride.trim() : "";
   return {
-    email: config.gitAuthorEmail,
+    email: trimmed || config.gitAuthorEmail,
     name: config.gitAuthorName,
   };
 }

@@ -4,14 +4,15 @@
  * These classes extend RpcTarget and define the methods available to
  * RPC clients. They provide a typed, permission-scoped API surface.
  *
- * API hierarchy:
- *   DodoPublicApi     — unauthenticated (health, version)
- *   DodoAuthenticatedApi — authenticated user (list sessions, create session)
+ * The API is constructed in the Hono handler (`/rpc`) directly bound to
+ * the authenticated email. There is NO `authenticate(email)` factory that
+ * lets a caller assert their identity — the email is fixed by the Worker's
+ * auth middleware and cannot be changed by the RPC client. (audit finding H1)
  */
 
 import { RpcTarget } from "capnweb";
 import type { Env } from "./types";
-import { getUserControlStub, isAdmin } from "./auth";
+import { canonicalizeEmail, getUserControlStub, isAdmin } from "./auth";
 
 // ─── Shared types ───
 
@@ -29,48 +30,54 @@ interface RpcSessionSummary {
 }
 
 // ─── Public API (no auth required) ───
+//
+// Retains a `health()` method that exposes nothing user-specific. Anything
+// requiring authentication MUST live on `DodoAuthenticatedApi`, which is
+// constructed from a server-validated email — never from a client claim.
 
 export class DodoPublicApi extends RpcTarget {
   private env: Env;
-  private authenticatedEmail: string | undefined;
 
-  constructor(env: Env, email?: string) {
+  constructor(env: Env) {
     super();
     this.env = env;
-    this.authenticatedEmail = email;
   }
 
   health(): { status: string; version: string } {
     return { status: "ok", version: this.env.DODO_VERSION ?? "unknown" };
   }
+}
 
-  /**
-   * Authenticate with a user email and return a user-scoped API.
-   * In production, this would verify a CF Access JWT. For now, we accept
-   * the email directly (the Worker's auth middleware already verified it).
-   */
-  authenticate(email: string): DodoAuthenticatedApi {
-    const env = this.env;
-    return new DodoAuthenticatedApi({
-      userInfo: { email, isAdmin: isAdmin(email, env) },
-      listSessions: async () => {
-        const stub = getUserControlStub(env, email);
-        const res = await stub.fetch("https://user-control/sessions");
-        const body = (await res.json()) as { sessions: RpcSessionSummary[] };
-        return body.sessions;
-      },
-      createSession: async () => {
-        const sessionId = crypto.randomUUID();
-        const stub = getUserControlStub(env, email);
-        await stub.fetch("https://user-control/sessions", {
-          body: JSON.stringify({ id: sessionId, ownerEmail: email, createdBy: email }),
-          headers: { "content-type": "application/json" },
-          method: "POST",
-        });
-        return sessionId;
-      },
-    });
+/** Build a user-scoped RPC API for a server-authenticated email.
+ *  Callers (Hono handlers) MUST have validated the email against the
+ *  Access JWT or dev-mode bypass before invoking this. */
+export function buildAuthenticatedApi(env: Env, email: string): DodoAuthenticatedApi {
+  const canonical = canonicalizeEmail(email);
+  if (!canonical) {
+    throw new Error("buildAuthenticatedApi: a non-empty email is required");
   }
+
+  return new DodoAuthenticatedApi({
+    userInfo: { email: canonical, isAdmin: isAdmin(canonical, env) },
+    listSessions: async () => {
+      const stub = getUserControlStub(env, canonical);
+      const res = await stub.fetch("https://user-control/sessions", {
+        headers: { "x-owner-email": canonical },
+      });
+      const body = (await res.json()) as { sessions: RpcSessionSummary[] };
+      return body.sessions;
+    },
+    createSession: async () => {
+      const sessionId = crypto.randomUUID();
+      const stub = getUserControlStub(env, canonical);
+      await stub.fetch("https://user-control/sessions", {
+        body: JSON.stringify({ id: sessionId, ownerEmail: canonical, createdBy: canonical }),
+        headers: { "content-type": "application/json", "x-owner-email": canonical },
+        method: "POST",
+      });
+      return sessionId;
+    },
+  });
 }
 
 // ─── Authenticated API (user-scoped) ───

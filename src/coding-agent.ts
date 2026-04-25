@@ -10,11 +10,13 @@ import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-ag
 import type { AttachmentRef } from "./attachments";
 import { rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
+import { bytesToBase64Chunked } from "./crypto";
 import { log } from "./logger";
 import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { sendNotification } from "./notify";
 import { runSandboxedCode } from "./executor";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
+import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc-transport";
 import { epochToIso, nowEpoch, SqlHelper } from "./sql-helpers";
@@ -352,27 +354,7 @@ function buildProviderFromConfig(config: DodoConfig, env: Env): LanguageModel {
   return buildProvider(appConfig, env).chatModel(config.model);
 }
 
-function normalizePath(path: string): string {
-  const trimmed = path.trim();
-  if (!trimmed) {
-    throw new Error("Path is required");
-  }
-
-  const raw = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-  const segments = raw.split("/").filter(Boolean);
-  const resolved: string[] = [];
-
-  for (const segment of segments) {
-    if (segment === "..") {
-      throw new Error("Parent path traversal is not allowed");
-    }
-    if (segment !== ".") {
-      resolved.push(segment);
-    }
-  }
-
-  return `/${resolved.join("/")}`;
-}
+// normalizePath imported at top of file from ./paths
 
 /**
  * Thrown when a caller references a facet name that has no run history
@@ -2928,7 +2910,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return Response.json({ error: "Nothing to commit. Make sure you edited files and staged them before committing." }, { status: 400 });
       }
       const config = await this.readAppConfig();
-      const result = await git.commit({ author: defaultAuthor(config), dir, message: body.message });
+      // Use x-author-email when present so guest commits land under the
+      // committing human's identity, not the session owner's. The header
+      // is set server-side from the authenticated email — clients can't
+      // spoof it. (audit finding M10)
+      const authorEmail = request.headers.get("x-author-email");
+      const result = await git.commit({ author: defaultAuthor(config, authorEmail), dir, message: body.message });
       return Response.json(result);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -3195,10 +3182,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       if (isBinary) {
         const bytes = await this.workspace.readFileBytes(path);
         if (bytes !== null) {
-          // Convert Uint8Array to base64
-          const binary = String.fromCharCode(...bytes);
-          const base64 = btoa(binary);
-          files.push({ content: base64, path, encoding: "base64" });
+          // Convert Uint8Array to base64 in chunks. The spread form
+          // (`String.fromCharCode(...bytes)`) blows the call stack on git
+          // pack files >~64 KB, which any non-trivial clone produces, and
+          // aborts the snapshot export. (audit finding H9)
+          files.push({ content: bytesToBase64Chunked(bytes), path, encoding: "base64" });
         }
       } else {
         const content = await this.workspace.readFile(path);
@@ -4868,9 +4856,24 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     void this.writeEvent(writer, { data: this.readSessionDetails(), type: "ready" });
 
+    // Periodic heartbeat. Cloudflare and intermediate proxies drop idle
+    // SSE connections after ~100s — without a heartbeat, long-idle
+    // sessions silently disconnect. (audit finding L3)
+    const heartbeatHandle = setInterval(() => {
+      try {
+        void writer.write(new TextEncoder().encode(`:heartbeat\n\n`)).catch(() => {
+          this.clients.delete(writer);
+          clearInterval(heartbeatHandle);
+        });
+      } catch {
+        clearInterval(heartbeatHandle);
+      }
+    }, 30_000);
+
     request.signal.addEventListener(
       "abort",
       () => {
+        clearInterval(heartbeatHandle);
         this.clients.delete(writer);
         try { void writer.close(); } catch { /* stream may already be closed */ }
         this.setState({ ...this.readSessionDetails() });
@@ -4889,7 +4892,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async writeEvent(writer: WritableStreamDefaultWriter<Uint8Array>, event: SessionEvent): Promise<void> {
     const payload = `event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`;
-    await writer.write(new TextEncoder().encode(payload));
+    // Bound the per-write wait so a stuck client can't pin a chained
+    // promise forever, holding DO CPU time and blocking GC of the event.
+    // 5s is generous for a healthy client and short enough that an
+    // intermediate proxy (Cloudflare front-line, customer corp HTTP
+    // proxy) hanging the connection gets unstuck. (audit finding M16)
+    await Promise.race([
+      writer.write(new TextEncoder().encode(payload)),
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error("SSE write timeout")), 5000)),
+    ]);
   }
 
   private emitEvent(event: SessionEvent): void {
@@ -5641,10 +5652,44 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private async destroyStorage(): Promise<void> {
+    // Cancel every armed cron schedule before deleting the cron_jobs rows.
+    // Without this, the alarms continue firing — runCronPrompt rehydrates
+    // the DO with empty state and the "deleted" session reanimates.
+    // (audit finding H6)
+    try {
+      const cronRows = this.db.all("SELECT id FROM cron_jobs");
+      for (const row of cronRows) {
+        const id = String(row.id);
+        try {
+          await this.cancelSchedule(id);
+        } catch (err) {
+          log("warn", "destroyStorage: cancelSchedule failed", { id, err: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    } catch (err) {
+      log("warn", "destroyStorage: cron enumeration failed", { err: err instanceof Error ? err.message : String(err) });
+    }
+
+    // Drop every table this DO writes to. Missing tables here mean stale
+    // rows hang around after a "delete" and can leak between session
+    // recreations on the same DO key.
     this.db.exec("DELETE FROM message_metadata");
+    this.db.exec("DELETE FROM message_attachments");
     this.db.exec("DELETE FROM prompts");
+    this.db.exec("DELETE FROM prompt_queue");
     this.db.exec("DELETE FROM cron_jobs");
+    this.db.exec("DELETE FROM session_todos");
+    this.db.exec("DELETE FROM facet_runs");
     this.db.exec("DELETE FROM metadata");
+
+    // Clear the daily MCP-hygiene alarm armed in onStart. ctx.storage is
+    // shared with cancelSchedule so we drop any remaining alarm wholesale.
+    try {
+      await this.ctx.storage.deleteAlarm();
+    } catch (err) {
+      log("warn", "destroyStorage: deleteAlarm failed", { err: err instanceof Error ? err.message : String(err) });
+    }
+
     // Clean up Think sessions
     const thinkSessionId = this.getCurrentSessionId();
     if (thinkSessionId) {

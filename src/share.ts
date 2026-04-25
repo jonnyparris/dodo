@@ -23,11 +23,20 @@ export function generateShareToken(): string {
   return bytesToHex(bytes);
 }
 
-/** Hash a share token with HMAC-SHA256 for storage. Returns hex string. */
+/** Hash a share token with HMAC-SHA256 for storage. Returns hex string.
+ *
+ *  Fails hard if no secret is provided. Falling back to a hard-coded literal
+ *  (the previous behaviour) made every share-token hash forgeable by anyone
+ *  who learned the literal — share tokens are stored only as their hash, so
+ *  that's enough to mint valid shares offline. (audit finding H8)
+ */
 export async function hashShareToken(token: string, secret?: string): Promise<string> {
+  if (!secret) {
+    throw new Error("hashShareToken requires COOKIE_SECRET to be configured");
+  }
   const key = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(secret || "dodo-share-token"),
+    new TextEncoder().encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
@@ -47,7 +56,13 @@ export async function signCookie(payload: string, secret: string): Promise<strin
   );
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
   const payloadB64 = btoa(payload);
-  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(signature)));
+  // 32-byte HMAC fits trivially in a single fromCharCode call, but using
+  // the chunked encoder keeps the codebase consistent and immune to
+  // future signature size changes. (audit finding H9)
+  const sigBytes = new Uint8Array(signature);
+  let sigBin = "";
+  for (let i = 0; i < sigBytes.length; i++) sigBin += String.fromCharCode(sigBytes[i]);
+  const sigB64 = btoa(sigBin);
   return `${payloadB64}:${sigB64}`;
 }
 

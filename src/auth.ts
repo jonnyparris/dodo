@@ -4,10 +4,13 @@ import type { AccessIdentity, Env } from "./types";
 const DEV_EMAIL = "dev@dodo.local";
 const PLACEHOLDER_VALUES = new Set(["your-cf-access-audience-tag", "https://your-team.cloudflareaccess.com", ""]);
 
-/** Resolve the admin email from env. Returns undefined when not configured. */
+/** Resolve the admin email from env. Returns undefined when not configured.
+ *  Always returns the canonical (lowercased+trimmed) form so admin checks
+ *  match regardless of how ADMIN_EMAIL was provisioned. */
 export function resolveAdminEmail(env: Env): string | undefined {
   if (!env.ADMIN_EMAIL || env.ADMIN_EMAIL === "you@example.com") return undefined;
-  return env.ADMIN_EMAIL;
+  const canonical = env.ADMIN_EMAIL.trim().toLowerCase();
+  return canonical || undefined;
 }
 
 /** Check whether Cloudflare Access JWT validation is configured. */
@@ -18,6 +21,22 @@ export function isAccessConfigured(env: Env): boolean {
     !PLACEHOLDER_VALUES.has(env.CF_ACCESS_AUD) &&
     !PLACEHOLDER_VALUES.has(env.CF_ACCESS_TEAM_DOMAIN)
   );
+}
+
+/**
+ * Canonicalize an email for consistent DO keying, admin checks, and
+ * SharedIndex lookups. Trims whitespace and lowercases. Returns null for
+ * empty / non-string input.
+ *
+ * Every place that derives a DO ID from an email or compares an email
+ * against `resolveAdminEmail` MUST use this helper. Mixed casing in
+ * different parts of the system silently routes a user to a different
+ * UserControl DO and bypasses admin checks (audit finding H5).
+ */
+export function canonicalizeEmail(email: string | null | undefined): string | null {
+  if (typeof email !== "string") return null;
+  const trimmed = email.trim().toLowerCase();
+  return trimmed || null;
 }
 
 function readAccessToken(request: Request): string | null {
@@ -60,10 +79,19 @@ export async function verifyAccess(request: Request, env: Env): Promise<AccessId
     return { email: DEV_EMAIL, source: "dev" };
   }
 
-  // When Access is not configured, trust the email header (if Access is in
-  // front at the network level) or fall back to the admin email.
+  // When Access is not configured, ONLY trust the client-set
+  // Cf-Access-Authenticated-User-Email header in dev mode. In production
+  // (no dev flag, no Access JWT validation), there is no way to verify
+  // that header came from an Access edge — refuse the request rather than
+  // accept arbitrary identities. (audit finding M1)
   if (!isAccessConfigured(env)) {
-    const headerEmail = request.headers.get("Cf-Access-Authenticated-User-Email");
+    if (!isDevMode(env)) {
+      throw new AuthError(
+        "Cloudflare Access is not configured (CF_ACCESS_AUD / CF_ACCESS_TEAM_DOMAIN). Configure Access or set ALLOW_UNAUTHENTICATED_DEV=true for local dev.",
+        500,
+      );
+    }
+    const headerEmail = canonicalizeEmail(request.headers.get("Cf-Access-Authenticated-User-Email"));
     if (headerEmail) return { email: headerEmail, source: "access" };
     const admin = resolveAdminEmail(env);
     if (admin) return { email: admin, source: "dev" };
@@ -87,10 +115,10 @@ export async function verifyAccess(request: Request, env: Env): Promise<AccessId
     throw new AuthError("Invalid or expired Access token", 401);
   }
 
+  const rawEmail = (typeof payload.email === "string" ? payload.email : null) ??
+    request.headers.get("Cf-Access-Authenticated-User-Email");
   return {
-    email:
-      (typeof payload.email === "string" ? payload.email : null) ??
-      request.headers.get("Cf-Access-Authenticated-User-Email"),
+    email: canonicalizeEmail(rawEmail),
     source: "access",
   };
 }
@@ -103,10 +131,12 @@ export async function checkAllowlist(email: string, env: Env): Promise<{ allowed
   return (await response.json()) as { allowed: boolean; role?: string };
 }
 
-/** Check if an email is the admin. */
+/** Check if an email is the admin. Compares canonical forms so the check
+ *  is case-insensitive (audit finding H5). */
 export function isAdmin(email: string | null, env: Env): boolean {
-  if (!email) return false;
-  return email === resolveAdminEmail(env);
+  const canonical = canonicalizeEmail(email);
+  if (!canonical) return false;
+  return canonical === resolveAdminEmail(env);
 }
 
 /** Check if a user has browser access enabled (admin-controlled flag in SharedIndex). */
@@ -127,5 +157,11 @@ export function getSharedIndexStub(env: Env): DurableObjectStub {
 }
 
 export function getUserControlStub(env: Env, email: string): DurableObjectStub {
-  return env.USER_CONTROL.get(env.USER_CONTROL.idFromName(email));
+  // Always canonicalize so DO routing is deterministic regardless of caller
+  // casing (audit finding H5).
+  const canonical = canonicalizeEmail(email);
+  if (!canonical) {
+    throw new Error("getUserControlStub: email is required");
+  }
+  return env.USER_CONTROL.get(env.USER_CONTROL.idFromName(canonical));
 }

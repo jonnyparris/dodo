@@ -41,29 +41,38 @@ async function userControlFetch(
 /**
  * Fork an existing session into a new session owned by `ownerEmail`.
  *
- * Extracted from the `POST /session/:id/fork` route (src/index.ts) and the
- * `fork_session` MCP tool (src/mcp.ts) — both previously copy-pasted this
- * sequence:
- *
+ * Steps:
  *   1. GET source /snapshot from CodingAgent
  *   2. POST snapshot bytes to UserControl /fork-snapshots, get a snapshot id
  *   3. Register a new session in UserControl
  *   4. POST /snapshot/import on the new CodingAgent with the snapshot id
  *   5. DELETE the snapshot from UserControl
  *
+ * Source existence is verified against the source owner's UserControl, not
+ * the caller's. When the caller has been granted access to a session they
+ * don't own, pass `sourceOwnerEmail` so the existence check hits the right
+ * DO. Without it, the caller would get a spurious SourceSessionMissingError
+ * for any session they didn't create themselves. (audit finding M5)
+ *
  * Throws SourceSessionMissingError if the source session is not registered
- * in the owner's UserControl.
+ * in the resolved owner's UserControl.
  */
 export async function forkSessionInternal(
   env: Env,
   ownerEmail: string,
   sourceSessionId: string,
   title: string | null,
+  sourceOwnerEmail?: string | null,
 ): Promise<{ id: string; sourceId: string }> {
-  // Verify source exists in owner's UserControl.
+  // Verify source exists in the source owner's UserControl. Falls back to
+  // the caller when no source owner is provided (legacy behaviour, kept
+  // for the same-owner case).
+  const checkOwner = sourceOwnerEmail && sourceOwnerEmail !== ownerEmail
+    ? sourceOwnerEmail
+    : ownerEmail;
   const checkRes = await userControlFetch(
     env,
-    ownerEmail,
+    checkOwner,
     `/sessions/${encodeURIComponent(sourceSessionId)}/check`,
   );
   if (!checkRes.ok) {

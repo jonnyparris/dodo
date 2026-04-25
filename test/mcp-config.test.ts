@@ -176,12 +176,15 @@ describe("Approved MCP catalog admin operations", () => {
 });
 
 describe("MCP Catalog", () => {
-  it("returns catalog with at least 4 entries", async () => {
+  it("returns catalog with at least 3 entries", async () => {
     const res = await fetchJson("/api/mcp-catalog");
     expect(res.status).toBe(200);
     const catalog = (await res.json()) as Array<{ id: string; name: string; description: string; url: string; setupGuide: string }>;
     expect(Array.isArray(catalog)).toBe(true);
-    expect(catalog.length).toBeGreaterThanOrEqual(4);
+    // Catalog seed is config-driven (PR #48). Three entries land by default —
+    // dodo-self, github, browser-rendering — and admins can add more via
+    // /api/admin/approved-mcps.
+    expect(catalog.length).toBeGreaterThanOrEqual(3);
 
     // Verify known entries exist
     const ids = catalog.map((c) => c.id);

@@ -10,8 +10,26 @@
 
 // ─── Key Derivation ───
 
-/** Derive a Passkey-Derived Key (PDK) from user passkey + salt via PBKDF2-SHA256. */
-export async function derivePDK(passkey: string, salt: Uint8Array): Promise<CryptoKey> {
+/**
+ * Default PBKDF2 iteration count for new envelopes. Set to 600k to match
+ * OWASP guidance (≥600k for PBKDF2-SHA256 as of 2023+). Legacy envelopes
+ * created with the previous 100k count keep working — see PBKDF2_LEGACY_ITERATIONS
+ * and the `pbkdf2_iterations` column on `key_envelope`. (audit finding M2)
+ */
+export const PBKDF2_DEFAULT_ITERATIONS = 600_000;
+
+/** Iteration count used by envelopes created before the bump. Read from
+ *  the envelope row when present; assume this when the column is NULL. */
+export const PBKDF2_LEGACY_ITERATIONS = 100_000;
+
+/** Derive a Passkey-Derived Key (PDK) from user passkey + salt via PBKDF2-SHA256.
+ *  `iterations` defaults to PBKDF2_DEFAULT_ITERATIONS for new wraps; existing
+ *  rows pass the value stored alongside their wrap so unlock keeps working. */
+export async function derivePDK(
+  passkey: string,
+  salt: Uint8Array,
+  iterations: number = PBKDF2_DEFAULT_ITERATIONS,
+): Promise<CryptoKey> {
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(passkey).buffer as ArrayBuffer,
@@ -20,7 +38,7 @@ export async function derivePDK(passkey: string, salt: Uint8Array): Promise<Cryp
     ["deriveKey"],
   );
   return crypto.subtle.deriveKey(
-    { name: "PBKDF2", hash: "SHA-256", salt: salt.buffer as ArrayBuffer, iterations: 100_000 },
+    { name: "PBKDF2", hash: "SHA-256", salt: salt.buffer as ArrayBuffer, iterations },
     keyMaterial,
     { name: "AES-GCM", length: 256 },
     false,
@@ -139,6 +157,24 @@ export function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/**
+ * Chunked Uint8Array → base64 conversion. Use for large binary buffers
+ * (git pack files, attachments) where the per-byte loop above is OK but
+ * `String.fromCharCode(...bytes)` would blow the call stack at >~64 KB.
+ * (audit finding H9)
+ *
+ * Both forms are functionally equivalent for small inputs; this one is
+ * just safe at any size.
+ */
+export function bytesToBase64Chunked(bytes: Uint8Array, chunkSize = 0x8000): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+    binary += String.fromCharCode(...slice);
   }
   return btoa(binary);
 }

@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
-import { getSharedIndexStub, getUserControlStub, resolveAdminEmail } from "./auth";
+import { canonicalizeEmail, getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
 import { createDraftPrForRun } from "./github-pr";
 import { pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-actions";
 import { getKnownRepo, listKnownRepos } from "./repos";
@@ -20,11 +20,87 @@ import type { Env, WorkerRunRecord } from "./types";
  * (CI etc.) are the only ones hitting this path.
  */
 function mcpUserEmail(env: Env, userEmail?: string): string {
-  if (userEmail) return userEmail;
+  const canonical = canonicalizeEmail(userEmail ?? null);
+  if (canonical) return canonical;
   const email = resolveAdminEmail(env);
   if (!email) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
   console.warn("[mcp] Operation attributed to admin via service-mode fallback (no userEmail threaded).");
   return email;
+}
+
+/**
+ * Check whether the caller has at least `required` permission on the session.
+ *
+ * Without this check, any user with a valid MCP token could read/write/execute
+ * code in any session whose UUID they can learn (audit finding H3). The
+ * permission check covers:
+ *   - direct ownership in the caller's UserControl
+ *   - platform admin
+ *   - granted permission in SharedIndex (readonly/readwrite)
+ *
+ * Share-cookie guests are intentionally NOT honoured for MCP — MCP tokens
+ * authenticate a user identity, not a guest browser session.
+ */
+async function checkSessionPermission(
+  env: Env,
+  email: string,
+  sessionId: string,
+  required: "readonly" | "write" | "admin",
+): Promise<{ allowed: boolean; permission: "readonly" | "write" | "admin" | null }> {
+  const PERMISSION_LEVELS: Record<string, number> = { readonly: 0, readwrite: 1, write: 1, admin: 2 };
+
+  // Owner check via the caller's UserControl
+  const stub = getUserControlStub(env, email);
+  const ownerCheck = await stub.fetch(
+    `https://user-control/sessions/${encodeURIComponent(sessionId)}/check`,
+    { headers: { "x-owner-email": email } },
+  );
+  if (ownerCheck.ok) {
+    return { allowed: true, permission: "admin" };
+  }
+
+  // Platform admin
+  if (isAdmin(email, env)) {
+    return { allowed: true, permission: "admin" };
+  }
+
+  // SharedIndex grant
+  const sharedStub = getSharedIndexStub(env);
+  const permRes = await sharedStub.fetch(
+    `https://shared-index/permissions/${encodeURIComponent(sessionId)}/${encodeURIComponent(email)}`,
+  );
+  if (permRes.ok) {
+    const perm = (await permRes.json()) as { permission: string };
+    let granted: "readonly" | "write" | "admin" | null = null;
+    if (perm.permission === "readwrite") granted = "write";
+    else if (perm.permission === "readonly") granted = "readonly";
+    if (granted && (PERMISSION_LEVELS[granted] ?? -1) >= (PERMISSION_LEVELS[required] ?? 999)) {
+      return { allowed: true, permission: granted };
+    }
+    return { allowed: false, permission: granted };
+  }
+
+  return { allowed: false, permission: null };
+}
+
+/** Convenience wrapper that turns a denied check into an MCP error result. */
+async function ensureSessionAccess(
+  env: Env,
+  userEmail: string | undefined,
+  sessionId: string,
+  required: "readonly" | "write" | "admin",
+): Promise<{ ok: true } | { ok: false; result: { content: Array<{ type: "text"; text: string }>; isError: true } }> {
+  const email = mcpUserEmail(env, userEmail);
+  const check = await checkSessionPermission(env, email, sessionId, required);
+  if (!check.allowed) {
+    return {
+      ok: false,
+      result: errorResult({
+        error: `Session '${sessionId}' not found or access denied (need '${required}' permission)`,
+      }),
+    };
+  }
+  return { ok: true };
 }
 
 async function userControlFetch(env: Env, path: string, init?: RequestInit, userEmail?: string): Promise<Response> {
@@ -358,23 +434,22 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   });
 
   server.tool("get_session", "Get the state of a Dodo session", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
-    // Verify the session exists in UserControl before querying the agent
-    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`, undefined, userEmail);
-    if (!checkRes.ok) {
-      return errorResult({ error: `Session '${sessionId}' not found. Run list_sessions to see available sessions.` });
-    }
+    // Permission check covers ownership / admin / shared grant — without it
+    // any MCP-token holder could read any session by guessing its UUID.
+    // (audit finding H3 / M8)
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
     return jsonFetch(env, "agent", "/", { sessionId, depth });
   });
 
   server.tool("delete_session", "Delete a Dodo session and its storage. The session can be restored within 5 minutes using restore_session.", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
-    // Verify the session exists before deleting
-    const checkRes = await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/check`, undefined, userEmail);
-    if (!checkRes.ok) {
-      return errorResult({ error: `Session '${sessionId}' not found. Run list_sessions to see available sessions.` });
-    }
+    // Delete is admin-level — only the session owner / platform admin may
+    // soft-delete. (audit finding H3)
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "admin");
+    if (!access.ok) return access.result;
     const result = await agentFetch(env, sessionId, "/", { method: "DELETE" }, depth);
     // Soft-delete in UserControl (marks as deleted, auto-purges after 5 minutes)
-    await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/soft-delete`, { method: "POST" });
+    await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}/soft-delete`, { method: "POST" }, userEmail);
     const data = await result.json();
     return textResult({ ...data as object, sessionId, recoverable: true, recoverableUntil: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
   });
@@ -762,159 +837,196 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
 
   // --- File tools ---
 
+  // All session-scoped tools below run a permission check before touching
+  // the CodingAgent DO. Without this gate, any MCP-token holder could
+  // read/write/execute against any session by learning its UUID.
+  // (audit finding H3)
+
   server.tool("list_files", "List files in a session's workspace", {
     sessionId: z.string().describe("Session ID"),
     path: z.string().default("/").describe("Directory path"),
-  }, async ({ sessionId, path }) =>
-    jsonFetch(env, "agent", `/files?path=${encodeURIComponent(path)}`, { sessionId, depth }),
-  );
+  }, async ({ sessionId, path }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", `/files?path=${encodeURIComponent(path)}`, { sessionId, depth });
+  });
 
   server.tool("read_file", "Read a file from a session's workspace", {
     sessionId: z.string().describe("Session ID"),
     path: z.string().describe("File path"),
-  }, async ({ sessionId, path }) =>
-    jsonFetch(env, "agent", `/file?path=${encodeURIComponent(path)}`, { sessionId, depth }),
-  );
+  }, async ({ sessionId, path }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", `/file?path=${encodeURIComponent(path)}`, { sessionId, depth });
+  });
 
   server.tool("write_file", "Write a file to a session's workspace", {
     sessionId: z.string().describe("Session ID"),
     path: z.string().describe("File path"),
     content: z.string().describe("File content"),
-  }, async ({ sessionId, path, content }) =>
-    jsonFetch(env, "agent", `/file?path=${encodeURIComponent(path)}`, {
+  }, async ({ sessionId, path, content }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", `/file?path=${encodeURIComponent(path)}`, {
       sessionId,
       depth,
       init: { body: JSON.stringify({ content }), headers: { "content-type": "application/json" }, method: "PUT" },
-    }),
-  );
+    });
+  });
 
   server.tool("search_files", "Search workspace files by glob pattern and optional content query", {
     sessionId: z.string().describe("Session ID"),
     pattern: z.string().describe("Glob pattern (e.g. **/*.ts)"),
     query: z.string().optional().describe("Content search query (omit to match by filename only)"),
-  }, async ({ sessionId, pattern, query }) =>
-    jsonFetch(env, "agent", "/search", {
+  }, async ({ sessionId, pattern, query }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/search", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ pattern, query: query ?? "" }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   // --- Code execution ---
 
   server.tool("execute_code", "Execute JavaScript code in a sandboxed Worker against the session workspace", {
     sessionId: z.string().describe("Session ID"),
     code: z.string().describe("JavaScript code to execute"),
-  }, async ({ sessionId, code }) =>
-    jsonFetch(env, "agent", "/execute", {
+  }, async ({ sessionId, code }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/execute", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ code }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   // --- Chat tools ---
 
   server.tool("send_message", "Send a synchronous message to the Dodo coding agent and wait for the full response", {
     sessionId: z.string().describe("Session ID"),
     content: z.string().describe("Message content"),
-  }, async ({ sessionId, content }) =>
-    jsonFetch(env, "agent", "/message", {
+  }, async ({ sessionId, content }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/message", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ content }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   server.tool("send_prompt", "Send an async message to the Dodo coding agent (returns immediately, runs in background). Use get_prompts to check status.", {
     sessionId: z.string().describe("Session ID"),
     content: z.string().describe("Prompt content"),
-  }, async ({ sessionId, content }) =>
-    jsonFetch(env, "agent", "/prompt", {
+  }, async ({ sessionId, content }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/prompt", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ content }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   server.tool("generate_image", "Generate an image with Workers AI FLUX-1-schnell and post it to the session. Bypasses the chat LLM — routes straight to the image model.", {
     sessionId: z.string().describe("Session ID"),
     prompt: z.string().min(1).max(2048).describe("Text prompt describing the image (1-2048 chars)"),
-  }, async ({ sessionId, prompt }) =>
-    jsonFetch(env, "agent", "/generate", {
+  }, async ({ sessionId, prompt }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/generate", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ content: prompt }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   server.tool("abort_prompt", "Abort a running async prompt", {
     sessionId: z.string().describe("Session ID"),
-  }, async ({ sessionId }) =>
-    jsonFetch(env, "agent", "/abort", { sessionId, depth, init: { method: "POST", body: "{}", headers: { "content-type": "application/json" } } }),
-  );
+  }, async ({ sessionId }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/abort", { sessionId, depth, init: { method: "POST", body: "{}", headers: { "content-type": "application/json" } } });
+  });
 
   server.tool("get_messages", "Get message history for a session", {
     sessionId: z.string().describe("Session ID"),
-  }, async ({ sessionId }) =>
-    jsonFetch(env, "agent", "/messages", { sessionId, depth }),
-  );
+  }, async ({ sessionId }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/messages", { sessionId, depth });
+  });
 
   server.tool("get_prompts", "Get prompt history for a session", {
     sessionId: z.string().describe("Session ID"),
-  }, async ({ sessionId }) =>
-    jsonFetch(env, "agent", "/prompts", { sessionId, depth }),
-  );
+  }, async ({ sessionId }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/prompts", { sessionId, depth });
+  });
 
   // --- Git tools ---
 
   server.tool("git_status", "Get git status for a session workspace", {
     sessionId: z.string().describe("Session ID"),
     dir: z.string().optional().describe("Repo directory path"),
-  }, async ({ sessionId, dir }) =>
-    jsonFetch(env, "agent", `/git/status${dir ? `?dir=${encodeURIComponent(dir)}` : ""}`, { sessionId, depth }),
-  );
+  }, async ({ sessionId, dir }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", `/git/status${dir ? `?dir=${encodeURIComponent(dir)}` : ""}`, { sessionId, depth });
+  });
 
   server.tool("git_init", "Initialize a git repo in the session workspace", {
     sessionId: z.string().describe("Session ID"),
     dir: z.string().optional().describe("Directory to init in"),
-  }, async ({ sessionId, dir }) =>
-    jsonFetch(env, "agent", "/git/init", {
+  }, async ({ sessionId, dir }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/git/init", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ dir }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   server.tool("git_add", "Stage files in a session's git repo", {
     sessionId: z.string().describe("Session ID"),
     filepath: z.string().default(".").describe("File or directory to stage"),
     dir: z.string().optional().describe("Repo directory path"),
-  }, async ({ sessionId, filepath, dir }) =>
-    jsonFetch(env, "agent", "/git/add", {
+  }, async ({ sessionId, filepath, dir }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/git/add", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ filepath, dir }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   server.tool("git_commit", "Commit staged changes in a session's git repo", {
     sessionId: z.string().describe("Session ID"),
     message: z.string().describe("Commit message"),
     dir: z.string().optional().describe("Repo directory path"),
-  }, async ({ sessionId, message, dir }) =>
-    jsonFetch(env, "agent", "/git/commit", {
+  }, async ({ sessionId, message, dir }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/git/commit", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ message, dir }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   server.tool("git_log", "Get git log for a session's repo", {
     sessionId: z.string().describe("Session ID"),
     dir: z.string().optional().describe("Repo directory path"),
     depth: z.number().optional().describe("Number of commits to show"),
   }, async ({ sessionId, dir, depth: logDepth }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
     const params = new URLSearchParams();
     if (dir) params.set("dir", dir);
     if (logDepth) params.set("depth", String(logDepth));
@@ -924,9 +1036,11 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   server.tool("git_diff", "Get git diff for a session's repo", {
     sessionId: z.string().describe("Session ID"),
     dir: z.string().optional().describe("Repo directory path"),
-  }, async ({ sessionId, dir }) =>
-    jsonFetch(env, "agent", `/git/diff${dir ? `?dir=${encodeURIComponent(dir)}` : ""}`, { sessionId, depth }),
-  );
+  }, async ({ sessionId, dir }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", `/git/diff${dir ? `?dir=${encodeURIComponent(dir)}` : ""}`, { sessionId, depth });
+  });
 
   server.tool("git_clone", "Clone a git repo into the session workspace", {
     sessionId: z.string().describe("Session ID"),
@@ -934,13 +1048,15 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     dir: z.string().optional().describe("Target directory"),
     branch: z.string().optional().describe("Branch to clone"),
     depth: z.number().optional().describe("Clone depth (shallow clone)"),
-  }, async ({ sessionId, url, dir, branch, depth: cloneDepth }) =>
-    jsonFetch(env, "agent", "/git/clone", {
+  }, async ({ sessionId, url, dir, branch, depth: cloneDepth }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/git/clone", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ url, dir, branch, depth: cloneDepth }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   server.tool("git_push", "Push commits to remote", {
     sessionId: z.string().describe("Session ID"),
@@ -948,13 +1064,15 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     remote: z.string().optional().describe("Remote name (default: origin)"),
     ref: z.string().optional().describe("Branch ref to push"),
     force: z.boolean().optional().describe("Force push"),
-  }, async ({ sessionId, dir, remote, ref, force }) =>
-    jsonFetch(env, "agent", "/git/push", {
+  }, async ({ sessionId, dir, remote, ref, force }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/git/push", {
       sessionId,
       depth,
       init: { body: JSON.stringify({ dir, remote, ref, force }), headers: { "content-type": "application/json" }, method: "POST" },
-    }),
-  );
+    });
+  });
 
   // --- Memory tools (per-user) ---
 

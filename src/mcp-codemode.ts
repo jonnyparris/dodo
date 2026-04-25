@@ -1,7 +1,7 @@
 import { getAgentByName } from "agents";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getUserControlStub, resolveAdminEmail } from "./auth";
+import { canonicalizeEmail, getUserControlStub, resolveAdminEmail } from "./auth";
 import type { Env } from "./types";
 
 // ─── API Catalog ───
@@ -108,10 +108,21 @@ declare const catalog: CatalogEntry[];
 
 // ─── Helpers ───
 
-function mcpUserEmail(env: Env): string {
-  const email = resolveAdminEmail(env);
-  if (!email) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
-  return email;
+/**
+ * Resolve the email to attribute MCP operations to.
+ *
+ * Prefers the explicit caller email (resolved upstream from the user-scoped
+ * `dodo_*` token). Only falls back to ADMIN_EMAIL when no user email was
+ * threaded — which now only happens for service-mode callers using the
+ * shared `DODO_MCP_TOKEN` (audit finding H2).
+ */
+function mcpUserEmail(env: Env, userEmail?: string): string {
+  const canonical = canonicalizeEmail(userEmail ?? null);
+  if (canonical) return canonical;
+  const admin = resolveAdminEmail(env);
+  if (!admin) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
+  console.warn("[mcp-codemode] Operation attributed to admin via service-mode fallback (no userEmail threaded).");
+  return admin;
 }
 
 function errorResult(data: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
@@ -127,7 +138,7 @@ function truncateResponse(data: unknown, maxChars = 16_000): string {
 
 // ─── Code-Mode MCP Server ───
 
-export function createDodoCodeModeMcpServer(env: Env, depth = 0): McpServer {
+export function createDodoCodeModeMcpServer(env: Env, userEmail: string | undefined, depth = 0): McpServer {
   const server = new McpServer({ name: "dodo-codemode", version: "0.4.0" });
 
   // --- Search tool: query the API catalog ---
@@ -166,6 +177,10 @@ async () => {
   });
 
   // --- Execute tool: call dodo.request() ---
+  // The dodo client is bound to the resolved caller email so all UserControl
+  // and CodingAgent traffic from the sandbox is scoped to that user.
+  // Per-session ACLs are enforced inside buildDodoClient before each agent
+  // call (audit finding H3).
   server.tool("execute", `Execute JavaScript code against the Dodo API. First use 'search' to find endpoints, then write code using dodo.request().
 
 Available in your code:
@@ -211,7 +226,7 @@ async () => {
     code: z.string().describe("JavaScript async arrow function to execute"),
   }, async ({ code }) => {
     try {
-      const dodoClient = buildDodoClient(env, depth);
+      const dodoClient = buildDodoClient(env, userEmail, depth);
       const fn = new Function("dodo", `return (${code})()`);
       const result = await fn(dodoClient);
       return { content: [{ type: "text", text: truncateResponse(result) }] };
@@ -226,8 +241,8 @@ async () => {
 // ─── Dodo Client ───
 // Routes requests to the appropriate internal Durable Object (UserControl or CodingAgent).
 
-function buildDodoClient(env: Env, depth: number) {
-  const email = mcpUserEmail(env);
+function buildDodoClient(env: Env, userEmail: string | undefined, depth: number) {
+  const email = mcpUserEmail(env, userEmail);
 
   return {
     async request(options: { method: string; path: string; query?: Record<string, string | number | boolean | undefined>; body?: unknown }) {
@@ -245,6 +260,19 @@ function buildDodoClient(env: Env, depth: number) {
         if (!match) throw new Error(`Invalid agent path: ${path}`);
         sessionId = match[1];
         targetPath = match[2] || "/";
+
+        // Per-session ACL check: agent paths target a CodingAgent DO keyed
+        // by sessionId. Without this check, any caller with a valid MCP
+        // token could touch any session by guessing/learning its UUID.
+        // (audit finding H3)
+        const stub = getUserControlStub(env, email);
+        const checkRes = await stub.fetch(
+          `https://user-control/sessions/${encodeURIComponent(sessionId)}/check`,
+          { headers: { "x-owner-email": email } },
+        );
+        if (!checkRes.ok) {
+          throw new Error(`Session '${sessionId}' not found or access denied for caller`);
+        }
       }
 
       // Build URL with query params

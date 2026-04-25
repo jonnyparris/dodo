@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import type { AttachmentRef } from "./attachments";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
+import { normalizePath } from "./paths";
 import { createBrowserTools } from "./browser/tools";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
 import { getKnownRepo, listKnownRepos } from "./repos";
@@ -1665,13 +1666,22 @@ function buildTools(
       new_string: z.string().describe("Replacement text"),
     }),
     execute: async ({ path, old_string, new_string }: { path: string; old_string: string; new_string: string }) => {
-      const content = await workspace.readFile(path);
-      if (content === null) return { error: `File not found: ${path}` };
+      // Normalize and reject `..` traversal — matches the HTTP file
+      // handlers in coding-agent.ts so a tool can't reach outside the
+      // workspace by stringing `..` segments. (audit finding M11)
+      let normalized: string;
+      try {
+        normalized = normalizePath(path);
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : "Invalid path" };
+      }
+      const content = await workspace.readFile(normalized);
+      if (content === null) return { error: `File not found: ${normalized}` };
       if (!content.includes(old_string)) return { error: "old_string not found in file. Read the file first to verify the exact text." };
       const count = content.split(old_string).length - 1;
       const newContent = content.replaceAll(old_string, new_string);
-      await workspace.writeFile(path, newContent);
-      return { path, replacements: count, old_string, new_string };
+      await workspace.writeFile(normalized, newContent);
+      return { path: normalized, replacements: count, old_string, new_string };
     },
   });
 

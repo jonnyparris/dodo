@@ -15,6 +15,8 @@ import {
   generateSalt,
   unwrapDEK,
   wrapDEK,
+  PBKDF2_DEFAULT_ITERATIONS,
+  PBKDF2_LEGACY_ITERATIONS,
 } from "./crypto";
 import { HttpMcpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { log } from "./logger";
@@ -638,14 +640,19 @@ export class UserControl extends DurableObject<Env> {
       // ─── Key Envelope / Passkey ───
 
       if (request.method === "POST" && url.pathname === "/passkey/init") {
-        const body = z.object({ passkey: z.string().min(4) }).parse(await request.json());
+        // Minimum 12 chars. Combined with the bumped PBKDF2 iteration count
+        // (audit finding M2), this raises the offline cracking cost on a
+        // leaked envelope from "minutes on a GPU" to "infeasible at modest
+        // budget". 4-char passkeys offered essentially no security.
+        // (audit finding M3)
+        const body = z.object({ passkey: z.string().min(12) }).parse(await request.json());
         const ownerEmail = request.headers.get("x-owner-email") ?? "";
         await this.initKeyEnvelope(body.passkey, ownerEmail);
         return Response.json({ initialized: true });
       }
 
       if (request.method === "POST" && url.pathname === "/passkey/change") {
-        const body = z.object({ currentPasskey: z.string().min(1), newPasskey: z.string().min(4) }).parse(await request.json());
+        const body = z.object({ currentPasskey: z.string().min(1), newPasskey: z.string().min(12) }).parse(await request.json());
         const ownerEmail = request.headers.get("x-owner-email") ?? "";
         await this.changePasskey(body.currentPasskey, body.newPasskey, ownerEmail);
         return Response.json({ changed: true });
@@ -812,6 +819,12 @@ export class UserControl extends DurableObject<Env> {
       )
     `);
 
+    // One-shot purge of literal "undefined"/"null" strings caused by an
+    // older bug that called `String(undefined)` on optional fields. Cheap
+    // SQL even when the table is large; readConfig still defensively
+    // treats those as blank if anything slips through. (audit finding L5)
+    this.db.exec("DELETE FROM user_config WHERE value IN ('undefined', 'null')");
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
@@ -861,9 +874,17 @@ export class UserControl extends DurableObject<Env> {
         wrapped_dek_passkey TEXT NOT NULL,
         wrapped_dek_server TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        rotated_at INTEGER
+        rotated_at INTEGER,
+        pbkdf2_iterations INTEGER
       )
     `);
+    // Additive migration for existing envelopes — SQLite ignores the column
+    // if it already exists. (audit finding M2)
+    try {
+      this.db.exec("ALTER TABLE key_envelope ADD COLUMN pbkdf2_iterations INTEGER");
+    } catch {
+      // Column already exists, fine.
+    }
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS encrypted_secrets (
@@ -1011,10 +1032,16 @@ export class UserControl extends DurableObject<Env> {
         email TEXT NOT NULL,
         label TEXT,
         created_at INTEGER NOT NULL,
-        last_used_at INTEGER
+        last_used_at INTEGER,
+        synced_to_index INTEGER NOT NULL DEFAULT 1
       )
     `);
+    // Additive migration for existing tables (audit finding M15)
+    try {
+      this.db.exec("ALTER TABLE user_mcp_tokens ADD COLUMN synced_to_index INTEGER NOT NULL DEFAULT 1");
+    } catch { /* column already exists */ }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_email ON user_mcp_tokens (email)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_synced ON user_mcp_tokens (synced_to_index) WHERE synced_to_index = 0");
 
     // TTL cleanup: remove fork snapshots older than 1 hour
     const oneHourAgo = nowEpoch() - 3600;
@@ -1563,25 +1590,58 @@ export class UserControl extends DurableObject<Env> {
     const token = `dodo_${crypto.randomUUID().replace(/-/g, "")}`;
     const normalisedEmail = email.trim().toLowerCase();
     const now = Date.now();
+    // Insert with synced_to_index=0 first; flip to 1 only after the
+    // SharedIndex write succeeds. Background reconciliation
+    // (`reconcileUnsyncedMcpTokens`) replays unsynced rows. (audit finding M15)
     this.db.exec(
-      "INSERT INTO user_mcp_tokens (token, email, label, created_at, last_used_at) VALUES (?, ?, ?, ?, NULL)",
+      "INSERT INTO user_mcp_tokens (token, email, label, created_at, last_used_at, synced_to_index) VALUES (?, ?, ?, ?, NULL, 0)",
       token, normalisedEmail, label ?? null, now,
     );
-    // Sync to SharedIndex so /mcp can look the token up without knowing
-    // which user's DO to ask. Best-effort — if the index write fails, the
-    // token can still be authenticated via the fallback DODO_MCP_TOKEN, but
-    // user-scoped auth will not work for this token.
     try {
       const sharedIndex = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
-      await sharedIndex.fetch("https://shared-index/mcp-token-index", {
+      const res = await sharedIndex.fetch("https://shared-index/mcp-token-index", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ token, email: normalisedEmail }),
       });
+      if (res.ok) {
+        this.db.exec("UPDATE user_mcp_tokens SET synced_to_index = 1 WHERE token = ?", token);
+      } else {
+        log("warn", "user-control: SharedIndex token sync returned non-OK", { status: res.status, token: token.slice(0, 12) });
+      }
     } catch (err) {
-      console.warn("[user-control] Failed to sync token to SharedIndex:", err);
+      log("warn", "user-control: failed to sync token to SharedIndex (will retry)", {
+        err: err instanceof Error ? err.message : String(err),
+      });
     }
     return { token, created_at: now };
+  }
+
+  /**
+   * Re-attempt SharedIndex writes for any tokens that failed to sync at
+   * creation time. Safe to call repeatedly — idempotent on the SharedIndex
+   * side and a no-op when there's nothing to reconcile. (audit finding M15)
+   */
+  private async reconcileUnsyncedMcpTokens(): Promise<void> {
+    const rows = this.db.all("SELECT token, email FROM user_mcp_tokens WHERE synced_to_index = 0 LIMIT 50");
+    if (rows.length === 0) return;
+    const sharedIndex = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
+    for (const row of rows) {
+      const token = String(row.token);
+      const email = String(row.email);
+      try {
+        const res = await sharedIndex.fetch("https://shared-index/mcp-token-index", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token, email }),
+        });
+        if (res.ok) {
+          this.db.exec("UPDATE user_mcp_tokens SET synced_to_index = 1 WHERE token = ?", token);
+        }
+      } catch {
+        // Try again next sweep.
+      }
+    }
   }
 
   public lookupUserMcpToken(token: string): { email: string; label: string | null; created_at: number } | null {
@@ -1863,17 +1923,21 @@ export class UserControl extends DurableObject<Env> {
 
     const salt = generateSalt();
     const dek = generateDEK();
-    const pdk = await derivePDK(passkey, salt);
+    // New envelopes use the modern iteration count. Legacy rows keep their
+    // original count via the pbkdf2_iterations column (NULL → legacy).
+    // (audit finding M2)
+    const pdk = await derivePDK(passkey, salt, PBKDF2_DEFAULT_ITERATIONS);
     const sdk = await deriveSDK(masterKeyHex, ownerEmail);
     const wrappedPasskey = await wrapDEK(dek, pdk);
     const wrappedServer = await wrapDEK(dek, sdk);
 
     this.db.exec(
-      "INSERT INTO key_envelope (id, pbkdf2_salt, wrapped_dek_passkey, wrapped_dek_server, created_at) VALUES ('default', ?, ?, ?, ?)",
+      "INSERT INTO key_envelope (id, pbkdf2_salt, wrapped_dek_passkey, wrapped_dek_server, created_at, pbkdf2_iterations) VALUES ('default', ?, ?, ?, ?, ?)",
       bytesToBase64(salt),
       wrappedPasskey,
       wrappedServer,
       nowEpoch(),
+      PBKDF2_DEFAULT_ITERATIONS,
     );
   }
 
@@ -1888,11 +1952,41 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private async unwrapDEKWithPasskey(passkey: string): Promise<Uint8Array> {
-    const envelope = this.db.one("SELECT pbkdf2_salt, wrapped_dek_passkey FROM key_envelope WHERE id = 'default'");
+    const envelope = this.db.one("SELECT pbkdf2_salt, wrapped_dek_passkey, pbkdf2_iterations FROM key_envelope WHERE id = 'default'");
     if (!envelope) throw new Error("No key envelope.");
     const salt = base64ToBytes(String(envelope.pbkdf2_salt));
-    const pdk = await derivePDK(passkey, salt);
-    return unwrapDEK(String(envelope.wrapped_dek_passkey), pdk);
+    // Legacy envelopes (pre-M2) have a NULL iteration count and were derived
+    // with the old 100k value. Use that to unwrap, then opportunistically
+    // re-wrap at the modern count below in unwrapAndUpgradePasskey.
+    const iterations = envelope.pbkdf2_iterations === null || envelope.pbkdf2_iterations === undefined
+      ? PBKDF2_LEGACY_ITERATIONS
+      : Number(envelope.pbkdf2_iterations);
+    const pdk = await derivePDK(passkey, salt, iterations);
+    const dek = await unwrapDEK(String(envelope.wrapped_dek_passkey), pdk);
+
+    // Opportunistic upgrade: if the envelope was minted before the iteration
+    // bump, re-wrap with the new count and persist. This makes the user's
+    // *next* unlock pay the new (higher) cost without forcing a manual
+    // change-passkey flow. Skip on failure — better to leave the legacy
+    // wrap in place than to break the user's onboarding.
+    if (iterations < PBKDF2_DEFAULT_ITERATIONS) {
+      try {
+        const newSalt = generateSalt();
+        const newPdk = await derivePDK(passkey, newSalt, PBKDF2_DEFAULT_ITERATIONS);
+        const newWrapped = await wrapDEK(dek, newPdk);
+        this.db.exec(
+          "UPDATE key_envelope SET pbkdf2_salt = ?, wrapped_dek_passkey = ?, pbkdf2_iterations = ?, rotated_at = ? WHERE id = 'default'",
+          bytesToBase64(newSalt),
+          newWrapped,
+          PBKDF2_DEFAULT_ITERATIONS,
+          nowEpoch(),
+        );
+      } catch (err) {
+        log("warn", "PBKDF2 envelope upgrade failed (will retry on next unlock)", { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    return dek;
   }
 
   private async setSecret(key: string, plaintext: string, ownerEmail: string): Promise<void> {
@@ -1923,18 +2017,19 @@ export class UserControl extends DurableObject<Env> {
     }
   }
 
-  private async changePasskey(currentPasskey: string, newPasskey: string, ownerEmail: string): Promise<void> {
+  private async changePasskey(currentPasskey: string, newPasskey: string, _ownerEmail: string): Promise<void> {
     // Verify current passkey works
     const dek = await this.unwrapDEKWithPasskey(currentPasskey);
     try {
-      // Generate new salt and PDK
+      // Generate new salt and PDK using the current default iteration count.
       const newSalt = generateSalt();
-      const newPdk = await derivePDK(newPasskey, newSalt);
+      const newPdk = await derivePDK(newPasskey, newSalt, PBKDF2_DEFAULT_ITERATIONS);
       const newWrappedPasskey = await wrapDEK(dek, newPdk);
       this.db.exec(
-        "UPDATE key_envelope SET pbkdf2_salt = ?, wrapped_dek_passkey = ?, rotated_at = ? WHERE id = 'default'",
+        "UPDATE key_envelope SET pbkdf2_salt = ?, wrapped_dek_passkey = ?, pbkdf2_iterations = ?, rotated_at = ? WHERE id = 'default'",
         bytesToBase64(newSalt),
         newWrappedPasskey,
+        PBKDF2_DEFAULT_ITERATIONS,
         nowEpoch(),
       );
     } finally {
@@ -2234,6 +2329,11 @@ export class UserControl extends DurableObject<Env> {
     // bounded by IDLE_SWEEP_BATCH_SIZE when there is.
     await this.sweepIdleSessions();
 
+    // Replay any MCP token writes that didn't make it to SharedIndex on
+    // their original create call (audit finding M15). Idempotent on the
+    // index side; bounded LIMIT keeps wake-ups cheap.
+    await this.reconcileUnsyncedMcpTokens();
+
     await this.rearmAlarm();
   }
 
@@ -2335,10 +2435,17 @@ export class UserControl extends DurableObject<Env> {
     // field comment). Effective cap is 120/hr combined: interactive + scheduled.
     const rl = this.scheduledFireLimiter.check(`prompt:${ownerEmail}`, 60, 60 * 60 * 1000);
     if (!rl.allowed) {
+      // Bump failure_count on rate-limit so an entire batch hitting the
+      // limit eventually stalls (and a human gets paged) instead of the DO
+      // alarm ping-ponging on the same row every few seconds.
+      // (audit finding M9)
       const retryAfter = rl.retryAfter ?? 60;
-      const nextRun = nowEpoch() + retryAfter;
+      // Add a small jitter so siblings on the same DO don't all retry on
+      // the same tick once the window opens.
+      const jitter = Math.floor(Math.random() * 30);
+      const nextRun = nowEpoch() + retryAfter + jitter;
       this.db.exec(
-        "UPDATE scheduled_sessions SET next_run_epoch = ?, last_error = ? WHERE id = ?",
+        "UPDATE scheduled_sessions SET next_run_epoch = ?, last_error = ?, failure_count = failure_count + 1 WHERE id = ?",
         nextRun,
         "rate_limited",
         id,
@@ -2367,6 +2474,12 @@ export class UserControl extends DurableObject<Env> {
       //    behaviour).
       const config = this.readConfig();
       const prompt = String(row.prompt);
+      // Audit trail: prefer the schedule's `created_by` so we can trace
+      // which human configured the schedule, even after re-shares or
+      // permission revocations. Falls back to the owner. (audit finding M4)
+      const createdBy = row.created_by === null || row.created_by === undefined
+        ? ownerEmail
+        : String(row.created_by);
       const agent = await getAgentByName(this.env.CODING_AGENT as never, newSessionId);
       const dispatchRes = await agent.fetch(
         new Request("https://coding-agent/prompt", {
@@ -2378,7 +2491,10 @@ export class UserControl extends DurableObject<Env> {
             "x-dodo-gateway": config.activeGateway,
             "x-dodo-model": config.model,
             "x-dodo-opencode-base-url": config.opencodeBaseURL,
-            "x-author-email": "scheduled-session",
+            // Mark the source explicitly so logs can distinguish scheduled
+            // fires from interactive prompts. The createdBy field is the
+            // real human; "scheduled-session" is the trigger label.
+            "x-author-email": `scheduled-session:${createdBy}`,
             "x-owner-email": ownerEmail,
           },
           body: JSON.stringify({ content: prompt }),

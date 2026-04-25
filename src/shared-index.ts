@@ -226,6 +226,12 @@ export class SharedIndex extends DurableObject<Env> {
       // ─── Session shares ───
 
       if (request.method === "POST" && url.pathname === "/shares") {
+        if (!this.env.COOKIE_SECRET) {
+          // Without a server-side secret, share-token hashes are forgeable
+          // (audit finding H8). Refuse to mint shares rather than fall back
+          // to a hard-coded literal.
+          return Response.json({ error: "Sharing not configured (COOKIE_SECRET unset)" }, { status: 500 });
+        }
         const body = z.object({
           sessionId: z.string().min(1),
           ownerEmail: z.string().email(),
@@ -252,6 +258,11 @@ export class SharedIndex extends DurableObject<Env> {
       }
 
       if (request.method === "POST" && url.pathname === "/shares/verify") {
+        if (!this.env.COOKIE_SECRET) {
+          // Same hard-fail rule as share creation — without the secret,
+          // verify can't recompute the stored hash safely. (audit finding H8)
+          return Response.json({ valid: false, error: "Sharing not configured" }, { status: 500 });
+        }
         const body = z.object({ token: z.string().min(1) }).parse(await request.json());
         const result = await this.verifyShareToken(body.token);
         return Response.json(result);

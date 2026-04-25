@@ -3,7 +3,7 @@ import { createMcpHandler } from "agents/mcp";
 import { newRpcResponse } from "@hono/capnweb";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { AuthError, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, resolveAdminEmail, verifyAccess } from "./auth";
+import { AuthError, canonicalizeEmail, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, resolveAdminEmail, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
 import { ExploreAgent } from "./explore-agent";
 import { TaskAgent } from "./task-agent";
@@ -15,7 +15,7 @@ import { MCP_CATALOG } from "./mcp-catalog";
 import { fetchAttachment } from "./attachments";
 import { AllowlistOutbound } from "./outbound";
 import { RateLimiter } from "./rate-limit";
-import { DodoPublicApi } from "./rpc-api";
+import { buildAuthenticatedApi } from "./rpc-api";
 import { signCookie, verifyCookie } from "./share";
 import { SharedIndex } from "./shared-index";
 import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
@@ -323,7 +323,11 @@ app.all("/mcp/codemode", async (c) => {
     return c.json({ error: "MCP recursion depth exceeded" }, 429);
   }
 
-  const server = createDodoCodeModeMcpServer(c.env, depth);
+  // Pass the resolved user email so codemode operations run with the
+  // calling user's identity instead of falling back to admin via
+  // resolveAdminEmail (audit finding H2). This keeps per-user secrets,
+  // session ACLs, and outbound auth scoped to the real caller.
+  const server = createDodoCodeModeMcpServer(c.env, resolved.email, depth);
   const handler = createMcpHandler(server);
   return handler(c.req.raw, c.env, c.executionCtx);
 });
@@ -343,7 +347,7 @@ app.post("/api/bootstrap", async (c) => {
   if (users.length > 0) {
     return c.json({ error: "Already bootstrapped — users exist" }, 409);
   }
-  const adminEmail = c.env.ADMIN_EMAIL;
+  const adminEmail = resolveAdminEmail(c.env);
   if (!adminEmail) {
     return c.json({ error: "ADMIN_EMAIL not configured" }, 500);
   }
@@ -355,7 +359,12 @@ app.post("/api/bootstrap", async (c) => {
   if (!addResp.ok) {
     return c.json({ error: "Failed to seed admin user" }, 500);
   }
-  log("info", "Bootstrap: admin user seeded", { email: adminEmail });
+  // Log loud — bootstrap is a one-time privileged action and we want it
+  // visible if it ever fires unexpectedly. (audit finding M13)
+  log("warn", "Bootstrap: admin user seeded", {
+    email: adminEmail,
+    ip: c.req.header("cf-connecting-ip") ?? "unknown",
+  });
   return c.json({ bootstrapped: true, adminEmail }, 201);
 });
 
@@ -468,45 +477,57 @@ app.use("*", async (c, next) => {
     return c.json({ error: "Authentication failed" }, 403);
   }
 
-  if (!identity.email) {
+  // Canonicalize the email exactly once, at the auth boundary. Every
+  // downstream call site (UserControl DO routing, isAdmin checks, x-owner-email
+  // header propagation, SharedIndex lookups) reads from c.get("userEmail")
+  // and inherits the canonical form. (audit finding H5)
+  const canonicalEmail = canonicalizeEmail(identity.email);
+  if (!canonicalEmail) {
     log("warn", "Auth failure", { source: identity.source, error: "No email in token" });
     return c.json({ error: "No email in token" }, 403);
   }
 
   // In dev mode, skip the allowlist check entirely
   if (!isDevMode(c.env)) {
-    const { allowed } = await checkAllowlist(identity.email, c.env);
+    const { allowed } = await checkAllowlist(canonicalEmail, c.env);
     if (!allowed) {
       // Share-link guests bypass the allowlist — session-level permissions
       // are enforced later by the resolveSessionPermission middleware.
       const hasValidShareCookie = await checkShareCookie(c.req.raw, c.env);
       if (!hasValidShareCookie) {
-        log("warn", "Auth failure", { email: identity.email, source: identity.source, error: "Not on allowlist" });
+        log("warn", "Auth failure", { email: canonicalEmail, source: identity.source, error: "Not on allowlist" });
         return c.json({ error: "Not authorized — not on Dodo allowlist" }, 403);
       }
-      log("info", "Auth: share-cookie guest bypassed allowlist", { email: identity.email });
+      log("info", "Auth: share-cookie guest bypassed allowlist", { email: canonicalEmail });
     }
   }
 
-  log("info", "Auth success", { email: identity.email, source: identity.source });
-  c.set("identity", identity);
-  c.set("userEmail", identity.email);
+  log("info", "Auth success", { email: canonicalEmail, source: identity.source });
+  // Store the canonical identity so all downstream c.get("userEmail") calls
+  // receive a consistent form.
+  c.set("identity", { ...identity, email: canonicalEmail });
+  c.set("userEmail", canonicalEmail);
 
   // Inject owner email into the incoming request headers so proxyToAgent /
   // proxyToUserControl forwarders can propagate it to DOs without every
   // call site needing to thread it manually. The DO uses this to detect
   // Access identity drift and clear stale OAuth MCP connections.
   const mutable = new Headers(c.req.raw.headers);
-  mutable.set("x-owner-email", identity.email.trim().toLowerCase());
+  mutable.set("x-owner-email", canonicalEmail);
   c.req.raw = new Request(c.req.raw, { headers: mutable });
 
   return next();
 });
 
 // ─── Cap'n Web RPC (authenticated) ───
+//
+// The RPC surface is bound to the server-authenticated email. There is no
+// client-callable `authenticate(email)` factory — that would let any
+// allowlisted user impersonate any other user via the RPC channel.
+// (audit finding H1)
 
 app.all("/rpc", async (c) => {
-  const api = new DodoPublicApi(c.env, c.get("userEmail"));
+  const api = buildAuthenticatedApi(c.env, c.get("userEmail"));
   return newRpcResponse(c, api);
 });
 
@@ -752,6 +773,13 @@ app.post("/api/tasks/batch-dispatch", async (c) => {
   if (!Array.isArray(taskIds) || taskIds.length === 0 || taskIds.length > 10) {
     return c.json({ error: "taskIds must be an array of 1-10 task IDs" }, 400);
   }
+  // Charge the prompt limiter for the whole batch up front. Without this,
+  // a single batch-dispatch call burned 10× the per-prompt quota with no
+  // hard cap on per-user LLM spend. (audit finding M6/M7)
+  for (let i = 0; i < taskIds.length; i++) {
+    const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
+    if (!rl.allowed) return rateLimitedResponse(rl, "prompt-batch", email);
+  }
 
   // Fetch all tasks
   const listRes = await proxyToUserControl(c.env, email, "/tasks");
@@ -847,6 +875,11 @@ app.get("/api/tasks/:id/check", async (c) => {
 app.post("/api/tasks/:id/dispatch", async (c) => {
   const email = c.get("userEmail");
   const taskId = c.req.param("id");
+
+  // Per-task dispatch counts against the same per-user prompt budget as the
+  // interactive `/session/:id/prompt` route. (audit finding M6/M7)
+  const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
+  if (!rl.allowed) return rateLimitedResponse(rl, "prompt-dispatch", email);
 
   // 1. Fetch the task
   const taskRes = await proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(taskId)}/check`);
@@ -1164,8 +1197,18 @@ app.post("/api/mcp/start-auth", async (c) => {
   const displayName = parsedUrl.host;
 
   try {
+    // Derive the callback host from the live request URL, falling back to
+    // the env override if the worker is behind a known internal hostname.
+    // The previous hard-coded WORKER_URL ("http://localhost:8787") would
+    // silently break OAuth on every fresh deploy that didn't override it.
+    // (audit finding M12)
+    const reqUrl = new URL(c.req.raw.url);
+    const inferredHost = `${reqUrl.protocol}//${reqUrl.host}`;
+    const callbackHost = c.env.WORKER_URL && c.env.WORKER_URL !== "http://localhost:8787"
+      ? c.env.WORKER_URL
+      : inferredHost;
     const result = await stub.addMcpServer(displayName, mcpUrl, {
-      callbackHost: c.env.WORKER_URL,
+      callbackHost,
       callbackPath: "/agents",
     });
     if (result.state === "authenticating") {
@@ -1897,8 +1940,13 @@ app.post("/session/:id/fork", async (c) => {
   if (denied) return denied;
   const email = c.get("userEmail");
   const sourceId = c.req.param("id");
+  // Pass the resolved source owner so forkSessionInternal can hit the
+  // source's UserControl DO instead of the caller's. Without this, users
+  // with a granted readwrite share could not fork a session they don't
+  // personally own. (audit finding M5)
+  const sourceOwner = c.get("sessionOwnerEmail") || email;
   try {
-    const { id, sourceId: resolvedSourceId } = await forkSessionInternal(c.env, email, sourceId, null);
+    const { id, sourceId: resolvedSourceId } = await forkSessionInternal(c.env, email, sourceId, null, sourceOwner);
     return c.json({ id, sourceId: resolvedSourceId }, 201);
   } catch (error) {
     if (error instanceof SourceSessionMissingError) {

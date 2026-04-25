@@ -51,9 +51,15 @@ describe("Share token utilities", () => {
   it("hashShareToken produces consistent hash", async () => {
     const { hashShareToken } = await import("../src/share");
     const token = "a".repeat(64);
-    const hash1 = await hashShareToken(token);
-    const hash2 = await hashShareToken(token);
+    const secret = "test-secret-do-not-use-in-prod";
+    const hash1 = await hashShareToken(token, secret);
+    const hash2 = await hashShareToken(token, secret);
     expect(hash1).toBe(hash2);
     expect(hash1).not.toBe(token);
+  });
+
+  it("hashShareToken throws when secret is missing", async () => {
+    const { hashShareToken } = await import("../src/share");
+    await expect(hashShareToken("token")).rejects.toThrow("COOKIE_SECRET");
   });
 });
