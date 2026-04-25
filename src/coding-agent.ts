@@ -4025,21 +4025,30 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /** List attachment refs for one or more messages, ordered by creation time. */
-  private listMessageAttachments(messageIds: string[]): Map<string, Array<{ mediaType: string; url: string; size: number }>> {
-    const result = new Map<string, Array<{ mediaType: string; url: string; size: number }>>();
+  private listMessageAttachments(messageIds: string[]): Map<string, Array<{ mediaType: string; url: string; size: number; source: "user" | "assistant" | "tool" }>> {
+    const result = new Map<string, Array<{ mediaType: string; url: string; size: number; source: "user" | "assistant" | "tool" }>>();
     if (messageIds.length === 0) return result;
     const placeholders = messageIds.map(() => "?").join(",");
+    // Surface `source` so the UI can distinguish user uploads from
+    // tool-produced screenshots and assistant-emitted artifacts. Falls
+    // back to "tool" for legacy rows written before the column became
+    // NOT NULL (defensive — should not happen in practice). (audit
+    // follow-up: previously dead column.)
     const rows = this.db.all(
-      `SELECT message_id, media_type, url, size FROM message_attachments WHERE message_id IN (${placeholders}) ORDER BY id ASC`,
+      `SELECT message_id, media_type, url, size, source FROM message_attachments WHERE message_id IN (${placeholders}) ORDER BY id ASC`,
       ...messageIds,
     );
     for (const row of rows) {
       const id = String(row.message_id);
       const list = result.get(id) ?? [];
+      const rawSource = row.source === null || row.source === undefined ? "tool" : String(row.source);
+      const source: "user" | "assistant" | "tool" =
+        rawSource === "user" || rawSource === "assistant" || rawSource === "tool" ? rawSource : "tool";
       list.push({
         mediaType: String(row.media_type),
         url: String(row.url),
         size: Number(row.size ?? 0),
+        source,
       });
       result.set(id, list);
     }

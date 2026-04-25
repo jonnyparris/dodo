@@ -666,15 +666,36 @@ export class UserControl extends DurableObject<Env> {
       }
 
       if (request.method === "GET" && url.pathname === "/passkey/status") {
-        const hasEnvelope = !!this.db.one("SELECT id FROM key_envelope WHERE id = 'default'");
-        return Response.json({ initialized: hasEnvelope });
+        // Surface created_at / rotated_at so the security UI can show
+        // when the encryption envelope was set up and last rotated.
+        // (audit follow-up: previously dead columns.)
+        const row = this.db.one(
+          "SELECT id, created_at, rotated_at FROM key_envelope WHERE id = 'default'",
+        );
+        if (!row) return Response.json({ initialized: false });
+        return Response.json({
+          initialized: true,
+          createdAt: epochToIso(Number(row.created_at)),
+          rotatedAt: row.rotated_at === null ? null : epochToIso(Number(row.rotated_at)),
+        });
       }
 
       // ─── Secrets ───
 
       if (request.method === "GET" && url.pathname === "/secrets") {
-        const keys = this.db.all("SELECT key FROM encrypted_secrets ORDER BY key ASC").map((row) => String(row.key));
-        return Response.json({ keys });
+        // Surface created_at / updated_at so the settings UI can show
+        // when each secret was added and last edited — useful for spotting
+        // stale tokens. (audit follow-up: previously dead columns.)
+        const rows = this.db.all(
+          "SELECT key, created_at, updated_at FROM encrypted_secrets ORDER BY key ASC",
+        );
+        const secrets = rows.map((row) => ({
+          key: String(row.key),
+          createdAt: epochToIso(Number(row.created_at)),
+          updatedAt: epochToIso(Number(row.updated_at)),
+        }));
+        // Keep the legacy `keys` field for now so existing clients keep working.
+        return Response.json({ keys: secrets.map((s) => s.key), secrets });
       }
 
       if (request.method === "PUT" && url.pathname.startsWith("/secrets/")) {

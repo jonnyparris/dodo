@@ -135,7 +135,7 @@ export interface SessionState {
 }
 
 export interface ChatMessageRecord {
-  attachments?: Array<{ mediaType: string; url: string }>;
+  attachments?: Array<{ mediaType: string; url: string; source?: "user" | "assistant" | "tool" }>;
   authorEmail?: string | null;
   content: string;
   createdAt: string;
