@@ -530,9 +530,48 @@ export class UserControl extends DurableObject<Env> {
       // ─── Fork snapshots ───
 
       if (request.method === "POST" && url.pathname === "/fork-snapshots") {
-        const payload = await request.text();
+        const headerLen = request.headers.get("content-length");
+        const readStart = Date.now();
+        let payload: string;
+        try {
+          payload = await request.text();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log("error", "fork-snapshots: body read failed", {
+            headerContentLength: headerLen,
+            ms: Date.now() - readStart,
+            error: message,
+          });
+          return Response.json({ error: `Reading snapshot body failed: ${message}`, headerContentLength: headerLen }, { status: 413 });
+        }
         const id = crypto.randomUUID();
-        this.db.exec("INSERT INTO fork_snapshots (id, payload, created_at) VALUES (?, ?, ?)", id, payload, nowEpoch());
+        const insertStart = Date.now();
+        try {
+          this.db.exec("INSERT INTO fork_snapshots (id, payload, created_at) VALUES (?, ?, ?)", id, payload, nowEpoch());
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log("error", "fork-snapshots: SQLite insert failed", {
+            id,
+            headerContentLength: headerLen,
+            measuredBytes: payload.length,
+            sizeMB: (payload.length / 1024 / 1024).toFixed(2),
+            readMs: insertStart - readStart,
+            insertMs: Date.now() - insertStart,
+            error: message,
+          });
+          return Response.json({
+            error: `Storing snapshot failed: ${message}`,
+            measuredBytes: payload.length,
+            headerContentLength: headerLen,
+          }, { status: 507 });
+        }
+        log("info", "fork-snapshots: stored", {
+          id,
+          headerContentLength: headerLen,
+          measuredBytes: payload.length,
+          sizeMB: (payload.length / 1024 / 1024).toFixed(2),
+          totalMs: Date.now() - readStart,
+        });
         return Response.json({ id }, { status: 201 });
       }
 
@@ -903,7 +942,18 @@ export class UserControl extends DurableObject<Env> {
       return new Response("Not Found", { status: 404 });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected request failure";
-      return Response.json({ error: message }, { status: 400 });
+      // Log the path + method so we can correlate which handler tripped
+      // the wrap-all 400. Previously the response body had only the
+      // message and prod logs had nothing — making it impossible to tell
+      // which endpoint failed when a generic 400 came back.
+      const stack = error instanceof Error ? error.stack : undefined;
+      log("error", "user-control: unhandled fetch error", {
+        method: request.method,
+        path: new URL(request.url).pathname,
+        error: message,
+        stackPreview: stack?.slice(0, 512),
+      });
+      return Response.json({ error: message, path: new URL(request.url).pathname }, { status: 400 });
     }
   }
 

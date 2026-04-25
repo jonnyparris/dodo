@@ -2358,7 +2358,33 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
 
       if (request.method === "GET" && url.pathname === "/snapshot") {
-        return Response.json(await this.exportSnapshot());
+        // Phase 0 diagnostics for fork-snapshot 400s — measure the
+        // serialized JSON size before it crosses the wire so we know
+        // exactly what the receiver is dealing with. (plan
+        // 2026-04-25-dodo-seed-fork-large-snapshot.md phase 0)
+        const exportStart = Date.now();
+        const snapshot = await this.exportSnapshot();
+        const exportMs = Date.now() - exportStart;
+        const serializeStart = Date.now();
+        const json = JSON.stringify(snapshot);
+        const serializeMs = Date.now() - serializeStart;
+        const fileCount = Array.isArray((snapshot as { files?: unknown[] }).files)
+          ? (snapshot as { files: unknown[] }).files.length
+          : 0;
+        log("info", "snapshot: exported", {
+          sessionId: this.sessionId() || request.headers.get("x-dodo-session-id") || "",
+          fileCount,
+          jsonBytes: json.length,
+          jsonSizeMB: (json.length / 1024 / 1024).toFixed(2),
+          exportMs,
+          serializeMs,
+        });
+        return new Response(json, {
+          headers: {
+            "content-type": "application/json",
+            "content-length": String(json.length),
+          },
+        });
       }
 
       if (request.method === "POST" && (url.pathname === "/snapshot" || url.pathname === "/snapshot/import")) {

@@ -16,6 +16,7 @@
 
 import { getAgentByName } from "agents";
 import { getUserControlStub } from "./auth";
+import { log } from "./logger";
 import type { Env } from "./types";
 
 /** Thrown by `forkSessionInternal` when the source session is gone. */
@@ -81,24 +82,64 @@ export async function forkSessionInternal(
 
   // 1. Snapshot the source session.
   const sourceAgent = await getAgentByName(env.CODING_AGENT as never, sourceSessionId);
+  const exportStart = Date.now();
   const snapshotResponse = await sourceAgent.fetch(
     new Request("https://coding-agent/snapshot", { method: "GET" }),
   );
   if (!snapshotResponse.ok) {
-    throw new Error(`Failed to snapshot source session: ${snapshotResponse.status}`);
+    const errBody = await snapshotResponse.text().catch(() => "");
+    log("error", "fork: snapshot export failed", {
+      sourceSessionId,
+      status: snapshotResponse.status,
+      bodyPreview: errBody.slice(0, 256),
+    });
+    throw new Error(`Failed to snapshot source session: ${snapshotResponse.status} ${errBody.slice(0, 256)}`);
   }
   const snapshot = await snapshotResponse.text();
+  const exportMs = Date.now() - exportStart;
+  log("info", "fork: snapshot exported", {
+    sourceSessionId,
+    bytes: snapshot.length,
+    sizeMB: (snapshot.length / 1024 / 1024).toFixed(2),
+    ms: exportMs,
+  });
 
   // 2. Store the snapshot in UserControl.
+  // Track the precise size and duration so we can correlate failures with
+  // workerd memory / DO storage limits. The /fork-snapshots handler often
+  // returns 400 with an opaque message — capture the body so the caller
+  // sees the real error instead of just the status code. (audit follow-up:
+  // diagnostics for fork-snapshot failures, plan
+  // 2026-04-25-dodo-seed-fork-large-snapshot.md phase 0.)
+  const storeStart = Date.now();
   const snapshotStoreResponse = await userControlFetch(env, ownerEmail, "/fork-snapshots", {
     body: snapshot,
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      "content-length": String(snapshot.length),
+    },
     method: "POST",
   });
   if (!snapshotStoreResponse.ok) {
-    throw new Error(`Failed to store fork snapshot: ${snapshotStoreResponse.status}`);
+    const errBody = await snapshotStoreResponse.text().catch(() => "");
+    log("error", "fork: snapshot store failed", {
+      sourceSessionId,
+      ownerEmail,
+      status: snapshotStoreResponse.status,
+      bytes: snapshot.length,
+      sizeMB: (snapshot.length / 1024 / 1024).toFixed(2),
+      bodyPreview: errBody.slice(0, 512),
+      ms: Date.now() - storeStart,
+    });
+    throw new Error(`Failed to store fork snapshot: ${snapshotStoreResponse.status} ${errBody.slice(0, 256)}`);
   }
   const { id: snapshotId } = (await snapshotStoreResponse.json()) as { id: string };
+  log("info", "fork: snapshot stored", {
+    sourceSessionId,
+    snapshotId,
+    bytes: snapshot.length,
+    ms: Date.now() - storeStart,
+  });
 
   // 3. Register the new session.
   const sessionId = crypto.randomUUID();
@@ -114,6 +155,7 @@ export async function forkSessionInternal(
 
   // 4. Import the snapshot into the target agent.
   const targetAgent = await getAgentByName(env.CODING_AGENT as never, sessionId);
+  const importStart = Date.now();
   const importResponse = await targetAgent.fetch(
     new Request(
       `https://coding-agent/snapshot/import?snapshotId=${encodeURIComponent(snapshotId)}`,
@@ -126,6 +168,7 @@ export async function forkSessionInternal(
       },
     ),
   );
+  const importMs = Date.now() - importStart;
   // 5. Always attempt snapshot cleanup, even if import failed.
   await userControlFetch(
     env,
@@ -135,9 +178,18 @@ export async function forkSessionInternal(
   );
 
   if (!importResponse.ok) {
-    const text = await importResponse.text();
-    throw new Error(`Failed to import snapshot into forked session: ${importResponse.status} ${text}`);
+    const text = await importResponse.text().catch(() => "");
+    log("error", "fork: snapshot import failed", {
+      sessionId,
+      sourceSessionId,
+      snapshotId,
+      status: importResponse.status,
+      bodyPreview: text.slice(0, 512),
+      ms: importMs,
+    });
+    throw new Error(`Failed to import snapshot into forked session: ${importResponse.status} ${text.slice(0, 256)}`);
   }
+  log("info", "fork: snapshot imported", { sessionId, sourceSessionId, snapshotId, ms: importMs });
 
   return { id: sessionId, sourceId: sourceSessionId };
 }
