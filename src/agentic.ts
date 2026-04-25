@@ -1174,11 +1174,15 @@ function buildSkillTool(parent: NonNullable<BuildToolsOptions["parentAgent"]>): 
       name: z.string().min(1).describe("Exact skill name from the <available_skills> manifest."),
     }),
     execute: async ({ name }: { name: string }) => {
-      const render = parent.renderSkillForTool;
-      if (!render) {
+      // Call methods on `parent` directly — destructuring (e.g.
+      // `const render = parent.renderSkillForTool`) strips the `this`
+      // binding and the method's internal `this.getSkillByName(...)`
+      // throws "Cannot read properties of undefined". (caught in prod
+      // session 7ac07871 — first live test of the skill tool)
+      if (typeof parent.renderSkillForTool !== "function") {
         return "skill tool unavailable — parent agent missing renderSkillForTool. This is a bug.";
       }
-      const out = render(name);
+      const out = parent.renderSkillForTool(name);
       if (out) return out;
       const list = parent.listSkillNames?.() ?? [];
       const available = list.length === 0
