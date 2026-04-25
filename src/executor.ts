@@ -20,8 +20,13 @@ export const OWNER_ID_HEADER = "x-dodo-owner-id";
  * user's encrypted secrets to use, so per-user GitHub/GitLab tokens
  * never reach outbound requests from codemode and the env-var fallback
  * is also skipped (audit finding H4).
+ *
+ * Exported because the AI-tool codemode path in `agentic.ts` also needs
+ * to apply the same wrapper — without it, owner-id was only injected
+ * for the HTTP `/execute` route, not for sandbox fetches issued via the
+ * agent loop's `codemode` tool.
  */
-function wrapOutboundWithOwner(outbound: Fetcher | null, ownerId: string | undefined): Fetcher | null {
+export function wrapOutboundWithOwner(outbound: Fetcher | null, ownerId: string | undefined): Fetcher | null {
   if (!outbound || !ownerId) return outbound;
 
   // Return a Fetcher-shaped object. Workers runtime requires the real

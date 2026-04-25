@@ -5659,9 +5659,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // the DO with empty state and the "deleted" session reanimates.
     // (audit finding H6)
     try {
-      const cronRows = this.db.all("SELECT id FROM cron_jobs");
+      // The cron_jobs table's primary key column is `schedule_id`, not `id`
+      // — see the CREATE TABLE statement in initializeSchema. The previous
+      // version of this loop selected `id` and got `undefined` for every
+      // row, so the cancelSchedule calls were silent no-ops and the H6 fix
+      // shipped in d1a138f didn't actually cancel alarms. Caught by the
+      // /audit-stubs sweep on 2026-04-25.
+      const cronRows = this.db.all("SELECT schedule_id FROM cron_jobs");
       for (const row of cronRows) {
-        const id = String(row.id);
+        const id = String(row.schedule_id);
         try {
           await this.cancelSchedule(id);
         } catch (err) {

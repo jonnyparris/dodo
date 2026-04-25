@@ -9,7 +9,10 @@ export interface OnboardingState {
 
 const STEP_ORDER: OnboardingStep[] = ["welcome", "gateway", "passkey", "secrets", "memory", "integrations", "complete"];
 
-export function getNextStep(current: OnboardingStep, _skip?: boolean): OnboardingStep {
+export function getNextStep(current: OnboardingStep): OnboardingStep {
+  // Skipping a step doesn't change *which* step comes next — it just
+  // marks the current one done without requiring data. The pass-through
+  // `skip` parameter was vestigial. (audit follow-up F8)
   const idx = STEP_ORDER.indexOf(current);
   if (idx === -1 || idx >= STEP_ORDER.length - 1) return "complete";
   return STEP_ORDER[idx + 1];
@@ -70,7 +73,7 @@ export function advanceStep(
     ? state.completedSteps
     : [...state.completedSteps, step];
 
-  const nextStep = getNextStep(step, skip);
+  const nextStep = getNextStep(step);
   const isComplete = nextStep === "complete";
 
   return {

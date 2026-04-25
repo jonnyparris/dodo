@@ -33,3 +33,22 @@ AI_GATEWAY_KEY=
 
 # CF_ACCESS_AUD=
 # CF_ACCESS_TEAM_DOMAIN=
+
+# ─── Optional: notifications ───
+# ntfy.sh topic for worker run state-transition push notifications.
+# Leave unset to disable notifications. Public ntfy.sh accepts any topic
+# string; pick something unguessable.
+# NTFY_TOPIC=
+
+# ─── Optional: git fallbacks ───
+# Per-user GitHub/GitLab tokens are the preferred path (stored encrypted
+# in each user's UserControl DO). These env-level fallbacks are only used
+# for the admin account and only when no per-user secret is configured.
+# Set them via `wrangler secret put` in production, not via this file.
+# GITHUB_TOKEN=
+# GITLAB_TOKEN=
+
+# ─── Optional: local dev ───
+# When set to "true", auth bypass is enabled and every request is treated
+# as `dev@dodo.local`. NEVER set this in production.
+ALLOW_UNAUTHENTICATED_DEV=true

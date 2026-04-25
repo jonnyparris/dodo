@@ -1,20 +1,21 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { StateBackend } from "@cloudflare/shell";
-import { generateText, jsonSchema, stepCountIs, tool, zodSchema, type ModelMessage, type Tool as AnyToolType } from "ai";
+import { generateText, jsonSchema, stepCountIs, tool, zodSchema, type ModelMessage } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import type { AttachmentRef } from "./attachments";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
+import { wrapOutboundWithOwner } from "./executor";
 import { normalizePath } from "./paths";
 import { createBrowserTools } from "./browser/tools";
-import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
+import type { McpGatekeeper } from "./mcp-gatekeeper";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env, TodoStore } from "./types";
 
 /** Options passed through from the coding agent into tool factories. */
 /** Metadata describing an OAuth-connected MCP tool federated from the per-user hub DO. */
-export interface OAuthToolInfo {
+interface OAuthToolInfo {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
@@ -22,7 +23,7 @@ export interface OAuthToolInfo {
   displayName?: string;
 }
 
-export interface BuildToolsOptions {
+interface BuildToolsOptions {
   authorEmail?: string;
   browserEnabled?: boolean;
   isAdminUser?: boolean;
@@ -1562,7 +1563,12 @@ function buildTools(
   const gitTools = buildGitTools(env, workspace, config, options?.ownerEmail);
 
   if (env.LOADER) {
-    const outbound = env.OUTBOUND ?? null;
+    // Wrap OUTBOUND so codemode fetches from the AI-tool sandbox carry an
+    // `x-dodo-owner-id` header — without it AllowlistOutbound can't resolve
+    // the calling user's GitHub/GitLab tokens and falls back to no auth.
+    // The HTTP `/execute` path already wraps via `runSandboxedCode`; this
+    // closes the same gap for the agent-loop path. (audit follow-up F2)
+    const outbound = wrapOutboundWithOwner(env.OUTBOUND ?? null, options?.ownerId);
 
     const codemodeTool = createExecuteTool({
       tools: workspaceTools,

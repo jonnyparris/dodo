@@ -14,7 +14,7 @@ import { createDodoCodeModeMcpServer } from "./mcp-codemode";
 import { MCP_CATALOG } from "./mcp-catalog";
 import { fetchAttachment } from "./attachments";
 import { AllowlistOutbound } from "./outbound";
-import { RateLimiter } from "./rate-limit";
+import { errorLimiter, maybeCleanupRateLimiters, messageLimiter, promptLimiter, shareLimiter } from "./rate-limiters";
 import { buildAuthenticatedApi } from "./rpc-api";
 import { signCookie, verifyCookie } from "./share";
 import { SharedIndex } from "./shared-index";
@@ -22,27 +22,8 @@ import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
 import { UserControl } from "./user-control";
 import type { AccessIdentity, AppConfig, Env } from "./types";
 
-// ─── Per-isolate rate limiters ───
-// Intentionally module-level mutable state. Rate limiters are approximate
-// (per-isolate, not global) — sufficient for abuse prevention without
-// requiring a DO round-trip. The requestCount counter is also per-isolate;
-// it drives periodic cleanup of expired sliding windows and carries no
-// cross-request semantics.
-
-const promptLimiter = new RateLimiter();
-const shareLimiter = new RateLimiter();
-const messageLimiter = new RateLimiter();
-const errorLimiter = new RateLimiter();
-
-let requestCount = 0;
-function maybeCleanupRateLimiters() {
-  if (++requestCount % 100 === 0) {
-    promptLimiter.cleanup();
-    shareLimiter.cleanup();
-    messageLimiter.cleanup();
-    errorLimiter.cleanup();
-  }
-}
+// Rate limiters live in src/rate-limiters.ts so MCP tools can charge the
+// same per-user budgets as the HTTP routes (audit follow-up F3).
 
 type PermissionLevel = "readonly" | "readwrite" | "write" | "admin";
 
@@ -612,29 +593,28 @@ app.post("/api/admin/health-check", adminGuard as never, async (c) => {
   return c.json(report);
 });
 
-app.get("/api/admin/approved-mcps", async (c) => {
+// Approved-MCPs admin routes use the shared `adminGuard` middleware so the
+// admin gate is applied consistently with every other /api/admin/* route.
+// (audit follow-up F7 — was previously inline `isAdmin` checks.)
+app.get("/api/admin/approved-mcps", adminGuard as never, async (c) => {
   const email = c.get("userEmail");
-  if (!isAdmin(email, c.env)) return c.json({ error: "forbidden" }, 403);
   return proxyToUserControl(c.env, email, "/approved-mcps", { method: "GET" });
 });
 
-app.post("/api/admin/approved-mcps", async (c) => {
+app.post("/api/admin/approved-mcps", adminGuard as never, async (c) => {
   const email = c.get("userEmail");
-  if (!isAdmin(email, c.env)) return c.json({ error: "forbidden" }, 403);
   const body = await c.req.raw.clone().text();
   return proxyToUserControl(c.env, email, "/approved-mcps", { method: "POST", headers: { "content-type": "application/json" }, body });
 });
 
-app.put("/api/admin/approved-mcps/:url", async (c) => {
+app.put("/api/admin/approved-mcps/:url", adminGuard as never, async (c) => {
   const email = c.get("userEmail");
-  if (!isAdmin(email, c.env)) return c.json({ error: "forbidden" }, 403);
   const body = await c.req.raw.clone().text();
   return proxyToUserControl(c.env, email, `/approved-mcps/${encodeURIComponent(c.req.param("url"))}`, { method: "PUT", headers: { "content-type": "application/json" }, body });
 });
 
-app.delete("/api/admin/approved-mcps/:url", async (c) => {
+app.delete("/api/admin/approved-mcps/:url", adminGuard as never, async (c) => {
   const email = c.get("userEmail");
-  if (!isAdmin(email, c.env)) return c.json({ error: "forbidden" }, 403);
   return proxyToUserControl(c.env, email, `/approved-mcps/${encodeURIComponent(c.req.param("url"))}`, { method: "DELETE" });
 });
 

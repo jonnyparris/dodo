@@ -38,31 +38,31 @@ describe("Onboarding", () => {
 
   describe("state machine: getNextStep()", () => {
     it("welcome → gateway", () => {
-      expect(getNextStep("welcome", false)).toBe("gateway");
+      expect(getNextStep("welcome")).toBe("gateway");
     });
 
     it("gateway → passkey", () => {
-      expect(getNextStep("gateway", false)).toBe("passkey");
+      expect(getNextStep("gateway")).toBe("passkey");
     });
 
     it("passkey → secrets", () => {
-      expect(getNextStep("passkey", false)).toBe("secrets");
+      expect(getNextStep("passkey")).toBe("secrets");
     });
 
     it("secrets → memory", () => {
-      expect(getNextStep("secrets", false)).toBe("memory");
+      expect(getNextStep("secrets")).toBe("memory");
     });
 
     it("memory → integrations", () => {
-      expect(getNextStep("memory", false)).toBe("integrations");
+      expect(getNextStep("memory")).toBe("integrations");
     });
 
     it("integrations → complete", () => {
-      expect(getNextStep("integrations", false)).toBe("complete");
+      expect(getNextStep("integrations")).toBe("complete");
     });
 
     it("complete → complete (terminal)", () => {
-      expect(getNextStep("complete", false)).toBe("complete");
+      expect(getNextStep("complete")).toBe("complete");
     });
   });
 
