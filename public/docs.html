@@ -59,6 +59,7 @@
         <li><a href="#git">Git</a></li>
         <li><a href="#kanban">Task Board (Kanban)</a></li>
         <li><a href="#memory">Memory</a></li>
+        <li><a href="#skills">Skills</a></li>
         <li><a href="#cron">Cron Jobs</a></li>
         <li><a href="#integrations">Integrations (MCP)</a></li>
         <li><a href="#settings">Session Settings</a></li>
@@ -70,7 +71,7 @@
 
     <!-- ─── Architecture ─── -->
     <h2 id="architecture">Architecture</h2>
-    <p>Every Dodo deployment runs as a Cloudflare Worker with three types of Durable Objects: a global SharedIndex (user allowlist, permissions, models cache), one UserControl per user (state, config, tasks, secrets), and one CodingAgent per session (code, chat, git).</p>
+    <p>Every Dodo deployment runs as a Cloudflare Worker with three types of Durable Objects: a global SharedIndex (user allowlist, permissions, models cache), one UserControl per user (state, config, tasks, memory, skills, secrets), and one CodingAgent per session (code, chat, git).</p>
     <div class="diagram">
       <svg viewBox="0 0 720 340" width="100%" style="max-width:720px">
         <rect x="10" y="10" width="700" height="60" rx="12" fill="#e8f5e9" stroke="#0a7c66" stroke-width="1.5"/>
@@ -78,7 +79,7 @@
         <text x="360" y="55" text-anchor="middle" font-size="11" fill="#666">CORS · Auth (CF Access / Bearer) · MCP · Static Assets</text>
         <rect x="10" y="100" width="320" height="120" rx="12" fill="#fff3e0" stroke="#e65100" stroke-width="1.5"/>
         <text x="170" y="125" text-anchor="middle" font-size="13" font-weight="600" fill="#e65100">UserControl DO (per user)</text>
-        <text x="170" y="148" text-anchor="middle" font-size="11" fill="#666">Config · Sessions · Memory</text>
+        <text x="170" y="148" text-anchor="middle" font-size="11" fill="#666">Config · Sessions · Memory · Skills</text>
         <text x="170" y="166" text-anchor="middle" font-size="11" fill="#666">Tasks · Secrets · MCP Configs</text>
         <text x="170" y="184" text-anchor="middle" font-size="11" fill="#666">Fork Snapshots · Onboarding</text>
         <rect x="30" y="198" width="100" height="14" rx="4" fill="#fff8e1"/>
@@ -368,6 +369,24 @@
       <li>Memory is scoped to your user account, not individual sessions.</li>
     </ul>
 
+    <!-- ─── Skills ─── -->
+    <h2 id="skills">Skills</h2>
+    <p>SKILL.md files the agent loads on demand. The format matches Claude Skills and OpenCode skills exactly — anything written for either runs in Dodo unchanged.</p>
+    <p>Three sources, merged in this precedence order:</p>
+    <table>
+      <tr><th>Source</th><th>Lives in</th><th>How to add</th></tr>
+      <tr><td><strong>Personal</strong></td><td>Your UserControl Durable Object</td><td><code>skill_write</code> MCP tool, <code>skill_import_url</code>, or <code>POST /api/skills</code></td></tr>
+      <tr><td><strong>Workspace</strong></td><td><code>.dodo/skills/</code>, <code>.claude/skills/</code>, <code>.agents/skills/</code>, or <code>.opencode/skill/</code> in the workspace</td><td>Drop a SKILL.md into the directory; auto-discovered each turn</td></tr>
+      <tr><td><strong>Builtin</strong></td><td>Bundled with the Worker</td><td>Edit <code>src/builtin-skills.ts</code> and redeploy</td></tr>
+    </table>
+    <p>Skills load in two stages:</p>
+    <ol>
+      <li><strong>Session start.</strong> Every enabled skill's <code>name</code> + <code>description</code> appears in the system prompt under <code>&lt;available_skills&gt;</code> (~150 tokens each, capped at 4 KB).</li>
+      <li><strong>On demand.</strong> When the agent picks one, the <code>skill</code> tool returns the full body and a sampled list of bundled file paths. Bundled files (<code>references/</code>, <code>scripts/</code>, <code>assets/</code>) are listed but never auto-loaded — the agent reads them on demand.</li>
+    </ol>
+    <p>The frontmatter parser is loose. Only <code>name</code> and <code>description</code> are required; extra fields are preserved verbatim. Personal skills can spill bundled assets to R2 under <code>skills/{userId}/{skillName}/...</code>.</p>
+    <div class="callout"><p>Tip: Personal skills override workspace skills with the same name, and workspace skills override builtins. Useful for tweaking a stock skill without forking Dodo.</p></div>
+
     <!-- ─── Cron ─── -->
     <h2 id="cron">Cron Jobs</h2>
     <p>Schedule prompts that run automatically. Each cron job sends a prompt to its session after a delay.</p>
@@ -461,13 +480,14 @@
       <tr><td>GET</td><td><code>/api/status</code></td><td>Version, session count, passkey status</td></tr>
       <tr><td>*</td><td><code>/api/allowlist</code></td><td>Host allowlist CRUD</td></tr>
       <tr><td>*</td><td><code>/api/memory</code></td><td>Memory store CRUD + search</td></tr>
+      <tr><td>*</td><td><code>/api/skills</code></td><td>Personal SKILL.md store CRUD (list, read, write, enable, delete)</td></tr>
       <tr><td>*</td><td><code>/api/tasks</code></td><td>Task CRUD</td></tr>
       <tr><td>POST</td><td><code>/api/tasks/:id/dispatch</code></td><td>Dispatch a task to a new session</td></tr>
       <tr><td>POST</td><td><code>/api/tasks/batch-dispatch</code></td><td>Dispatch up to 10 tasks in parallel</td></tr>
       <tr><td>*</td><td><code>/api/secrets</code></td><td>Encrypted secrets CRUD</td></tr>
       <tr><td>*</td><td><code>/api/mcp-configs</code></td><td>Integration (MCP server) CRUD</td></tr>
       <tr><td>*</td><td><code>/api/passkey</code></td><td>Init, change passkey</td></tr>
-      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth) — 48 tools for orchestration</td></tr>
+      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth) — 55 tools for orchestration</td></tr>
       <tr><td>ALL</td><td><code>/mcp/codemode</code></td><td>Code-mode MCP endpoint — 2 tools (<code>search</code> + <code>execute</code>), ~1k tokens context. Ideal for coding agents.</td></tr>
     </table>
 

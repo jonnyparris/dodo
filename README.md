@@ -147,7 +147,7 @@ Dodo exposes two MCP endpoints. Use the one that fits your use case:
 
 | Endpoint | Tools | Best for |
 |----------|-------|----------|
-| `/mcp` | 48 | **Orchestrators** -- full control over sessions, tasks, git, memory, dispatch |
+| `/mcp` | 55 | **Orchestrators** -- full control over sessions, tasks, git, memory, skills, dispatch |
 | `/mcp/codemode` | 2 | **Coding agents** -- just `search` + `execute` (~1k tokens context) |
 
 **Example config** (works with OpenCode, Claude Code, Cursor, or any MCP client):
@@ -218,6 +218,25 @@ Four job types: delayed (N seconds), datetime (specific time), cron expression, 
 
 Per-user key-value store with text search, persistent across sessions. Your agent can save learnings, preferences, and context that carry forward to future sessions.
 
+### Skills
+
+Drop a `SKILL.md` file into a workspace, store one in your personal library, or import one from a URL — Dodo loads it like a tool. The format is identical to [Claude Skills](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/skills) and [OpenCode skills](https://opencode.ai/docs/skills/), so anything written for either runs in Dodo unchanged.
+
+Three sources, merged with personal > workspace > builtin precedence:
+
+| Source | Where it lives | Editable from Dodo |
+|--------|----------------|---------------------|
+| **Personal** | UserControl Durable Object SQLite (per-user) | Yes — via `skill_write` MCP tool, `skill_import_url`, or `POST /api/skills` |
+| **Workspace** | Auto-discovered at `.dodo/skills/`, `.claude/skills/`, `.agents/skills/`, `.opencode/skill/` (workspace root + first-level subdirs of any cloned repo) | Read-only — copy a body via `skill_write` to fork it |
+| **Builtin** | Bundled in the Worker (`src/builtin-skills.ts`) | Read-only — extend the source file and redeploy |
+
+Loaded with two-stage progressive disclosure (matches Claude Code / OpenCode):
+
+1. **Session start** — every enabled skill's `name + description` lands in the system prompt under `<available_skills>` (~150 tokens each, capped at 4 KB total).
+2. **On demand** — when the model picks one, the `skill` tool returns the full body and a sampled list of bundled files. Bundled files (`references/`, `scripts/`, `assets/`) are listed by relative path but never auto-loaded; the model uses `read` to fetch them.
+
+The frontmatter parser is loose — only `name` and `description` are required. Extra fields (`version`, `last_updated`, etc.) are preserved verbatim, so a skill written for Anthropic's [`anthropics/skills`](https://github.com/anthropics/skills) repo loads in Dodo without modification. Personal skills can spill bundled assets to R2 under `skills/{userId}/{skillName}/...`.
+
 ### Browser
 
 Headless Chrome via Cloudflare Browser Rendering. Full CDP (Chrome DevTools Protocol) access through two code-mode tools: `browser_search` (query the CDP spec) and `browser_execute` (run CDP commands). The agent can navigate pages, read documentation, fill forms, and scrape data. Desktop viewport + full-page capture work out of the box. Screenshots captured via `Page.captureScreenshot` render inline in the chat and persist across reloads -- see Attachments below.
@@ -254,7 +273,7 @@ Images surface in the chat from four sources and flow through the same R2-backed
 
 Built-in support for dispatching work to worker sessions and shepherding it to a reviewable PR:
 
-- **Seed sessions** -- Clone a repo once, fork for each task (avoids repeated clones). Stacked PRs work too: when `baseBranch != main`, the clone goes deeper so the LLM can see the stack's history.
+- **Seed sessions** -- Clone a repo once, fork for each task (avoids repeated clones). The seed cache is **global** — the first call across all users cold-clones, every subsequent call across all users forks it in sub-second time. Stacked PRs work too: when `baseBranch != main`, the clone goes deeper so the LLM can see the stack's history.
 - **Deterministic edit pipelines** -- Apply text edits, commit, push, verify.
 - **Agent-driven dispatch** -- Send a prompt to a session and verify the result later.
 - **Worker run tracking** -- State machine from session creation through push verification to merged PR.

@@ -59,6 +59,7 @@
         <li><a href="#kanban-dispatch">Dispatch Tasks from the Kanban Board</a></li>
         <li><a href="#push-code">Push Code to GitHub</a></li>
         <li><a href="#memory">Use Memory Across Sessions</a></li>
+        <li><a href="#skills">Add a Skill</a></li>
       </ul>
     </nav>
 
@@ -152,6 +153,23 @@ memory_search({ query: "default branch for dodo" })
 </code></pre>
     <p>Use memory for durable context, not large source files. Keep entries short, searchable, and specific enough to help future sessions.</p>
     <div class="callout"><p>Tip: Save recurring setup facts in memory so you do not need to repeat them in every new session.</p></div>
+
+    <h2 id="skills">Add a Skill</h2>
+    <h3>Teach the agent a workflow once and reuse it everywhere</h3>
+    <p>Skills are markdown files that describe a workflow, format, or domain the agent should know about. Dodo's skill format is identical to Claude Skills and OpenCode skills, so any skill written for either tool runs in Dodo unchanged.</p>
+    <p>Three ways to add one:</p>
+    <ol>
+      <li><strong>Personal skill</strong> — call <code>skill_write</code> from your MCP client. The skill is stored in your user account and appears in every new session.</li>
+      <li><strong>Workspace skill</strong> — drop a <code>SKILL.md</code> into <code>.dodo/skills/&lt;name&gt;/</code>, <code>.claude/skills/&lt;name&gt;/</code>, or <code>.opencode/skill/&lt;name&gt;/</code> in the workspace (or in any cloned repo). It auto-loads on the next prompt.</li>
+      <li><strong>Import from URL</strong> — call <code>skill_import_url({ url: "https://raw.githubusercontent.com/.../SKILL.md" })</code> to pull a skill from someone else's repo into your personal library.</li>
+    </ol>
+    <pre><code>skill_write({
+  name: "release-checklist",
+  description: "Pre-release checks for the dodo repo. Use before tagging a release.",
+  body: "# Release checklist\n\n1. Run `npm test`\n2. Update CHANGELOG\n3. Tag and push"
+})</code></pre>
+    <p>Once added, the agent sees the name and description in every session. To use it, the agent calls the <code>skill</code> tool with the name and the full body loads on demand. Bundled files (<code>references/</code>, <code>scripts/</code>) are listed by path but only loaded if the agent reads them.</p>
+    <div class="callout"><p>Tip: Write the description like a tool description — say <em>what</em> the skill does and <em>when</em> to use it. The agent only sees the description until it loads the body.</p></div>
   </main>
 </body>
 </html>
