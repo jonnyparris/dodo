@@ -36,6 +36,15 @@ const ARTIFACTS_DIR = "/repo";
 const ARTIFACTS_DEFAULT_DEPTH = 50;
 
 /**
+ * Token TTL for short-lived artifacts repo tokens. Used by both the
+ * agent's getOrCreateArtifactsContext (when minting fresh tokens) and
+ * the /artifacts route handler (so the UI can surface an accurate
+ * expiry hint). Hoisted to a single source of truth so the two stay
+ * in sync.
+ */
+export const ARTIFACTS_TOKEN_TTL_SECONDS = 3600;
+
+/**
  * Cached state that lives on the CodingAgent instance for the lifetime
  * of the DO. Shape is intentionally flat so the agent can hold these
  * fields directly alongside `_artifactsRepo`.
@@ -43,8 +52,6 @@ const ARTIFACTS_DEFAULT_DEPTH = 50;
 export interface ArtifactsFsCache {
   fs: InMemoryFs;
   dir: string;
-  /** OID of the commit currently checked out in `fs`. Used to detect no-op refreshes. */
-  headOid: string | null;
   /** Set true after a successful flush; next read triggers a fetch+checkout. */
   dirty: boolean;
 }
@@ -92,8 +99,7 @@ async function cloneIntoMemfs(remote: string, token: string): Promise<ArtifactsF
       onAuth: makeOnAuth(token),
     });
 
-    const headOid = await resolveHead(fs);
-    return { fs, dir: ARTIFACTS_DIR, headOid, dirty: false };
+    return { fs, dir: ARTIFACTS_DIR, dirty: false };
   } catch (err) {
     log("warn", "[artifacts-read] clone failed", { err: err instanceof Error ? err.message : String(err) });
     return null;
@@ -125,17 +131,9 @@ async function fetchAndCheckout(cache: ArtifactsFsCache, remote: string, token: 
     const newOid = await git.resolveRef({ fs: fsAdapter, dir: cache.dir, ref: "refs/remotes/origin/main" });
     await git.writeRef({ fs: fsAdapter, dir: cache.dir, ref: "refs/heads/main", value: newOid, force: true });
     await git.checkout({ fs: fsAdapter, dir: cache.dir, ref: "main", force: true });
-    return { ...cache, headOid: newOid, dirty: false };
+    return { ...cache, dirty: false };
   } catch (err) {
     log("warn", "[artifacts-read] fetch failed", { err: err instanceof Error ? err.message : String(err) });
-    return null;
-  }
-}
-
-async function resolveHead(fs: InMemoryFs): Promise<string | null> {
-  try {
-    return await git.resolveRef({ fs: createIsomorphicGitFs(fs), dir: ARTIFACTS_DIR, ref: "HEAD" });
-  } catch {
     return null;
   }
 }

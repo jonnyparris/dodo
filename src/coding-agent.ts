@@ -3,6 +3,7 @@ import { type AgentNamespace, type Connection, type ConnectionContext, type WSMe
 import type { ArtifactsRepo } from "./artifacts-types";
 import { flushTurnToArtifacts } from "./artifacts-flush";
 import {
+  ARTIFACTS_TOKEN_TTL_SECONDS,
   type ArtifactsFsCache,
   buildArtifactsCloneUrl,
   listArtifactsTree,
@@ -3031,9 +3032,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       name: sessionIdHint ? `dodo-${sessionIdHint}` : null,
       remote: ctx.remote,
       cloneUrl,
-      // Token TTL is 1h (set in getOrCreateArtifactsContext); surface it
-      // so the UI can show a "regenerate" hint when it gets close.
-      tokenTtlSeconds: 3600,
+      // Surface the same TTL the binding minted so the UI can show
+      // an accurate "regenerate" hint as expiry approaches.
+      tokenTtlSeconds: ARTIFACTS_TOKEN_TTL_SECONDS,
     });
   }
 
@@ -4624,10 +4625,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     await this.chat(userMsg, callback, { signal: options?.signal });
 
-    // Flush workspace changes to Artifacts. Fire-and-forget — never blocks the turn.
+    // Flush workspace changes to Artifacts. Never blocks the turn —
+    // we attach a then-handler to update the read-side cache flag,
+    // and a catch to swallow any rejection so an unhandled-rejection
+    // warning never reaches Workers logs.
     const artifactsCtx = await this.getOrCreateArtifactsContext().catch(() => null);
     if (artifactsCtx) {
-      void flushTurnToArtifacts({
+      flushTurnToArtifacts({
         workspace: this.workspace,
         remote: artifactsCtx.remote,
         tokenSecret: artifactsCtx.tokenSecret,
@@ -4635,11 +4639,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         author: options?.authorEmail
           ? { name: options.authorEmail, email: options.authorEmail }
           : { name: "Dodo", email: "dodo@workers.dev" },
-      }).then((pushed) => {
-        // On a successful push, the cached read-side fs is now stale.
-        // Flag it so the next /files request fetches the new tip.
-        if (pushed) this.markArtifactsFsDirty();
-      });
+      })
+        .then((pushed) => {
+          // On a successful push, lift the first-flush gate and mark
+          // any existing read-side cache stale.
+          if (pushed) this.markArtifactsFsDirty();
+        })
+        .catch(() => {
+          // flushTurnToArtifacts catches its own errors and returns
+          // false, but belt-and-braces in case it ever throws.
+        });
     }
 
     // If the stream contained an error chunk that Think silently dropped,
@@ -5347,7 +5356,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const info = await repo.info();
         if (!info?.remote) return null;
         remote = info.remote;
-        const tokenResult = await repo.createToken("write", 3600);
+        const tokenResult = await repo.createToken("write", ARTIFACTS_TOKEN_TTL_SECONDS);
         tokenSecret = stripTokenExpiry(tokenResult.token);
       }
 

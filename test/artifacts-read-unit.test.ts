@@ -34,7 +34,7 @@ function makeCache(): ArtifactsFsCache {
   // Pretend `.git` exists — listArtifactsTree hides it
   fs.mkdirSync("/repo/.git/objects", { recursive: true });
   fs.writeFileSync("/repo/.git/HEAD", "ref: refs/heads/main\n");
-  return { fs, dir: "/repo", headOid: "deadbeef", dirty: false };
+  return { fs, dir: "/repo", dirty: false };
 }
 
 describe("buildArtifactsCloneUrl", () => {
