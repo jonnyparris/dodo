@@ -84,6 +84,26 @@ const memoryWriteSchema = z
   })
   .strict();
 
+// Skills — Claude/OpenCode-compatible SKILL.md persistence.
+// Caps mirror the registry's hard limits (32 KB body, 1024-char description).
+const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-_]*$/;
+const skillWriteSchema = z
+  .object({
+    name: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(SKILL_NAME_PATTERN, "skill name must be lowercase letters, digits, hyphens or underscores"),
+    description: z.string().min(1).max(1024),
+    body: z.string().min(1).max(64_000),
+    enabled: z.boolean().optional().default(true),
+    rawFrontmatter: z.record(z.string(), z.unknown()).optional(),
+    sourceOrigin: z.enum(["manual", "workspace-import", "url-import", "auto-generated"]).optional().default("manual"),
+    sourceUrl: z.string().url().optional(),
+  })
+  .strict();
+const skillEnableSchema = z.object({ enabled: z.boolean() }).strict();
+
 const mcpConfigCreateSchema = z
   .object({
     name: z.string().min(1),
@@ -394,6 +414,52 @@ export class UserControl extends DurableObject<Env> {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
         this.db.exec("DELETE FROM memory_entries WHERE id = ?", id);
         return Response.json({ deleted: true, id });
+      }
+
+      // ─── Skills (Claude/OpenCode-compatible SKILL.md store) ───
+
+      if (request.method === "GET" && url.pathname === "/skills") {
+        const enabledOnly = url.searchParams.get("enabled") === "true";
+        return Response.json({ skills: this.listSkills(enabledOnly) });
+      }
+
+      if (request.method === "POST" && url.pathname === "/skills") {
+        const body = skillWriteSchema.parse(await request.json());
+        return Response.json(this.upsertSkill(body), { status: 201 });
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/skills/")) {
+        const segments = url.pathname.split("/").filter(Boolean);
+        // /skills/{name}
+        if (segments.length === 2) {
+          const name = decodeURIComponent(segments[1]);
+          const skill = this.getSkill(name);
+          if (!skill) return Response.json({ error: `Skill '${name}' not found` }, { status: 404 });
+          return Response.json(skill);
+        }
+      }
+
+      if (request.method === "PUT" && url.pathname.match(/^\/skills\/[^/]+$/)) {
+        const name = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        const body = skillWriteSchema.parse(await request.json());
+        if (body.name !== name) {
+          return Response.json({ error: "name in body must match URL" }, { status: 400 });
+        }
+        return Response.json(this.upsertSkill(body));
+      }
+
+      if (request.method === "PUT" && url.pathname.match(/^\/skills\/[^/]+\/enabled$/)) {
+        const name = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const body = skillEnableSchema.parse(await request.json());
+        const ok = this.setSkillEnabled(name, body.enabled);
+        if (!ok) return Response.json({ error: `Skill '${name}' not found` }, { status: 404 });
+        return Response.json({ name, enabled: body.enabled });
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/skills\/[^/]+$/)) {
+        const name = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        this.deleteSkill(name);
+        return Response.json({ deleted: true, name });
       }
 
       // ─── Tasks ───
@@ -1083,6 +1149,26 @@ export class UserControl extends DurableObject<Env> {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_email ON user_mcp_tokens (email)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_synced ON user_mcp_tokens (synced_to_index) WHERE synced_to_index = 0");
 
+    // Skills — Claude/OpenCode-compatible SKILL.md store. Personal skills
+    // are user-curated and overridable; the workspace and built-in sources
+    // live elsewhere (filesystem scan + bundled markdown). See
+    // src/skill-registry.ts for the loader.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS skills (
+        name TEXT PRIMARY KEY,
+        description TEXT NOT NULL,
+        body TEXT NOT NULL,
+        raw_frontmatter TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        source_origin TEXT NOT NULL DEFAULT 'manual',
+        source_url TEXT,
+        asset_keys_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_skills_enabled ON skills(enabled, name)");
+
     // TTL cleanup: remove fork snapshots older than 1 hour
     const oneHourAgo = nowEpoch() - 3600;
     this.db.exec("DELETE FROM fork_snapshots WHERE created_at < ?", oneHourAgo);
@@ -1472,6 +1558,134 @@ export class UserControl extends DurableObject<Env> {
       id: String(row.id),
       tags: JSON.parse(String(row.tags_json)) as string[],
       title: String(row.title),
+      updatedAt: epochToIso(row.updated_at),
+    };
+  }
+
+  // ─── Skills (personal store) ───
+
+  private listSkills(enabledOnly: boolean): Array<{
+    name: string;
+    description: string;
+    body: string;
+    enabled: boolean;
+    source: "personal";
+    location: string;
+    assetPaths: string[];
+    rawFrontmatter?: Record<string, unknown>;
+    sourceOrigin: string;
+    sourceUrl: string | null;
+    createdAt: string;
+    updatedAt: string;
+  }> {
+    const sql = enabledOnly
+      ? "SELECT * FROM skills WHERE enabled = 1 ORDER BY name"
+      : "SELECT * FROM skills ORDER BY name";
+    return this.db.all(sql).map((row) => this.mapSkillRow(row));
+  }
+
+  private getSkill(name: string): ReturnType<UserControl["mapSkillRow"]> | null {
+    const row = this.db.one("SELECT * FROM skills WHERE name = ?", name);
+    return row ? this.mapSkillRow(row) : null;
+  }
+
+  private upsertSkill(input: {
+    name: string;
+    description: string;
+    body: string;
+    enabled?: boolean;
+    rawFrontmatter?: Record<string, unknown>;
+    sourceOrigin?: string;
+    sourceUrl?: string;
+  }): ReturnType<UserControl["mapSkillRow"]> {
+    const now = nowEpoch();
+    const enabled = input.enabled === false ? 0 : 1;
+    const fm = input.rawFrontmatter ? JSON.stringify(input.rawFrontmatter) : null;
+    const origin = input.sourceOrigin ?? "manual";
+    // SQLite UPSERT — preserve created_at on update.
+    this.db.exec(
+      `INSERT INTO skills (name, description, body, raw_frontmatter, enabled, source_origin, source_url, asset_keys_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)
+       ON CONFLICT(name) DO UPDATE SET
+         description = excluded.description,
+         body = excluded.body,
+         raw_frontmatter = excluded.raw_frontmatter,
+         enabled = excluded.enabled,
+         source_origin = excluded.source_origin,
+         source_url = excluded.source_url,
+         updated_at = excluded.updated_at`,
+      input.name,
+      input.description,
+      input.body,
+      fm,
+      enabled,
+      origin,
+      input.sourceUrl ?? null,
+      now,
+      now,
+    );
+    const result = this.getSkill(input.name);
+    if (!result) throw new Error(`Skill ${input.name} disappeared after upsert`);
+    return result;
+  }
+
+  private setSkillEnabled(name: string, enabled: boolean): boolean {
+    const row = this.db.one("SELECT name FROM skills WHERE name = ?", name);
+    if (!row) return false;
+    this.db.exec(
+      "UPDATE skills SET enabled = ?, updated_at = ? WHERE name = ?",
+      enabled ? 1 : 0,
+      nowEpoch(),
+      name,
+    );
+    return true;
+  }
+
+  private deleteSkill(name: string): void {
+    this.db.exec("DELETE FROM skills WHERE name = ?", name);
+  }
+
+  private mapSkillRow(row: SqlRow): {
+    name: string;
+    description: string;
+    body: string;
+    enabled: boolean;
+    source: "personal";
+    location: string;
+    assetPaths: string[];
+    rawFrontmatter?: Record<string, unknown>;
+    sourceOrigin: string;
+    sourceUrl: string | null;
+    createdAt: string;
+    updatedAt: string;
+  } {
+    const name = String(row.name);
+    let assetPaths: string[] = [];
+    if (row.asset_keys_json) {
+      try {
+        const parsed = JSON.parse(String(row.asset_keys_json));
+        if (Array.isArray(parsed)) assetPaths = parsed.filter((s) => typeof s === "string");
+      } catch { /* malformed JSON in legacy row, ignore */ }
+    }
+    let rawFrontmatter: Record<string, unknown> | undefined;
+    if (row.raw_frontmatter) {
+      try {
+        const parsed = JSON.parse(String(row.raw_frontmatter));
+        if (parsed && typeof parsed === "object") rawFrontmatter = parsed as Record<string, unknown>;
+      } catch { /* malformed JSON, ignore */ }
+    }
+    return {
+      name,
+      description: String(row.description),
+      body: String(row.body),
+      enabled: Number(row.enabled) !== 0,
+      source: "personal",
+      location: `do://user-control/skill/${encodeURIComponent(name)}`,
+      assetPaths,
+      rawFrontmatter,
+      sourceOrigin: String(row.source_origin ?? "manual"),
+      sourceUrl: row.source_url ? String(row.source_url) : null,
+      createdAt: epochToIso(row.created_at),
       updatedAt: epochToIso(row.updated_at),
     };
   }
