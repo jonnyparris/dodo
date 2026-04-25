@@ -3914,8 +3914,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     try {
       const result = await this.runThinkChat(content, { authorEmail, signal, images });
 
-      // Guard: treat empty LLM response as a failure
+      // Guard: treat empty LLM response as a failure — UNLESS the prompt
+      // was aborted, in which case the empty result is expected and
+      // `handleAbort` has already marked the prompt as `aborted`.
+      // (Without this guard, an abort racing the LLM would clobber the
+      // abort handler's status with `failed` because Think.chat swallows
+      // AbortError into onError() rather than rethrowing — so the catch
+      // block at the bottom of this try never fires for abort cases.)
       if (!result.text && !result.assistantMessageId) {
+        if (signal.aborted) return;
         const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
         this.emitEvent({ data: { message }, type: "error_message" });
         await this.finishPrompt(promptId, { error: message, status: "failed" });

@@ -37,24 +37,50 @@ function makeStream(text: string): ReadableStream<unknown> {
   });
 }
 
-let releaseSlowPrompt: (() => void) | null = null;
+// `released` is a plain flag rather than a stored resolver so the wait loop
+// re-checks it on every microtask. We cannot use `await new Promise(resolve
+// => releaseSlowPrompt = resolve)` because the workerd test runtime's DO
+// input gate seems to wait for the fiber's pending promise to settle before
+// admitting a second concurrent fetch into the same DO. A flag-and-yield
+// loop releases control back to the runtime between iterations, which lets
+// abort and queue requests reach the DO while the fiber is still "slow".
+let released = false;
+let aborted = false;
 
-async function waitForSlowPrompt(_abortSignal?: AbortSignal): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    releaseSlowPrompt = () => {
-      resolve();
-    };
-  });
-  releaseSlowPrompt = null;
+async function waitForSlowPrompt(abortSignal?: AbortSignal): Promise<void> {
+  if (abortSignal?.aborted) {
+    aborted = true;
+    throw new DOMException("Aborted", "AbortError");
+  }
+  abortSignal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+  // Bounded loop: at 1ms per iteration we trip after ~30s. In practice
+  // the test releases (or aborts) within ~100ms. Abort is checked BEFORE
+  // release so an abort fired during the wait wins over a stale release
+  // flag from a previous test (releases set the flag globally and we
+  // reset it in resetMockAgentic between tests, but during a single test
+  // that calls both abort and release the abort path must take priority
+  // — otherwise the AI SDK hits the "empty LLM response" guard in
+  // runFiberPrompt and the prompt ends up `failed` instead of `aborted`).
+  for (let i = 0; i < 30_000; i++) {
+    if (aborted) throw new DOMException("Aborted", "AbortError");
+    if (released) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("waitForSlowPrompt: timed out after 30s — the test forgot to call releaseMockSlowPrompt()");
 }
 
 export function releaseMockSlowPrompt(): void {
-  releaseSlowPrompt?.();
-  releaseSlowPrompt = null;
+  released = true;
+}
+
+/** Reset the slow-prompt flags between tests. Called from resetMockAgentic(). */
+function resetSlowPromptFlags(): void {
+  released = false;
+  aborted = false;
 }
 
 export function resetMockAgentic(): void {
-  releaseSlowPrompt = null;
+  resetSlowPromptFlags();
   buildProvider.mockClear();
   buildToolsForThink.mockClear();
 }
