@@ -43,7 +43,16 @@
     // `scripts/setup-attachment-lifecycle.sh` once per account to provision
     // the 30-day auto-expiry rule — lifecycle rules aren't yet configurable
     // from wrangler.jsonc, so they live out-of-band.
-    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" }
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" },
+    // Fork snapshots — large opaque JSON blobs (often 5–10 MB once a
+    // cloned repo's git pack files are base64-encoded) used by
+    // forkSessionInternal to copy a workspace from one CodingAgent into
+    // another. Previously stored as a single SQLite TEXT row in the
+    // owner's UserControl DO, which trips SQLITE_TOOBIG above ~2 MB.
+    // R2 has no relevant size cap at this scale and the snapshot is
+    // already a one-shot intermediate (deleted after import), so a
+    // dedicated bucket is the simplest fix.
+    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-fork-snapshots" }
   ],
   "browser": {
     "binding": "BROWSER"

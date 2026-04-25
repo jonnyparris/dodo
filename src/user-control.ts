@@ -528,62 +528,161 @@ export class UserControl extends DurableObject<Env> {
       }
 
       // ─── Fork snapshots ───
+      //
+      // Storage backend split:
+      //   • `backend = 'r2'`  — payload in R2 (FORK_SNAPSHOTS bucket).
+      //                         New default. Required for snapshots > ~2 MB
+      //                         (SQLite SQLITE_TOOBIG cell limit).
+      //   • `backend = 'sqlite'` — payload in the local SQLite TEXT column.
+      //                         Legacy path, read-only. Existing rows still
+      //                         resolve via GET; nothing new is written here.
+      //
+      // The pipeline is short-lived: forkSessionInternal POSTs a snapshot,
+      // immediately calls /snapshot/import on the target CodingAgent (which
+      // GETs the body back through this handler), and DELETEs once import
+      // returns. Cleanup of orphans happens in the alarm-driven sweep
+      // below (1-hour TTL).
 
       if (request.method === "POST" && url.pathname === "/fork-snapshots") {
         const headerLen = request.headers.get("content-length");
         const readStart = Date.now();
-        let payload: string;
+        const id = crypto.randomUUID();
+        const r2 = this.env.FORK_SNAPSHOTS;
+        if (!r2) {
+          log("error", "fork-snapshots: FORK_SNAPSHOTS R2 binding missing");
+          return Response.json({ error: "FORK_SNAPSHOTS R2 binding not configured" }, { status: 500 });
+        }
+
+        // Buffer to ArrayBuffer first. Streaming PUTs to R2 require an
+        // accurate Content-Length up front — workerd silently truncates
+        // unknown-length streams (R2 gotcha). 9 MB sits well within the
+        // DO's ~128 MB memory ceiling, so buffering is fine for now.
+        let buffer: ArrayBuffer;
         try {
-          payload = await request.text();
+          buffer = await request.arrayBuffer();
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           log("error", "fork-snapshots: body read failed", {
+            id,
             headerContentLength: headerLen,
             ms: Date.now() - readStart,
             error: message,
           });
           return Response.json({ error: `Reading snapshot body failed: ${message}`, headerContentLength: headerLen }, { status: 413 });
         }
-        const id = crypto.randomUUID();
-        const insertStart = Date.now();
+        const sizeBytes = buffer.byteLength;
+        const r2Key = `snapshots/${id}.json`;
+        const putStart = Date.now();
         try {
-          this.db.exec("INSERT INTO fork_snapshots (id, payload, created_at) VALUES (?, ?, ?)", id, payload, nowEpoch());
+          await r2.put(r2Key, buffer, {
+            httpMetadata: { contentType: "application/json" },
+            customMetadata: { ownerEmail: request.headers.get("x-owner-email") ?? "" },
+          });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          log("error", "fork-snapshots: SQLite insert failed", {
+          log("error", "fork-snapshots: R2 put failed", {
             id,
+            r2Key,
             headerContentLength: headerLen,
-            measuredBytes: payload.length,
-            sizeMB: (payload.length / 1024 / 1024).toFixed(2),
-            readMs: insertStart - readStart,
-            insertMs: Date.now() - insertStart,
+            measuredBytes: sizeBytes,
+            sizeMB: (sizeBytes / 1024 / 1024).toFixed(2),
+            putMs: Date.now() - putStart,
             error: message,
           });
           return Response.json({
-            error: `Storing snapshot failed: ${message}`,
-            measuredBytes: payload.length,
+            error: `Storing snapshot to R2 failed: ${message}`,
+            measuredBytes: sizeBytes,
             headerContentLength: headerLen,
-          }, { status: 507 });
+          }, { status: 502 });
         }
+
+        // Persist a tiny metadata row keyed by id so GET/DELETE can route
+        // to R2 without an extra round-trip and so the alarm sweep can
+        // reap orphans without listing the whole bucket.
+        try {
+          // payload is NOT NULL on the legacy schema; pass an empty string
+          // for R2-backed rows so the migration stays additive (no table
+          // rebuild required). Real bytes live at `r2_key`.
+          this.db.exec(
+            "INSERT INTO fork_snapshots (id, payload, created_at, backend, r2_key, size_bytes) VALUES (?, '', ?, 'r2', ?, ?)",
+            id,
+            nowEpoch(),
+            r2Key,
+            sizeBytes,
+          );
+        } catch (err) {
+          // The R2 object is already written; if metadata insert fails,
+          // delete the R2 object so we don't leak. Then surface the
+          // SQLite error to the caller. (this should never happen with a
+          // 1-byte row — included for safety.)
+          await r2.delete(r2Key).catch(() => undefined);
+          const message = err instanceof Error ? err.message : String(err);
+          log("error", "fork-snapshots: metadata insert failed", { id, r2Key, error: message });
+          return Response.json({ error: `Storing snapshot metadata failed: ${message}` }, { status: 507 });
+        }
+
         log("info", "fork-snapshots: stored", {
           id,
+          backend: "r2",
+          r2Key,
           headerContentLength: headerLen,
-          measuredBytes: payload.length,
-          sizeMB: (payload.length / 1024 / 1024).toFixed(2),
+          measuredBytes: sizeBytes,
+          sizeMB: (sizeBytes / 1024 / 1024).toFixed(2),
           totalMs: Date.now() - readStart,
+          putMs: Date.now() - putStart,
         });
         return Response.json({ id }, { status: 201 });
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/fork-snapshots/")) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        const row = this.db.one("SELECT payload FROM fork_snapshots WHERE id = ?", id);
+        const row = this.db.one("SELECT payload, backend, r2_key FROM fork_snapshots WHERE id = ?", id);
         if (!row) return Response.json({ error: `Fork snapshot ${id} not found` }, { status: 404 });
+        const backend = row.backend === null || row.backend === undefined ? "sqlite" : String(row.backend);
+        if (backend === "r2") {
+          const r2 = this.env.FORK_SNAPSHOTS;
+          if (!r2) return Response.json({ error: "FORK_SNAPSHOTS R2 binding not configured" }, { status: 500 });
+          const r2Key = String(row.r2_key);
+          const object = await r2.get(r2Key);
+          if (!object) {
+            // Metadata row exists but R2 object is gone — treat as 404.
+            log("warn", "fork-snapshots: r2 object missing for known id", { id, r2Key });
+            return Response.json({ error: `Fork snapshot ${id} content missing` }, { status: 404 });
+          }
+          // Stream straight back to the caller. R2's `object.body` is a
+          // ReadableStream so this never materialises the full payload
+          // in DO memory on the read path.
+          return new Response(object.body, {
+            headers: {
+              "content-type": "application/json",
+              "content-length": String(object.size),
+              "etag": object.httpEtag,
+            },
+          });
+        }
+        // Legacy SQLite path — kept for any in-flight rows from before
+        // the R2 migration. New writes never land here.
         return new Response(String(row.payload), { headers: { "content-type": "application/json" } });
       }
 
       if (request.method === "DELETE" && url.pathname.startsWith("/fork-snapshots/")) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        const row = this.db.one("SELECT backend, r2_key FROM fork_snapshots WHERE id = ?", id);
+        if (row && row.backend === "r2" && row.r2_key) {
+          const r2 = this.env.FORK_SNAPSHOTS;
+          if (r2) {
+            await r2.delete(String(row.r2_key)).catch((err) => {
+              // Best-effort: a failed R2 delete leaves an orphan object
+              // that the alarm sweep will reap on its next pass. Don't
+              // block the caller waiting for retries.
+              log("warn", "fork-snapshots: R2 delete failed (will retry via sweep)", {
+                id,
+                r2Key: String(row.r2_key),
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+          }
+        }
         this.db.exec("DELETE FROM fork_snapshots WHERE id = ?", id);
         return Response.json({ deleted: true, id });
       }
@@ -1058,6 +1157,20 @@ export class UserControl extends DurableObject<Env> {
         created_at INTEGER NOT NULL
       )
     `);
+    // Migration for R2-backed snapshots. The original schema kept the full
+    // JSON payload as a SQLite TEXT cell, which trips SQLITE_TOOBIG above
+    // ~2 MB and made fork-from-seed impossible for any non-trivial repo.
+    // New rows write payload='' and store the actual bytes in R2 under
+    // `r2_key`; legacy rows keep `backend` NULL (treated as 'sqlite' on read).
+    try {
+      this.db.exec("ALTER TABLE fork_snapshots ADD COLUMN backend TEXT");
+    } catch { /* already added */ }
+    try {
+      this.db.exec("ALTER TABLE fork_snapshots ADD COLUMN r2_key TEXT");
+    } catch { /* already added */ }
+    try {
+      this.db.exec("ALTER TABLE fork_snapshots ADD COLUMN size_bytes INTEGER");
+    } catch { /* already added */ }
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS worker_runs (
@@ -1219,8 +1332,32 @@ export class UserControl extends DurableObject<Env> {
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_skills_enabled ON skills(enabled, name)");
 
-    // TTL cleanup: remove fork snapshots older than 1 hour
+    // TTL cleanup: remove fork snapshots older than 1 hour. Reap R2
+    // objects in the same pass — a failed DELETE during the normal
+    // POST → import → DELETE cycle leaves an orphan that this sweep
+    // catches. We swallow R2 delete errors per-row so one stuck object
+    // doesn't block the rest.
     const oneHourAgo = nowEpoch() - 3600;
+    const stale = this.db.all(
+      "SELECT id, backend, r2_key FROM fork_snapshots WHERE created_at < ?",
+      oneHourAgo,
+    );
+    if (stale.length > 0 && this.env.FORK_SNAPSHOTS) {
+      const r2 = this.env.FORK_SNAPSHOTS;
+      const r2Keys = stale
+        .filter((row) => row.backend === "r2" && row.r2_key)
+        .map((row) => String(row.r2_key));
+      if (r2Keys.length > 0) {
+        // R2 batch delete tops out at 1000 keys per call, well above the
+        // ~handful of orphans we expect to see in a sweep.
+        r2.delete(r2Keys).catch((err) => {
+          log("warn", "fork-snapshots: TTL R2 batch delete failed", {
+            count: r2Keys.length,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+    }
     this.db.exec("DELETE FROM fork_snapshots WHERE created_at < ?", oneHourAgo);
     // Keep failure snapshots for 7 days
     this.db.exec("DELETE FROM failure_snapshots WHERE created_at < ?", nowEpoch() - 604800);
@@ -2872,7 +3009,8 @@ export class UserControl extends DurableObject<Env> {
       throw new SourceSessionMissingError(sourceSessionId);
     }
 
-    // Snapshot the source agent.
+    // Snapshot the source agent. Buffer to ArrayBuffer so we can both
+    // size it for the R2 PUT and avoid streaming-truncation gotchas.
     const sourceAgent = await getAgentByName(this.env.CODING_AGENT as never, sourceSessionId);
     const snapshotRes = await sourceAgent.fetch(
       new Request("https://coding-agent/snapshot", { method: "GET" }),
@@ -2880,15 +3018,28 @@ export class UserControl extends DurableObject<Env> {
     if (!snapshotRes.ok) {
       throw new Error(`snapshot of source session failed (${snapshotRes.status})`);
     }
-    const snapshotPayload = await snapshotRes.text();
+    const snapshotBuffer = await snapshotRes.arrayBuffer();
 
-    // Store snapshot in local fork_snapshots table.
+    // Store snapshot in R2 (same backend as the public /fork-snapshots
+    // POST handler). The DO's own SQLite TEXT column trips SQLITE_TOOBIG
+    // on real-world snapshots, which is why we keep R2 as the storage
+    // tier and only use SQLite for the metadata pointer.
     const snapshotId = crypto.randomUUID();
+    const r2 = this.env.FORK_SNAPSHOTS;
+    if (!r2) {
+      throw new Error("FORK_SNAPSHOTS R2 binding not configured");
+    }
+    const r2Key = `snapshots/${snapshotId}.json`;
+    await r2.put(r2Key, snapshotBuffer, {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: { ownerEmail },
+    });
     this.db.exec(
-      "INSERT INTO fork_snapshots (id, payload, created_at) VALUES (?, ?, ?)",
+      "INSERT INTO fork_snapshots (id, payload, created_at, backend, r2_key, size_bytes) VALUES (?, '', ?, 'r2', ?, ?)",
       snapshotId,
-      snapshotPayload,
       nowEpoch(),
+      r2Key,
+      snapshotBuffer.byteLength,
     );
 
     // Register the new session.
@@ -2916,7 +3067,16 @@ export class UserControl extends DurableObject<Env> {
       }
       importOk = true;
     } finally {
-      // Always clean up the snapshot row.
+      // Always clean up the snapshot — both the R2 object and the row.
+      // R2 delete is best-effort; orphans get reaped by the 1-hour
+      // alarm sweep.
+      await r2.delete(r2Key).catch((err) => {
+        log("warn", "forkScheduledSession: R2 delete failed (will retry via sweep)", {
+          snapshotId,
+          r2Key,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
       this.db.exec("DELETE FROM fork_snapshots WHERE id = ?", snapshotId);
     }
 

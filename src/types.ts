@@ -31,6 +31,16 @@ export interface Env {
   OUTBOUND?: Fetcher;
   WORKER_URL: string;
   WORKSPACE_BUCKET?: R2Bucket;
+  /**
+   * Bucket for inter-DO fork snapshots. Snapshots are JSON payloads
+   * containing the full workspace (including base64-encoded `.git/objects`
+   * pack files) that fork sources upload and fork targets download. Stored
+   * here instead of DO SQLite because real-world payloads exceed the
+   * SQLITE_TOOBIG cell limit (~2 MB) — dodo's seed snapshot is ~9 MB.
+   * Objects are short-lived: written by `/fork-snapshots` POST, read by
+   * `/snapshot/import`, deleted by `/fork-snapshots/:id` DELETE.
+   */
+  FORK_SNAPSHOTS?: R2Bucket;
 
   // Durable Object bindings
   CODING_AGENT: DurableObjectNamespace<CodingAgent>;

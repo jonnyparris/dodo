@@ -41,7 +41,8 @@
     }
   ],
   "r2_buckets": [
-    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" }
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" },
+    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-fork-snapshots" }
   ],
   "browser": {
     "binding": "BROWSER"
