@@ -1040,9 +1040,9 @@ export class UserControl extends DurableObject<Env> {
 
     const existingCount = this.db.one("SELECT COUNT(*) AS n FROM approved_mcps WHERE is_deleted = 0");
     if (Number(existingCount?.n ?? 0) === 0) {
-      const { MCP_CATALOG } = await import("./mcp-catalog");
+      const { getDeployMcpCatalog } = await import("./mcp-catalog");
       const seedNow = Date.now();
-      for (const entry of MCP_CATALOG) {
+      for (const entry of getDeployMcpCatalog(this.env)) {
         this.db.exec(
           `INSERT INTO approved_mcps (mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status, is_deleted, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'enabled', 0, ?, ?)`,

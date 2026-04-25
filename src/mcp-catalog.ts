@@ -1,15 +1,21 @@
+import type { Env } from "./types";
+
 export interface McpCatalogEntry {
   id: string;
   name: string;
-  description: string;
+  description?: string;
   url: string;
-  setupGuide: string;
+  setupGuide?: string;
   auth_type?: "oauth" | "static_headers";
   /** Hostnames implicitly allowed without requiring admin allowlist entry. */
   knownHosts?: string[];
 }
 
-export const MCP_CATALOG: McpCatalogEntry[] = [
+export type McpCatalogConfig = {
+  cloudflareRemoteMcps?: McpCatalogEntry[];
+};
+
+const CORE_MCP_CATALOG: McpCatalogEntry[] = [
   {
     id: "dodo-self",
     name: "Dodo Self",
@@ -30,87 +36,9 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     auth_type: "oauth",
     knownHosts: ["api.githubcopilot.com"],
   },
-  {
-    id: "cloudflare-api-docs",
-    name: "Cloudflare Docs",
-    description: "Search Cloudflare's developer documentation",
-    url: "https://docs.mcp.cloudflare.com/mcp",
-    setupGuide: "Connect with OAuth",
-    auth_type: "oauth",
-    knownHosts: ["docs.mcp.cloudflare.com"],
-  },
-  {
-    id: "cloudflare-api-bindings",
-    name: "Cloudflare Bindings",
-    description: "Manage Workers bindings (KV, R2, D1, Queues, etc.)",
-    url: "https://bindings.mcp.cloudflare.com/mcp",
-    setupGuide: "Connect with OAuth",
-    auth_type: "oauth",
-    knownHosts: ["bindings.mcp.cloudflare.com"],
-  },
-  {
-    id: "cloudflare-api-builds",
-    name: "Cloudflare Builds",
-    description: "Manage Workers Builds and deployments",
-    url: "https://builds.mcp.cloudflare.com/mcp",
-    setupGuide: "Connect with OAuth",
-    auth_type: "oauth",
-    knownHosts: ["builds.mcp.cloudflare.com"],
-  },
-  {
-    id: "cloudflare-api-observability",
-    name: "Cloudflare Observability",
-    description: "Query Workers logs, metrics, and traces",
-    url: "https://observability.mcp.cloudflare.com/mcp",
-    setupGuide: "Connect with OAuth",
-    auth_type: "oauth",
-    knownHosts: ["observability.mcp.cloudflare.com"],
-  },
-  {
-    id: "cloudflare-api-radar",
-    name: "Cloudflare Radar",
-    description: "Query Cloudflare Radar for internet insights and threat data",
-    url: "https://radar.mcp.cloudflare.com/mcp",
-    setupGuide: "Connect with OAuth",
-    auth_type: "oauth",
-    knownHosts: ["radar.mcp.cloudflare.com"],
-  },
-  {
-    id: "cloudflare-api-containers",
-    name: "Cloudflare Containers",
-    description: "Manage Cloudflare Containers",
-    url: "https://containers.mcp.cloudflare.com/mcp",
-    setupGuide: "Connect with OAuth",
-    auth_type: "oauth",
-    knownHosts: ["containers.mcp.cloudflare.com"],
-  },
-  {
-    id: "cloudflare-api-logs",
-    name: "Cloudflare Logs",
-    description: "Query and manage Cloudflare logs",
-    url: "https://logs.mcp.cloudflare.com/mcp",
-    setupGuide: "Connect with OAuth",
-    auth_type: "oauth",
-    knownHosts: ["logs.mcp.cloudflare.com"],
-  },
-  {
-    id: "cloudflare-api-ai-gateway",
-    name: "Cloudflare AI Gateway",
-    description: "Manage AI Gateway configurations and query LLM usage",
-    url: "https://ai-gateway.mcp.cloudflare.com/mcp",
-    setupGuide: "Connect with OAuth",
-    auth_type: "oauth",
-    knownHosts: ["ai-gateway.mcp.cloudflare.com"],
-  },
-  {
-    id: "cloudflare-api-autorag",
-    name: "Cloudflare AutoRAG",
-    description: "Manage AutoRAG retrieval pipelines",
-    url: "https://autorag.mcp.cloudflare.com/mcp",
-    setupGuide: "Connect with OAuth",
-    auth_type: "oauth",
-    knownHosts: ["autorag.mcp.cloudflare.com"],
-  },
+];
+
+const DEFAULT_CLOUDFLARE_REMOTE_MCP_CATALOG: McpCatalogEntry[] = [
   {
     id: "browser-rendering",
     name: "Browser Rendering",
@@ -123,3 +51,25 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     knownHosts: ["browser.mcp.cloudflare.com"],
   },
 ];
+
+export const DEPLOY_MCP_CATALOG_CONFIG: McpCatalogConfig = {
+  cloudflareRemoteMcps: DEFAULT_CLOUDFLARE_REMOTE_MCP_CATALOG,
+};
+
+export function getMcpCatalog(config: McpCatalogConfig = DEPLOY_MCP_CATALOG_CONFIG): McpCatalogEntry[] {
+  return [...CORE_MCP_CATALOG, ...(config.cloudflareRemoteMcps ?? [])];
+}
+
+export function getDeployMcpCatalog(env?: Pick<Env, "DEPLOY_MCP_CATALOG_CONFIG">): McpCatalogEntry[] {
+  const rawConfig = env?.DEPLOY_MCP_CATALOG_CONFIG;
+  if (!rawConfig) return getMcpCatalog(DEPLOY_MCP_CATALOG_CONFIG);
+
+  try {
+    const parsed = JSON.parse(rawConfig) as McpCatalogConfig;
+    return getMcpCatalog(parsed);
+  } catch {
+    return getMcpCatalog(DEPLOY_MCP_CATALOG_CONFIG);
+  }
+}
+
+export const MCP_CATALOG: McpCatalogEntry[] = getDeployMcpCatalog();
