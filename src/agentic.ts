@@ -5,10 +5,11 @@ import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import type { AttachmentRef } from "./attachments";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
+import { createPullRequest } from "./github-pr";
 import { normalizePath } from "./paths";
 import { createBrowserTools } from "./browser/tools";
 import type { McpGatekeeper, McpToolInfo } from "./mcp-gatekeeper";
-import { getKnownRepo, listKnownRepos } from "./repos";
+import { getKnownRepo, listKnownRepos, parseRemoteSpec } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import type { AppConfig, Env, TodoStore } from "./types";
 
@@ -869,6 +870,97 @@ function buildGitTools(
           throw new Error(verification.error ?? `Branch '${ref}' failed verification`);
         }
         return verification;
+      },
+    }),
+
+    pr_create: tool({
+      description: "Open a pull request (GitHub) or merge request (GitLab) for the current branch. Auto-detects the provider from the remote URL. Auto-fills `head` from the current branch and `title` / `body` from the latest commit if you omit them. Defaults to draft. Push the branch first (use git_push_checked).",
+      inputSchema: zodSchema(z.object({
+        dir: z.string().optional().describe("Repo directory"),
+        remote: z.string().optional().describe("Remote name (default: origin)"),
+        head: z.string().optional().describe("Source branch. Defaults to the current branch."),
+        base: z.string().optional().describe("Target branch. Defaults to 'main'."),
+        title: z.string().optional().describe("PR/MR title. Defaults to the first line of the latest commit message."),
+        body: z.string().optional().describe("PR/MR body. Defaults to the latest commit body + 'Drafted via Dodo session' footer."),
+        draft: z.boolean().optional().describe("Open as draft. Defaults to true."),
+      })),
+      execute: async ({ dir, remote, head, base, title, body, draft }) => {
+        // Resolve remote URL from the workspace's git config.
+        const remoteName = remote ?? "origin";
+        const remotes = await git.remote({ dir, list: true });
+        const remoteEntry = Array.isArray(remotes)
+          ? remotes.find((entry: { remote: string; url: string }) => entry.remote === remoteName)
+          : undefined;
+        if (!remoteEntry?.url) {
+          throw new Error(`No '${remoteName}' remote configured. Run git_clone first or add a remote.`);
+        }
+        const parsed = parseRemoteSpec(remoteEntry.url);
+        if (!parsed) {
+          throw new Error(`Remote URL '${remoteEntry.url}' is not on a supported provider (github.com, gitlab.com, gitlab.cfdata.org).`);
+        }
+
+        // Resolve head branch (current branch if not specified).
+        let resolvedHead = head;
+        if (!resolvedHead) {
+          const branchInfo = await git.branch({ dir, list: true });
+          if (branchInfo && "current" in branchInfo && branchInfo.current) {
+            resolvedHead = branchInfo.current;
+          }
+        }
+        if (!resolvedHead) {
+          throw new Error("Could not determine the current branch. Pass `head` explicitly or run git_branch to inspect.");
+        }
+        const resolvedBase = base ?? "main";
+        if (resolvedHead === resolvedBase) {
+          throw new Error(`Head and base branches are both '${resolvedHead}'. Create a feature branch first with git_checkout.`);
+        }
+
+        // Auto-fill title/body from latest commit if not provided.
+        let resolvedTitle = title;
+        let resolvedBody = body;
+        if (!resolvedTitle || !resolvedBody) {
+          const log = await git.log({ depth: 1, dir });
+          const latest = Array.isArray(log) && log.length > 0 ? log[0] : null;
+          const message = latest?.message ?? "";
+          const [firstLine, ...rest] = message.split("\n");
+          if (!resolvedTitle) {
+            resolvedTitle = firstLine.trim() || `Update from ${resolvedHead}`;
+          }
+          if (!resolvedBody) {
+            const commitBody = rest.join("\n").trim();
+            const parts: string[] = [];
+            if (commitBody) parts.push(commitBody);
+            parts.push("---");
+            parts.push("Drafted via Dodo session.");
+            resolvedBody = parts.join("\n\n");
+          }
+        }
+
+        const result = await createPullRequest(
+          env,
+          {
+            remoteUrl: remoteEntry.url,
+            head: resolvedHead,
+            base: resolvedBase,
+            title: resolvedTitle,
+            body: resolvedBody,
+            draft,
+          },
+          ownerEmail,
+        );
+        if (!result.ok) {
+          throw new Error(result.error);
+        }
+        return {
+          ok: true,
+          url: result.url,
+          number: result.number,
+          provider: result.provider,
+          head: resolvedHead,
+          base: resolvedBase,
+          draft: draft ?? true,
+          message: `Opened ${result.provider === "github" ? "PR" : "MR"} #${result.number}: ${result.url}`,
+        };
       },
     }),
 

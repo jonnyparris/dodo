@@ -1,4 +1,5 @@
 import { getUserControlStub } from "./auth";
+import { parseRemoteSpec } from "./repos";
 import type { Env, WorkerRunRecord } from "./types";
 
 /**
@@ -17,13 +18,19 @@ export function parseGithubRepo(url: string): { owner: string; repo: string } | 
   }
 }
 
-async function resolveGithubToken(env: Env, ownerEmail?: string): Promise<string | undefined> {
+async function resolveProviderToken(
+  env: Env,
+  provider: "github" | "gitlab",
+  ownerEmail?: string,
+): Promise<string | undefined> {
+  const secretKey = provider === "github" ? "github_token" : "gitlab_token";
   if (ownerEmail) {
     try {
       const stub = getUserControlStub(env, ownerEmail);
-      const response = await stub.fetch("https://user-control/internal/secret/github_token", {
-        headers: { "x-owner-email": ownerEmail },
-      });
+      const response = await stub.fetch(
+        `https://user-control/internal/secret/${encodeURIComponent(secretKey)}`,
+        { headers: { "x-owner-email": ownerEmail } },
+      );
       if (response.ok) {
         const { value } = (await response.json()) as { value: string };
         if (value) return value;
@@ -32,7 +39,11 @@ async function resolveGithubToken(env: Env, ownerEmail?: string): Promise<string
       // Fall through to env
     }
   }
-  return env.GITHUB_TOKEN;
+  return provider === "github" ? env.GITHUB_TOKEN : env.GITLAB_TOKEN;
+}
+
+async function resolveGithubToken(env: Env, ownerEmail?: string): Promise<string | undefined> {
+  return resolveProviderToken(env, "github", ownerEmail);
 }
 
 /**
@@ -111,5 +122,177 @@ export async function createDraftPrForRun(
   } catch (err) {
     console.warn("[auto-pr] failed to create PR:", err);
     return null;
+  }
+}
+
+// ─── Interactive PR/MR creation (for the pr_create tool) ───
+
+export interface CreatePullRequestInput {
+  /** Remote URL (https or ssh) — used to detect provider and parse owner/repo. */
+  remoteUrl: string;
+  /** Source branch (head ref). */
+  head: string;
+  /** Target branch (base ref). */
+  base: string;
+  /** PR/MR title. */
+  title: string;
+  /** Optional body. Pass through as-is. */
+  body?: string;
+  /** Open as draft. Defaults to true to match Dodo dispatch behavior. */
+  draft?: boolean;
+}
+
+export interface CreatePullRequestSuccess {
+  ok: true;
+  url: string;
+  number: number;
+  provider: "github" | "gitlab";
+}
+
+export interface CreatePullRequestFailure {
+  ok: false;
+  error: string;
+  provider?: "github" | "gitlab";
+}
+
+export type CreatePullRequestResult = CreatePullRequestSuccess | CreatePullRequestFailure;
+
+/**
+ * Create a pull request (GitHub) or merge request (GitLab). Auto-detects the
+ * provider from the remote URL. Uses the owner's per-user encrypted token
+ * (`github_token` / `gitlab_token`), falling back to env vars.
+ *
+ * Unlike `createDraftPrForRun`, this function THROWS on bad input but returns
+ * a structured `{ ok: false, error }` for API failures so the calling tool can
+ * surface a useful message to the agent.
+ */
+export async function createPullRequest(
+  env: Env,
+  input: CreatePullRequestInput,
+  ownerEmail?: string,
+): Promise<CreatePullRequestResult> {
+  const parsed = parseRemoteSpec(input.remoteUrl);
+  if (!parsed) {
+    return {
+      ok: false,
+      error: `Could not parse remote URL '${input.remoteUrl}'. Only github.com and gitlab.com / gitlab.cfdata.org are supported.`,
+    };
+  }
+
+  const draft = input.draft ?? true;
+  const token = await resolveProviderToken(env, parsed.provider, ownerEmail);
+  if (!token) {
+    return {
+      ok: false,
+      error: `No ${parsed.provider} token available. Add it via the secrets UI (key '${parsed.provider}_token') or set ${parsed.provider === "github" ? "GITHUB_TOKEN" : "GITLAB_TOKEN"} on the worker.`,
+      provider: parsed.provider,
+    };
+  }
+
+  if (parsed.provider === "github") {
+    return createGithubPr({ env: env, parsed, input, token, draft });
+  }
+  return createGitlabMr({ parsed, input, token, draft });
+}
+
+async function createGithubPr(args: {
+  env: Env;
+  parsed: NonNullable<ReturnType<typeof parseRemoteSpec>>;
+  input: CreatePullRequestInput;
+  token: string;
+  draft: boolean;
+}): Promise<CreatePullRequestResult> {
+  const { parsed, input, token, draft } = args;
+  try {
+    const response = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}/pulls`,
+      {
+        method: "POST",
+        headers: {
+          "Accept": "application/vnd.github+json",
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "User-Agent": "dodo-agent",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        body: JSON.stringify({
+          title: input.title,
+          head: input.head,
+          base: input.base,
+          body: input.body ?? "",
+          draft,
+        }),
+      },
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      return {
+        ok: false,
+        error: `GitHub API returned ${response.status}: ${text.slice(0, 300)}`,
+        provider: "github",
+      };
+    }
+    const data = (await response.json()) as { html_url?: string; number?: number };
+    if (!data.html_url || typeof data.number !== "number") {
+      return { ok: false, error: "GitHub returned an unexpected response", provider: "github" };
+    }
+    return { ok: true, url: data.html_url, number: data.number, provider: "github" };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      provider: "github",
+    };
+  }
+}
+
+async function createGitlabMr(args: {
+  parsed: NonNullable<ReturnType<typeof parseRemoteSpec>>;
+  input: CreatePullRequestInput;
+  token: string;
+  draft: boolean;
+}): Promise<CreatePullRequestResult> {
+  const { parsed, input, token, draft } = args;
+  try {
+    // GitLab marks MRs as draft via title prefix "Draft: ".
+    const title = draft && !input.title.startsWith("Draft:") ? `Draft: ${input.title}` : input.title;
+    const project = encodeURIComponent(parsed.fullName);
+    const response = await fetch(
+      `https://${parsed.host}/api/v4/projects/${project}/merge_requests`,
+      {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+          "PRIVATE-TOKEN": token,
+          "User-Agent": "dodo-agent",
+        },
+        body: JSON.stringify({
+          source_branch: input.head,
+          target_branch: input.base,
+          title,
+          description: input.body ?? "",
+        }),
+      },
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      return {
+        ok: false,
+        error: `GitLab API returned ${response.status}: ${text.slice(0, 300)}`,
+        provider: "gitlab",
+      };
+    }
+    const data = (await response.json()) as { web_url?: string; iid?: number };
+    if (!data.web_url || typeof data.iid !== "number") {
+      return { ok: false, error: "GitLab returned an unexpected response", provider: "gitlab" };
+    }
+    return { ok: true, url: data.web_url, number: data.iid, provider: "gitlab" };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      provider: "gitlab",
+    };
   }
 }

@@ -954,6 +954,156 @@ describe("auto-PR creation", () => {
   });
 });
 
+describe("createPullRequest (interactive PR/MR tool)", () => {
+  const restoreFetch = (original: typeof fetch) => {
+    globalThis.fetch = original;
+  };
+
+  it("rejects unsupported remotes", async () => {
+    const { createPullRequest } = await import("../src/github-pr");
+    const result = await createPullRequest(env as Env, {
+      remoteUrl: "https://example.com/foo/bar",
+      head: "feat/x",
+      base: "main",
+      title: "Ship it",
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("Could not parse");
+  });
+
+  it("returns a structured failure when no token is available", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as typeof fetch;
+    try {
+      const { createPullRequest } = await import("../src/github-pr");
+      const result = await createPullRequest(env as Env, {
+        remoteUrl: "https://github.com/foo/bar",
+        head: "feat/x",
+        base: "main",
+        title: "Ship it",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain("No github token");
+        expect(result.provider).toBe("github");
+      }
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("opens a draft GitHub PR via the API", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      const u = typeof url === "string" ? url : url.toString();
+      expect(u).toBe("https://api.github.com/repos/foo/bar/pulls");
+      expect(init?.method).toBe("POST");
+      const body = JSON.parse(init!.body as string);
+      expect(body).toEqual({
+        title: "Ship it",
+        head: "feat/x",
+        base: "main",
+        body: "Body text",
+        draft: true,
+      });
+      return new Response(JSON.stringify({ html_url: "https://github.com/foo/bar/pull/42", number: 42 }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
+    try {
+      const { createPullRequest } = await import("../src/github-pr");
+      const result = await createPullRequest(envWithToken, {
+        remoteUrl: "https://github.com/foo/bar",
+        head: "feat/x",
+        base: "main",
+        title: "Ship it",
+        body: "Body text",
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.url).toBe("https://github.com/foo/bar/pull/42");
+        expect(result.number).toBe(42);
+        expect(result.provider).toBe("github");
+      }
+      expect(fetchSpy).toHaveBeenCalledOnce();
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("opens a draft GitLab MR via the API and prefixes title with Draft:", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      const u = typeof url === "string" ? url : url.toString();
+      expect(u).toBe("https://gitlab.com/api/v4/projects/foo%2Fbar/merge_requests");
+      expect(init?.method).toBe("POST");
+      const body = JSON.parse(init!.body as string);
+      expect(body).toEqual({
+        source_branch: "feat/x",
+        target_branch: "main",
+        title: "Draft: Ship it",
+        description: "",
+      });
+      return new Response(JSON.stringify({ web_url: "https://gitlab.com/foo/bar/-/merge_requests/7", iid: 7 }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITLAB_TOKEN: "test-token" };
+    try {
+      const { createPullRequest } = await import("../src/github-pr");
+      const result = await createPullRequest(envWithToken, {
+        remoteUrl: "https://gitlab.com/foo/bar",
+        head: "feat/x",
+        base: "main",
+        title: "Ship it",
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.url).toBe("https://gitlab.com/foo/bar/-/merge_requests/7");
+        expect(result.number).toBe(7);
+        expect(result.provider).toBe("gitlab");
+      }
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("surfaces GitHub API errors as structured failures", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn(async () => {
+      return new Response(JSON.stringify({ message: "Validation Failed" }), {
+        status: 422,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
+    try {
+      const { createPullRequest } = await import("../src/github-pr");
+      const result = await createPullRequest(envWithToken, {
+        remoteUrl: "https://github.com/foo/bar",
+        head: "feat/x",
+        base: "main",
+        title: "Ship it",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.provider).toBe("github");
+        expect(result.error).toContain("422");
+      }
+    } finally {
+      restoreFetch(original);
+    }
+  });
+});
+
 describe("Worker run notifications", () => {
   // `sendRunNotification` calls `sendNotification` via a module-internal
   // reference that vitest's `vi.mock` cannot intercept. Instead we observe
