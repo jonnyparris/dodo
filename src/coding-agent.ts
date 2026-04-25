@@ -2425,7 +2425,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
 
       if (request.method === "GET" && url.pathname === "/artifacts") {
-        return await this.handleArtifactsInfo();
+        return await this.handleArtifactsInfo(request);
       }
 
       if (request.method === "PUT" && url.pathname === "/file") {
@@ -3014,16 +3014,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * Return artifacts repo metadata + a short-lived authenticated clone
    * URL the customer can paste into a terminal. Token TTL matches what
    * `getOrCreateArtifactsContext` mints (1h).
+   *
+   * Falls back to the `x-dodo-session-id` header for the session id
+   * hint — DO metadata isn't populated until the first message/prompt
+   * runs through `ensureMetadata`, so a fresh session that has only
+   * ever been hit on this endpoint would otherwise lose the name.
    */
-  private async handleArtifactsInfo(): Promise<Response> {
-    const ctx = await this.getOrCreateArtifactsContext().catch(() => null);
+  private async handleArtifactsInfo(request: Request): Promise<Response> {
+    const sessionIdHint = this.sessionId() || request.headers.get("x-dodo-session-id") || "";
+    const ctx = await this.getOrCreateArtifactsContext(sessionIdHint).catch(() => null);
     if (!ctx) {
       return Response.json({ error: "Artifacts unavailable for this session" }, { status: 503 });
     }
-    const sessionId = this.sessionId();
     const cloneUrl = buildArtifactsCloneUrl(ctx.remote, ctx.tokenSecret);
     return Response.json({
-      name: sessionId ? `dodo-${sessionId}` : null,
+      name: sessionIdHint ? `dodo-${sessionIdHint}` : null,
       remote: ctx.remote,
       cloneUrl,
       // Token TTL is 1h (set in getOrCreateArtifactsContext); surface it
