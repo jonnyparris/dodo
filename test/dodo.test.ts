@@ -435,7 +435,7 @@ describe("Dodo foundation", () => {
     expect(body.message.content).toContain("ai-gateway:Use the fallback gateway now.");
   });
 
-  it.skip("supports async prompts and aborting a running prompt — vitest-pool-workers can't release promises across DO boundaries", async () => {
+  it("supports async prompts and aborting a running prompt", async () => {
     const sessionId = await createSession();
 
     const promptStart = await fetchWithoutWaiting(`/session/${sessionId}/prompt`, {
@@ -538,7 +538,7 @@ describe("Dodo foundation", () => {
     expect(body.error).toContain("root");
   });
 
-  it.skip("returns 409 when a prompt is already running — vitest-pool-workers can't release promises across DO boundaries", async () => {
+  it("queues a second prompt while the first is still running", async () => {
     const sessionId = await createSession();
 
     const firstPrompt = await fetchWithoutWaiting(`/session/${sessionId}/prompt`, {
