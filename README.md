@@ -286,6 +286,10 @@ Built-in support for dispatching work to worker sessions and shepherding it to a
 
 Every Dodo session automatically gets its own [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/) repo -- a git-compatible repo hosted at `artifacts.cloudflare.net`, cloneable by any standard git client with a repo-scoped token. Workspace changes flush to it at the end of each agent turn. Forked sessions fork the Artifacts repo too, so branch history is preserved. You get a reviewable git history of what the agent did, without waiting for the agent to remember to commit.
 
+**Clone your session locally.** The Git panel in the right sidebar has a `Clone this session` collapsible. Expand it, copy the URL (which embeds a 1-hour authenticated token), paste into a terminal, and `git clone`. Refresh the panel to mint a new token when one expires.
+
+**Faster file tree.** Once a session has flushed at least once, the file tree and file viewer in the UI read from an in-Worker clone of the Artifacts repo instead of round-tripping to the workspace shell. First turn behaviour is unchanged; subsequent file-tree expansions are RAM-speed.
+
 Note: this is **separate** from the auto-draft-PR feature on GitHub, which only applies to orchestrated dispatch runs (`dispatch_repo_prompt`) that target a user-configured GitHub repo. Artifacts repos are always per-session and always on Cloudflare.
 
 ### Publishing to GitHub
