@@ -4,11 +4,27 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Dodo</title>
+  <meta name="description" content="Dodo — a self-hostable AI coding assistant. Dispatch long-running autonomous coding agents on Cloudflare Workers."/>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" id="favicon"/>
-  <script defer src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin/>
+  <!-- marked@15.0.7 + DOMPurify@3.2.4 with SRI hashes. DOMPurify is loaded
+       synchronously (no `defer`) because it must be ready before the first
+       markdown render runs. marked still defers — its first call is in chat
+       streaming, well after DOMContentLoaded. -->
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js" integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js" integrity="sha384-H+hy9ULve6xfxRkWIh/YOtvDdpXgV2fmAGQkIDTxIgZwNoaoBal14Di2YTMR6MzR" crossorigin="anonymous"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2/src/regular/style.css" media="print" onload="this.media='all'"/>
   <noscript><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2/src/regular/style.css"/></noscript>
   <style>
+    /* === Skip-to-content link (WCAG 2.4.1) === */
+    .skip-link{position:absolute;top:-40px;left:8px;background:var(--brand);color:#fff;padding:8px 14px;border-radius:var(--radius);z-index:5000;font-weight:600;font-size:13px;text-decoration:none}
+    .skip-link:focus{top:8px;outline:2px solid #fff;outline-offset:2px}
+    /* Visually hidden — keeps content available to screen readers */
+    .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+    /* === Reduced-motion support (WCAG 2.3.3) === */
+    @media(prefers-reduced-motion:reduce){
+      *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;scroll-behavior:auto !important}
+    }
     /* === Kumo Design Tokens === */
     :root{
       color-scheme:light dark;
@@ -251,8 +267,11 @@
     .tag{display:inline-block;background:var(--brand-tint);color:var(--text-info);padding:2px 8px;border-radius:100px;font-size:11px;font-weight:500;margin-right:4px}
     .empty{color:var(--text-inactive);font-style:italic;font-size:12px;padding:8px 0}
 
-    /* === Example prompts — Kumo layer card style === */
-    .example-prompt{padding:10px 14px;border-radius:var(--radius);border:1px solid var(--line);cursor:pointer;font-size:13px;margin-bottom:8px;line-height:1.45;background:var(--base);transition:border-color .12s,background .12s,box-shadow .12s}
+    /* === Example prompts — Kumo layer card style.
+           Rendered as <button> for keyboard accessibility (was <div onclick>);
+           reset min-height + width + text-align that the global button{} rule
+           imposes so the cards still look like cards. */
+    .example-prompt{padding:10px 14px;border-radius:var(--radius);border:1px solid var(--line);cursor:pointer;font-size:13px;margin-bottom:8px;line-height:1.45;background:var(--base);transition:border-color .12s,background .12s,box-shadow .12s;width:100%;min-height:0;text-align:left;color:var(--text-default);font-weight:400;font-family:inherit;display:block;white-space:normal;box-shadow:none}
     .example-prompt:hover{border-color:var(--brand);background:var(--brand-tint);box-shadow:var(--shadow-sm)}
     .onboarding{padding:32px;text-align:center;color:var(--text-subtle)}
     .onboarding-sessions{display:none}
@@ -535,12 +554,19 @@
   </style>
 </head>
 <body>
+  <a href="#main-content" class="skip-link">Skip to main content</a>
+  <!-- Live region for streaming chat output and toasts. aria-live="polite"
+       so screen readers announce new content without interrupting the user.
+       The textContent is updated by code; the visible chat surface remains
+       the source of truth. -->
+  <div id="aria-live-polite" class="visually-hidden" aria-live="polite" aria-atomic="false"></div>
+  <div id="aria-live-assertive" class="visually-hidden" role="alert" aria-live="assertive" aria-atomic="true"></div>
   <div id="banner-container"></div>
   <div class="app" id="app">
-    <div class="sidebar" id="sidebar-panel">
+    <nav class="sidebar" id="sidebar-panel" aria-label="Sessions and configuration">
       <div class="mobile-panel-header">
         <h3>Menu</h3>
-        <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel"><i class="ph ph-x"></i></button>
+        <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel"><i class="ph ph-x" aria-hidden="true"></i></button>
       </div>
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:8px 10px;background:var(--accent-bg);border-radius:var(--radius)">
         <img src="/favicon.svg" alt="Dodo" class="dodo-logo sm dodo-logo-img"/>
@@ -561,19 +587,19 @@
         <details style="margin-top:8px">
           <summary>Edit config</summary>
           <div style="margin-top:8px">
-            <label style="font-size:11px;color:var(--muted)">Model</label>
+            <label for="cfg-model" style="font-size:11px;color:var(--muted)">Model</label>
             <input id="cfg-model" list="model-list" style="margin-bottom:6px"/>
             <datalist id="model-list"></datalist>
-            <label style="font-size:11px;color:var(--muted)">Gateway</label>
+            <label for="cfg-gateway" style="font-size:11px;color:var(--muted)">Gateway</label>
             <select id="cfg-gateway" style="margin-bottom:6px" onchange="loadModels()">
               <option value="ai-gateway">AI Gateway</option>
               <option value="opencode">OpenCode</option>
             </select>
-            <label style="font-size:11px;color:var(--muted)">Gateway URL</label>
+            <label for="cfg-gateway-url" style="font-size:11px;color:var(--muted)">Gateway URL</label>
             <input id="cfg-gateway-url" placeholder="https://..." style="margin-bottom:6px"/>
-            <label style="font-size:11px;color:var(--muted)">Git Author Name</label>
+            <label for="cfg-git-author-name" style="font-size:11px;color:var(--muted)">Git Author Name</label>
             <input id="cfg-git-author-name" placeholder="Dodo" style="margin-bottom:6px"/>
-            <label style="font-size:11px;color:var(--muted)">Git Author Email</label>
+            <label for="cfg-git-author-email" style="font-size:11px;color:var(--muted)">Git Author Email</label>
             <input id="cfg-git-author-email" type="email" placeholder="dodo@example.com" style="margin-bottom:6px"/>
             <button onclick="saveConfig()" style="margin-top:4px">Save</button>
           </div>
@@ -584,39 +610,39 @@
           <summary>Manage hosts</summary>
           <div id="allowlist-display"></div>
           <div style="display:flex;gap:4px;margin-top:6px">
-            <input id="allowlist-input" placeholder="hostname" style="flex:1"/>
-            <button onclick="addHost()">+</button>
+            <input id="allowlist-input" placeholder="hostname" aria-label="Hostname to allowlist" style="flex:1"/>
+            <button onclick="addHost()" aria-label="Add host">+</button>
           </div>
         </details>
       </div>
       <div id="sidebar-version" style="font-size:11px;color:var(--text-inactive);text-align:center;margin-top:16px;padding:8px 0"></div>
-    </div>
+    </nav>
 
-    <div class="resize-handle" id="resize-left" aria-label="Resize left sidebar"></div>
+    <div class="resize-handle" id="resize-left" role="separator" aria-orientation="vertical" aria-label="Resize left sidebar"></div>
 
-    <div class="center">
+    <main class="center" id="main-content">
       <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--panel);gap:8px">
         <div style="display:flex;align-items:center;min-width:0;flex:1">
-          <span id="session-status-dot" class="status-dot idle"></span>
-          <strong id="session-title-display" style="cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0" onclick="renameSession()" title="Click to rename">No session</strong>
+          <span id="session-status-dot" class="status-dot idle" role="img" aria-label="Session status: idle"></span>
+          <strong id="session-title-display" style="cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0" onclick="renameSession()" title="Click to rename" tabindex="0" role="button" aria-label="Click to rename session" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();renameSession()}">No session</strong>
           <span id="session-id-display" style="font-size:11px;color:var(--muted);margin-left:8px;flex-shrink:0"></span>
           <span id="token-summary" class="token-summary" style="margin-left:8px;flex-shrink:0"></span>
           <span id="build-version" class="token-summary" style="margin-left:8px;flex-shrink:0"></span>
           <div id="presence-bar" class="presence-bar"></div>
         </div>
         <div class="header-actions">
-          <button onclick="showSessionSettings()" title="Session settings" aria-label="Session settings"><span class="btn-label">Settings</span><span class="btn-icon"><i class="ph ph-gear"></i></span></button>
-          <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle dark/light mode"><i class="ph ph-moon" id="theme-icon"></i></button>
-          <button onclick="showHelp()" title="Help" aria-label="Help"><i class="ph ph-question"></i></button>
-          <button class="mobile-hide" onclick="forkSession()" title="Fork copies this session's files, git history, and conversation so you can try a different approach." aria-label="Fork session"><span class="btn-label">Fork</span><span class="btn-icon"><i class="ph ph-git-fork"></i></span></button>
-          <button class="mobile-hide" id="abort-btn" onclick="abortPrompt()" disabled title="Abort prompt" aria-label="Abort prompt"><span class="btn-label">Abort</span><span class="btn-icon"><i class="ph ph-stop-circle"></i></span></button>
-          <button class="danger mobile-hide" onclick="deleteSession()" title="Delete session" aria-label="Delete session"><span class="btn-label">Delete</span><span class="btn-icon"><i class="ph ph-trash"></i></span></button>
+          <button onclick="showSessionSettings()" title="Session settings" aria-label="Session settings"><span class="btn-label">Settings</span><span class="btn-icon"><i class="ph ph-gear" aria-hidden="true"></i></span></button>
+          <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle dark/light mode" aria-label="Toggle dark/light mode"><i class="ph ph-moon" id="theme-icon" aria-hidden="true"></i></button>
+          <button onclick="showHelp()" title="Help" aria-label="Help"><i class="ph ph-question" aria-hidden="true"></i></button>
+          <button class="mobile-hide" onclick="forkSession()" title="Fork copies this session's files, git history, and conversation so you can try a different approach." aria-label="Fork session"><span class="btn-label">Fork</span><span class="btn-icon"><i class="ph ph-git-fork" aria-hidden="true"></i></span></button>
+          <button class="mobile-hide" id="abort-btn" onclick="abortPrompt()" disabled title="Abort prompt" aria-label="Abort prompt"><span class="btn-label">Abort</span><span class="btn-icon"><i class="ph ph-stop-circle" aria-hidden="true"></i></span></button>
+          <button class="danger mobile-hide" onclick="deleteSession()" title="Delete session" aria-label="Delete session"><span class="btn-label">Delete</span><span class="btn-icon"><i class="ph ph-trash" aria-hidden="true"></i></span></button>
           <div class="top-bar-overflow">
-            <button class="top-bar-overflow-btn" onclick="toggleOverflowMenu(event)" title="More actions"><i class="ph ph-dots-three-vertical"></i></button>
-            <div class="top-bar-overflow-menu" id="overflow-menu">
-              <button onclick="forkSession();closeOverflowMenu()"><i class="ph ph-git-fork"></i> Fork session</button>
-              <button onclick="abortPrompt();closeOverflowMenu()" id="abort-btn-mobile"><i class="ph ph-stop-circle"></i> Abort prompt</button>
-              <button class="danger" onclick="deleteSession();closeOverflowMenu()"><i class="ph ph-trash"></i> Delete session</button>
+            <button class="top-bar-overflow-btn" onclick="toggleOverflowMenu(event)" title="More actions" aria-label="More actions" aria-haspopup="menu"><i class="ph ph-dots-three-vertical" aria-hidden="true"></i></button>
+            <div class="top-bar-overflow-menu" id="overflow-menu" role="menu">
+              <button role="menuitem" onclick="forkSession();closeOverflowMenu()"><i class="ph ph-git-fork" aria-hidden="true"></i> Fork session</button>
+              <button role="menuitem" onclick="abortPrompt();closeOverflowMenu()" id="abort-btn-mobile"><i class="ph ph-stop-circle" aria-hidden="true"></i> Abort prompt</button>
+              <button role="menuitem" class="danger" onclick="deleteSession();closeOverflowMenu()"><i class="ph ph-trash" aria-hidden="true"></i> Delete session</button>
             </div>
           </div>
         </div>
@@ -633,13 +659,15 @@
             <div id="onboarding-session-list"></div>
           </div>
           <div style="margin-top:16px;text-align:left;max-width:400px;margin-left:auto;margin-right:auto">
-            <h2>Try these prompts</h2>
-            <div class="example-prompt" onclick="useExample(this)">Create a Cloudflare Worker that returns the current time as JSON. Write it to /src/index.ts</div>
-            <div class="example-prompt" onclick="useExample(this)">Write a fibonacci function in /src/fib.ts, then write tests for it in /test/fib.test.ts</div>
-            <div class="example-prompt" onclick="useExample(this)">Read all files in the workspace and give me a summary of what's there</div>
-            <div class="example-prompt" onclick="useExample(this)">Initialize a git repo, create a README.md with a project description, and make an initial commit</div>
-            <div class="example-prompt" onclick="useExample(this)">Create a simple TODO app with an HTML file and a Worker API backend. Put files in /src/</div>
-            <div class="example-prompt" onclick="useExample(this)">/generate a cyberpunk cat wearing sunglasses, neon city background</div>
+            <h2 id="example-prompts-heading">Try these prompts</h2>
+            <ul role="list" aria-labelledby="example-prompts-heading" style="list-style:none;padding:0;margin:0">
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Create a Cloudflare Worker that returns the current time as JSON. Write it to /src/index.ts</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Write a fibonacci function in /src/fib.ts, then write tests for it in /test/fib.test.ts</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Read all files in the workspace and give me a summary of what's there</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Initialize a git repo, create a README.md with a project description, and make an initial commit</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Create a simple TODO app with an HTML file and a Worker API backend. Put files in /src/</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">/generate a cyberpunk cat wearing sunglasses, neon city background</button></li>
+            </ul>
           </div>
         </div>
       </div>
@@ -650,25 +678,26 @@
         <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash command suggestions" hidden></div>
         <textarea id="msg-input" rows="1" placeholder="Ask Dodo to build something..." onkeydown="handleInputKeydown(event)" oninput="autoResizeInput(this);sendTypingStart();updateSlashMenu()" onpaste="handleImagePaste(event)" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)" onblur="setTimeout(hideSlashMenu,150)" aria-label="Message input" aria-autocomplete="list" aria-controls="slash-menu"></textarea>
         <div class="input-actions">
+          <label for="image-file-input" class="visually-hidden">Attach image files</label>
           <input type="file" id="image-file-input" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml" multiple style="display:none" onchange="handleFileSelect(this)"/>
-          <button class="ghost" onclick="$('image-file-input').click()" title="Attach image" aria-label="Attach image"><i class="ph ph-paperclip"></i></button>
-          <button class="sending" id="send-btn" onclick="handleSendBtn()" aria-label="Send message"><i class="ph ph-paper-plane-right"></i></button>
+          <button class="ghost" onclick="$('image-file-input').click()" title="Attach image" aria-label="Attach image"><i class="ph ph-paperclip" aria-hidden="true"></i></button>
+          <button class="sending" id="send-btn" onclick="handleSendBtn()" aria-label="Send message"><i class="ph ph-paper-plane-right" aria-hidden="true"></i></button>
         </div>
       </div>
       <div class="footer" id="footer">
         <button class="ghost sm" onclick="togglePanel('sidebar')" title="Toggle left sidebar" aria-label="Toggle left sidebar" id="toggle-sidebar-btn">&laquo;</button>
         <span id="footer-text" style="display:inline-flex;align-items:center;gap:4px"><img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/>Dodo</span>
-        <a href="https://github.com/jonnyparris/dodo" target="_blank" title="View on GitHub" style="color:inherit;margin-left:8px;"><i class="ph ph-github-logo"></i></a>
+        <a href="https://github.com/jonnyparris/dodo" target="_blank" rel="noopener noreferrer" title="View on GitHub" aria-label="View Dodo source on GitHub" style="color:inherit;margin-left:8px;"><i class="ph ph-github-logo" aria-hidden="true"></i><span class="visually-hidden">View on GitHub</span></a>
         <button class="ghost sm" onclick="togglePanel('right')" title="Toggle right panel" aria-label="Toggle right panel" id="toggle-right-btn">&raquo;</button>
       </div>
-    </div>
+    </main>
 
-    <div class="resize-handle" id="resize-right" aria-label="Resize right sidebar"></div>
+    <div class="resize-handle" id="resize-right" role="separator" aria-orientation="vertical" aria-label="Resize right sidebar"></div>
 
-    <div class="right" id="right-panel">
+    <aside class="right" id="right-panel" aria-label="Files, tools, and integrations">
       <div class="mobile-panel-header">
         <h3 id="right-panel-title">Files &amp; Tools</h3>
-        <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel"><i class="ph ph-x"></i></button>
+        <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel"><i class="ph ph-x" aria-hidden="true"></i></button>
       </div>
       <!-- Files group (shown on Files tab) -->
       <div id="files-group">
@@ -700,8 +729,11 @@
           </details>
           <details style="margin-top:6px">
             <summary>Add task</summary>
+            <label for="task-title" class="visually-hidden">Task title</label>
             <input id="task-title" placeholder="Title" style="margin-top:6px;margin-bottom:4px"/>
+            <label for="task-desc" class="visually-hidden">Task description</label>
             <textarea id="task-desc" rows="2" placeholder="Description"></textarea>
+            <label for="task-priority" class="visually-hidden">Task priority</label>
             <select id="task-priority" style="margin-top:4px;margin-bottom:4px">
               <option value="low">Low priority</option>
               <option value="medium" selected>Medium priority</option>
@@ -714,9 +746,12 @@
           <h2>Cron Jobs</h2>
           <div id="cron-list"></div>
           <details style="margin-top:6px">
-            <summary >Schedule task</summary>
+            <summary>Schedule task</summary>
+            <label for="cron-desc" class="visually-hidden">Description</label>
             <input id="cron-desc" placeholder="Description" style="margin-top:6px;margin-bottom:4px"/>
+            <label for="cron-prompt" class="visually-hidden">Prompt text</label>
             <input id="cron-prompt" placeholder="Prompt text" style="margin-bottom:4px"/>
+            <label for="cron-delay" class="visually-hidden">Delay in seconds</label>
             <input id="cron-delay" placeholder="Delay (seconds)" type="number" style="margin-bottom:4px"/>
             <button onclick="createCron()">Schedule</button>
           </details>
@@ -724,15 +759,19 @@
         <div class="section">
           <h2>Memory</h2>
           <div style="display:flex;gap:4px;margin-bottom:8px">
+            <label for="mem-search" class="visually-hidden">Search memory entries</label>
             <input id="mem-search" placeholder="Search..." style="flex:1" oninput="loadMemory(this.value)"/>
           </div>
           <p style="margin:0 0 6px">Memory entries persist across sessions. Use them to store context the agent should remember.</p>
           <div id="memory-list"></div>
           <details style="margin-top:6px">
-            <summary >Add / Edit entry</summary>
+            <summary>Add / Edit entry</summary>
             <input id="mem-id" type="hidden"/>
+            <label for="mem-title" class="visually-hidden">Title</label>
             <input id="mem-title" placeholder="Title" style="margin-top:6px;margin-bottom:4px"/>
+            <label for="mem-content" class="visually-hidden">Content</label>
             <textarea id="mem-content" rows="3" placeholder="Content"></textarea>
+            <label for="mem-tags" class="visually-hidden">Tags, comma separated</label>
             <input id="mem-tags" placeholder="Tags (comma-separated)" style="margin-top:4px;margin-bottom:4px"/>
             <div style="display:flex;gap:4px">
               <button onclick="saveMemory()" style="flex:1">Save</button>
@@ -747,12 +786,14 @@
           <details style="margin-top:4px" id="browser-config-details">
             <summary>Configure your own credentials</summary>
             <p style="font-size:11px;color:var(--muted);margin:6px 0">Enter your Cloudflare Account ID and an API Token with <strong>Browser Rendering - Edit</strong> permission. Browser sessions bill to your account.</p>
+            <label for="browser-cf-account" class="visually-hidden">Cloudflare Account ID</label>
             <input id="browser-cf-account" placeholder="Cloudflare Account ID" style="margin-bottom:4px"/>
+            <label for="browser-cf-token" class="visually-hidden">Cloudflare API Token</label>
             <input id="browser-cf-token" type="password" placeholder="Cloudflare API Token" style="margin-bottom:4px"/>
             <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
               <button onclick="saveBrowserConfig()">Save</button>
               <button class="sm danger" onclick="deleteBrowserConfig()" id="browser-delete-btn" style="display:none">Remove</button>
-              <a href="https://dash.cloudflare.com/?to=/:account/browser-rendering" target="_blank" style="font-size:11px;color:var(--accent);margin-left:auto">Cloudflare Dashboard</a>
+              <a href="https://dash.cloudflare.com/?to=/:account/browser-rendering" target="_blank" rel="noopener noreferrer" style="font-size:11px;color:var(--accent);margin-left:auto">Cloudflare Dashboard</a>
             </div>
           </details>
         </div>
@@ -760,9 +801,12 @@
           <h2>Integrations</h2>
           <div id="integrations-list"></div>
           <details style="margin-top:6px">
-            <summary >Add integration</summary>
+            <summary>Add integration</summary>
+            <label for="integ-name" class="visually-hidden">Integration name</label>
             <input id="integ-name" placeholder="Name" style="margin-top:6px;margin-bottom:4px"/>
+            <label for="integ-url" class="visually-hidden">Integration URL</label>
             <input id="integ-url" placeholder="URL (https://...)" style="margin-bottom:4px"/>
+            <label for="integ-auth-header" class="visually-hidden">Auth header value, optional</label>
             <input id="integ-auth-header" placeholder="Auth header value (optional)" style="margin-bottom:4px"/>
             <button onclick="addIntegration()">Add</button>
           </details>
@@ -772,50 +816,55 @@
           <div id="passkey-status"></div>
           <div id="secrets-list"></div>
           <details style="margin-top:6px" id="secrets-form-details">
-            <summary >Manage secrets</summary>
+            <summary>Manage secrets</summary>
             <div id="passkey-init-form" style="display:none;margin-top:6px">
               <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Set a passkey to protect your secrets. This enables encrypted token storage.</p>
+              <label for="passkey-input" class="visually-hidden">Passkey, minimum 4 characters</label>
               <input id="passkey-input" type="password" placeholder="Passkey (min 4 chars)" style="margin-bottom:4px"/>
               <button onclick="initPasskey()">Set Passkey</button>
             </div>
             <div id="secret-add-form" style="margin-top:6px">
+              <label for="secret-key" class="visually-hidden">Secret type</label>
               <select id="secret-key" style="margin-bottom:4px">
                 <option value="github_token">GitHub Token</option>
                 <option value="gitlab_token">GitLab Token</option>
                 <option value="gateway_token">Gateway Token</option>
                 <option value="ntfy_topic">Ntfy Topic</option>
               </select>
+              <label for="secret-value" class="visually-hidden">Secret value</label>
               <input id="secret-value" type="password" placeholder="Secret value" style="margin-bottom:4px"/>
               <button onclick="setSecret()">Save Secret</button>
             </div>
             <details style="margin-top:6px">
               <summary>Change passkey</summary>
+              <label for="passkey-current" class="visually-hidden">Current passkey</label>
               <input id="passkey-current" type="password" placeholder="Current passkey" style="margin-top:4px;margin-bottom:4px"/>
+              <label for="passkey-new" class="visually-hidden">New passkey</label>
               <input id="passkey-new" type="password" placeholder="New passkey" style="margin-bottom:4px"/>
               <button onclick="changePasskey()">Change</button>
             </details>
           </details>
         </div>
       </div>
-    </div>
+    </aside>
   </div>
 
   <!-- Mobile navigation -->
-  <div class="mobile-nav" id="mobile-nav">
+  <nav class="mobile-nav" id="mobile-nav" aria-label="Mobile primary">
     <div class="mobile-nav-inner">
-      <button class="active" onclick="switchTab('chat')" aria-label="Chat"><span class="nav-icon"><i class="ph ph-chat-circle"></i></span>Chat</button>
-      <button onclick="switchTab('files')" aria-label="Files"><span class="nav-icon"><i class="ph ph-files"></i></span>Files</button>
-      <button onclick="switchTab('tools')" aria-label="Tools"><span class="nav-icon"><i class="ph ph-wrench"></i></span>Tools</button>
-      <button onclick="switchTab('settings')" aria-label="Settings"><span class="nav-icon"><i class="ph ph-sliders-horizontal"></i></span>Menu</button>
+      <button class="active" onclick="switchTab('chat')" aria-label="Chat"><span class="nav-icon"><i class="ph ph-chat-circle" aria-hidden="true"></i></span>Chat</button>
+      <button onclick="switchTab('files')" aria-label="Files"><span class="nav-icon"><i class="ph ph-files" aria-hidden="true"></i></span>Files</button>
+      <button onclick="switchTab('tools')" aria-label="Tools"><span class="nav-icon"><i class="ph ph-wrench" aria-hidden="true"></i></span>Tools</button>
+      <button onclick="switchTab('settings')" aria-label="Settings"><span class="nav-icon"><i class="ph ph-sliders-horizontal" aria-hidden="true"></i></span>Menu</button>
     </div>
-  </div>
-  <button class="fab" onclick="createSession()" title="New session" aria-label="New session"><i class="ph ph-plus"></i></button>
+  </nav>
+  <button class="fab" onclick="createSession()" title="New session" aria-label="New session"><i class="ph ph-plus" aria-hidden="true"></i></button>
 
   <!-- Help overlay -->
-  <div class="help-overlay" id="help-overlay" style="display:none" onclick="if(event.target===this)hideHelp()">
+  <div class="help-overlay" id="help-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="help-overlay-title" onclick="if(event.target===this)hideHelp()">
     <div class="help-content">
       <div style="display:flex;justify-content:space-between;align-items:center">
-        <h3>How Dodo Works</h3>
+        <h3 id="help-overlay-title">How Dodo Works</h3>
         <button onclick="hideHelp()" class="sm">Close</button>
       </div>
       <p style="color:var(--muted);margin-bottom:16px">Dodo is a self-hostable platform for dispatching long-running autonomous coding agents. Each session is an isolated workspace with its own files, git repo, and conversation history.</p>
@@ -838,10 +887,10 @@
   </div>
 
   <!-- Session Settings overlay -->
-  <div class="settings-overlay" id="settings-overlay" style="display:none" onclick="if(event.target===this)hideSessionSettings()">
+  <div class="settings-overlay" id="settings-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="settings-overlay-title" onclick="if(event.target===this)hideSessionSettings()">
     <div class="settings-content">
       <div style="display:flex;justify-content:space-between;align-items:center">
-        <h3>Session Settings</h3>
+        <h3 id="settings-overlay-title">Session Settings</h3>
         <button onclick="hideSessionSettings()" class="sm">Close</button>
       </div>
 
@@ -849,6 +898,7 @@
       <div class="settings-section">
         <h4>Sharing</h4>
         <div style="display:flex;gap:4px;margin-bottom:8px">
+          <label for="share-permission" class="visually-hidden">Share permission level</label>
           <select id="share-permission" style="width:auto;flex:0 0 auto">
             <option value="readonly">Read-only</option>
             <option value="readwrite">Read-write</option>
@@ -863,7 +913,9 @@
       <div class="settings-section">
         <h4>Permissions</h4>
         <div style="display:flex;gap:4px;margin-bottom:8px">
-          <input id="perm-email" placeholder="user@example.com" style="flex:1"/>
+          <label for="perm-email" class="visually-hidden">Email address</label>
+          <input id="perm-email" type="email" placeholder="user@example.com" style="flex:1"/>
+          <label for="perm-level" class="visually-hidden">Permission level</label>
           <select id="perm-level" style="width:auto;flex:0 0 auto">
             <option value="readonly">Read-only</option>
             <option value="readwrite">Read-write</option>
@@ -896,10 +948,10 @@
   </div>
 
   <!-- Onboarding Wizard overlay -->
-  <div class="wizard-overlay" id="wizard-overlay" style="display:none">
+  <div class="wizard-overlay" id="wizard-overlay" style="display:none" role="dialog" aria-modal="true" aria-label="Setup wizard">
     <div class="wizard-card">
       <button class="wizard-skip" onclick="skipOnboarding()">Skip setup</button>
-      <div class="wizard-dots" id="wizard-dots"></div>
+      <div class="wizard-dots" id="wizard-dots" aria-hidden="true"></div>
       <div id="wizard-body"></div>
     </div>
   </div>

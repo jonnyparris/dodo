@@ -128,5 +128,8 @@ function renderOnboardingSessions(){
   if(!container||!list||!allSessions.length)return;
   container.classList.add('has-sessions');
   const recent=allSessions.slice(0,4);
-  list.innerHTML=recent.map(s=>`<div class="example-prompt" onclick="selectSession('${esc(s.id)}')"><strong>${esc(s.title||s.id.slice(0,8))}</strong><div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`).join('');
+  // Use <button> for the same reason as example prompts: keyboard
+  // accessibility. The .example-prompt CSS class already handles the
+  // visual reset (width, text-align, colors).
+  list.innerHTML=recent.map(s=>{const id=esc(s.id);const title=esc(s.title||s.id.slice(0,8));return `<button type="button" class="example-prompt" onclick="selectSession('${id}')" aria-label="Open session: ${title}"><strong>${title}</strong><div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></button>`}).join('');
 }

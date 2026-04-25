@@ -44,8 +44,11 @@ function renderTaskCard(t,status){
   }else if(status==='done'){
     overflow.push(`<button class="del-btn" onclick="deleteTaskUI(event,'${eid}')">Delete</button>`);
   }
-  const overflowHtml=overflow.length?`<span class="overflow-menu"><button class="overflow-btn" onclick="toggleOverflow(event)" title="More">\u22EF</button><span class="overflow-items">${overflow.join('')}</span></span>`:'';
-  return `<div class="kanban-card ${sel}" draggable="true" data-task-id="${eid}" onclick="toggleSelectTask(event,'${eid}')" ondragstart="kanbanDragStart(event,'${eid}')" ondragend="kanbanDragEnd(event)"><div class="card-title">${esc(t.title)}<span class="priority ${priClass}">${esc(t.priority)}</span></div><div class="card-actions">${primary}${overflowHtml}</div></div>`;
+  const overflowHtml=overflow.length?`<span class="overflow-menu"><button class="overflow-btn" onclick="toggleOverflow(event)" title="More" aria-label="More actions" aria-haspopup="menu">\u22EF</button><span class="overflow-items" role="menu">${overflow.join('')}</span></span>`:'';
+  // role="button" + tabindex + keyboard handler so cards are keyboard
+  // operable. WCAG 2.5.7: drag is supplementary — every action also has
+  // explicit move/dispatch buttons in `primary`/`overflow`.
+  return `<div class="kanban-card ${sel}" role="button" tabindex="0" draggable="true" data-task-id="${eid}" onclick="toggleSelectTask(event,'${eid}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSelectTask(event,'${eid}')}" ondragstart="kanbanDragStart(event,'${eid}')" ondragend="kanbanDragEnd(event)" aria-label="Task: ${esc(t.title)}, ${esc(t.priority)} priority"><div class="card-title">${esc(t.title)}<span class="priority ${priClass}">${esc(t.priority)}</span></div><div class="card-actions">${primary}${overflowHtml}</div></div>`;
 }
 
 function renderBatchBar(){

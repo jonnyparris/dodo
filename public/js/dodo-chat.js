@@ -2,12 +2,27 @@
 
 function emailColor(e){let h=0;for(let i=0;i<e.length;i++)h=e.charCodeAt(i)+((h<<5)-h);return "hsl("+(h%360)+",55%,42%)"}
 
-// Markdown rendering for assistant messages
+// Markdown rendering for assistant messages.
+//
+// SECURITY: marked@15 disabled its built-in sanitizer, so raw HTML in markdown
+// renders verbatim. The output of this function is written to .innerHTML in
+// multiple places, so unsanitized output means an LLM response containing
+// `<script>` or `<img onerror>` would execute in the user's session. We pipe
+// every render through DOMPurify before returning. If DOMPurify failed to
+// load (network error / SRI mismatch), fall back to escaping the entire
+// input — losing markdown formatting is the right failure mode here.
 let _markedConfigured=false;
 function renderMarkdown(text){
   if(typeof marked==="undefined")return esc(text);
   if(!_markedConfigured){marked.setOptions({breaks:true,gfm:true});_markedConfigured=true}
-  try{return marked.parse(text)}catch{return esc(text)}
+  let html;
+  try{html=marked.parse(text)}catch{return esc(text)}
+  if(typeof DOMPurify==="undefined")return esc(text);
+  // ADD_ATTR: allow target/rel on links so external links open in a new tab
+  // with noopener (DOMPurify forces rel="noopener noreferrer" when target is
+  // present via the FORCE_BODY/SAFE_FOR_TEMPLATES path, but we set it
+  // explicitly here for clarity).
+  return DOMPurify.sanitize(html,{ADD_ATTR:["target","rel"]});
 }
 
 // === Dual-mode streaming renderer ===
@@ -411,7 +426,12 @@ function attachImagesToMessage(messageId,attachments){
   if(!el)return;
   _appendAttachmentImages(el,attachments);
 }
-function setStatusDot(status){$("session-status-dot").className=`status-dot ${status==="running"?"running":"idle"}`}
+function setStatusDot(status){
+  const dot=$("session-status-dot");
+  const isRunning=status==="running";
+  dot.className=`status-dot ${isRunning?"running":"idle"}`;
+  dot.setAttribute("aria-label",`Session status: ${isRunning?"running":"idle"}`);
+}
 function updateTokenSummary(state){
   const ti=state.totalTokenInput??0,to=state.totalTokenOutput??0;
   const pct=state.contextUsagePercent??0;

@@ -13,12 +13,18 @@ async function loadFiles(path){
   }catch{if(path==="/")$("file-tree").innerHTML='<div class="empty">Empty workspace</div>'}
 }
 function renderFileEntries(entries,parentPath){
+  // Each entry is keyboard-accessible: role="button", tabindex="0", and an
+  // onkeydown handler that triggers on Enter or Space (matching native
+  // <button> behaviour). For directories we use aria-expanded so screen
+  // readers announce the open/closed state.
   return entries.map(e=>{
     if(e.type==="directory"){
       const expanded=expandedDirs.has(e.path);
-      return `<div class="file-entry" onclick="toggleDir('${esc(e.path)}')"><span><i class="ph ph-caret-${expanded?'down':'right'}"></i></span><span><i class="ph ph-folder${expanded?'-open':''}"></i> ${esc(e.name)}</span></div>${expanded?`<div class="file-children" id="dir-${esc(e.path)}"></div>`:''}`
+      const escPath=esc(e.path);
+      return `<div class="file-entry" role="button" tabindex="0" aria-expanded="${expanded}" onclick="toggleDir('${escPath}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleDir('${escPath}')}"><span aria-hidden="true"><i class="ph ph-caret-${expanded?'down':'right'}"></i></span><span><i class="ph ph-folder${expanded?'-open':''}" aria-hidden="true"></i> ${esc(e.name)}</span></div>${expanded?`<div class="file-children" id="dir-${escPath}"></div>`:''}`
     }
-    return `<div class="file-entry" onclick="readFile('${esc(e.path)}')"><span><i class="ph ph-file"></i></span><span>${esc(e.name)}</span></div>`
+    const escPath=esc(e.path);
+    return `<div class="file-entry" role="button" tabindex="0" onclick="readFile('${escPath}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();readFile('${escPath}')}"><span aria-hidden="true"><i class="ph ph-file"></i></span><span>${esc(e.name)}</span></div>`
   }).join("")
 }
 async function toggleDir(path){
@@ -102,7 +108,7 @@ async function createCron(){if(!currentSession)return;const desc=$("cron-desc").
 async function deleteCron(id){if(!currentSession)return;await apiSafe(`/session/${currentSession}/cron/${encodeURIComponent(id)}`,{method:"DELETE"});await loadCron()}
 
 // --- Memory ---
-async function loadMemory(query){const q=query??$("mem-search")?.value??"";const d=await apiSafe(`/api/memory${q?`?q=${encodeURIComponent(q)}`:""}`);if(!d)return;const{entries}=d;$("memory-list").innerHTML=entries.length?entries.slice(0,15).map(e=>`<div class="kv" style="flex-wrap:wrap"><span style="cursor:pointer" onclick="editMemory('${esc(e.id)}')">${esc(e.title)}</span><span style="display:flex;gap:4px;align-items:center">${(e.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}<button onclick="deleteMemory('${esc(e.id)}')" class="sm">x</button></span></div>`).join(""):'<div class="empty">No entries</div>'}
+async function loadMemory(query){const q=query??$("mem-search")?.value??"";const d=await apiSafe(`/api/memory${q?`?q=${encodeURIComponent(q)}`:""}`);if(!d)return;const{entries}=d;$("memory-list").innerHTML=entries.length?entries.slice(0,15).map(e=>{const id=esc(e.id);const title=esc(e.title);return `<div class="kv" style="flex-wrap:wrap"><span role="button" tabindex="0" style="cursor:pointer" onclick="editMemory('${id}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();editMemory('${id}')}" aria-label="Edit memory entry: ${title}">${title}</span><span style="display:flex;gap:4px;align-items:center">${(e.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}<button onclick="deleteMemory('${id}')" class="sm" aria-label="Delete memory entry: ${title}">x</button></span></div>`}).join(""):'<div class="empty">No entries</div>'}
 async function editMemory(id){const entry=await apiSafe(`/api/memory/${encodeURIComponent(id)}`);if(!entry)return;$("mem-id").value=entry.id;$("mem-title").value=entry.title;$("mem-content").value=entry.content;$("mem-tags").value=(entry.tags||[]).join(", ");const details=$("mem-title").closest("details");if(details)details.open=true}
 function clearMemoryForm(){$("mem-id").value="";$("mem-title").value="";$("mem-content").value="";$("mem-tags").value=""}
 async function saveMemory(){const id=$("mem-id").value;const title=$("mem-title").value.trim();const content=$("mem-content").value.trim();const tags=$("mem-tags").value.split(",").map(t=>t.trim()).filter(Boolean);if(!title||!content)return;let r;if(id){r=await jsonSafe(`/api/memory/${encodeURIComponent(id)}`,{title,content,tags},"PUT")}else{r=await jsonSafe("/api/memory",{title,content,tags})}if(r)toast('Memory saved','success');else toast('Failed to save','error');clearMemoryForm();await loadMemory()}

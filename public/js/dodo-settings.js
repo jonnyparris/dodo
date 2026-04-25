@@ -15,7 +15,10 @@ async function loadIdentity(){
 async function loadPasskeyStatus(){
   try{
     const{initialized}=await api("/api/passkey/status");
-    $("passkey-status").innerHTML=initialized?'<div style="font-size:11px;color:var(--accent)">Passkey configured</div>':'<div style="font-size:11px;color:var(--red)">No passkey set</div>';
+    // Use --text-success / --text-danger which are tuned for WCAG AA on
+    // both light and dark canvas — the raw --accent (brand violet) at 11px
+    // failed Lighthouse contrast on the dark theme (3.78 vs 4.5 required).
+    $("passkey-status").innerHTML=initialized?'<div style="font-size:11px;color:var(--text-success)">Passkey configured</div>':'<div style="font-size:11px;color:var(--text-danger)">No passkey set</div>';
     if(!initialized){$("passkey-init-form").style.display="block";$("secret-add-form").style.display="none"}
     else{$("passkey-init-form").style.display="none";$("secret-add-form").style.display="block"}
   }catch{$("passkey-status").innerHTML=""}
@@ -217,15 +220,17 @@ function renderIntegrations(){
 }
 
 function renderIntegCard(name,description,catalogUrl,config){
+  // --text-success has higher contrast than --accent on the dark canvas
+  // (Lighthouse flagged --accent on 10px text at 3.57 vs 4.5 required).
   const statusHtml=config
-    ?`<span class="integ-status" style="color:var(--accent)">Configured</span>`
-    :`<span class="integ-status" style="color:var(--muted)">Not configured</span>`;
+    ?`<span class="integ-status" style="color:var(--text-success)">Configured</span>`
+    :`<span class="integ-status" style="color:var(--text-subtle)">Not configured</span>`;
   let actionsHtml="";
   if(config){
     const checked=config.enabled?"checked":"";
-    actionsHtml=`<label class="toggle-switch"><input type="checkbox" ${checked} onchange="toggleIntegration('${esc(config.id)}',this.checked)"/><span class="slider"></span></label><button class="sm" onclick="testIntegration('${esc(config.id)}')">Test</button><button class="sm danger" onclick="deleteIntegration('${esc(config.id)}')">x</button>`;
+    actionsHtml=`<label class="toggle-switch" aria-label="Enable ${esc(name)}"><span class="visually-hidden">Enable ${esc(name)}</span><input type="checkbox" ${checked} onchange="toggleIntegration('${esc(config.id)}',this.checked)" aria-label="Enable ${esc(name)}"/><span class="slider" aria-hidden="true"></span></label><button class="sm" onclick="testIntegration('${esc(config.id)}')" aria-label="Test ${esc(name)} connection">Test</button><button class="sm danger" onclick="deleteIntegration('${esc(config.id)}')" aria-label="Delete ${esc(name)} integration">x</button>`;
   }else if(catalogUrl){
-    actionsHtml=`<a href="${esc(catalogUrl)}" target="_blank" style="font-size:11px;color:var(--accent)">Setup guide</a>`;
+    actionsHtml=`<a href="${esc(catalogUrl)}" target="_blank" rel="noopener noreferrer" style="font-size:11px;color:var(--text-link)">Setup guide</a>`;
   }
   return `<div class="integ-card"><div class="integ-name">${esc(name)}</div><div class="integ-desc">${esc(description)}</div>${statusHtml}<div class="integ-actions">${actionsHtml}</div></div>`;
 }
@@ -266,10 +271,12 @@ async function deleteIntegration(id){
 // --- Session Settings ---
 function showSessionSettings(){
   if(!currentSession)return toast("Select a session first","warning");
-  $("settings-overlay").style.display="flex";
+  const o=$("settings-overlay");
+  o.style.display="flex";
+  trapFocus(o);
   loadSharesList();loadPermissionsList();loadBrowserStatus();loadSessionMcpConfigs();
 }
-function hideSessionSettings(){$("settings-overlay").style.display="none"}
+function hideSessionSettings(){const o=$("settings-overlay");releaseFocus(o);o.style.display="none"}
 
 async function createShareLink(){
   if(!currentSession)return;

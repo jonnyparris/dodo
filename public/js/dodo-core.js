@@ -51,7 +51,11 @@ let allSessions=[];
 
 // --- DOM helpers ---
 const $=(id)=>document.getElementById(id);
-const esc=(s)=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+// Escape HTML special characters. The single quote (`'`) escape is required:
+// many call sites interpolate values into single-quoted attributes (e.g.
+// `onclick="foo('${esc(val)}')"`), so without it a value containing `'`
+// could break out of the JS string literal and execute as code.
+const esc=(s)=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 
 // === Theme management ===
 function getTheme(){
@@ -308,8 +312,22 @@ function updateGridColumns(){
   setupHandle('resize-right','--right-w','dodo-right-width','right');
 })();
 
+// === Screen reader live regions (WCAG 4.1.3) ===
+// `polite` for non-urgent updates (chat streaming, toasts).
+// `assertive` for errors and warnings that need immediate attention.
+// Re-set textContent each time so identical sequential messages still
+// announce — screen readers ignore unchanged content.
+function announce(message,urgency='polite'){
+  const el=$(urgency==='assertive'?'aria-live-assertive':'aria-live-polite');
+  if(!el||!message)return;
+  el.textContent='';
+  // requestAnimationFrame so the empty state propagates before we set the
+  // new message — ensures even repeated identical messages re-announce.
+  requestAnimationFrame(()=>{el.textContent=String(message)});
+}
+
 // === Toast notifications ===
-const TOAST_ICONS={success:'<i class="ph ph-check-circle"></i>',error:'<i class="ph ph-x-circle"></i>',warning:'<i class="ph ph-warning"></i>',info:'<i class="ph ph-info"></i>',default:''};
+const TOAST_ICONS={success:'<i class="ph ph-check-circle" aria-hidden="true"></i>',error:'<i class="ph ph-x-circle" aria-hidden="true"></i>',warning:'<i class="ph ph-warning" aria-hidden="true"></i>',info:'<i class="ph ph-info" aria-hidden="true"></i>',default:''};
 function toast(titleOrMsg,type='default',duration=3500){
   const container=$('toast-container');
   const el=document.createElement('div');
@@ -322,6 +340,10 @@ function toast(titleOrMsg,type='default',duration=3500){
     <div class="toast-body">${title?`<div class="toast-title">${esc(title)}</div>`:''}${desc?`<div class="toast-desc">${esc(desc)}</div>`:''}</div>
     <button class="toast-close" onclick="this.parentElement.remove()" aria-label="Dismiss">&times;</button>`;
   container.appendChild(el);
+  // Mirror the toast into a screen-reader live region. Errors/warnings go
+  // assertive; everything else goes polite.
+  const announceText=desc?`${title}: ${desc}`:title;
+  announce(announceText,(type==='error'||type==='warning')?'assertive':'polite');
   setTimeout(()=>{el.classList.add('fade-out');setTimeout(()=>el.remove(),200)},duration);
 }
 
@@ -329,11 +351,18 @@ function toast(titleOrMsg,type='default',duration=3500){
 function appConfirm(message,{confirmText='Delete',cancelText='Cancel',danger=true}={}){
   return new Promise(resolve=>{
     const overlay=document.createElement('div');overlay.className='confirm-overlay';
-    overlay.innerHTML=`<div class="confirm-card"><p>${esc(message)}</p><div class="confirm-actions"><button class="ghost" id="confirm-cancel">${esc(cancelText)}</button><button class="${danger?'danger':'primary'}" id="confirm-ok">${esc(confirmText)}</button></div></div>`;
+    overlay.setAttribute('role','alertdialog');
+    overlay.setAttribute('aria-modal','true');
+    overlay.setAttribute('aria-labelledby','confirm-message');
+    overlay.innerHTML=`<div class="confirm-card"><p id="confirm-message">${esc(message)}</p><div class="confirm-actions"><button class="ghost" id="confirm-cancel">${esc(cancelText)}</button><button class="${danger?'danger':'primary'}" id="confirm-ok">${esc(confirmText)}</button></div></div>`;
     document.body.appendChild(overlay);
-    overlay.querySelector('#confirm-ok').onclick=()=>{overlay.remove();resolve(true)};
-    overlay.querySelector('#confirm-cancel').onclick=()=>{overlay.remove();resolve(false)};
-    overlay.addEventListener('click',(e)=>{if(e.target===overlay){overlay.remove();resolve(false)}});
+    const finish=(value)=>{releaseFocus(overlay);overlay.remove();resolve(value)};
+    overlay.querySelector('#confirm-ok').onclick=()=>finish(true);
+    overlay.querySelector('#confirm-cancel').onclick=()=>finish(false);
+    overlay.addEventListener('click',(e)=>{if(e.target===overlay)finish(false)});
+    trapFocus(overlay);
+    // After trapFocus, override default first-element focus to the confirm
+    // button — matches the previous behaviour.
     overlay.querySelector('#confirm-ok').focus();
   });
 }
@@ -343,9 +372,58 @@ async function showConfirm(message,onConfirm,{confirmText='Confirm',danger=false
   if(ok&&onConfirm)await onConfirm();
 }
 
+// === Modal focus management (WCAG 2.4.3, 2.1.2) ===
+// Tracks the element that had focus before a modal opened so we can restore
+// it when the modal closes. Also installs a Tab-key handler that traps focus
+// inside the modal while it's open.
+//
+// Usage:
+//   trapFocus(overlayEl)   -> call after making the overlay visible
+//   releaseFocus(overlayEl) -> call before hiding
+const _focusTraps=new WeakMap();
+function _focusableIn(root){
+  return Array.from(root.querySelectorAll(
+    'a[href],button:not([disabled]),input:not([disabled]):not([type="hidden"]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+  )).filter(el=>el.offsetParent!==null);
+}
+function trapFocus(overlay){
+  if(!overlay||_focusTraps.has(overlay))return;
+  const previouslyFocused=document.activeElement;
+  const handler=(e)=>{
+    if(e.key==='Escape'){
+      // Let the consumer handle the close — most overlays already wire their
+      // own click-on-backdrop close. We only intervene to kick focus.
+      const closer=overlay.querySelector('[data-modal-close],.sm,.ghost');
+      if(closer&&typeof closer.click==='function')closer.click();
+      return;
+    }
+    if(e.key!=='Tab')return;
+    const items=_focusableIn(overlay);
+    if(!items.length)return;
+    const first=items[0],last=items[items.length-1];
+    if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}
+    else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
+  };
+  overlay.addEventListener('keydown',handler);
+  _focusTraps.set(overlay,{handler,previouslyFocused});
+  // Move focus into the modal so screen readers announce its label.
+  const items=_focusableIn(overlay);
+  if(items.length)items[0].focus();
+}
+function releaseFocus(overlay){
+  if(!overlay)return;
+  const trap=_focusTraps.get(overlay);
+  if(!trap)return;
+  overlay.removeEventListener('keydown',trap.handler);
+  _focusTraps.delete(overlay);
+  if(trap.previouslyFocused&&typeof trap.previouslyFocused.focus==='function'){
+    try{trap.previouslyFocused.focus()}catch{}
+  }
+}
+
 // --- Help overlay ---
-function showHelp(){$('help-overlay').style.display='flex'}
-function hideHelp(){$('help-overlay').style.display='none'}
+function showHelp(){const o=$('help-overlay');o.style.display='flex';trapFocus(o)}
+function hideHelp(){const o=$('help-overlay');releaseFocus(o);o.style.display='none'}
 
 // --- Processing state ---
 let sseActivityTimer=null;
