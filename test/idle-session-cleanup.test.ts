@@ -53,7 +53,7 @@ async function backdateSession(sessionId: string, secondsAgo: number): Promise<v
 
 async function getSessionStatus(sessionId: string): Promise<string | null> {
   const stub = getUserControlStub();
-  const result = await runInDurableObject<string | null, import("../src/user-control").UserControl>(
+  const result = await runInDurableObject<import("../src/user-control").UserControl, string | null>(
     stub,
     async (_, state) => {
       const row = state.storage.sql.exec(
@@ -112,7 +112,7 @@ describe("Idle session auto-cleanup", () => {
   it("arms the alarm on session creation so the sweep will run", async () => {
     await createSession();
     const stub = getUserControlStub();
-    const alarmAt = await runInDurableObject<number | null, import("../src/user-control").UserControl>(
+    const alarmAt = await runInDurableObject<import("../src/user-control").UserControl, number | null>(
       stub,
       async (_, state) => await state.storage.getAlarm(),
     );
