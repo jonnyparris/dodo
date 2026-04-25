@@ -5304,6 +5304,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * via fetch+checkout when `_artifactsFsCache.dirty` is true.
    */
   private _artifactsFsCache: ArtifactsFsCache | null = null;
+  /**
+   * Set true the first time a flush succeeds. Until then,
+   * getArtifactsFsCache short-circuits to null without consulting the
+   * artifacts binding or attempting a clone — the remote repo has no
+   * commits yet, so any clone would fail and fall through to the
+   * workspace anyway.
+   */
+  private _artifactsHasFlushed: boolean = false;
 
   private sessionId(): string {
     return this.readMetadata("session_id") ?? "";
@@ -5356,15 +5364,19 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
-   * Lazily get (or refresh) the in-DO clone of the artifacts repo. The
-   * cache is created on first call after a flush has landed; subsequent
-   * calls reuse it unless `markArtifactsFsDirty()` was called in
-   * between.
+   * Lazily get (or refresh) the in-DO clone of the artifacts repo.
    *
-   * Returns null when artifacts isn't reachable or the clone failed —
-   * callers must fall back to the workspace shell.
+   * Gated on `_artifactsHasFlushed`: until at least one flush has
+   * succeeded for this session, we know the remote has no commits
+   * and any clone attempt will fail. Returning null early avoids the
+   * wasted HTTP round-trip and the failure log noise.
+   *
+   * Returns null when artifacts isn't reachable, the gate is closed,
+   * or the clone failed — callers must fall back to the workspace
+   * shell.
    */
   async getArtifactsFsCache(): Promise<ArtifactsFsCache | null> {
+    if (!this._artifactsHasFlushed) return null;
     const ctx = await this.getOrCreateArtifactsContext().catch(() => null);
     if (!ctx) return null;
     const refreshed = await refreshArtifactsFs({
@@ -5379,10 +5391,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
-   * Called by the flush hook after a successful push. Marks the cache
-   * dirty so the next read pulls the new tip. Cheap — flips a bool.
+   * Called by the flush hook after a successful push. Two effects:
+   *   1. Lifts the first-flush gate so subsequent reads can populate
+   *      the cache.
+   *   2. Marks any existing cache dirty so the next read fetches the
+   *      new tip.
+   * Cheap — flips two bools.
    */
   markArtifactsFsDirty(): void {
+    this._artifactsHasFlushed = true;
     if (this._artifactsFsCache) {
       this._artifactsFsCache.dirty = true;
     }

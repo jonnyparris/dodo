@@ -146,4 +146,33 @@ describe("GET /session/:id/files fast-path fallback", () => {
     const body = (await response.json()) as { entries: unknown[] };
     expect(Array.isArray(body.entries)).toBe(true);
   });
+
+  it("getArtifactsFsCache returns null on a fresh agent (no flush yet)", async () => {
+    // F1: gate cache attempts on a first-flush flag. Without the
+    // gate, every /files request before the first successful flush
+    // attempts a git.clone over HTTP that fails (empty repo with no
+    // main branch). With the gate, getArtifactsFsCache returns null
+    // immediately and the route falls back to the workspace shell
+    // without any network work.
+    //
+    // We assert the negative case here: a fresh agent that has never
+    // seen a flush returns null from getArtifactsFsCache.
+    const sessionId = await createSession();
+    const ns = (env as Env).CODING_AGENT;
+    const agent = await ns.get(ns.idFromName(sessionId));
+    const api = agent as unknown as {
+      getArtifactsFsCache: () => Promise<unknown>;
+    };
+
+    // Fresh agent, no flush has been signalled → cache must be null.
+    const cache = await api.getArtifactsFsCache();
+    expect(cache).toBeNull();
+
+    // Belt-and-braces: the artifacts binding must not have been
+    // consulted either. Confirms we short-circuited before the
+    // clone attempt that the audit flagged.
+    const artifacts = (env as unknown as { ARTIFACTS: { create: ReturnType<typeof vi.fn>; get: ReturnType<typeof vi.fn> } }).ARTIFACTS;
+    expect(artifacts.create).not.toHaveBeenCalled();
+    expect(artifacts.get).not.toHaveBeenCalled();
+  });
 });
