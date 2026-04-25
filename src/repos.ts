@@ -24,7 +24,7 @@ export function listKnownRepos(): KnownRepo[] {
   return Object.values(KNOWN_REPOS);
 }
 
-export function isKnownRepoId(value: string): value is KnownRepoId {
+function isKnownRepoId(value: string): value is KnownRepoId {
   return Object.prototype.hasOwnProperty.call(KNOWN_REPOS, value);
 }
 

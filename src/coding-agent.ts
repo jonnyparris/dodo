@@ -362,7 +362,7 @@ function buildProviderFromConfig(config: DodoConfig, env: Env): LanguageModel {
  * Thrown when a caller references a facet name that has no run history
  * on this session. Maps to HTTP 404 at the request boundary.
  */
-export class FacetNotFoundError extends Error {
+class FacetNotFoundError extends Error {
   constructor(public readonly facetName: string) {
     super(`facet not found: ${facetName}`);
     this.name = "FacetNotFoundError";

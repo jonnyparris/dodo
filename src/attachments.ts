@@ -240,7 +240,7 @@ function decodeBase64(base64: string): Uint8Array {
   return bytes;
 }
 
-export interface UploadAttachmentInput {
+interface UploadAttachmentInput {
   sessionId: string;
   messageId: string;
   mediaType: string;

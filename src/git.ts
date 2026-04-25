@@ -62,7 +62,7 @@ function chooseTokenForUrl(url: string, env: Env): string | undefined {
   return undefined;
 }
 
-export interface RemoteBranchVerification {
+interface RemoteBranchVerification {
   aheadBy: number;
   baseRef: string;
   branch: string;

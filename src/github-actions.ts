@@ -13,12 +13,12 @@ import { getUserControlStub } from "./auth";
  * on every dispatched PR.
  */
 
-export interface VerifyTriggerResult {
+interface VerifyTriggerResult {
   runId: string;
   htmlUrl: string;
 }
 
-export interface VerifyPollResult {
+interface VerifyPollResult {
   conclusion: "success" | "failure" | "cancelled" | "timed_out" | "action_required" | "neutral" | "skipped" | "stale" | "startup_failure";
   htmlUrl: string;
   /** ISO timestamp of when the workflow run finished. */

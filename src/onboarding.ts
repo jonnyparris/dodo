@@ -1,4 +1,4 @@
-export type OnboardingStep = "welcome" | "gateway" | "passkey" | "secrets" | "memory" | "integrations" | "complete";
+type OnboardingStep = "welcome" | "gateway" | "passkey" | "secrets" | "memory" | "integrations" | "complete";
 
 export interface OnboardingState {
   currentStep: OnboardingStep;
