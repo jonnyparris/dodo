@@ -91,6 +91,18 @@ interface BuildToolsOptions {
       tokenOutput: number;
       scratchWrites?: string[];
     }>;
+    /**
+     * Resolve a skill by name and return the on-demand rendering used by
+     * the `skill` tool. Returns null when no skill matches — the tool then
+     * surfaces an error with the available names so the model can retry.
+     */
+    renderSkillForTool?: (name: string) => string | null;
+    /**
+     * List the skills the parent has currently warmed (name + source).
+     * Used by the `skill` tool's not-found branch so the error message
+     * can suggest what's actually available right now.
+     */
+    listSkillNames?: () => Array<{ name: string; source: "personal" | "workspace" | "builtin" }>;
   };
 }
 
@@ -1138,6 +1150,45 @@ export function resolveSubagentModel(
  * subagent; `task` is a general-purpose delegate with a tighter time budget
  * per call but more steps.
  */
+/**
+ * Build the `skill` tool — on-demand loader for the second stage of the
+ * progressive-disclosure skill model. The system prompt's `<available_skills>`
+ * block lists name + description for every enabled skill; this tool returns
+ * the full SKILL.md body when the model decides one matches the task.
+ *
+ * Implementation lives in coding-agent.ts (so the warmed cache is local).
+ * This tool is a thin shim that calls `parent.renderSkillForTool(name)`.
+ *
+ * Token cost: ~80 tokens for the tool definition. Per-load: 500-2000 tokens
+ * depending on body size. Bundled files (references/, scripts/) are listed
+ * by relative path but never auto-loaded — the model uses `read` to fetch.
+ */
+function buildSkillTool(parent: NonNullable<BuildToolsOptions["parentAgent"]>): AnyTool {
+  return tool({
+    description: [
+      "Load a skill by name. Skills are listed in <available_skills> in the system prompt.",
+      "Returns the full SKILL.md body and a list of bundled files. Use the `read` tool to",
+      "fetch any bundled files you need — they are NOT auto-loaded.",
+    ].join(" "),
+    inputSchema: z.object({
+      name: z.string().min(1).describe("Exact skill name from the <available_skills> manifest."),
+    }),
+    execute: async ({ name }: { name: string }) => {
+      const render = parent.renderSkillForTool;
+      if (!render) {
+        return "skill tool unavailable — parent agent missing renderSkillForTool. This is a bug.";
+      }
+      const out = render(name);
+      if (out) return out;
+      const list = parent.listSkillNames?.() ?? [];
+      const available = list.length === 0
+        ? "(no skills currently loaded)"
+        : list.map((s) => `${s.name} (${s.source})`).join(", ");
+      return `Skill "${name}" not found. Available: ${available}`;
+    },
+  });
+}
+
 function buildSubagentTool(spec: {
   name: string;
   description: string;
@@ -1796,6 +1847,14 @@ function buildTools(
   // delegated to a fresh context window. When `config.taskMode === "facet"`,
   // delegates to a TaskAgent facet DO and unlocks scratch-workspace mode.
   tools.task = buildTaskTool(workspace, config, env, options?.parentAgent);
+
+  // Skill tool — loads a SKILL.md body on demand. The <available_skills>
+  // manifest in the system prompt lists name + description per skill;
+  // this tool returns the full body when the model picks one. Two-stage
+  // progressive disclosure mirrors Claude Code / OpenCode.
+  if (options?.parentAgent?.renderSkillForTool) {
+    tools.skill = buildSkillTool(options.parentAgent);
+  }
 
   // Todo tools — durable checklist backed by per-session SQLite. Helps the
   // model stay oriented across long multi-step tasks and compactions.

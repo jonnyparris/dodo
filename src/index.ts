@@ -714,6 +714,52 @@ app.delete("/api/memory/:id", async (c) => {
   return proxyToUserControl(c.env, email, `/memory/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" });
 });
 
+// ─── Skills (per-user SKILL.md store) ───
+
+app.get("/api/skills", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills${new URL(c.req.raw.url).search}`);
+});
+
+app.post("/api/skills", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/skills", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.get("/api/skills/:name", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills/${encodeURIComponent(c.req.param("name"))}`);
+});
+
+app.put("/api/skills/:name", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills/${encodeURIComponent(c.req.param("name"))}`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.put("/api/skills/:name/enabled", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills/${encodeURIComponent(c.req.param("name"))}/enabled`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/skills/:name", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills/${encodeURIComponent(c.req.param("name"))}`, {
+    method: "DELETE",
+  });
+});
+
 // ─── Models (global via SharedIndex) ───
 
 app.get("/api/models", async (c) => proxyToSharedIndex(c.env, `/models${new URL(c.req.raw.url).search}`));

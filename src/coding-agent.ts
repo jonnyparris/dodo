@@ -15,6 +15,15 @@ import { log } from "./logger";
 import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { sendNotification } from "./notify";
 import { runSandboxedCode } from "./executor";
+import {
+  createPersonalSkillClient,
+  mergeSkills,
+  renderManifest as renderSkillManifest,
+  renderSkillContent,
+  scanWorkspaceSkills,
+  type Skill,
+} from "./skill-registry";
+import { listBuiltinSkills } from "./builtin-skills";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
@@ -426,6 +435,19 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   private _projectInstructions: string | null = null;
   /**
+   * Cached skill set (personal + workspace + builtin) merged into one
+   * deduplicated list. Warmed by `warmSkills()` before each turn so
+   * `getSystemPrompt()` and the `skill` tool can read synchronously.
+   *
+   * Personal skills come from UserControl DO (per-user). Workspace skills
+   * are scanned from the cloned repo's `.claude/skills/`, `.opencode/skill/`
+   * etc. directories. Built-in skills ship with Dodo. Last write wins by
+   * source precedence: personal > workspace > builtin.
+   */
+  private _skills: Skill[] | null = null;
+  /** Pre-rendered `<available_skills>` block — recomputed when `_skills` changes. */
+  private _skillManifest: string | null = null;
+  /**
    * Per-tool-call attachment references captured during streaming. Populated
    * by the `onToolAttachments` callback threaded into `buildToolsForThink`.
    * Cleared per chat turn in `runThinkChat` so attachments from one prompt
@@ -462,6 +484,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   override getSystemPrompt(): string {
     let prompt = SYSTEM_PROMPT;
+
+    // Skill manifest — name + description per available skill. Bodies are
+    // not included; the model loads them on demand via the `skill` tool.
+    // Warmed by `warmSkills()` in onChatMessage before this call.
+    if (this._skillManifest) {
+      prompt = `${prompt}\n\n${this._skillManifest}`;
+    }
 
     // Conditionally include browser tools section
     const browserEnabled = this.readMetadata("browser_enabled") === "true";
@@ -594,6 +623,80 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
+   * Warm the skill registry. Loads personal skills from UserControl,
+   * scans the workspace for SKILL.md files, and merges built-in skills.
+   * Caches the merged list and the rendered manifest on this instance so
+   * `getSystemPrompt()` can read them synchronously.
+   *
+   * Called from `onChatMessage()` before each turn. Cheap on the warm path —
+   * the personal-skill HTTP fetch is the only network hop and skips on miss.
+   * If everything fails the session continues with no skills (degrade gracefully,
+   * never block the chat turn).
+   */
+  private async warmSkills(): Promise<void> {
+    const ownerEmail = this.readMetadata("owner_email");
+    const personal: Skill[] = [];
+    if (ownerEmail) {
+      try {
+        const stub = getUserControlStub(this.env, ownerEmail);
+        const client = createPersonalSkillClient(stub);
+        const list = await client.list();
+        personal.push(...list);
+      } catch (error) {
+        log("warn", "skills-personal-load-failed", {
+          sessionId: this.sessionId(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    let workspace: Skill[] = [];
+    try {
+      workspace = await scanWorkspaceSkills(this.workspace);
+    } catch (error) {
+      log("warn", "skills-workspace-scan-failed", {
+        sessionId: this.sessionId(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    const builtin = listBuiltinSkills();
+
+    const merged = mergeSkills(personal, workspace, builtin);
+    this._skills = merged;
+    this._skillManifest = renderSkillManifest(merged) || null;
+    log("info", "skills-warmed", {
+      sessionId: this.sessionId(),
+      personal: personal.length,
+      workspace: workspace.length,
+      builtin: builtin.length,
+      merged: merged.length,
+    });
+  }
+
+  /**
+   * Resolve a skill by name from the warmed cache. Used by the `skill`
+   * tool to render full content on demand.
+   */
+  getSkillByName(name: string): Skill | null {
+    if (!this._skills) return null;
+    return this._skills.find((s) => s.name === name) ?? null;
+  }
+
+  /** Render the on-demand `skill` tool output for a given skill name. */
+  renderSkillForTool(name: string): string | null {
+    const skill = this.getSkillByName(name);
+    if (!skill) return null;
+    return renderSkillContent(skill);
+  }
+
+  /** List the warmed skills' name + source pairs (used by the skill tool's not-found branch). */
+  listSkillNames(): Array<{ name: string; source: "personal" | "workspace" | "builtin" }> {
+    if (!this._skills) return [];
+    return this._skills.map((s) => ({ name: s.name, source: s.source }));
+  }
+
+  /**
    * Build a bounded workspace summary — shallow root listing only.
    * Returns null if the workspace is empty. Capped at ~40 entries
    * to prevent bloating the system prompt on large repos.
@@ -696,6 +799,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Warm project instructions (AGENTS.md / CLAUDE.md) before getSystemPrompt()
     // reads them. Idempotent — only loads once per session.
     await this.warmProjectInstructions();
+
+    // Warm the skill registry — populates the manifest read by getSystemPrompt()
+    // and the cache used by the `skill` tool. Refreshed every turn so newly
+    // created/imported skills become visible without restarting the session.
+    await this.warmSkills();
 
     const baseTools = this.getTools();
     const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;

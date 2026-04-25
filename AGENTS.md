@@ -77,7 +77,9 @@ In the Dodo-session case, worktrees solve a problem that doesn't exist — there
 - `src/coding-agent.ts` — per-session agent DO (extends Think, chat via Think.chat(), fibers, workspace, git, cron, prompts, snapshots, SSE). **Contains the system prompt.**
 - `src/think-adapter.ts` — Think integration boundary: re-exports, types (DodoConfig, MessageMetadata, SnapshotV2), adapter functions
 - `src/agentic.ts` — LLM provider construction (buildProvider), tool composition (buildToolsForThink), git tools
-- `src/user-control.ts` — per-user DO (config, sessions, memory, tasks, key envelope, encrypted secrets, fork snapshots)
+- `src/user-control.ts` — per-user DO (config, sessions, memory, tasks, skills, key envelope, encrypted secrets, fork snapshots)
+- `src/skill-registry.ts` — Claude/OpenCode-compatible SKILL.md loader (parser, manifest renderer, workspace scanner, R2 asset helpers)
+- `src/builtin-skills.ts` — built-in SKILL.md content shipped with Dodo
 - `src/shared-index.ts` — global singleton DO (user allowlist, host allowlist, models cache, session shares/permissions)
 - `src/executor.ts` — DynamicWorkerExecutor wrapper for sandboxed code execution (direct API route)
 - `src/git.ts` — git helpers via @cloudflare/shell, multi-host token injection (GitHub + GitLab)
@@ -190,4 +192,35 @@ These tools are available to the agent at runtime (built in `src/agentic.ts`):
 **Code execution** (from `@cloudflare/think/tools/execute`):
 - `codemode` — sandboxed JS execution with workspace filesystem and git access, gated outbound fetch
 
+**Skill loader** (`src/skill-registry.ts`):
+- `skill` — load a SKILL.md body on demand. The system prompt's `<available_skills>` block lists name + description per skill; this tool returns the full body when the model picks one. Two-stage progressive disclosure mirrors Claude Code / OpenCode.
+
 All tools are registered as top-level tools. Codemode also has access to workspace and git tools internally as providers.
+
+---
+
+## Skills
+
+Dodo supports SKILL.md files compatible with both Claude Code and OpenCode. Three sources merged into one deduplicated list (precedence: personal > workspace > builtin):
+
+1. **Personal** — per-user, stored in UserControl DO SQLite. Created via the `skill_write` MCP tool or `POST /api/skills`. Bundled assets live in R2 under `skills/{userId}/{skillName}/...`.
+2. **Workspace** — scanned from the cloned repo's `.dodo/skills/`, `.claude/skills/`, `.agents/skills/`, `.opencode/skill/`, `.opencode/skills/` directories. Read-only — promote to personal to edit.
+3. **Builtin** — shipped with Dodo via `src/builtin-skills.ts`.
+
+### Loading model
+
+Two-stage progressive disclosure (matches Claude Code / OpenCode):
+
+- **Session start:** `getSystemPrompt()` injects `<available_skills>` with name + description per enabled skill (~150 tokens each, capped at 4 KB total).
+- **On demand:** the `skill` tool returns the full SKILL.md body and a sampled list of bundled file paths. Bundled files are NOT auto-loaded — the model uses `read` to fetch.
+
+### MCP tools
+
+- `skill_list` — list personal skills
+- `skill_read` — get full body of a personal skill
+- `skill_write` — create/update a personal skill
+- `skill_enable` — toggle enabled flag
+- `skill_delete` — remove a personal skill
+- `skill_import_url` — fetch a SKILL.md from a URL and store it as personal
+
+Workspace and built-in skills are visible from inside the chat (via the `skill` tool) but cannot be modified through the MCP CRUD surface. To edit a workspace skill, copy its body into a personal skill via `skill_write`.

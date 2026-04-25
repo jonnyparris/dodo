@@ -1228,6 +1228,104 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     }),
   );
 
+  // --- Skill tools (per-user) ---
+  // Personal SKILL.md store. Skills loaded by Dodo via two-stage progressive
+  // disclosure (manifest in system prompt → full body via the `skill` tool).
+
+  server.tool("skill_list", "List Dodo skills (personal layer only — workspace + builtin skills are visible from inside the chat).", {
+    enabledOnly: z.boolean().optional().describe("If true, only enabled skills are returned"),
+  }, async ({ enabledOnly }) =>
+    jsonFetch(env, "user", `/skills${enabledOnly ? "?enabled=true" : ""}`),
+  );
+
+  server.tool("skill_read", "Get the full SKILL.md body of a personal skill by name.", {
+    name: z.string().describe("Skill name"),
+  }, async ({ name }) =>
+    jsonFetch(env, "user", `/skills/${encodeURIComponent(name)}`),
+  );
+
+  server.tool("skill_write", "Create or overwrite a personal SKILL.md skill. Body should be the markdown after the YAML frontmatter — frontmatter fields go in their own params. Skills with the same name are replaced; pass enabled:false to write a draft without surfacing it to the agent.", {
+    name: z.string().describe("Skill name (lowercase letters, digits, hyphens, underscores; max 64 chars)"),
+    description: z.string().describe("One-sentence description that says WHAT the skill does and WHEN to use it. Max 1024 chars. This is the only thing the model sees at startup — write it like a tool description."),
+    body: z.string().describe("Full SKILL.md body (markdown, no frontmatter)"),
+    enabled: z.boolean().optional().describe("Default true — set false to save a draft without enabling"),
+    sourceUrl: z.string().url().optional().describe("Optional URL the skill was imported from"),
+  }, async ({ name, description, body, enabled, sourceUrl }) =>
+    jsonFetch(env, "user", "/skills", {
+      init: {
+        body: JSON.stringify({
+          name,
+          description,
+          body,
+          enabled: enabled ?? true,
+          sourceOrigin: sourceUrl ? "url-import" : "manual",
+          sourceUrl,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      },
+    }),
+  );
+
+  server.tool("skill_enable", "Enable or disable a personal skill. Disabled skills don't appear in the manifest but stay in storage.", {
+    name: z.string().describe("Skill name"),
+    enabled: z.boolean().describe("true to enable, false to disable"),
+  }, async ({ name, enabled }) =>
+    jsonFetch(env, "user", `/skills/${encodeURIComponent(name)}/enabled`, {
+      init: { body: JSON.stringify({ enabled }), headers: { "content-type": "application/json" }, method: "PUT" },
+    }),
+  );
+
+  server.tool("skill_delete", "Delete a personal skill. Workspace and built-in skills cannot be deleted via this tool.", {
+    name: z.string().describe("Skill name"),
+  }, async ({ name }) =>
+    jsonFetch(env, "user", `/skills/${encodeURIComponent(name)}`, {
+      init: { method: "DELETE" },
+    }),
+  );
+
+  server.tool("skill_import_url", "Import a SKILL.md from a URL (raw markdown). Parses the frontmatter, validates name + description, and stores it as a personal skill. Use for pulling skills from github raw URLs or skill-pack hosts.", {
+    url: z.string().url().describe("URL to a raw SKILL.md file"),
+    enabled: z.boolean().optional().describe("Default true — set false to save as a draft"),
+  }, async ({ url, enabled }) => {
+    // Fetch raw content with a tight timeout. The OUTBOUND allowlist applies
+    // upstream — this fetch goes through the platform's default outbound.
+    let raw: string;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) {
+        return errorResult({ error: `Fetch failed: HTTP ${res.status} ${res.statusText}` });
+      }
+      raw = await res.text();
+    } catch (err) {
+      return errorResult({ error: `Fetch failed: ${err instanceof Error ? err.message : String(err)}` });
+    }
+    if (raw.length > 200_000) {
+      return errorResult({ error: `SKILL.md too large (${raw.length} bytes). Max 200KB.` });
+    }
+    let parsed: { name: string; description: string; body: string };
+    try {
+      const { parseSkillFile, normalizeFrontmatter } = await import("./skill-registry");
+      const { frontmatter, body } = parseSkillFile(raw);
+      const norm = normalizeFrontmatter(frontmatter, body);
+      parsed = { name: norm.name, description: norm.description, body: norm.body };
+    } catch (err) {
+      return errorResult({ error: `Parse failed: ${err instanceof Error ? err.message : String(err)}` });
+    }
+    return jsonFetch(env, "user", "/skills", {
+      init: {
+        body: JSON.stringify({
+          ...parsed,
+          enabled: enabled ?? true,
+          sourceOrigin: "url-import",
+          sourceUrl: url,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      },
+    });
+  });
+
   // --- Config tools (per-user) ---
 
   server.tool("get_config", "Get Dodo's current LLM and git configuration", {}, async () =>
