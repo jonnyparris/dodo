@@ -109,8 +109,31 @@ async function saveMemory(){const id=$("mem-id").value;const title=$("mem-title"
 async function deleteMemory(id){await apiSafe(`/api/memory/${encodeURIComponent(id)}`,{method:"DELETE"});await loadMemory()}
 
 // --- Git ---
+// Render the "Clone this session's repo" affordance in the Git panel.
+// Fetches /session/{id}/artifacts (which returns a short-lived
+// authenticated clone URL). Cached for the life of the panel render so
+// we don't mint a fresh token on every refreshGit() tick.
+async function refreshArtifactsClone(){
+  const el=$("artifacts-clone");if(!el||!currentSession)return;
+  const d=await apiSafe(`/session/${currentSession}/artifacts`);
+  if(!d||!d.cloneUrl){el.innerHTML="";return}
+  // Mask the token in the visible URL but keep the full one for copy.
+  const masked=d.cloneUrl.replace(/:([^@/]+)@/,":***@");
+  el.innerHTML=`<details><summary style="font-size:12px;font-weight:600;cursor:pointer">Clone this session</summary>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:6px">
+      <code style="flex:1;font-size:11px;background:var(--code-bg);color:var(--code-text);padding:6px 8px;border-radius:4px;overflow:auto;white-space:nowrap">${esc(masked)}</code>
+      <button class="sm" onclick="copyCloneUrl(this,'${esc(d.cloneUrl)}')">Copy</button>
+    </div>
+    <p style="font-size:10px;color:var(--muted);margin-top:4px">Token expires in ${Math.round((d.tokenTtlSeconds||3600)/60)} min. Refresh this panel to mint a new one.</p>
+  </details>`;
+}
+function copyCloneUrl(btn,url){
+  navigator.clipboard.writeText(url).then(()=>{const t=btn.textContent;btn.textContent='Copied!';setTimeout(()=>{btn.textContent=t},1500)})
+}
 async function refreshGit(){
-  if(!currentSession){$("git-status-display").innerHTML="";$("git-log-display").innerHTML="";return}
+  if(!currentSession){$("git-status-display").innerHTML="";$("git-log-display").innerHTML="";const ac=$("artifacts-clone");if(ac)ac.innerHTML="";return}
+  // Fire-and-forget — clone URL render is independent of git status.
+  refreshArtifactsClone().catch(()=>{});
   try{
     const{entries}=await api(`/session/${currentSession}/git/status`);
     // Filter out false "untracked" files: after clone, isomorphic-git's statusMatrix

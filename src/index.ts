@@ -1804,6 +1804,16 @@ app.get("/session/:id/files", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/files${new URL(c.req.raw.url).search}`);
 });
 
+app.get("/session/:id/artifacts", async (c) => {
+  // Returns the per-session Artifacts repo metadata + a short-lived
+  // authenticated clone URL. Readonly because the caller is just
+  // viewing/cloning their own session repo. Same scope gate as the
+  // existing get_artifacts_remote MCP tool.
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/artifacts");
+});
+
 app.get("/session/:id/file", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;
