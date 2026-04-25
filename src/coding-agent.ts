@@ -5217,10 +5217,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.clients.set(writer, Promise.resolve());
     this.setState({ ...this.readSessionDetails() });
 
-    void this.writeEvent(writer, { data: this.readSessionDetails(), type: "ready" });
+    // Catches required: if the client disconnects before the first writes
+    // resolve, the readable side tears down and writer.write() rejects with
+    // "The readable side of this TransformStream is no longer readable".
+    // Without a handler that surfaces as an unhandled rejection in tests.
+    void this.writeEvent(writer, { data: this.readSessionDetails(), type: "ready" })
+      .catch(() => {
+        this.clients.delete(writer);
+      });
     // Replay current todos so a freshly-connected client is hydrated without
     // needing a separate fetch round-trip.
-    void this.writeEvent(writer, { data: { items: this.listTodos() }, type: "todos" });
+    void this.writeEvent(writer, { data: { items: this.listTodos() }, type: "todos" })
+      .catch(() => {
+        this.clients.delete(writer);
+      });
 
     // Periodic heartbeat. Cloudflare and intermediate proxies drop idle
     // SSE connections after ~100s — without a heartbeat, long-idle
@@ -5241,7 +5251,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       () => {
         clearInterval(heartbeatHandle);
         this.clients.delete(writer);
-        try { void writer.close(); } catch { /* stream may already be closed */ }
+        // close() returns a promise that can reject async — must use .catch()
+        // not try/catch (which only catches sync throws).
+        void writer.close().catch(() => { /* stream may already be closed */ });
         this.setState({ ...this.readSessionDetails() });
       },
       { once: true },

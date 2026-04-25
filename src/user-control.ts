@@ -3165,14 +3165,22 @@ export class UserControl extends DurableObject<Env> {
     const writer = stream.writable.getWriter();
     this.sseClients.set(writer, Promise.resolve());
 
-    // Send initial ready event with session count
-    void this.writeUserEvent(writer, { type: "ready", sessionCount: this.listSessions().length });
+    // Send initial ready event with session count.
+    // The .catch() is required: if the client disconnects before the first
+    // write resolves, the readable side is torn down and writer.write() rejects
+    // with "The readable side of this TransformStream is no longer readable".
+    // Without a handler that surfaces as an unhandled rejection in tests.
+    void this.writeUserEvent(writer, { type: "ready", sessionCount: this.listSessions().length })
+      .catch(() => {
+        this.sseClients.delete(writer);
+      });
 
     request.signal.addEventListener(
       "abort",
       () => {
         this.sseClients.delete(writer);
-        try { void writer.close(); } catch { /* stream may already be closed */ }
+        // close() can also reject if the readable side is already gone — swallow.
+        void writer.close().catch(() => { /* stream may already be closed */ });
       },
       { once: true },
     );
