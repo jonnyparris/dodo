@@ -36,7 +36,7 @@ import {
   chatRecordToUIMessage,
 } from "./think-adapter";
 import type { SnapshotV2 } from "./think-adapter";
-import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, TodoPriority, TodoStatus, TodoStore, WorkspaceEntry } from "./types";
+import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, TodoItem, TodoPriority, TodoStatus, TodoStore, WorkspaceEntry } from "./types";
 import { FALLBACK_MODELS, WORKERS_AI_MODELS, FLUX_IMAGE_MODEL, FLUX_IMAGE_MEDIA_TYPE, FLUX_MAX_PROMPT_LENGTH, extractGeneratePrompt } from "./shared-index";
 
 /**
@@ -2147,6 +2147,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return Response.json({ prompts: this.listPrompts() });
       }
 
+      if (request.method === "GET" && url.pathname === "/todos") {
+        return Response.json({ items: this.listTodos() });
+      }
+
       if (request.method === "GET" && url.pathname === "/prompts/count") {
         // Lightweight count endpoint used by the UserControl idle-session
         // sweep. Full /prompts would serialise the whole list.
@@ -2738,19 +2742,26 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * without coupling them to the DO internals. Each method is a small,
    * synchronous SQL operation — no async bookkeeping needed.
    */
+  private listTodos(): TodoItem[] {
+    const rows = this.db.all(
+      "SELECT id, content, status, priority, created_at, updated_at FROM session_todos ORDER BY id ASC",
+    );
+    return rows.map((r) => ({
+      id: Number(r.id),
+      content: String(r.content),
+      status: r.status as TodoStatus,
+      priority: r.priority as TodoPriority,
+    }));
+  }
+
+  /** Broadcast the current todo list to all SSE/WebSocket subscribers. */
+  private emitTodos(): void {
+    this.emitEvent({ data: { items: this.listTodos() }, type: "todos" });
+  }
+
   private todoStore(): TodoStore {
     return {
-      list: () => {
-        const rows = this.db.all(
-          "SELECT id, content, status, priority, created_at, updated_at FROM session_todos ORDER BY id ASC",
-        );
-        return rows.map((r) => ({
-          id: Number(r.id),
-          content: String(r.content),
-          status: r.status as TodoStatus,
-          priority: r.priority as TodoPriority,
-        }));
-      },
+      list: () => this.listTodos(),
       add: (content, priority) => {
         const now = nowEpoch();
         this.db.exec(
@@ -2760,6 +2771,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           now,
           now,
         );
+        this.emitTodos();
       },
       update: (id, patch) => {
         const now = nowEpoch();
@@ -2789,10 +2801,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             id,
           );
         }
+        this.emitTodos();
         return true;
       },
       clear: () => {
         this.db.exec("DELETE FROM session_todos");
+        this.emitTodos();
       },
     };
   }
@@ -4983,6 +4997,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.setState({ ...this.readSessionDetails() });
 
     void this.writeEvent(writer, { data: this.readSessionDetails(), type: "ready" });
+    // Replay current todos so a freshly-connected client is hydrated without
+    // needing a separate fetch round-trip.
+    void this.writeEvent(writer, { data: { items: this.listTodos() }, type: "todos" });
 
     // Periodic heartbeat. Cloudflare and intermediate proxies drop idle
     // SSE connections after ~100s — without a heartbeat, long-idle

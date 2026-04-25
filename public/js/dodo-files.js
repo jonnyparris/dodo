@@ -61,6 +61,41 @@ async function removeHost(hostname){await apiSafe(`/api/allowlist/${encodeURICom
 // --- Prompts (kept for backward compat — UI section removed) ---
 function loadPrompts(){}
 
+// --- Session todos ---
+// Rendered in the right panel (`#session-todos-list`). Hydrated by the SSE
+// `todos` event, which the server fires on connect and after every mutation
+// from the agent's todo_* tools. No polling.
+const TODO_STATUS_ICONS={
+  pending:'<i class="ph ph-circle"></i>',
+  in_progress:'<i class="ph ph-spinner-gap"></i>',
+  completed:'<i class="ph ph-check-circle-fill"></i>',
+  cancelled:'<i class="ph ph-x-circle"></i>',
+};
+function renderSessionTodos(items){
+  const list=$("session-todos-list");
+  const empty=$("session-todos-empty");
+  if(!list)return;
+  const arr=Array.isArray(items)?items:[];
+  if(!arr.length){
+    list.innerHTML="";
+    if(empty)empty.style.display="";
+    return;
+  }
+  if(empty)empty.style.display="none";
+  // Order: in_progress first, then pending, then completed, then cancelled.
+  const rank={in_progress:0,pending:1,completed:2,cancelled:3};
+  const sorted=[...arr].sort((a,b)=>(rank[a.status]??9)-(rank[b.status]??9)||a.id-b.id);
+  list.innerHTML=sorted.map(t=>{
+    const icon=TODO_STATUS_ICONS[t.status]||TODO_STATUS_ICONS.pending;
+    return `<div class="session-todo" data-id="${t.id}" data-status="${esc(t.status)}" data-priority="${esc(t.priority||"medium")}"><span class="todo-icon">${icon}</span><span class="todo-text">${esc(t.content)}</span><span class="todo-priority">${esc(t.priority||"")}</span></div>`;
+  }).join("");
+}
+async function loadSessionTodos(){
+  if(!currentSession){renderSessionTodos([]);return}
+  try{const{items}=await api(`/session/${currentSession}/todos`);renderSessionTodos(items||[])}
+  catch{renderSessionTodos([])}
+}
+
 // --- Cron ---
 async function loadCron(){if(!currentSession)return;try{const{jobs}=await api(`/session/${currentSession}/cron`);$("cron-list").innerHTML=jobs.length?jobs.map(j=>`<div class="kv"><span>${esc(j.description)}</span><button onclick="deleteCron('${esc(j.id)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No cron jobs</div>'}catch{$("cron-list").innerHTML='<div class="empty">No cron jobs</div>'}}
 async function createCron(){if(!currentSession)return;const desc=$("cron-desc").value.trim();const prompt=$("cron-prompt").value.trim();const delay=parseInt($("cron-delay").value,10);if(!desc||!prompt||!delay)return;const r=await jsonSafe(`/session/${currentSession}/cron`,{description:desc,prompt,type:"delayed",delayInSeconds:delay});if(r)toast('Cron job scheduled','success');$("cron-desc").value="";$("cron-prompt").value="";$("cron-delay").value="";await loadCron()}

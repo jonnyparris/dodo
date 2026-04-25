@@ -229,6 +229,23 @@
     .file-entry:hover{background:var(--fill-hover)}
     .file-children{padding-left:16px}
 
+    /* === Session todos === */
+    .session-todos{display:flex;flex-direction:column;gap:4px}
+    .session-todo{display:flex;align-items:flex-start;gap:8px;padding:6px 8px;border-radius:var(--radius);font-size:12px;line-height:1.4;border:1px solid transparent;transition:background .12s,border-color .12s}
+    .session-todo:hover{background:var(--fill-hover)}
+    .session-todo .todo-icon{flex-shrink:0;margin-top:1px;font-size:14px;width:14px;display:inline-flex;justify-content:center}
+    .session-todo .todo-text{flex:1;min-width:0;word-break:break-word}
+    .session-todo[data-status="completed"] .todo-text{color:var(--text-subtle);text-decoration:line-through}
+    .session-todo[data-status="cancelled"] .todo-text{color:var(--text-inactive);text-decoration:line-through}
+    .session-todo[data-status="in_progress"]{background:var(--brand-tint);border-color:var(--brand)}
+    .session-todo[data-status="in_progress"] .todo-icon{color:var(--brand);animation:pulse 1.4s infinite}
+    .session-todo[data-status="completed"] .todo-icon{color:var(--success)}
+    .session-todo[data-status="cancelled"] .todo-icon{color:var(--text-inactive)}
+    .session-todo[data-status="pending"] .todo-icon{color:var(--text-subtle)}
+    .session-todo .todo-priority{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-subtle);flex-shrink:0;align-self:center}
+    .session-todo[data-priority="high"] .todo-priority{color:var(--danger)}
+    .session-todo[data-priority="low"] .todo-priority{display:none}
+
     .section{margin-bottom:24px}
     .kv{display:flex;justify-content:space-between;padding:6px 0;font-size:12px;align-items:center;gap:8px}
     .tag{display:inline-block;background:var(--brand-tint);color:var(--text-info);padding:2px 8px;border-radius:100px;font-size:11px;font-weight:500;margin-right:4px}
@@ -655,6 +672,11 @@
       </div>
       <!-- Files group (shown on Files tab) -->
       <div id="files-group">
+        <div class="section">
+          <h2>Agent Todos</h2>
+          <div id="session-todos-list" class="session-todos"></div>
+          <p id="session-todos-empty" style="font-size:11px;color:var(--muted);margin-top:8px">No todos yet. The agent will populate this list when it plans multi-step work.</p>
+        </div>
         <div class="section">
           <h2>Workspace Files</h2>
           <div id="file-tree" class="file-tree"></div>

@@ -86,11 +86,15 @@ async function selectSession(id){
   showSkeleton($("chat"),5);
   $("session-id-display").textContent=id.slice(0,8);
   $("session-title-display").textContent=id.slice(0,8);
+  // Clear stale todos from the previous session immediately so users don't
+  // see a flash of the wrong list while the new session loads.
+  if(typeof renderSessionTodos==='function')renderSessionTodos([]);
   const [,state,msgData]=await Promise.all([
     loadSessions(),
     apiSafe(`/session/${id}`),
     apiSafe(`/session/${id}/messages`),
-    loadFiles("/"),loadCron(),refreshGit()
+    loadFiles("/"),loadCron(),refreshGit(),
+    typeof loadSessionTodos==='function'?loadSessionTodos():Promise.resolve()
   ]);
   $("chat").innerHTML="";
   if(!state&&!msgData){
