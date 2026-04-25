@@ -20,7 +20,7 @@
     "@cloudflare/think": "^0.1.1",
     "@hono/capnweb": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.28.0",
-    "agents": "^0.8.7",
+    "agents": "0.9.0",
     "ai": "^6.0.142",
     "capnweb": "^0.6.1",
     "cron-schedule": "^6.0.0",
