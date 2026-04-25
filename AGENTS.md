@@ -45,7 +45,7 @@ Workflow:
 1. After cloning, create a branch directly: `git_branch` then `git_checkout`, or `git_checkout` with a `new` flag. Branch off `main`.
 2. Make changes. Stage specific files. Commit with a clear message.
 3. Push with `git_push_checked` — pass an explicit branch ref, never push to `main`.
-4. **Open the draft PR before replying to the user.** If you have a `dodo_dispatch_repo_prompt`-style tool that opens the PR for you, use it. Otherwise construct the GitHub compare URL (`https://github.com/<owner>/<repo>/compare/main...<branch>?expand=1`) and include it in your final message. The user should never have to ask "where's the PR?" — that's a workflow failure.
+4. **Open the draft PR with `pr_create` before replying to the user.** It auto-detects GitHub vs GitLab, auto-fills title and body from your latest commit, and returns the PR/MR URL. Quote that URL in your reply. If `pr_create` fails (e.g. missing per-user token), fall back to a compare URL and tell the user what's missing — but don't just leave them with a pushed branch and no PR.
 5. Branch naming: `fix/sse-serialization`, `feat/per-user-auth`, `docs/update-readme`, `chore/<scope>`.
 
 ### If you're running locally via OpenCode CLI in `~/dev/dodo`

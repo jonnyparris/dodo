@@ -1,5 +1,12 @@
-import { getUserControlStub } from "./auth";
+import { getUserControlStub, isAdmin } from "./auth";
+import { log } from "./logger";
+import { parseRemoteSpec } from "./repos";
 import type { Env, WorkerRunRecord } from "./types";
+
+/** Timeout for PR/MR creation HTTP calls. Workers DOs can stall indefinitely
+ *  on a misbehaving upstream — bound it so a single tool call can't hold a
+ *  turn open forever. */
+const PR_FETCH_TIMEOUT_MS = 20_000;
 
 /**
  * Parse a GitHub repo URL like https://github.com/owner/repo (optionally .git)
@@ -17,13 +24,21 @@ export function parseGithubRepo(url: string): { owner: string; repo: string } | 
   }
 }
 
-async function resolveGithubToken(env: Env, ownerEmail?: string): Promise<string | undefined> {
+async function resolveProviderToken(
+  env: Env,
+  provider: "github" | "gitlab",
+  ownerEmail?: string,
+): Promise<string | undefined> {
+  const secretKey = provider === "github" ? "github_token" : "gitlab_token";
+
+  // Try per-user encrypted secret first.
   if (ownerEmail) {
     try {
       const stub = getUserControlStub(env, ownerEmail);
-      const response = await stub.fetch("https://user-control/internal/secret/github_token", {
-        headers: { "x-owner-email": ownerEmail },
-      });
+      const response = await stub.fetch(
+        `https://user-control/internal/secret/${encodeURIComponent(secretKey)}`,
+        { headers: { "x-owner-email": ownerEmail } },
+      );
       if (response.ok) {
         const { value } = (await response.json()) as { value: string };
         if (value) return value;
@@ -32,7 +47,21 @@ async function resolveGithubToken(env: Env, ownerEmail?: string): Promise<string
       // Fall through to env
     }
   }
-  return env.GITHUB_TOKEN;
+
+  // Restricted env var fallback — admin account only. Mirrors the policy in
+  // src/outbound.ts so non-admin tenants can't accidentally use the admin's
+  // provider tokens.
+  if (ownerEmail && isAdmin(ownerEmail, env)) {
+    const envToken = provider === "github" ? env.GITHUB_TOKEN : env.GITLAB_TOKEN;
+    if (envToken) return envToken;
+  }
+
+  log("warn", "github-pr: no token available for provider", { provider, hasOwnerEmail: !!ownerEmail });
+  return undefined;
+}
+
+async function resolveGithubToken(env: Env, ownerEmail?: string): Promise<string | undefined> {
+  return resolveProviderToken(env, "github", ownerEmail);
 }
 
 /**
@@ -98,18 +127,216 @@ export async function createDraftPrForRun(
         body: buildPrBody(run),
         draft: true,
       }),
+      signal: AbortSignal.timeout(PR_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.warn(`[auto-pr] GitHub API returned ${response.status}:`, errorText.slice(0, 500));
+      log("warn", "auto-pr: GitHub API returned non-OK", { status: response.status, body: errorText.slice(0, 500) });
       return null;
     }
 
     const data = (await response.json()) as { html_url: string };
     return data.html_url ?? null;
   } catch (err) {
-    console.warn("[auto-pr] failed to create PR:", err);
+    log("warn", "auto-pr: failed to create PR", { error: err instanceof Error ? err.message : String(err) });
     return null;
+  }
+}
+
+// ─── Interactive PR/MR creation (for the pr_create tool) ───
+
+export interface CreatePullRequestInput {
+  /** Remote URL (https or ssh) — used to detect provider and parse owner/repo. */
+  remoteUrl: string;
+  /** Source branch (head ref). */
+  head: string;
+  /** Target branch (base ref). */
+  base: string;
+  /** PR/MR title. */
+  title: string;
+  /** Optional body. Pass through as-is. */
+  body?: string;
+  /** Open as draft. Defaults to true to match Dodo dispatch behavior. */
+  draft?: boolean;
+}
+
+export interface CreatePullRequestSuccess {
+  ok: true;
+  url: string;
+  number: number;
+  provider: "github" | "gitlab";
+}
+
+export interface CreatePullRequestFailure {
+  ok: false;
+  error: string;
+  provider?: "github" | "gitlab";
+}
+
+export type CreatePullRequestResult = CreatePullRequestSuccess | CreatePullRequestFailure;
+
+/**
+ * Create a pull request (GitHub) or merge request (GitLab). Auto-detects the
+ * provider from the remote URL. Uses the owner's per-user encrypted token
+ * (`github_token` / `gitlab_token`), falling back to env vars.
+ *
+ * Unlike `createDraftPrForRun`, this function THROWS on bad input but returns
+ * a structured `{ ok: false, error }` for API failures so the calling tool can
+ * surface a useful message to the agent.
+ */
+export async function createPullRequest(
+  env: Env,
+  input: CreatePullRequestInput,
+  ownerEmail?: string,
+): Promise<CreatePullRequestResult> {
+  const parsed = parseRemoteSpec(input.remoteUrl);
+  if (!parsed) {
+    return {
+      ok: false,
+      error: `Could not parse remote URL '${input.remoteUrl}'. Only github.com and gitlab.com / gitlab.cfdata.org are supported.`,
+    };
+  }
+
+  const draft = input.draft ?? true;
+  const token = await resolveProviderToken(env, parsed.provider, ownerEmail);
+  if (!token) {
+    return {
+      ok: false,
+      error: `No ${parsed.provider} token available. Add it via the secrets UI (key '${parsed.provider}_token') or set ${parsed.provider === "github" ? "GITHUB_TOKEN" : "GITLAB_TOKEN"} on the worker.`,
+      provider: parsed.provider,
+    };
+  }
+
+  if (parsed.provider === "github") {
+    return createGithubPr({ env: env, parsed, input, token, draft });
+  }
+  return createGitlabMr({ parsed, input, token, draft });
+}
+
+/**
+ * Add a hint to common 422 errors so the agent can self-correct.
+ *
+ * GitHub returns 422 for both "PR already exists" and "head branch not
+ * found" — both of which the agent can fix without escalating to the user
+ * (push first, or check existing PRs). Hint nudges them in that direction.
+ */
+function annotatePrError(provider: "github" | "gitlab", status: number, body: string): string {
+  const base = `${provider === "github" ? "GitHub" : "GitLab"} API returned ${status}: ${body.slice(0, 300)}`;
+  if (status !== 422 && status !== 400) return base;
+  const lower = body.toLowerCase();
+  if (lower.includes("already exists") || lower.includes("a pull request already exists")) {
+    return `${base}\n\nHint: a PR/MR may already exist between this head and base. Check the repo's existing PRs.`;
+  }
+  if (lower.includes("not found") || lower.includes("head ref") || lower.includes("source_branch")) {
+    return `${base}\n\nHint: the head branch may not be on the remote yet. Push it first with git_push_checked, or pass a branch name that exists on the remote.`;
+  }
+  if (lower.includes("base") || lower.includes("target_branch")) {
+    return `${base}\n\nHint: the base/target branch may not exist on the remote. Pass an explicit base (e.g. base: 'master' or 'staging') if 'main' isn't the default.`;
+  }
+  return base;
+}
+
+async function createGithubPr(args: {
+  env: Env;
+  parsed: NonNullable<ReturnType<typeof parseRemoteSpec>>;
+  input: CreatePullRequestInput;
+  token: string;
+  draft: boolean;
+}): Promise<CreatePullRequestResult> {
+  const { parsed, input, token, draft } = args;
+  try {
+    const response = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}/pulls`,
+      {
+        method: "POST",
+        headers: {
+          "Accept": "application/vnd.github+json",
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "User-Agent": "dodo-agent",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        body: JSON.stringify({
+          title: input.title,
+          head: input.head,
+          base: input.base,
+          body: input.body ?? "",
+          draft,
+        }),
+        signal: AbortSignal.timeout(PR_FETCH_TIMEOUT_MS),
+      },
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      return {
+        ok: false,
+        error: annotatePrError("github", response.status, text),
+        provider: "github",
+      };
+    }
+    const data = (await response.json()) as { html_url?: string; number?: number };
+    if (!data.html_url || typeof data.number !== "number") {
+      return { ok: false, error: "GitHub returned an unexpected response", provider: "github" };
+    }
+    return { ok: true, url: data.html_url, number: data.number, provider: "github" };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const friendly = err instanceof Error && err.name === "TimeoutError"
+      ? `GitHub API request timed out after ${PR_FETCH_TIMEOUT_MS / 1000}s. Try again, or fall back to the compare URL.`
+      : message;
+    return { ok: false, error: friendly, provider: "github" };
+  }
+}
+
+async function createGitlabMr(args: {
+  parsed: NonNullable<ReturnType<typeof parseRemoteSpec>>;
+  input: CreatePullRequestInput;
+  token: string;
+  draft: boolean;
+}): Promise<CreatePullRequestResult> {
+  const { parsed, input, token, draft } = args;
+  try {
+    // GitLab marks MRs as draft via title prefix "Draft: ".
+    const title = draft && !input.title.startsWith("Draft:") ? `Draft: ${input.title}` : input.title;
+    const project = encodeURIComponent(parsed.fullName);
+    const response = await fetch(
+      `https://${parsed.host}/api/v4/projects/${project}/merge_requests`,
+      {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+          "PRIVATE-TOKEN": token,
+          "User-Agent": "dodo-agent",
+        },
+        body: JSON.stringify({
+          source_branch: input.head,
+          target_branch: input.base,
+          title,
+          description: input.body ?? "",
+        }),
+        signal: AbortSignal.timeout(PR_FETCH_TIMEOUT_MS),
+      },
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      return {
+        ok: false,
+        error: annotatePrError("gitlab", response.status, text),
+        provider: "gitlab",
+      };
+    }
+    const data = (await response.json()) as { web_url?: string; iid?: number };
+    if (!data.web_url || typeof data.iid !== "number") {
+      return { ok: false, error: "GitLab returned an unexpected response", provider: "gitlab" };
+    }
+    return { ok: true, url: data.web_url, number: data.iid, provider: "gitlab" };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const friendly = err instanceof Error && err.name === "TimeoutError"
+      ? `GitLab API request timed out after ${PR_FETCH_TIMEOUT_MS / 1000}s. Try again, or fall back to the compare URL.`
+      : message;
+    return { ok: false, error: friendly, provider: "gitlab" };
   }
 }
