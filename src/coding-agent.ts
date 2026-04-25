@@ -2,6 +2,13 @@ import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
 import { type AgentNamespace, type Connection, type ConnectionContext, type WSMessage, getAgentByName } from "agents";
 import type { ArtifactsRepo } from "./artifacts-types";
 import { flushTurnToArtifacts } from "./artifacts-flush";
+import {
+  type ArtifactsFsCache,
+  buildArtifactsCloneUrl,
+  listArtifactsTree,
+  readArtifactsFile,
+  refreshArtifactsFs,
+} from "./artifacts-read";
 import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
@@ -2417,6 +2424,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return await this.handleReadFile(url);
       }
 
+      if (request.method === "GET" && url.pathname === "/artifacts") {
+        return await this.handleArtifactsInfo();
+      }
+
       if (request.method === "PUT" && url.pathname === "/file") {
         return await this.handleWriteFile(request, url);
       }
@@ -2955,18 +2966,70 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async handleListFiles(url: URL): Promise<Response> {
     const path = normalizePath(url.searchParams.get("path") ?? "/");
+
+    // Fast path: serve from the cached artifacts clone when available.
+    // The cache only exists once a turn has flushed; before that, fall
+    // through to the workspace shell so the first turn renders normally.
+    // We catch any error so a transient artifacts hiccup never breaks
+    // the file tree.
+    try {
+      const cache = await this.getArtifactsFsCache();
+      if (cache) {
+        const result = await listArtifactsTree(cache, path);
+        if (result) return Response.json(result);
+      }
+    } catch (err) {
+      log("warn", "[files] artifacts fast-path failed, falling back", { path, err: err instanceof Error ? err.message : String(err) });
+    }
+
     const entries = await this.workspace.readDir(path);
     return Response.json({ entries: entries.map((entry) => this.mapWorkspaceEntry(entry)) });
   }
 
   private async handleReadFile(url: URL): Promise<Response> {
     const path = normalizePath(url.searchParams.get("path") ?? "");
+
+    // Same fast-path strategy as handleListFiles. If the file isn't
+    // present in the artifacts clone (e.g. written this turn but not
+    // yet flushed) we drop through to the workspace.
+    try {
+      const cache = await this.getArtifactsFsCache();
+      if (cache) {
+        const result = await readArtifactsFile(cache, path);
+        if (result) return Response.json(result);
+      }
+    } catch (err) {
+      log("warn", "[file] artifacts fast-path failed, falling back", { path, err: err instanceof Error ? err.message : String(err) });
+    }
+
     const content = await this.workspace.readFile(path);
     if (content === null) {
       return Response.json({ error: `File not found: ${path}` }, { status: 404 });
     }
 
     return Response.json({ content, path });
+  }
+
+  /**
+   * Return artifacts repo metadata + a short-lived authenticated clone
+   * URL the customer can paste into a terminal. Token TTL matches what
+   * `getOrCreateArtifactsContext` mints (1h).
+   */
+  private async handleArtifactsInfo(): Promise<Response> {
+    const ctx = await this.getOrCreateArtifactsContext().catch(() => null);
+    if (!ctx) {
+      return Response.json({ error: "Artifacts unavailable for this session" }, { status: 503 });
+    }
+    const sessionId = this.sessionId();
+    const cloneUrl = buildArtifactsCloneUrl(ctx.remote, ctx.tokenSecret);
+    return Response.json({
+      name: sessionId ? `dodo-${sessionId}` : null,
+      remote: ctx.remote,
+      cloneUrl,
+      // Token TTL is 1h (set in getOrCreateArtifactsContext); surface it
+      // so the UI can show a "regenerate" hint when it gets close.
+      tokenTtlSeconds: 3600,
+    });
   }
 
   private async handleWriteFile(request: Request, url: URL): Promise<Response> {
@@ -4567,6 +4630,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         author: options?.authorEmail
           ? { name: options.authorEmail, email: options.authorEmail }
           : { name: "Dodo", email: "dodo@workers.dev" },
+      }).then((pushed) => {
+        // On a successful push, the cached read-side fs is now stale.
+        // Flag it so the next /files request fetches the new tip.
+        if (pushed) this.markArtifactsFsDirty();
       });
     }
 
@@ -5226,6 +5293,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private _artifactsRepo: ArtifactsRepo | null = null;
   private _artifactsRemote: string | null = null;
   private _artifactsTokenSecret: string | null = null;
+  /**
+   * In-DO clone of the per-session artifacts repo. Lazily populated on
+   * the first /files or /file read once a flush has landed. Refreshed
+   * via fetch+checkout when `_artifactsFsCache.dirty` is true.
+   */
+  private _artifactsFsCache: ArtifactsFsCache | null = null;
 
   private sessionId(): string {
     return this.readMetadata("session_id") ?? "";
@@ -5275,6 +5348,40 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       console.warn("[artifacts] failed to get/create repo:", err);
       return null;
     }
+  }
+
+  /**
+   * Lazily get (or refresh) the in-DO clone of the artifacts repo. The
+   * cache is created on first call after a flush has landed; subsequent
+   * calls reuse it unless `markArtifactsFsDirty()` was called in
+   * between.
+   *
+   * Returns null when artifacts isn't reachable or the clone failed —
+   * callers must fall back to the workspace shell.
+   */
+  async getArtifactsFsCache(): Promise<ArtifactsFsCache | null> {
+    const ctx = await this.getOrCreateArtifactsContext().catch(() => null);
+    if (!ctx) return null;
+    const refreshed = await refreshArtifactsFs({
+      cache: this._artifactsFsCache,
+      remote: ctx.remote,
+      tokenSecret: ctx.tokenSecret,
+    });
+    if (refreshed) {
+      this._artifactsFsCache = refreshed;
+    }
+    return this._artifactsFsCache;
+  }
+
+  /**
+   * Called by the flush hook after a successful push. Marks the cache
+   * dirty so the next read pulls the new tip. Cheap — flips a bool.
+   */
+  markArtifactsFsDirty(): void {
+    if (this._artifactsFsCache) {
+      this._artifactsFsCache.dirty = true;
+    }
+    // If cache is null, the next read will clone fresh anyway.
   }
 
   private readMetadata(key: string): string | null {
