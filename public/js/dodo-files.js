@@ -113,19 +113,52 @@ async function deleteMemory(id){await apiSafe(`/api/memory/${encodeURIComponent(
 // Fetches /session/{id}/artifacts (which returns a short-lived
 // authenticated clone URL). Cached for the life of the panel render so
 // we don't mint a fresh token on every refreshGit() tick.
+//
+// SECURITY: the clone URL embeds a token from the artifacts service.
+// We DO NOT interpolate it into an inline `onclick` attribute — the
+// project's `esc()` helper doesn't escape single quotes, so a token
+// containing `'` would break out of the JS string literal and execute
+// in the user's session. Instead we construct the elements via the
+// DOM API and bind the click handler with addEventListener; the URL
+// only ever lives inside a JS variable, never inside an HTML string.
 async function refreshArtifactsClone(){
   const el=$("artifacts-clone");if(!el||!currentSession)return;
   const d=await apiSafe(`/session/${currentSession}/artifacts`);
   if(!d||!d.cloneUrl){el.innerHTML="";return}
   // Mask the token in the visible URL but keep the full one for copy.
   const masked=d.cloneUrl.replace(/:([^@/]+)@/,":***@");
-  el.innerHTML=`<details><summary style="font-size:12px;font-weight:600;cursor:pointer">Clone this session</summary>
-    <div style="display:flex;gap:6px;align-items:center;margin-top:6px">
-      <code style="flex:1;font-size:11px;background:var(--code-bg);color:var(--code-text);padding:6px 8px;border-radius:4px;overflow:auto;white-space:nowrap">${esc(masked)}</code>
-      <button class="sm" onclick="copyCloneUrl(this,'${esc(d.cloneUrl)}')">Copy</button>
-    </div>
-    <p style="font-size:10px;color:var(--muted);margin-top:4px">Token expires in ${Math.round((d.tokenTtlSeconds||3600)/60)} min. Refresh this panel to mint a new one.</p>
-  </details>`;
+  const ttlMin=Math.round((d.tokenTtlSeconds||3600)/60);
+
+  // Tear down any previous render before rebuilding.
+  el.innerHTML="";
+
+  const details=document.createElement("details");
+  const summary=document.createElement("summary");
+  summary.style.cssText="font-size:12px;font-weight:600;cursor:pointer";
+  summary.textContent="Clone this session";
+  details.appendChild(summary);
+
+  const row=document.createElement("div");
+  row.style.cssText="display:flex;gap:6px;align-items:center;margin-top:6px";
+  const codeEl=document.createElement("code");
+  codeEl.style.cssText="flex:1;font-size:11px;background:var(--code-bg);color:var(--code-text);padding:6px 8px;border-radius:4px;overflow:auto;white-space:nowrap";
+  codeEl.textContent=masked;
+  const btn=document.createElement("button");
+  btn.className="sm";
+  btn.textContent="Copy";
+  // The URL is captured in the click closure — no string
+  // interpolation, no HTML escaping required.
+  btn.addEventListener("click",()=>copyCloneUrl(btn,d.cloneUrl));
+  row.appendChild(codeEl);
+  row.appendChild(btn);
+  details.appendChild(row);
+
+  const hint=document.createElement("p");
+  hint.style.cssText="font-size:10px;color:var(--muted);margin-top:4px";
+  hint.textContent=`Token expires in ${ttlMin} min. Refresh this panel to mint a new one.`;
+  details.appendChild(hint);
+
+  el.appendChild(details);
 }
 function copyCloneUrl(btn,url){
   navigator.clipboard.writeText(url).then(()=>{const t=btn.textContent;btn.textContent='Copied!';setTimeout(()=>{btn.textContent=t},1500)})
