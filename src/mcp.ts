@@ -42,7 +42,7 @@ function mcpUserEmail(env: Env, userEmail?: string): string {
  * Share-cookie guests are intentionally NOT honoured for MCP — MCP tokens
  * authenticate a user identity, not a guest browser session.
  */
-async function checkSessionPermission(
+export async function checkSessionPermission(
   env: Env,
   email: string,
   sessionId: string,
@@ -93,7 +93,7 @@ async function checkSessionPermission(
  * routes so MCP traffic and interactive traffic share one budget per
  * user.
  */
-function checkPromptBudget(email: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+export function checkPromptBudget(email: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
   const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
   if (!rl.allowed) {
     return errorResult({
@@ -104,7 +104,7 @@ function checkPromptBudget(email: string): { content: Array<{ type: "text"; text
   return null;
 }
 
-function checkMessageBudget(email: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+export function checkMessageBudget(email: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
   const rl = messageLimiter.check(`msg:${email}`, 120, 60 * 60 * 1000);
   if (!rl.allowed) {
     return errorResult({
@@ -115,7 +115,7 @@ function checkMessageBudget(email: string): { content: Array<{ type: "text"; tex
   return null;
 }
 
-function checkGenerateBudget(email: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+export function checkGenerateBudget(email: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
   // Mirrors the HTTP /generate route — both an hourly and a daily cap on
   // FLUX image generation since it's pay-per-call.
   const hr = promptLimiter.check(`generate-hr:${email}`, 30, 60 * 60 * 1000);
@@ -126,7 +126,7 @@ function checkGenerateBudget(email: string): { content: Array<{ type: "text"; te
 }
 
 /** Convenience wrapper that turns a denied check into an MCP error result. */
-async function ensureSessionAccess(
+export async function ensureSessionAccess(
   env: Env,
   userEmail: string | undefined,
   sessionId: string,
