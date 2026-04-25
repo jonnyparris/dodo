@@ -1646,6 +1646,12 @@ app.get("/session/:id/prompts", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompts");
 });
 
+app.get("/session/:id/todos", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/todos");
+});
+
 app.get("/session/:id/prompt-queue", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;

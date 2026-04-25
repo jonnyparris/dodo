@@ -211,6 +211,9 @@ function connectSSE(id){
   });
 
   eventSource.addEventListener("file",()=>loadFilesDebounced());
+  eventSource.addEventListener("todos",(e)=>{
+    try{const{items}=JSON.parse(e.data);renderSessionTodos(items||[])}catch{}
+  });
   eventSource.addEventListener("prompt",(e)=>{
     refreshGit();
     // Check for failed prompts and surface errors the error_message event may have missed
@@ -489,7 +492,7 @@ async function sendMessage(){
 }
 async function abortPrompt(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
 async function forkSession(){if(!currentSession)return;const d=await jsonSafe(`/session/${currentSession}/fork`,{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
-async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;clearPendingImages();$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("token-summary").style.color="";const cw=$("context-warning");if(cw)cw.style.display="none";$("presence-bar").innerHTML="";history.replaceState(null,"",location.pathname);await loadSessions();if(window.innerWidth<=900)switchTab('chat')}
+async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;clearPendingImages();$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("token-summary").style.color="";const cw=$("context-warning");if(cw)cw.style.display="none";$("presence-bar").innerHTML="";if(typeof renderSessionTodos==='function')renderSessionTodos([]);history.replaceState(null,"",location.pathname);await loadSessions();if(window.innerWidth<=900)switchTab('chat')}
 
 // --- Session rename ---
 async function renameSession(){

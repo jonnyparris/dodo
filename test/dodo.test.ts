@@ -520,6 +520,15 @@ describe("Dodo foundation", () => {
     await response.body?.cancel();
   });
 
+  it("exposes /todos with an empty list for a fresh session", async () => {
+    const sessionId = await createSession();
+    const response = await fetchJson(`/session/${sessionId}/todos`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { items: Array<unknown> };
+    expect(Array.isArray(body.items)).toBe(true);
+    expect(body.items.length).toBe(0);
+  });
+
   it("rejects path traversal attempts", async () => {
     const sessionId = await createSession();
 
