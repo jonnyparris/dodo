@@ -1,6 +1,12 @@
-import { getUserControlStub } from "./auth";
+import { getUserControlStub, isAdmin } from "./auth";
+import { log } from "./logger";
 import { parseRemoteSpec } from "./repos";
 import type { Env, WorkerRunRecord } from "./types";
+
+/** Timeout for PR/MR creation HTTP calls. Workers DOs can stall indefinitely
+ *  on a misbehaving upstream — bound it so a single tool call can't hold a
+ *  turn open forever. */
+const PR_FETCH_TIMEOUT_MS = 20_000;
 
 /**
  * Parse a GitHub repo URL like https://github.com/owner/repo (optionally .git)
@@ -24,6 +30,8 @@ async function resolveProviderToken(
   ownerEmail?: string,
 ): Promise<string | undefined> {
   const secretKey = provider === "github" ? "github_token" : "gitlab_token";
+
+  // Try per-user encrypted secret first.
   if (ownerEmail) {
     try {
       const stub = getUserControlStub(env, ownerEmail);
@@ -39,7 +47,17 @@ async function resolveProviderToken(
       // Fall through to env
     }
   }
-  return provider === "github" ? env.GITHUB_TOKEN : env.GITLAB_TOKEN;
+
+  // Restricted env var fallback — admin account only. Mirrors the policy in
+  // src/outbound.ts so non-admin tenants can't accidentally use the admin's
+  // provider tokens.
+  if (ownerEmail && isAdmin(ownerEmail, env)) {
+    const envToken = provider === "github" ? env.GITHUB_TOKEN : env.GITLAB_TOKEN;
+    if (envToken) return envToken;
+  }
+
+  log("warn", "github-pr: no token available for provider", { provider, hasOwnerEmail: !!ownerEmail });
+  return undefined;
 }
 
 async function resolveGithubToken(env: Env, ownerEmail?: string): Promise<string | undefined> {
@@ -109,18 +127,19 @@ export async function createDraftPrForRun(
         body: buildPrBody(run),
         draft: true,
       }),
+      signal: AbortSignal.timeout(PR_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.warn(`[auto-pr] GitHub API returned ${response.status}:`, errorText.slice(0, 500));
+      log("warn", "auto-pr: GitHub API returned non-OK", { status: response.status, body: errorText.slice(0, 500) });
       return null;
     }
 
     const data = (await response.json()) as { html_url: string };
     return data.html_url ?? null;
   } catch (err) {
-    console.warn("[auto-pr] failed to create PR:", err);
+    log("warn", "auto-pr: failed to create PR", { error: err instanceof Error ? err.message : String(err) });
     return null;
   }
 }
@@ -195,6 +214,29 @@ export async function createPullRequest(
   return createGitlabMr({ parsed, input, token, draft });
 }
 
+/**
+ * Add a hint to common 422 errors so the agent can self-correct.
+ *
+ * GitHub returns 422 for both "PR already exists" and "head branch not
+ * found" — both of which the agent can fix without escalating to the user
+ * (push first, or check existing PRs). Hint nudges them in that direction.
+ */
+function annotatePrError(provider: "github" | "gitlab", status: number, body: string): string {
+  const base = `${provider === "github" ? "GitHub" : "GitLab"} API returned ${status}: ${body.slice(0, 300)}`;
+  if (status !== 422 && status !== 400) return base;
+  const lower = body.toLowerCase();
+  if (lower.includes("already exists") || lower.includes("a pull request already exists")) {
+    return `${base}\n\nHint: a PR/MR may already exist between this head and base. Check the repo's existing PRs.`;
+  }
+  if (lower.includes("not found") || lower.includes("head ref") || lower.includes("source_branch")) {
+    return `${base}\n\nHint: the head branch may not be on the remote yet. Push it first with git_push_checked, or pass a branch name that exists on the remote.`;
+  }
+  if (lower.includes("base") || lower.includes("target_branch")) {
+    return `${base}\n\nHint: the base/target branch may not exist on the remote. Pass an explicit base (e.g. base: 'master' or 'staging') if 'main' isn't the default.`;
+  }
+  return base;
+}
+
 async function createGithubPr(args: {
   env: Env;
   parsed: NonNullable<ReturnType<typeof parseRemoteSpec>>;
@@ -222,13 +264,14 @@ async function createGithubPr(args: {
           body: input.body ?? "",
           draft,
         }),
+        signal: AbortSignal.timeout(PR_FETCH_TIMEOUT_MS),
       },
     );
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       return {
         ok: false,
-        error: `GitHub API returned ${response.status}: ${text.slice(0, 300)}`,
+        error: annotatePrError("github", response.status, text),
         provider: "github",
       };
     }
@@ -238,11 +281,11 @@ async function createGithubPr(args: {
     }
     return { ok: true, url: data.html_url, number: data.number, provider: "github" };
   } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-      provider: "github",
-    };
+    const message = err instanceof Error ? err.message : String(err);
+    const friendly = err instanceof Error && err.name === "TimeoutError"
+      ? `GitHub API request timed out after ${PR_FETCH_TIMEOUT_MS / 1000}s. Try again, or fall back to the compare URL.`
+      : message;
+    return { ok: false, error: friendly, provider: "github" };
   }
 }
 
@@ -273,13 +316,14 @@ async function createGitlabMr(args: {
           title,
           description: input.body ?? "",
         }),
+        signal: AbortSignal.timeout(PR_FETCH_TIMEOUT_MS),
       },
     );
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       return {
         ok: false,
-        error: `GitLab API returned ${response.status}: ${text.slice(0, 300)}`,
+        error: annotatePrError("gitlab", response.status, text),
         provider: "gitlab",
       };
     }
@@ -289,10 +333,10 @@ async function createGitlabMr(args: {
     }
     return { ok: true, url: data.web_url, number: data.iid, provider: "gitlab" };
   } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-      provider: "gitlab",
-    };
+    const message = err instanceof Error ? err.message : String(err);
+    const friendly = err instanceof Error && err.name === "TimeoutError"
+      ? `GitLab API request timed out after ${PR_FETCH_TIMEOUT_MS / 1000}s. Try again, or fall back to the compare URL.`
+      : message;
+    return { ok: false, error: friendly, provider: "gitlab" };
   }
 }

@@ -955,6 +955,12 @@ describe("auto-PR creation", () => {
 });
 
 describe("createPullRequest (interactive PR/MR tool)", () => {
+  // Admin email matches ADMIN_EMAIL in vitest.config.ts. Env-var token
+  // fallback is admin-only by design (mirrors src/outbound.ts), so any
+  // test that wants to exercise the env path must impersonate the admin.
+  const ADMIN_EMAIL = "admin@test.local";
+  const NON_ADMIN_EMAIL = "dev@dodo.local";
+
   const restoreFetch = (original: typeof fetch) => {
     globalThis.fetch = original;
   };
@@ -966,12 +972,61 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
       head: "feat/x",
       base: "main",
       title: "Ship it",
-    });
+    }, ADMIN_EMAIL);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("Could not parse");
   });
 
-  it("returns a structured failure when no token is available", async () => {
+  it("rejects look-alike github.com hosts (token exfiltration guard)", async () => {
+    // parseRemoteSpec must use exact + subdomain matching, not substring
+    // matching. A naive `host.includes("github.com")` check would treat
+    // `github.com.attacker.example` as GitHub and ship the user's token
+    // to the attacker. (audit finding H7)
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "secret-admin-token" };
+    try {
+      const { createPullRequest } = await import("../src/github-pr");
+      const result = await createPullRequest(envWithToken, {
+        remoteUrl: "https://github.com.attacker.example/foo/bar",
+        head: "feat/x",
+        base: "main",
+        title: "Ship it",
+      }, ADMIN_EMAIL);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("Could not parse");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("does NOT use env-var token fallback for non-admin users", async () => {
+    // Multi-tenant safety: env.GITHUB_TOKEN is the admin's secret. A
+    // non-admin session must not be able to use it just because the
+    // per-user secret lookup failed. (mirrors outbound.ts policy)
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "secret-admin-token" };
+    try {
+      const { createPullRequest } = await import("../src/github-pr");
+      const result = await createPullRequest(envWithToken, {
+        remoteUrl: "https://github.com/foo/bar",
+        head: "feat/x",
+        base: "main",
+        title: "Ship it",
+      }, NON_ADMIN_EMAIL);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("No github token");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("returns a structured failure when no token is available (GitHub)", async () => {
     const original = globalThis.fetch;
     const fetchSpy = vi.fn();
     globalThis.fetch = fetchSpy as typeof fetch;
@@ -982,11 +1037,34 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
         head: "feat/x",
         base: "main",
         title: "Ship it",
-      });
+      }, ADMIN_EMAIL);
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.error).toContain("No github token");
         expect(result.provider).toBe("github");
+      }
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("returns a structured failure when no token is available (GitLab)", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as typeof fetch;
+    try {
+      const { createPullRequest } = await import("../src/github-pr");
+      const result = await createPullRequest(env as Env, {
+        remoteUrl: "https://gitlab.com/foo/bar",
+        head: "feat/x",
+        base: "main",
+        title: "Ship it",
+      }, ADMIN_EMAIL);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain("No gitlab token");
+        expect(result.provider).toBe("gitlab");
       }
       expect(fetchSpy).not.toHaveBeenCalled();
     } finally {
@@ -1023,7 +1101,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
         base: "main",
         title: "Ship it",
         body: "Body text",
-      });
+      }, ADMIN_EMAIL);
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.url).toBe("https://github.com/foo/bar/pull/42");
@@ -1063,7 +1141,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
         head: "feat/x",
         base: "main",
         title: "Ship it",
-      });
+      }, ADMIN_EMAIL);
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.url).toBe("https://gitlab.com/foo/bar/-/merge_requests/7");
@@ -1075,10 +1153,10 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
     }
   });
 
-  it("surfaces GitHub API errors as structured failures", async () => {
+  it("surfaces GitHub API errors as structured failures with hints", async () => {
     const original = globalThis.fetch;
     const fetchSpy = vi.fn(async () => {
-      return new Response(JSON.stringify({ message: "Validation Failed" }), {
+      return new Response(JSON.stringify({ message: "A pull request already exists for foo:feat/x" }), {
         status: 422,
         headers: { "content-type": "application/json" },
       });
@@ -1092,12 +1170,38 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
         head: "feat/x",
         base: "main",
         title: "Ship it",
-      });
+      }, ADMIN_EMAIL);
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.provider).toBe("github");
         expect(result.error).toContain("422");
+        expect(result.error).toContain("Hint:");
+        expect(result.error.toLowerCase()).toContain("already");
       }
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("surfaces fetch timeouts with a friendly message", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn(async () => {
+      const err = new Error("aborted");
+      err.name = "TimeoutError";
+      throw err;
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
+    try {
+      const { createPullRequest } = await import("../src/github-pr");
+      const result = await createPullRequest(envWithToken, {
+        remoteUrl: "https://github.com/foo/bar",
+        head: "feat/x",
+        base: "main",
+        title: "Ship it",
+      }, ADMIN_EMAIL);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("timed out");
     } finally {
       restoreFetch(original);
     }

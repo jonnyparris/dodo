@@ -928,11 +928,11 @@ function buildGitTools(
           }
           if (!resolvedBody) {
             const commitBody = rest.join("\n").trim();
-            const parts: string[] = [];
-            if (commitBody) parts.push(commitBody);
-            parts.push("---");
-            parts.push("Drafted via Dodo session.");
-            resolvedBody = parts.join("\n\n");
+            // Skip the horizontal rule when there's no commit body — an
+            // orphan `---` above the footer reads like an empty section.
+            resolvedBody = commitBody
+              ? `${commitBody}\n\n---\n\nDrafted via Dodo session.`
+              : "Drafted via Dodo session.";
           }
         }
 

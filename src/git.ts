@@ -1,7 +1,8 @@
 import { WorkspaceFileSystem } from "@cloudflare/shell";
 import { createGit } from "@cloudflare/shell/git";
 import type { Workspace } from "@cloudflare/shell";
-import { getUserControlStub } from "./auth";
+import { getUserControlStub, isAdmin } from "./auth";
+import { isGitHubHost, isGitLabHost } from "./hosts";
 import { log } from "./logger";
 import { parseRemoteSpec } from "./repos";
 import type { AppConfig, Env } from "./types";
@@ -12,38 +13,6 @@ function hostFromUrl(url: string): string {
   } catch {
     return "";
   }
-}
-
-// Known provider hostnames. Substring matching (e.g. host.includes("github.com"))
-// would treat hostile hostnames like `evil-github.com.attacker.example` as
-// GitHub and ship a user's token to the attacker. Use exact + subdomain
-// matching instead. (audit finding H7)
-const GITHUB_HOSTS = new Set([
-  "github.com",
-  "api.github.com",
-  "raw.githubusercontent.com",
-  "objects.githubusercontent.com",
-]);
-
-const GITLAB_HOSTS = new Set([
-  "gitlab.com",
-  "gitlab.cfdata.org",
-]);
-
-function isGitHubHost(host: string): boolean {
-  if (GITHUB_HOSTS.has(host)) return true;
-  for (const known of GITHUB_HOSTS) {
-    if (host.endsWith(`.${known}`)) return true;
-  }
-  return false;
-}
-
-function isGitLabHost(host: string): boolean {
-  if (GITLAB_HOSTS.has(host)) return true;
-  for (const known of GITLAB_HOSTS) {
-    if (host.endsWith(`.${known}`)) return true;
-  }
-  return false;
 }
 
 /** Map a git remote URL hostname to the secret key name in UserControl. */
@@ -135,14 +104,19 @@ export async function resolveRemoteToken(input: {
     }
   }
 
-  // Fall back to env vars
-  const envToken = chooseTokenForUrl(resolvedUrl, input.env);
-  if (envToken) {
-    log("info", "git: using env var fallback for auth", { host });
-  } else {
-    log("warn", "git: no token found — request will be unauthenticated", { host, secretKey, hasOwnerEmail: !!input.ownerEmail });
+  // Restricted env var fallback — admin account only.
+  // Mirrors the policy in src/outbound.ts to prevent non-admin tenants from
+  // accidentally sending the admin's tokens to the configured provider.
+  if (input.ownerEmail && isAdmin(input.ownerEmail, input.env)) {
+    const envToken = chooseTokenForUrl(resolvedUrl, input.env);
+    if (envToken) {
+      log("info", "git: using env var fallback for auth (admin)", { host });
+      return envToken;
+    }
   }
-  return envToken;
+
+  log("warn", "git: no token found — request will be unauthenticated", { host, secretKey, hasOwnerEmail: !!input.ownerEmail });
+  return undefined;
 }
 
 async function resolveRemoteUrl(git: ReturnType<typeof createGit>, dir?: string, remote?: string): Promise<string | undefined> {

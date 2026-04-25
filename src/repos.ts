@@ -1,3 +1,5 @@
+import { isGitHubHost, isGitLabHost } from "./hosts";
+
 export type KnownRepoId = "dodo";
 
 export interface KnownRepo {
@@ -41,6 +43,19 @@ export interface ParsedRemoteSpec {
   repo: string;
 }
 
+/**
+ * Classify a hostname using exact + subdomain matching against the same
+ * known-host sets used by the auth/outbound layer. Substring matching (e.g.
+ * `host.includes("github.com")`) would treat hostile hostnames like
+ * `github.com.attacker.example` as GitHub and could leak tokens; we avoid
+ * that here by reusing the strict checks from src/git.ts.
+ */
+function classifyHost(host: string): "github" | "gitlab" | null {
+  if (isGitHubHost(host)) return "github";
+  if (isGitLabHost(host)) return "gitlab";
+  return null;
+}
+
 export function parseRemoteSpec(url: string): ParsedRemoteSpec | null {
   const normalized = url.trim();
   const httpsMatch = normalized.match(/^https?:\/\/([^/]+)\/([^/]+)\/([^/]+?)(?:\.git)?$/i);
@@ -48,11 +63,9 @@ export function parseRemoteSpec(url: string): ParsedRemoteSpec | null {
     const host = httpsMatch[1].toLowerCase();
     const owner = httpsMatch[2];
     const repo = httpsMatch[3];
-    if (host.includes("github.com")) {
-      return { fullName: `${owner}/${repo}`, host, owner, provider: "github", repo };
-    }
-    if (host.includes("gitlab")) {
-      return { fullName: `${owner}/${repo}`, host, owner, provider: "gitlab", repo };
+    const provider = classifyHost(host);
+    if (provider) {
+      return { fullName: `${owner}/${repo}`, host, owner, provider, repo };
     }
     return null;
   }
@@ -62,11 +75,9 @@ export function parseRemoteSpec(url: string): ParsedRemoteSpec | null {
     const host = sshMatch[1].toLowerCase();
     const owner = sshMatch[2];
     const repo = sshMatch[3];
-    if (host.includes("github.com")) {
-      return { fullName: `${owner}/${repo}`, host, owner, provider: "github", repo };
-    }
-    if (host.includes("gitlab")) {
-      return { fullName: `${owner}/${repo}`, host, owner, provider: "gitlab", repo };
+    const provider = classifyHost(host);
+    if (provider) {
+      return { fullName: `${owner}/${repo}`, host, owner, provider, repo };
     }
   }
 
