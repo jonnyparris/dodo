@@ -20,6 +20,7 @@ export interface Env {
   DEFAULT_EXPLORE_MODEL?: string;
   /** Default model for the `task` subagent. Same fallback semantics. */
   DEFAULT_TASK_MODEL?: string;
+  DEPLOY_MCP_CATALOG_CONFIG?: string;
   DODO_MCP_TOKEN?: string;
   DODO_COMMIT?: string;
   DODO_VERSION?: string;
