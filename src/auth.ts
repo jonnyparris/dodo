@@ -14,7 +14,7 @@ export function resolveAdminEmail(env: Env): string | undefined {
 }
 
 /** Check whether Cloudflare Access JWT validation is configured. */
-export function isAccessConfigured(env: Env): boolean {
+function isAccessConfigured(env: Env): boolean {
   return !!(
     env.CF_ACCESS_AUD &&
     env.CF_ACCESS_TEAM_DOMAIN &&

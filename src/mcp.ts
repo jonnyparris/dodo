@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
 import { canonicalizeEmail, getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
+import { messageLimiter, promptLimiter } from "./rate-limiters";
 import { createDraftPrForRun } from "./github-pr";
 import { pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-actions";
 import { getKnownRepo, listKnownRepos } from "./repos";
@@ -81,6 +82,47 @@ async function checkSessionPermission(
   }
 
   return { allowed: false, permission: null };
+}
+
+/**
+ * Charge the shared `promptLimiter` for an MCP-driven prompt dispatch.
+ * Returns null when the request is allowed; an MCP errorResult when
+ * over budget. (audit follow-up F3)
+ *
+ * Uses the same `prompt:${email}` and `msg:${email}` keys as the HTTP
+ * routes so MCP traffic and interactive traffic share one budget per
+ * user.
+ */
+function checkPromptBudget(email: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+  const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
+  if (!rl.allowed) {
+    return errorResult({
+      error: "Too many prompts (per-user hourly limit hit)",
+      retryAfter: rl.retryAfter ?? 60,
+    });
+  }
+  return null;
+}
+
+function checkMessageBudget(email: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+  const rl = messageLimiter.check(`msg:${email}`, 120, 60 * 60 * 1000);
+  if (!rl.allowed) {
+    return errorResult({
+      error: "Too many messages (per-user hourly limit hit)",
+      retryAfter: rl.retryAfter ?? 60,
+    });
+  }
+  return null;
+}
+
+function checkGenerateBudget(email: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+  // Mirrors the HTTP /generate route — both an hourly and a daily cap on
+  // FLUX image generation since it's pay-per-call.
+  const hr = promptLimiter.check(`generate-hr:${email}`, 30, 60 * 60 * 1000);
+  if (!hr.allowed) return errorResult({ error: "Too many image generations (hourly limit)", retryAfter: hr.retryAfter ?? 60 });
+  const day = promptLimiter.check(`generate-day:${email}`, 100, 24 * 60 * 60 * 1000);
+  if (!day.allowed) return errorResult({ error: "Too many image generations (daily limit)", retryAfter: day.retryAfter ?? 60 });
+  return null;
 }
 
 /** Convenience wrapper that turns a denied check into an MCP error result. */
@@ -492,6 +534,12 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   });
 
   server.tool("fork_session", "Fork a session (copy files + messages into a new session)", { sessionId: z.string().describe("Source session ID") }, async ({ sessionId }) => {
+    // Require at least readwrite on the source (matches /session/:id/fork
+    // HTTP route which requires "write"). Without this gate, an MCP-token
+    // holder could fork any session whose UUID they can guess.
+    // (audit follow-up F4)
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
     const email = mcpUserEmail(env, userEmail);
     let newId: string;
     try {
@@ -539,6 +587,11 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   });
 
   server.tool("get_artifacts_remote", "Get or create the per-session Cloudflare Artifacts repo remote.", { sessionId: z.string() }, async ({ sessionId }) => {
+    // Artifacts contexts hand out short-lived tokens that grant write
+    // access to the per-session repo. Gate behind session permission.
+    // (audit follow-up F4)
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
     const agent = (await getAgentByName(env.CODING_AGENT as never, sessionId)) as unknown as CodingAgent;
     const ctx = await agent.getOrCreateArtifactsContext(sessionId);
     if (!ctx) {
@@ -557,8 +610,12 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     ref: z.string().min(1).describe("Branch ref to verify"),
     baseRef: z.string().default("main").describe("Base branch to compare against"),
     expectedFiles: z.array(z.string()).optional().describe("Files that must appear in the remote diff"),
-  }, async ({ sessionId, dir, ref, baseRef, expectedFiles }) =>
-    jsonFetch(env, "agent", "/git/verify-branch", {
+  }, async ({ sessionId, dir, ref, baseRef, expectedFiles }) => {
+    // Permission check — verify-branch reads git state for the session.
+    // (audit follow-up F4)
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/git/verify-branch", {
       sessionId,
       depth,
       init: {
@@ -566,8 +623,8 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
         headers: { "content-type": "application/json" },
         method: "POST",
       },
-    }),
-  );
+    });
+  });
 
   server.tool("run_repo_edits", "Run a deterministic repo task end-to-end: fork a seeded repo session, create a branch, apply text edits, commit, push, verify, and record state transitions.", {
     repoId: z.string().describe("Known repo id (for example: dodo)"),
@@ -670,6 +727,12 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     prompt: z.string().min(1).describe("Worker prompt. The repo is already cloned and the branch is already checked out."),
     verifyWorkflow: z.string().min(1).nullable().optional().describe("GitHub Actions workflow filename (e.g. 'dodo-verify.yml') to run as an external typecheck/test gate after the branch pushes. The workflow must accept a `workflow_dispatch` trigger and a `ref` input. Leave null/unset to skip the verify gate (default). See .github/workflows/dodo-verify.yml.example for a template."),
   }, async ({ repoId, title, branch, baseBranch, commitMessage, expectedFiles, prompt, verifyWorkflow }) => {
+    // dispatch_repo_prompt fires /prompt against a worker session DO,
+    // bypassing the HTTP rate limiter. Charge the per-user prompt budget
+    // here so MCP orchestration can't drive unbounded LLM spend.
+    // (audit follow-up F3)
+    const limited = checkPromptBudget(mcpUserEmail(env, userEmail));
+    if (limited) return limited;
     const repo = getKnownRepo(repoId);
     const worker = await createSessionWithTitle(env, title);
     const run = await createWorkerRun(env, {
@@ -911,6 +974,10 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   }, async ({ sessionId, content }) => {
     const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
     if (!access.ok) return access.result;
+    // Charge the same per-user message budget as the HTTP route so
+    // MCP-token holders can't sidestep the limit. (audit follow-up F3)
+    const limited = checkMessageBudget(mcpUserEmail(env, userEmail));
+    if (limited) return limited;
     return jsonFetch(env, "agent", "/message", {
       sessionId,
       depth,
@@ -924,6 +991,8 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   }, async ({ sessionId, content }) => {
     const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
     if (!access.ok) return access.result;
+    const limited = checkPromptBudget(mcpUserEmail(env, userEmail));
+    if (limited) return limited;
     return jsonFetch(env, "agent", "/prompt", {
       sessionId,
       depth,
@@ -937,6 +1006,8 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   }, async ({ sessionId, prompt }) => {
     const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
     if (!access.ok) return access.result;
+    const limited = checkGenerateBudget(mcpUserEmail(env, userEmail));
+    if (limited) return limited;
     return jsonFetch(env, "agent", "/generate", {
       sessionId,
       depth,

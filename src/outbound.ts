@@ -1,7 +1,16 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { getSharedIndexStub, resolveAdminEmail } from "./auth";
 import { OWNER_ID_HEADER } from "./executor";
+import { MCP_CATALOG } from "./mcp-catalog";
 import type { Env } from "./types";
+
+// Catalog knownHosts are implicitly allowed at runtime so codemode fetches
+// to (e.g.) `api.githubcopilot.com` don't require an admin to also add
+// the host to the SharedIndex allowlist. Mirrors the config-time check
+// in src/index.ts:isHostAllowed. (audit follow-up F6)
+const CATALOG_HOSTNAMES = new Set(
+  MCP_CATALOG.flatMap((entry) => entry.knownHosts ?? []).map((h) => h.toLowerCase()),
+);
 
 const GITHUB_HOSTS = new Set([
   "api.github.com",
@@ -54,17 +63,22 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     const url = new URL(request.url);
     const hostname = url.hostname.toLowerCase();
 
-    const stub = getSharedIndexStub(this.env);
-    const checkResponse = await stub.fetch(
-      `https://shared-index/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
-    );
-    const { allowed } = (await checkResponse.json()) as { allowed: boolean };
-
-    if (!allowed) {
-      return new Response(
-        JSON.stringify({ error: `Outbound request to ${hostname} blocked — not in allowlist` }),
-        { status: 403, headers: { "content-type": "application/json" } },
+    // Static catalog hosts are always allowed — admins shouldn't have to
+    // duplicate well-known MCP catalog entries into the SharedIndex
+    // allowlist for runtime sandbox fetches. (audit follow-up F6)
+    if (!CATALOG_HOSTNAMES.has(hostname)) {
+      const stub = getSharedIndexStub(this.env);
+      const checkResponse = await stub.fetch(
+        `https://shared-index/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
       );
+      const { allowed } = (await checkResponse.json()) as { allowed: boolean };
+
+      if (!allowed) {
+        return new Response(
+          JSON.stringify({ error: `Outbound request to ${hostname} blocked — not in allowlist` }),
+          { status: 403, headers: { "content-type": "application/json" } },
+        );
+      }
     }
 
     // Extract and strip owner identity header before forwarding

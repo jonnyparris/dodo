@@ -286,8 +286,10 @@ Set via `wrangler secret put <NAME>` or through the Deploy to Cloudflare flow.
 | `CF_ACCESS_AUD` | If using Access | Cloudflare Access application audience tag |
 | `CF_ACCESS_TEAM_DOMAIN` | If using Access | Cloudflare Access team domain URL |
 | `NTFY_TOPIC` | Optional | ntfy.sh topic for worker run push notifications |
+| `GITHUB_TOKEN` | Optional | Admin-only env fallback when no per-user GitHub token is set |
+| `GITLAB_TOKEN` | Optional | Admin-only env fallback when no per-user GitLab token is set |
 
-Per-user secrets (GitHub token, GitLab token) are stored encrypted in each user's Durable Object using envelope encryption (AES-256-GCM) -- not as environment variables.
+Per-user secrets (GitHub token, GitLab token) are stored encrypted in each user's Durable Object using envelope encryption (AES-256-GCM) -- not as environment variables. The `GITHUB_TOKEN` / `GITLAB_TOKEN` env vars exist only as a fallback for the admin account when no per-user secret has been provisioned.
 
 ---
 

@@ -370,16 +370,20 @@ export class SharedIndex extends DurableObject<Env> {
         };
         if (!body.message) return Response.json({ error: "message required" }, { status: 400 });
 
-        // Rate limit: max 100 errors per email per hour
-        const email = body.email ?? "anonymous";
+        // Rate limit: 1000 total errors per hour across the whole instance.
+        // The previous email-based key was spoofable via `body.email` —
+        // an attacker could burn down a victim's quota and silence their
+        // legitimate error reports. The Worker layer already applies a
+        // per-IP cap (errorLimiter, 30/hr/IP) so the only remaining job
+        // here is a global ceiling that protects R2 / SQLite. Errors
+        // older than 7 days are auto-pruned below. (audit follow-up F5)
         const oneHourAgo = nowEpoch() - 3600;
         const countRow = this.db.one(
-          "SELECT COUNT(*) AS c FROM client_errors WHERE email = ? AND created_at > ?",
-          email,
+          "SELECT COUNT(*) AS c FROM client_errors WHERE created_at > ?",
           oneHourAgo,
         );
-        if (Number(countRow?.c ?? 0) >= 100) {
-          return Response.json({ error: "Rate limit exceeded" }, { status: 429 });
+        if (Number(countRow?.c ?? 0) >= 1000) {
+          return Response.json({ error: "Rate limit exceeded (global)" }, { status: 429 });
         }
 
         // Auto-prune errors older than 7 days
