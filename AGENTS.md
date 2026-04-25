@@ -36,16 +36,20 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
 
 ### If you're a Dodo session (sandboxed clone in a Durable Object)
 
-This is the case when the agent reading this file is running inside Dodo itself — the workspace is an ephemeral clone in a session DO, you have `git_*` tools (not a shell), and there is no `~/dev/dodo` parent checkout to share with.
+This is the case when the agent reading this file is running inside Dodo itself — the workspace is an ephemeral clone in a session DO, you have git tools (not a shell), and there is no `~/dev/dodo` parent checkout to share with.
 
 **Do not use `git worktree`.** It has no meaning here — there's nothing to share with, no concurrent local agents to collide with, and no `..` parent dir. The session's clone *is* the workspace.
 
+Git is split across two surfaces:
+- **Top-level tools (call directly):** `git_status`, `git_add`, `git_commit`, `git_diff`. The hot path.
+- **Inside codemode (call as `git.<name>`):** `git_clone_known`, `git_clone`, `git_push`, `git_push_checked`, `git_pull`, `git_branch`, `git_checkout`, `git_log`, `git_verify_remote_branch`, `pr_create`. Wrap them in a `codemode({ code: ... })` JS block.
+
 Workflow:
 
-1. After cloning, create a branch directly: `git_branch` then `git_checkout`, or `git_checkout` with a `new` flag. Branch off `main`.
-2. Make changes. Stage specific files. Commit with a clear message.
-3. Push with `git_push_checked` — pass an explicit branch ref, never push to `main`.
-4. **Open the draft PR with `pr_create` before replying to the user.** It auto-detects GitHub vs GitLab, auto-fills title and body from your latest commit, and returns the PR/MR URL. Quote that URL in your reply. If `pr_create` fails (e.g. missing per-user token), fall back to a compare URL and tell the user what's missing — but don't just leave them with a pushed branch and no PR.
+1. After cloning, create a branch directly inside codemode: `await git.git_branch({ name: "feat/x" })` then `await git.git_checkout({ branch: "feat/x" })`. Branch off `main`.
+2. Make changes. Use top-level `git_status` / `git_add` / `git_commit` for the inner loop.
+3. Push with `git.git_push_checked` from inside codemode — pass an explicit branch ref, never push to `main`.
+4. **Open the draft PR with `git.pr_create` before replying to the user.** It auto-detects GitHub vs GitLab, auto-fills title and body from your latest commit, and returns the PR/MR URL. Quote that URL in your reply. If `git.pr_create` fails (e.g. missing per-user token), fall back to a compare URL and tell the user what's missing — but don't just leave them with a pushed branch and no PR.
 5. Branch naming: `fix/sse-serialization`, `feat/per-user-auth`, `docs/update-readme`, `chore/<scope>`.
 
 ### If you're running locally via OpenCode CLI in `~/dev/dodo`
@@ -186,8 +190,10 @@ These tools are available to the agent at runtime (built in `src/agentic.ts`):
 - `replace_in_file` — find-and-replace within a file
 
 **Git tools** (built in `buildGitTools()`):
-- `git_clone`, `git_status`, `git_add`, `git_commit`, `git_push`, `git_pull`
-- `git_branch`, `git_checkout`, `git_diff`, `git_log`
+- **Top-level (hot path):** `git_status`, `git_add`, `git_commit`, `git_diff`
+- **Inside codemode only (call as `git.<name>`):** `git_clone_known`, `git_clone`, `git_push`, `git_push_checked`, `git_pull`, `git_branch`, `git_checkout`, `git_log`, `git_verify_remote_branch`, `pr_create`
+
+The lower-frequency git tools are reachable via codemode's `git` provider namespace rather than as individual top-level tools. This saves roughly 1k tokens of tool-schema budget per turn without losing any capability — see `buildTools()` in `src/agentic.ts` for the split.
 
 **Code execution** (from `@cloudflare/think/tools/execute`):
 - `codemode` — sandboxed JS execution with workspace filesystem and git access, gated outbound fetch
@@ -195,7 +201,7 @@ These tools are available to the agent at runtime (built in `src/agentic.ts`):
 **Skill loader** (`src/skill-registry.ts`):
 - `skill` — load a SKILL.md body on demand. The system prompt's `<available_skills>` block lists name + description per skill; this tool returns the full body when the model picks one. Two-stage progressive disclosure mirrors Claude Code / OpenCode.
 
-All tools are registered as top-level tools. Codemode also has access to workspace and git tools internally as providers.
+The hot-path tools (workspace primitives, the four top-level git tools, `codemode`, the subagent tools, and `skill`) are top-level. The rest of the git surface is exposed only through codemode's provider namespaces.
 
 ---
 

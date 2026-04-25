@@ -1834,8 +1834,17 @@ function buildTools(
     },
   });
 
-  // Git tools — always available as top-level tools
-  Object.assign(tools, gitTools);
+  // Git tools — only the hot-path subset is exposed at the top level.
+  // The full set (clone/push/pr_create/branch/checkout/log/pull/verify) is
+  // reachable inside codemode via the `git` provider namespace, so we save
+  // ~1k tokens of tool-schema budget per turn without losing capability.
+  // Hot-path: git_status, git_add, git_commit, git_diff are called every
+  // turn the model touches a repo — keeping them top-level avoids the
+  // codemode JS round-trip on the common case.
+  const TOP_LEVEL_GIT_TOOLS = ["git_status", "git_add", "git_commit", "git_diff"] as const;
+  for (const name of TOP_LEVEL_GIT_TOOLS) {
+    if (gitTools[name]) tools[name] = gitTools[name];
+  }
 
   // Explore tool — search subagent for token-efficient codebase discovery.
   // When `config.exploreMode === "facet"`, the tool delegates to an
