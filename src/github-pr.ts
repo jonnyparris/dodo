@@ -340,3 +340,136 @@ async function createGitlabMr(args: {
     return { ok: false, error: friendly, provider: "gitlab" };
   }
 }
+
+// ─── Create a fresh GitHub repo (for the publish_to_github tool) ───
+
+export interface CreateGithubRepoInput {
+  /** Repo name. Must match GitHub's naming rules (alphanumerics, `-`, `_`, `.`). */
+  name: string;
+  /** Org to create the repo under. If omitted, the repo is created on the
+   *  authenticated user's account. */
+  owner?: string;
+  /** Visibility. Defaults to private — Dodo sessions are personal scratch
+   *  spaces and shouldn't accidentally publish to the world. */
+  private?: boolean;
+  /** Optional description shown on the GitHub repo page. */
+  description?: string;
+}
+
+export interface CreateGithubRepoSuccess {
+  ok: true;
+  /** `https://github.com/<owner>/<repo>` */
+  htmlUrl: string;
+  /** `https://github.com/<owner>/<repo>.git` — the URL to push to. */
+  cloneUrl: string;
+  owner: string;
+  name: string;
+  private: boolean;
+}
+
+export interface CreateGithubRepoFailure {
+  ok: false;
+  error: string;
+  /** True when the failure is "name already taken" — the caller may want to
+   *  retry with a suffix. (`POST /user/repos` returns 422 in that case.) */
+  nameTaken?: boolean;
+}
+
+export type CreateGithubRepoResult = CreateGithubRepoSuccess | CreateGithubRepoFailure;
+
+const REPO_NAME_RE = /^[a-zA-Z0-9._-]+$/;
+
+/**
+ * Create a fresh GitHub repository. The token must have:
+ * - `repo` scope (classic PAT), OR
+ * - `Contents: Write` + `Administration: Write` (fine-grained PAT).
+ *
+ * Returns a structured `{ ok: true, cloneUrl }` on success so the caller can
+ * configure a remote and push to it.
+ */
+export async function createGithubRepo(
+  env: Env,
+  input: CreateGithubRepoInput,
+  ownerEmail?: string,
+): Promise<CreateGithubRepoResult> {
+  if (!REPO_NAME_RE.test(input.name)) {
+    return {
+      ok: false,
+      error: `Invalid repo name '${input.name}'. GitHub allows alphanumerics, '-', '_', and '.' only.`,
+    };
+  }
+
+  const token = await resolveProviderToken(env, "github", ownerEmail);
+  if (!token) {
+    return {
+      ok: false,
+      error: "No github token available. Add it via the secrets UI (key 'github_token') or set GITHUB_TOKEN on the worker. The token must have 'repo' scope (classic) or 'Administration: Write' (fine-grained) to create repos.",
+    };
+  }
+
+  const isPrivate = input.private ?? true;
+  const url = input.owner
+    ? `https://api.github.com/orgs/${encodeURIComponent(input.owner)}/repos`
+    : "https://api.github.com/user/repos";
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Accept": "application/vnd.github+json",
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "User-Agent": "dodo-agent",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      body: JSON.stringify({
+        name: input.name,
+        private: isPrivate,
+        description: input.description,
+        // Don't auto-init — we're about to push our own history.
+        auto_init: false,
+      }),
+      signal: AbortSignal.timeout(PR_FETCH_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      const lower = text.toLowerCase();
+      const nameTaken = response.status === 422 && (lower.includes("already exists") || lower.includes("name already"));
+      let error = `GitHub API returned ${response.status}: ${text.slice(0, 300)}`;
+      if (nameTaken) {
+        error += "\n\nHint: a repo with that name already exists. Try a different name, or pass `owner` to create under an org.";
+      } else if (response.status === 401 || response.status === 403) {
+        error += "\n\nHint: the token may be missing the 'repo' scope (classic PAT) or 'Administration: Write' (fine-grained PAT). Check the token's permissions and try again.";
+      } else if (response.status === 404 && input.owner) {
+        error += `\n\nHint: the org '${input.owner}' does not exist or your token doesn't have access to it.`;
+      }
+      return { ok: false, error, nameTaken };
+    }
+
+    const data = (await response.json()) as {
+      html_url?: string;
+      clone_url?: string;
+      private?: boolean;
+      owner?: { login?: string };
+      name?: string;
+    };
+    if (!data.html_url || !data.clone_url || !data.owner?.login || !data.name) {
+      return { ok: false, error: "GitHub returned an unexpected response (missing url/owner/name)." };
+    }
+    return {
+      ok: true,
+      htmlUrl: data.html_url,
+      cloneUrl: data.clone_url,
+      owner: data.owner.login,
+      name: data.name,
+      private: data.private ?? isPrivate,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const friendly = err instanceof Error && err.name === "TimeoutError"
+      ? `GitHub API request timed out after ${PR_FETCH_TIMEOUT_MS / 1000}s.`
+      : message;
+    return { ok: false, error: friendly };
+  }
+}

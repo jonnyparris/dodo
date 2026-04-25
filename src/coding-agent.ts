@@ -2347,6 +2347,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return await this.handleGitRemote(request);
       }
 
+      if (request.method === "POST" && url.pathname === "/git/publish-to-github") {
+        return await this.handleGitPublishToGitHub(request);
+      }
+
       if (request.method === "POST" && url.pathname === "/message") {
         return await this.handleMessage(request);
       }
@@ -3091,6 +3095,119 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return Response.json(
       await git.remote({ add: body.add, dir, list: body.list, remove: body.remove }),
     );
+  }
+
+  /**
+   * Push the workspace to a freshly-created GitHub repo. The MCP tool
+   * `publish_to_github` calls this after creating the repo via the GitHub API
+   * — by the time we get here the remote URL is real and we just need to
+   * configure a remote pointing at it and push.
+   *
+   * Distinct from `handleGitPush` because:
+   *  - It (re)writes the `github` remote idempotently — handy when the user
+   *    re-runs publish after fixing something.
+   *  - It defaults `ref` to the current branch (or `main`) so the agent
+   *    doesn't have to guess.
+   *  - It rejects an empty workspace with a clear message before issuing
+   *    a push that would just be a no-op.
+   */
+  private async handleGitPublishToGitHub(request: Request): Promise<Response> {
+    const body = z.object({
+      cloneUrl: z.string().url().describe("https://github.com/<owner>/<repo>.git"),
+      dir: z.string().optional(),
+      ref: z.string().optional(),
+      remoteName: z.string().optional(),
+    }).strict().parse(await request.json());
+
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const remoteName = body.remoteName ?? "github";
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+
+    // Ensure the workspace is a git repo. If `flushTurnToArtifacts` already
+    // ran this turn, it is. Otherwise initialise it, mirroring the auto-init
+    // path in artifacts-flush.ts so we never publish a repo with no history.
+    try {
+      await git.status({ dir });
+    } catch {
+      try {
+        await git.init({ defaultBranch: "main", dir });
+      } catch (err) {
+        return Response.json({ error: `Could not init workspace as a git repo: ${err instanceof Error ? err.message : String(err)}` }, { status: 400 });
+      }
+    }
+
+    // Resolve the branch to push. Prefer the explicit ref, then current
+    // branch, then fall back to `main` (which is what artifacts-flush uses).
+    let ref = body.ref;
+    if (!ref) {
+      try {
+        const branchInfo = await git.branch({ dir, list: true });
+        if (branchInfo && typeof branchInfo === "object" && "current" in branchInfo && typeof branchInfo.current === "string") {
+          ref = branchInfo.current;
+        }
+      } catch {
+        // Fall through — empty repos before the first commit have no branch.
+      }
+    }
+    ref = ref ?? "main";
+
+    // Refuse to publish a repo that has nothing to push. Without this check
+    // git.push silently succeeds with zero refs, the GitHub repo stays empty,
+    // and the user is left wondering why nothing happened.
+    try {
+      const log = await git.log({ depth: 1, dir, ref });
+      if (!Array.isArray(log) || log.length === 0) {
+        return Response.json({ error: `Branch '${ref}' has no commits. Stage and commit your work first (git_add + git_commit), then retry publish_to_github.` }, { status: 400 });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return Response.json({ error: `Branch '${ref}' has no commits or does not exist (${msg}). Stage and commit your work first.` }, { status: 400 });
+    }
+
+    // Configure the GitHub remote idempotently. `git.remote({ add })` errors
+    // if the remote already exists, so remove first if present.
+    try {
+      const remotes = (await git.remote({ dir, list: true })) as unknown as Array<{ remote: string; url: string }>;
+      if (Array.isArray(remotes) && remotes.some((r) => r.remote === remoteName)) {
+        await git.remote({ dir, remove: remoteName });
+      }
+      await git.remote({ dir, add: { name: remoteName, url: body.cloneUrl } });
+    } catch (err) {
+      return Response.json({ error: `Could not configure '${remoteName}' remote: ${err instanceof Error ? err.message : String(err)}` }, { status: 500 });
+    }
+
+    // Resolve the GitHub token via the standard remote-url-aware path. This
+    // honours per-user secrets first, then falls back to env (admin only) —
+    // identical policy to git_push and pr_create.
+    let token: string | undefined;
+    try {
+      token = await resolveRemoteToken({ dir, env: this.env, git, remote: remoteName, ownerEmail, url: body.cloneUrl });
+    } catch (err) {
+      return Response.json({ error: `Could not resolve GitHub token: ${err instanceof Error ? err.message : String(err)}` }, { status: 500 });
+    }
+    if (!token) {
+      return Response.json({ error: "No GitHub token available for the push. Add 'github_token' via the secrets UI." }, { status: 400 });
+    }
+
+    try {
+      const result = await git.push({ dir, ref, remote: remoteName, token });
+      if (!result.ok) {
+        const refErrors = Object.entries(result.refs ?? {})
+          .filter(([, v]) => !v.ok)
+          .map(([k, v]) => `${k}: ${v.error}`)
+          .join("; ");
+        return Response.json({ error: `Push to GitHub failed: ${refErrors || "remote rejected the push"}`, refs: result.refs }, { status: 422 });
+      }
+      const refs = result.refs ?? {};
+      if (Object.keys(refs).length === 0) {
+        return Response.json({ error: "Push was a no-op — no refs were pushed. The branch may already match the remote.", refs }, { status: 422 });
+      }
+      return Response.json({ ok: true, ref, remoteName, refs });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return Response.json({ error: `Push to GitHub failed: ${msg}` }, { status: 500 });
+    }
   }
 
   private async handleCreateCron(request: Request): Promise<Response> {

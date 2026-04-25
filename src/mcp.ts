@@ -3,7 +3,7 @@ import { getAgentByName } from "agents";
 import { z } from "zod";
 import { canonicalizeEmail, getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
 import { messageLimiter, promptLimiter } from "./rate-limiters";
-import { createDraftPrForRun } from "./github-pr";
+import { createDraftPrForRun, createGithubRepo } from "./github-pr";
 import { pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-actions";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
@@ -603,6 +603,71 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
       token: ctx.tokenSecret,
     });
   });
+
+  server.tool(
+    "publish_to_github",
+    "Create a fresh GitHub repository and push the session workspace to it. Use this when promoting an Artifacts-only project (or any session repo) to GitHub. Requires a 'github_token' with the 'repo' scope (classic PAT) or 'Administration: Write' (fine-grained PAT). Defaults to a private repo on the authenticated user's account; pass 'owner' to create under an organisation.",
+    {
+      sessionId: z.string().describe("Session whose workspace will be pushed to GitHub"),
+      name: z.string().min(1).describe("Repo name. Alphanumerics, '-', '_', '.' only."),
+      owner: z.string().optional().describe("GitHub org or user. If omitted, the repo is created on the authenticated user's account."),
+      private: z.boolean().optional().describe("Visibility. Defaults to true (private)."),
+      description: z.string().optional().describe("Repo description shown on GitHub."),
+      ref: z.string().optional().describe("Branch to push. Defaults to the workspace's current branch, or 'main'."),
+      dir: z.string().optional().describe("Repo directory inside the session workspace. Defaults to the workspace root (matches the Artifacts auto-flush)."),
+    },
+    async ({ sessionId, name, owner, private: isPrivate, description, ref, dir }) => {
+      // publish_to_github both creates a remote repo on GitHub *and* pushes
+      // session-owned content to it. That's a write operation against the
+      // session's data, plus an external side effect — gate at "write".
+      const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+      if (!access.ok) return access.result;
+
+      // 1. Create the empty GitHub repo. If creation fails (no token, name
+      //    taken, perms missing), surface the structured error to the agent
+      //    and stop — there's no point trying to push without a target.
+      const created = await createGithubRepo(env, { name, owner, private: isPrivate, description }, userEmail);
+      if (!created.ok) {
+        return textResult({ ok: false, step: "create_repo", error: created.error, nameTaken: created.nameTaken });
+      }
+
+      // 2. Push the session workspace to it. If the push fails, the GitHub
+      //    repo will exist but be empty — return both pieces of info so the
+      //    caller can either retry or delete the repo manually.
+      const push = await jsonFetch(env, "agent", "/git/publish-to-github", {
+        sessionId,
+        depth,
+        init: {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cloneUrl: created.cloneUrl, ref, dir }),
+        },
+      });
+      const pushPayload = (push.content?.[0]?.text ? JSON.parse(push.content[0].text) : {}) as Record<string, unknown>;
+      if (push.isError) {
+        return textResult({
+          ok: false,
+          step: "push",
+          repo: { htmlUrl: created.htmlUrl, cloneUrl: created.cloneUrl, owner: created.owner, name: created.name, private: created.private },
+          error: typeof pushPayload.error === "string" ? pushPayload.error : "Push to GitHub failed",
+          hint: "The GitHub repo was created but is empty. Fix the underlying issue (commit your work, check the branch name) and retry, or delete the repo manually.",
+        });
+      }
+
+      return textResult({
+        ok: true,
+        repo: {
+          htmlUrl: created.htmlUrl,
+          cloneUrl: created.cloneUrl,
+          owner: created.owner,
+          name: created.name,
+          private: created.private,
+        },
+        push: pushPayload,
+        message: `Published session workspace to ${created.htmlUrl}`,
+      });
+    },
+  );
 
   server.tool("verify_branch", "Verify that a pushed branch is ahead of the base branch and optionally contains expected changed files.", {
     sessionId: z.string().describe("Worker session id with the repo checkout"),

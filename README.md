@@ -269,6 +269,16 @@ Every Dodo session automatically gets its own [Cloudflare Artifacts](https://dev
 
 Note: this is **separate** from the auto-draft-PR feature on GitHub, which only applies to orchestrated dispatch runs (`dispatch_repo_prompt`) that target a user-configured GitHub repo. Artifacts repos are always per-session and always on Cloudflare.
 
+### Publishing to GitHub
+
+When a session-only / Artifacts-only project graduates into something you want on GitHub, call the MCP tool `publish_to_github` (params: `sessionId`, `name`, optional `owner`, `private`, `description`, `ref`, `dir`). It:
+
+1. Creates a fresh repo via `POST /user/repos` (or `POST /orgs/<owner>/repos` if `owner` is set).
+2. Adds a `github` remote in the session workspace pointing at the new clone URL.
+3. Pushes the workspace's current branch (or whatever you pass as `ref`) to it.
+
+Defaults to a private repo on the authenticated user's account. Requires a `github_token` saved via the secrets UI with the `repo` scope (classic PAT) or `Administration: Write` (fine-grained PAT). If the push fails after the repo is created, the response includes the empty repo's URL so you can retry or delete it.
+
 ---
 
 ## Secrets

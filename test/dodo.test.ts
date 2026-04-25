@@ -1208,6 +1208,171 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
   });
 });
 
+describe("createGithubRepo (publish_to_github helper)", () => {
+  const ADMIN_EMAIL = "admin@test.local";
+  const NON_ADMIN_EMAIL = "dev@dodo.local";
+
+  const restoreFetch = (original: typeof fetch) => {
+    globalThis.fetch = original;
+  };
+
+  it("rejects invalid repo names without making any API call", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
+    try {
+      const { createGithubRepo } = await import("../src/github-pr");
+      const result = await createGithubRepo(envWithToken, { name: "bad name with spaces" }, ADMIN_EMAIL);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("Invalid repo name");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("does NOT use env-var token fallback for non-admin users", async () => {
+    // Same multi-tenant safety as createPullRequest: a non-admin must not
+    // be able to create a GitHub repo using the admin's token just because
+    // the per-user secret lookup failed.
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "secret-admin-token" };
+    try {
+      const { createGithubRepo } = await import("../src/github-pr");
+      const result = await createGithubRepo(envWithToken, { name: "ok-name" }, NON_ADMIN_EMAIL);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("No github token");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("creates a private repo on the authenticated user's account by default", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      const u = typeof url === "string" ? url : url.toString();
+      expect(u).toBe("https://api.github.com/user/repos");
+      expect(init?.method).toBe("POST");
+      const body = JSON.parse(init!.body as string);
+      expect(body).toEqual({
+        name: "my-project",
+        private: true,
+        description: undefined,
+        auto_init: false,
+      });
+      const headers = init!.headers as Record<string, string>;
+      expect(headers.Authorization).toBe("Bearer test-token");
+      return new Response(JSON.stringify({
+        html_url: "https://github.com/jonnyparris/my-project",
+        clone_url: "https://github.com/jonnyparris/my-project.git",
+        owner: { login: "jonnyparris" },
+        name: "my-project",
+        private: true,
+      }), { status: 201, headers: { "content-type": "application/json" } });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
+    try {
+      const { createGithubRepo } = await import("../src/github-pr");
+      const result = await createGithubRepo(envWithToken, { name: "my-project" }, ADMIN_EMAIL);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.cloneUrl).toBe("https://github.com/jonnyparris/my-project.git");
+        expect(result.htmlUrl).toBe("https://github.com/jonnyparris/my-project");
+        expect(result.owner).toBe("jonnyparris");
+        expect(result.private).toBe(true);
+      }
+      expect(fetchSpy).toHaveBeenCalledOnce();
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("creates a public repo under an org when owner + private:false are set", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      const u = typeof url === "string" ? url : url.toString();
+      expect(u).toBe("https://api.github.com/orgs/cloudflare/repos");
+      const body = JSON.parse(init!.body as string);
+      expect(body.private).toBe(false);
+      expect(body.description).toBe("My new project");
+      return new Response(JSON.stringify({
+        html_url: "https://github.com/cloudflare/my-project",
+        clone_url: "https://github.com/cloudflare/my-project.git",
+        owner: { login: "cloudflare" },
+        name: "my-project",
+        private: false,
+      }), { status: 201, headers: { "content-type": "application/json" } });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
+    try {
+      const { createGithubRepo } = await import("../src/github-pr");
+      const result = await createGithubRepo(envWithToken, {
+        name: "my-project",
+        owner: "cloudflare",
+        private: false,
+        description: "My new project",
+      }, ADMIN_EMAIL);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.owner).toBe("cloudflare");
+        expect(result.private).toBe(false);
+      }
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("flags 422 'name already exists' errors as nameTaken with a hint", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn(async () => new Response(
+      JSON.stringify({ message: "Repository creation failed.", errors: [{ message: "name already exists on this account" }] }),
+      { status: 422, headers: { "content-type": "application/json" } },
+    ));
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
+    try {
+      const { createGithubRepo } = await import("../src/github-pr");
+      const result = await createGithubRepo(envWithToken, { name: "taken" }, ADMIN_EMAIL);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.nameTaken).toBe(true);
+        expect(result.error).toContain("422");
+        expect(result.error.toLowerCase()).toContain("already exists");
+        expect(result.error).toContain("Hint:");
+      }
+    } finally {
+      restoreFetch(original);
+    }
+  });
+
+  it("hints at missing token scope on 403", async () => {
+    const original = globalThis.fetch;
+    const fetchSpy = vi.fn(async () => new Response(
+      JSON.stringify({ message: "Resource not accessible by personal access token" }),
+      { status: 403, headers: { "content-type": "application/json" } },
+    ));
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
+    try {
+      const { createGithubRepo } = await import("../src/github-pr");
+      const result = await createGithubRepo(envWithToken, { name: "scope-test" }, ADMIN_EMAIL);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain("403");
+        expect(result.error.toLowerCase()).toContain("scope");
+      }
+    } finally {
+      restoreFetch(original);
+    }
+  });
+});
+
 describe("Worker run notifications", () => {
   // `sendRunNotification` calls `sendNotification` via a module-internal
   // reference that vitest's `vi.mock` cannot intercept. Instead we observe
