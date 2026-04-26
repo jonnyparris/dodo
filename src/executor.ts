@@ -16,6 +16,20 @@ export const OWNER_ID_HEADER = "x-dodo-owner-id";
  * Wrap the OUTBOUND service binding so every fetch() the sandbox makes
  * carries an `x-dodo-owner-id` header bound to the calling user.
  *
+ * Why a dynamically-loaded Worker rather than a plain JS object?
+ * `globalOutbound` must be a real `Fetcher` produced by the runtime —
+ * a duck-typed `{ fetch }` object cast via `as Fetcher` is rejected at
+ * runtime with:
+ *
+ *   Incorrect type for the 'globalOutbound' field on 'WorkerCode':
+ *   the provided value is not of type 'Fetcher'.
+ *
+ * `WorkerLoader.get()` returns a `WorkerStub` whose `getEntrypoint()`
+ * is a real `Fetcher` the runtime accepts. We load a tiny passthrough
+ * Worker whose own `globalOutbound` is the parent's `OUTBOUND` binding,
+ * and whose code injects `x-dodo-owner-id` before forwarding via the
+ * implicit-pass-through `fetch()` (which routes through globalOutbound).
+ *
  * Without this wrapper, AllowlistOutbound has no way to resolve which
  * user's encrypted secrets to use, so per-user GitHub/GitLab tokens
  * never reach outbound requests from codemode and the env-var fallback
@@ -26,24 +40,42 @@ export const OWNER_ID_HEADER = "x-dodo-owner-id";
  * for the HTTP `/execute` route, not for sandbox fetches issued via the
  * agent loop's `codemode` tool.
  */
-export function wrapOutboundWithOwner(outbound: Fetcher | null, ownerId: string | undefined): Fetcher | null {
+export function wrapOutboundWithOwner(
+  loader: WorkerLoader | undefined,
+  outbound: Fetcher | null,
+  ownerId: string | undefined,
+): Fetcher | null {
   if (!outbound || !ownerId) return outbound;
+  if (!loader) return outbound;
 
-  // Return a Fetcher-shaped object. Workers runtime requires the real
-  // ServiceStub at the binding level, but accepts any object exposing
-  // `fetch(...)` once codemode has captured the reference.
-  const wrapped = {
-    fetch(input: RequestInfo, init?: RequestInit): Promise<Response> {
-      const request = new Request(input, init);
-      const headers = new Headers(request.headers);
-      // Don't allow the sandboxed code to spoof the owner header — always
-      // overwrite with the server-resolved value.
-      headers.set(OWNER_ID_HEADER, ownerId);
-      return outbound.fetch(new Request(request, { headers }));
-    },
-  } as unknown as Fetcher;
+  // JSON-encode the ownerId to make string injection into the wrapper
+  // module source safe even if the value contained quotes or newlines.
+  const ownerIdLiteral = JSON.stringify(ownerId);
+  const headerLiteral = JSON.stringify(OWNER_ID_HEADER);
 
-  return wrapped;
+  const wrapperSource = `
+    export default {
+      async fetch(request) {
+        const headers = new Headers(request.headers);
+        // Server-resolved owner ID — sandboxed code cannot spoof it.
+        headers.set(${headerLiteral}, ${ownerIdLiteral});
+        return fetch(new Request(request, { headers }));
+      },
+    };
+  `;
+
+  // Stable name keyed on ownerId so repeated executions reuse the
+  // already-loaded wrapper isolate (workerd caches by name).
+  const stub = loader.get(`outbound-wrapper-${ownerId}`, () => ({
+    compatibilityDate: "2024-12-01",
+    mainModule: "wrapper.js",
+    modules: { "wrapper.js": wrapperSource },
+    // The wrapper's own outbound IS the parent's OUTBOUND binding —
+    // its top-level `fetch()` calls go straight to AllowlistOutbound.
+    globalOutbound: outbound,
+  }));
+
+  return stub.getEntrypoint();
 }
 
 export async function runSandboxedCode(input: {
@@ -61,11 +93,8 @@ export async function runSandboxedCode(input: {
     throw new Error("Dynamic Worker loader is not configured");
   }
 
-  // Pass the real OUTBOUND ServiceStub directly. The Workers runtime enforces
-  // that globalOutbound must be a Fetcher produced by a service binding —
-  // plain objects cast via `as Fetcher` fail with a type error at runtime.
   const baseOutbound = input.env.OUTBOUND ?? null;
-  const outbound = wrapOutboundWithOwner(baseOutbound, input.ownerId);
+  const outbound = wrapOutboundWithOwner(input.env.LOADER, baseOutbound, input.ownerId);
 
   const executor = new DynamicWorkerExecutor({
     globalOutbound: outbound,
