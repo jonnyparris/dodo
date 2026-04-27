@@ -35,6 +35,20 @@
     {
       "tag": "v4",
       "new_sqlite_classes": ["ExploreAgent", "TaskAgent"]
+    },
+    {
+      // No-op tag — server already at v5. Future migrations should bump
+      // from v6 onward.
+      "tag": "v5"
+    },
+    {
+      // The deployed worker has an `OutboundProxy` Durable Object class
+      // registered (added by an out-of-band wrapper-Worker spike on the
+      // codemode globalOutbound problem). The class is no longer in the
+      // codebase, so we delete it here. Without this migration the
+      // deploy fails with code 10064 (missing class).
+      "tag": "v6",
+      "deleted_classes": ["OutboundProxy"]
     }
   ],
   "r2_buckets": [
