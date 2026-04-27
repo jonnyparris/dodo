@@ -1715,7 +1715,7 @@ function buildTools(
     // the calling user's GitHub/GitLab tokens and falls back to no auth.
     // The HTTP `/execute` path already wraps via `runSandboxedCode`; this
     // closes the same gap for the agent-loop path. (audit follow-up F2)
-    const outbound = wrapOutboundWithOwner(env.LOADER, env.OUTBOUND ?? null, options?.ownerId);
+    const outbound = wrapOutboundWithOwner(env.OUTBOUND ?? null, options?.ownerId);
 
     const codemodeTool = createExecuteTool({
       tools: workspaceTools,
