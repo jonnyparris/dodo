@@ -5,55 +5,31 @@ import type { ExecuteResult } from "@cloudflare/codemode";
 import type { Env } from "./types";
 
 /**
- * Header name for injecting the session owner ID into outbound requests.
- * Read by AllowlistOutbound.injectAuth to look up per-user secrets in
- * UserControl. The header is stripped before the request leaves the
- * Worker (see src/outbound.ts).
+ * Header name historically used to inject the session owner ID into outbound
+ * requests for per-user token resolution. Currently unused — the duck-typed
+ * wrapper that set it broke `globalOutbound` (workerd rejects non-ServiceStub
+ * Fetchers at WorkerCode validation time). Three attempts at restoring per-user
+ * auth via different routes (PR #52 LOADER.get, PR #54 per-call props,
+ * PR #55 revert) all failed for runtime/architectural reasons.
+ *
+ * Kept exported for the constant + future reuse if a proxy-Worker approach
+ * (Option C) is implemented. The current AllowlistOutbound only enforces the
+ * hostname allowlist; sandbox `fetch()` calls run unauthenticated against the
+ * remote, and codemode tool authors must include their own auth headers when
+ * needed. Git operations are unaffected — auth resolves in the parent DO via
+ * resolveRemoteToken() and is passed directly to isomorphic-git.
  */
 export const OWNER_ID_HEADER = "x-dodo-owner-id";
-
-/**
- * Wrap the OUTBOUND service binding so every fetch() the sandbox makes
- * carries an `x-dodo-owner-id` header bound to the calling user.
- *
- * Without this wrapper, AllowlistOutbound has no way to resolve which
- * user's encrypted secrets to use, so per-user GitHub/GitLab tokens
- * never reach outbound requests from codemode and the env-var fallback
- * is also skipped (audit finding H4).
- *
- * Exported because the AI-tool codemode path in `agentic.ts` also needs
- * to apply the same wrapper — without it, owner-id was only injected
- * for the HTTP `/execute` route, not for sandbox fetches issued via the
- * agent loop's `codemode` tool.
- */
-export function wrapOutboundWithOwner(outbound: Fetcher | null, ownerId: string | undefined): Fetcher | null {
-  if (!outbound || !ownerId) return outbound;
-
-  // Return a Fetcher-shaped object. Workers runtime requires the real
-  // ServiceStub at the binding level, but accepts any object exposing
-  // `fetch(...)` once codemode has captured the reference.
-  const wrapped = {
-    fetch(input: RequestInfo, init?: RequestInit): Promise<Response> {
-      const request = new Request(input, init);
-      const headers = new Headers(request.headers);
-      // Don't allow the sandboxed code to spoof the owner header — always
-      // overwrite with the server-resolved value.
-      headers.set(OWNER_ID_HEADER, ownerId);
-      return outbound.fetch(new Request(request, { headers }));
-    },
-  } as unknown as Fetcher;
-
-  return wrapped;
-}
 
 export async function runSandboxedCode(input: {
   code: string;
   env: Env;
   workspace: Workspace;
   /**
-   * Stable identifier for the calling user (typically the hex string of
-   * their UserControl DO ID). Forwarded to AllowlistOutbound so per-user
-   * secrets resolve correctly inside the sandbox.
+   * Stable identifier for the calling user. Currently accepted for API
+   * compatibility but not threaded through — see OWNER_ID_HEADER docstring
+   * for the history. Kept on the signature so callers don't need to change
+   * if/when per-user injection is restored.
    */
   ownerId?: string;
 }): Promise<ExecuteResult> {
@@ -61,17 +37,20 @@ export async function runSandboxedCode(input: {
     throw new Error("Dynamic Worker loader is not configured");
   }
 
-  // Pass the real OUTBOUND ServiceStub directly. The Workers runtime enforces
-  // that globalOutbound must be a Fetcher produced by a service binding —
-  // plain objects cast via `as Fetcher` fail with a type error at runtime.
-  const baseOutbound = input.env.OUTBOUND ?? null;
-  const outbound = wrapOutboundWithOwner(baseOutbound, input.ownerId);
+  // Pass the real OUTBOUND ServiceStub directly. workerd validates that
+  // globalOutbound is a Fetcher produced by a service binding — plain
+  // objects cast via `as Fetcher` fail at WorkerCode construction with
+  // "Incorrect type for the 'globalOutbound' field on 'WorkerCode'".
+  // The allowlist still applies because OUTBOUND points at AllowlistOutbound.
+  const outbound = input.env.OUTBOUND ?? null;
 
   const executor = new DynamicWorkerExecutor({
     globalOutbound: outbound,
     loader: input.env.LOADER,
     timeout: 30000,
   });
+
+  void input.ownerId; // see docstring — accepted but unused
 
   return executor.execute(input.code, [resolveProvider(stateTools(input.workspace))]);
 }

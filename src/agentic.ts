@@ -5,7 +5,6 @@ import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import type { AttachmentRef } from "./attachments";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
-import { wrapOutboundWithOwner } from "./executor";
 import { createPullRequest } from "./github-pr";
 import { normalizePath } from "./paths";
 import { createBrowserTools } from "./browser/tools";
@@ -1710,19 +1709,22 @@ function buildTools(
   const gitTools = buildGitTools(env, workspace, config, options?.ownerEmail);
 
   if (env.LOADER) {
-    // Wrap OUTBOUND so codemode fetches from the AI-tool sandbox carry an
-    // `x-dodo-owner-id` header — without it AllowlistOutbound can't resolve
-    // the calling user's GitHub/GitLab tokens and falls back to no auth.
-    // The HTTP `/execute` path already wraps via `runSandboxedCode`; this
-    // closes the same gap for the agent-loop path. (audit follow-up F2)
-    const outbound = wrapOutboundWithOwner(env.OUTBOUND ?? null, options?.ownerId);
+    // Pass the real OUTBOUND ServiceStub directly. workerd rejects any
+    // wrapper (plain object cast as Fetcher) with "Incorrect type for the
+    // 'globalOutbound' field on 'WorkerCode'". AllowlistOutbound still
+    // enforces the hostname allowlist for every sandbox fetch — the
+    // perimeter is unchanged. Per-user token injection for raw fetch is
+    // currently unavailable (see src/executor.ts OWNER_ID_HEADER docstring);
+    // git operations are unaffected because resolveRemoteToken() runs in
+    // the parent DO and tokens are passed directly to isomorphic-git.
+    void options?.ownerId; // accepted for API compat — not threaded through
 
     const codemodeTool = createExecuteTool({
       tools: workspaceTools,
       state: options?.stateBackend,
       loader: env.LOADER,
       timeout: 30_000,
-      globalOutbound: outbound,
+      globalOutbound: env.OUTBOUND ?? null,
       providers: [
         { name: "git", tools: gitTools },
       ],
