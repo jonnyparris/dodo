@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import type { AttachmentRef } from "./attachments";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
-import { wrapOutboundWithOwner } from "./executor";
+import { bindOutboundWithOwner } from "./executor";
 import { createPullRequest } from "./github-pr";
 import { normalizePath } from "./paths";
 import { createBrowserTools } from "./browser/tools";
@@ -1710,12 +1710,13 @@ function buildTools(
   const gitTools = buildGitTools(env, workspace, config, options?.ownerEmail);
 
   if (env.LOADER) {
-    // Wrap OUTBOUND so codemode fetches from the AI-tool sandbox carry an
-    // `x-dodo-owner-id` header — without it AllowlistOutbound can't resolve
-    // the calling user's GitHub/GitLab tokens and falls back to no auth.
-    // The HTTP `/execute` path already wraps via `runSandboxedCode`; this
-    // closes the same gap for the agent-loop path. (audit follow-up F2)
-    const outbound = wrapOutboundWithOwner(env.OUTBOUND ?? null, options?.ownerId);
+    // Bind OUTBOUND with per-call props carrying the owner identity so
+    // AllowlistOutbound can resolve the caller's GitHub/GitLab tokens.
+    // Without it, codemode fetches from the AI-tool path fall back to no
+    // auth. The HTTP `/execute` path applies the same binding via
+    // `runSandboxedCode`; this closes the same gap for the agent-loop
+    // path. (audit follow-up F2)
+    const outbound = bindOutboundWithOwner(env.OUTBOUND, options?.ownerId);
 
     const codemodeTool = createExecuteTool({
       tools: workspaceTools,
