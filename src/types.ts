@@ -1,6 +1,5 @@
 import type { Artifacts } from "./artifacts-types";
 import type { CodingAgent } from "./coding-agent";
-import type { AllowlistOutbound } from "./outbound";
 import type { SharedIndex } from "./shared-index";
 import type { UserControl } from "./user-control";
 
@@ -29,14 +28,7 @@ export interface Env {
   GIT_AUTHOR_NAME?: string;
   LOADER?: WorkerLoader;
   OPENCODE_BASE_URL: string;
-  /**
-   * Self-binding to {@link AllowlistOutbound}. Typed as a
-   * `LoopbackServiceStub` so callers can invoke
-   * `env.OUTBOUND({ props: { ownerId } })` to receive a per-call Fetcher
-   * with the owner identity carried via workerd's runtime props
-   * mechanism — see src/outbound.ts for the consumer side.
-   */
-  OUTBOUND?: LoopbackServiceStub<AllowlistOutbound>;
+  OUTBOUND?: Fetcher;
   WORKER_URL: string;
   WORKSPACE_BUCKET?: R2Bucket;
   /**
