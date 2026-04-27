@@ -1,6 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { getSharedIndexStub, resolveAdminEmail } from "./auth";
-import { OWNER_ID_HEADER } from "./executor";
 import { MCP_CATALOG } from "./mcp-catalog";
 import type { Env } from "./types";
 
@@ -46,19 +45,33 @@ function secretKeyForHost(hostname: string): string | undefined {
 }
 
 /**
+ * Per-call props passed by the executor when binding `OUTBOUND` for a
+ * sandbox run. Read off `this.ctx.props` inside `fetch()`.
+ *
+ * Sandboxed code cannot tamper with these — workerd injects them via
+ * the runtime mechanism behind `LoopbackServiceStub({ props })`, not
+ * via the request itself.
+ */
+export interface AllowlistOutboundProps {
+  ownerId?: string;
+}
+
+/**
  * WorkerEntrypoint that intercepts all outbound fetch() calls from sandboxed
  * dynamic workers. Checks the hostname against the SharedIndex allowlist and
  * blocks requests to hosts that are not explicitly allowed.
  *
  * For allowlisted hosts that match a known provider (GitHub, GitLab), resolves
  * per-user authentication tokens from the owner's UserControl DO via the
- * `x-dodo-owner-id` header. Falls back to env var tokens only for the admin
- * account.
+ * `ownerId` prop on `this.ctx.props`. Falls back to env var tokens only for
+ * the admin account.
  *
  * Configured as a self-referencing service binding (OUTBOUND) in wrangler.jsonc
- * and passed as `globalOutbound` to DynamicWorkerExecutor.
+ * and passed as `globalOutbound` to DynamicWorkerExecutor — wrapped per call
+ * via `env.OUTBOUND({ props: { ownerId } })` so workerd's runtime propagates
+ * the owner identity tamper-proof.
  */
-export class AllowlistOutbound extends WorkerEntrypoint<Env> {
+export class AllowlistOutbound extends WorkerEntrypoint<Env, AllowlistOutboundProps> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const hostname = url.hostname.toLowerCase();
@@ -81,13 +94,12 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
       }
     }
 
-    // Extract and strip owner identity header before forwarding
-    const ownerId = request.headers.get(OWNER_ID_HEADER);
-    const headers = new Headers(request.headers);
-    headers.delete(OWNER_ID_HEADER);
+    // Pull owner identity from per-call props — sandboxed code can't tamper
+    // with workerd's props mechanism the way it could with a request header.
+    const ownerId = this.ctx.props?.ownerId;
 
-    // Inject authentication headers for known providers
-    await this.injectAuth(hostname, headers, ownerId);
+    const headers = new Headers(request.headers);
+    await this.injectAuth(hostname, headers, ownerId ?? null);
 
     // Clone via the original request to preserve all properties (cf, signal, etc.)
     const outboundRequest = new Request(request, { headers });

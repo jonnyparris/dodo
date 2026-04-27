@@ -198,3 +198,73 @@ describe("AllowlistOutbound auth injection", () => {
     });
   });
 });
+
+// ── bindOutboundWithOwner ────────────────────────────────────────────────
+
+import { bindOutboundWithOwner } from "../src/executor";
+import type { AllowlistOutbound } from "../src/outbound";
+
+describe("bindOutboundWithOwner", () => {
+  it("returns null when outbound is undefined", () => {
+    expect(bindOutboundWithOwner(undefined, "owner-1")).toBeNull();
+  });
+
+  it("returns the outbound stub unchanged when ownerId is undefined", () => {
+    // No props to bind → return the bare stub. AllowlistOutbound treats
+    // missing props.ownerId as "no per-user auth available" — same as
+    // before this fix.
+    const outboundCalls: unknown[] = [];
+    const fakeOutbound = Object.assign(
+      ((opts: unknown) => {
+        outboundCalls.push(opts);
+        return {} as Fetcher;
+      }) as unknown as LoopbackServiceStub<AllowlistOutbound>,
+      { fetch: vi.fn() },
+    );
+
+    const result = bindOutboundWithOwner(fakeOutbound, undefined);
+
+    expect(result).toBe(fakeOutbound);
+    expect(outboundCalls).toEqual([]);
+  });
+
+  it("invokes the loopback stub with props.ownerId when both are provided", () => {
+    const propsBoundFetcher = { __id: "props-bound" } as unknown as Fetcher;
+    const outboundCalls: Array<{ props?: { ownerId?: string } }> = [];
+    const fakeOutbound = Object.assign(
+      ((opts: { props?: { ownerId?: string } }) => {
+        outboundCalls.push(opts);
+        return propsBoundFetcher;
+      }) as unknown as LoopbackServiceStub<AllowlistOutbound>,
+      { fetch: vi.fn() },
+    );
+
+    const result = bindOutboundWithOwner(fakeOutbound, "owner-abc");
+
+    expect(outboundCalls).toEqual([{ props: { ownerId: "owner-abc" } }]);
+    expect(result).toBe(propsBoundFetcher);
+  });
+
+  it("does not mix props across ownerIds", () => {
+    const outboundCalls: Array<{ props?: { ownerId?: string } }> = [];
+    const fakeOutbound = Object.assign(
+      ((opts: { props?: { ownerId?: string } }) => {
+        outboundCalls.push(opts);
+        return {} as Fetcher;
+      }) as unknown as LoopbackServiceStub<AllowlistOutbound>,
+      { fetch: vi.fn() },
+    );
+
+    bindOutboundWithOwner(fakeOutbound, "owner-1");
+    bindOutboundWithOwner(fakeOutbound, "owner-2");
+    bindOutboundWithOwner(fakeOutbound, "owner-1");
+
+    expect(outboundCalls).toEqual([
+      { props: { ownerId: "owner-1" } },
+      { props: { ownerId: "owner-2" } },
+      { props: { ownerId: "owner-1" } },
+    ]);
+  });
+});
+
+
