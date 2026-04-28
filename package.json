@@ -7,6 +7,8 @@
     "dev": "wrangler dev -c wrangler.dev.jsonc",
     "build": "COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown') && echo \"{\\\"commit\\\":\\\"$COMMIT\\\",\\\"builtAt\\\":\\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"}\" > public/version.json",
     "deploy": "npm run build && wrangler deploy",
+    "deploy:safe": "npm run deploy && EXPECTED_COMMIT=$(git rev-parse --short HEAD) ./scripts/post-deploy-smoke.sh",
+    "smoke": "./scripts/post-deploy-smoke.sh",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",

@@ -104,9 +104,21 @@ wrangler secret put COOKIE_SECRET           # openssl rand -hex 32
 wrangler secret put DODO_MCP_TOKEN          # openssl rand -base64url 32
 wrangler secret put OPENCODE_GATEWAY_TOKEN  # your LLM gateway token
 
-# Deploy
+# Deploy (with post-deploy smoke probe — recommended)
+npm run deploy:safe
+
+# Or, for ad-hoc deploys without the probe
 npm run deploy
 ```
+
+The `deploy:safe` script runs `scripts/post-deploy-smoke.sh` against the deployed Worker after a successful upload, asserting that:
+
+- `/health` and `/version.json` respond
+- The `/version.json` `commit` field matches the local HEAD (catches deploys that uploaded but didn't apply)
+- A trivial codemode `execute` round-trips through `globalOutbound`
+- A real `git clone` lands files in the workspace
+
+If anything fails the script exits non-zero. Run `npm run smoke` to invoke the probe against an already-deployed Worker without re-deploying.
 
 ### Local development
 
@@ -361,12 +373,14 @@ npm install          # Install dependencies
 npm run dev          # Local dev server
 npm test             # Run tests (vitest + Workers pool)
 npm run typecheck    # Type check
-npm run deploy       # Build + deploy
+npm run deploy       # Build + deploy (no post-deploy probe)
+npm run deploy:safe  # Build + deploy + post-deploy smoke probe (recommended)
+npm run smoke        # Run the smoke probe against an already-deployed Worker
 ```
 
 ### Deploying
 
-Deploys are **manual**: run `npm run deploy` from a workstation authenticated to your Cloudflare account.
+Deploys are **manual**: run `npm run deploy:safe` from a workstation authenticated to your Cloudflare account. The `:safe` variant runs `scripts/post-deploy-smoke.sh` against the freshly-deployed Worker, asserting end-to-end that the codemode sandbox boots, `globalOutbound` is wired correctly, and a real `git clone` lands files in the workspace. See `scripts/post-deploy-smoke.sh` for the full check list.
 
 Workers Builds CI was intentionally disabled because Dodo uses the `"experimental"` compatibility flag (required by `@cloudflare/think` and the Agents SDK `subAgent()` facet API). The `experimental` flag is designed to block non-local deploys — local `wrangler deploy` currently works, but the Workers Builds service enforces the policy and rejects every automated deploy. See [issue #46](https://github.com/jonnyparris/dodo/issues/46) for the full diagnosis.
 
