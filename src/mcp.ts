@@ -940,7 +940,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
         `Do NOT run git_pull or git_fetch — the clone is singleBranch+shallow. The repository is already on the correct branch.`,
         `Use commit message: ${commitMessage}`,
         `Push with git_push_checked and ref set to '${branch}'.`,
-        `Skip npm/node verification commands (npm run typecheck, npm test, npm install) — the sandbox cannot run them. The dispatching system will verify externally.`,
+        `Use the in-isolate \`typecheck\` tool to verify TypeScript compiles before pushing — it runs \`tsc --noEmit\` against the workspace and returns structured diagnostics. \`npm test\` and \`npm install\` are still unavailable; the dispatching system will run them externally if a verify workflow is configured.`,
         prompt,
       ].join("\n\n");
 

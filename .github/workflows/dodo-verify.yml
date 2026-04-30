@@ -35,3 +35,5 @@ jobs:
         run: npm run typecheck
       - name: Test
         run: npm test
+      - name: Typecheck smoke (in-isolate tsc tool)
+        run: npm run test:typecheck-smoke

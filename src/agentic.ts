@@ -11,6 +11,7 @@ import { createBrowserTools } from "./browser/tools";
 import type { McpGatekeeper } from "./mcp-gatekeeper";
 import { getKnownRepo, listKnownRepos, parseRemoteSpec } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
+import { runTypecheck } from "./typecheck";
 import type { AppConfig, Env, TodoStore } from "./types";
 
 /** Options passed through from the coding agent into tool factories. */
@@ -1851,6 +1852,56 @@ function buildTools(
   for (const name of TOP_LEVEL_GIT_TOOLS) {
     if (gitTools[name]) tools[name] = gitTools[name];
   }
+
+  // Typecheck tool — runs `tsc --noEmit` against the workspace inside this
+  // DO. No subprocess, no native binaries: bundles the TypeScript compiler
+  // and lib `.d.ts` files into the Worker. Closes the long-standing "the
+  // sandbox can't run npm run typecheck" gap without introducing any
+  // container-specific assumption (per AGENTS.md).
+  //
+  // Heap-safe: refuses projects > 50 files / > 5 MB up front. Lazy-imports
+  // the TS compiler so non-typecheck cold starts pay nothing.
+  tools.typecheck = tool({
+    description: [
+      "Run TypeScript type checking (`tsc --noEmit`) against the workspace.",
+      "",
+      "Use this after writing or editing TypeScript code to confirm it type-checks before",
+      "you commit or push. Returns a structured list of diagnostics with file paths, line",
+      "numbers, error codes, and messages — feed those back into your next edit.",
+      "",
+      "Honours the workspace's `tsconfig.json` if one exists at the dir root; falls back to",
+      "Dodo's defaults (ES2022 target, bundler resolution, strict, isolatedModules).",
+      "",
+      "Limits: refuses projects with more than 50 .ts/.tsx files or more than 5 MB of source.",
+      "If you hit that, narrow the typecheck to a subdirectory by passing `dir`.",
+    ].join("\n"),
+    inputSchema: zodSchema(
+      z.object({
+        dir: z
+          .string()
+          .optional()
+          .describe(
+            "Subdirectory to root the typecheck in (e.g. 'my-repo'). Defaults to the workspace root.",
+          ),
+      }),
+    ),
+    execute: async ({ dir }) => {
+      const result = await runTypecheck(workspace, { dir });
+      // Cap diagnostics array so a project with 1000 errors doesn't blow
+      // the per-tool 32 KB budget. The model sees "+ N more — fix the
+      // shown ones first, then re-run" which is the right loop anyway.
+      const MAX_DIAGS = 100;
+      if (result.diagnostics.length > MAX_DIAGS) {
+        const dropped = result.diagnostics.length - MAX_DIAGS;
+        return {
+          ...result,
+          diagnostics: result.diagnostics.slice(0, MAX_DIAGS),
+          _truncated: `Showing first ${MAX_DIAGS} of ${result.diagnostics.length} diagnostics. Fix these and re-run typecheck — ${dropped} more remain.`,
+        };
+      }
+      return result;
+    },
+  });
 
   // Explore tool — search subagent for token-efficient codebase discovery.
   // When `config.exploreMode === "facet"`, the tool delegates to an
