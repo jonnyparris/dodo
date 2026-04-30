@@ -58,6 +58,7 @@
         <li><a href="#connect-mcp">Connect an MCP Server</a></li>
         <li><a href="#kanban-dispatch">Dispatch Tasks from the Kanban Board</a></li>
         <li><a href="#push-code">Push Code to GitHub</a></li>
+        <li><a href="#typecheck">Verify TypeScript Before Pushing</a></li>
         <li><a href="#memory">Use Memory Across Sessions</a></li>
         <li><a href="#skills">Add a Skill</a></li>
       </ul>
@@ -143,6 +144,17 @@ Token: optional-secret-token
 </code></pre>
     <p>After the push completes, verify the branch on GitHub and open a pull request if you want review before merging.</p>
     <div class="callout"><p>Tip: Ask the agent to run tests before pushing so you do not publish a broken branch.</p></div>
+
+    <h2 id="typecheck">Verify TypeScript Before Pushing</h2>
+    <h3>Run <code>tsc --noEmit</code> against the workspace from inside the session</h3>
+    <p>The agent has a <code>typecheck</code> tool that runs the real TypeScript compiler against the workspace. No shell, no <code>npm install</code> — TypeScript and the standard lib files are bundled into the Worker, so the check happens inside the session DO and returns structured diagnostics with file paths, line numbers, and error codes.</p>
+    <p>Ask the agent to typecheck before committing, or let it call the tool itself after a TypeScript edit:</p>
+    <pre><code>Run the typechecker on this branch and fix anything that fails.
+</code></pre>
+    <pre><code>typecheck({ dir: "src" })
+</code></pre>
+    <p>The tool honours the workspace's <code>tsconfig.json</code> if one exists at the dir root. It refuses projects with more than 50 <code>.ts</code>/<code>.tsx</code> files or 5 MB of source — pass <code>dir</code> to scope the check to a subdirectory if you hit that limit.</p>
+    <div class="callout"><p>Limits: third-party type definitions from <code>node_modules</code> are not available in the workspace, so imports of external packages surface as "Cannot find module" diagnostics. Focus on diagnostics in your own code; the verify workflow runs full <code>npm test</code> externally before merge.</p></div>
 
     <h2 id="memory">Use Memory Across Sessions</h2>
     <h3>Store information that survives session deletion</h3>

@@ -244,6 +244,9 @@
       <li>Full CRUD, glob search, and in-file search/replace are available to the agent via its built-in tools.</li>
     </ul>
 
+    <h3>TypeScript typecheck</h3>
+    <p>The agent has a <code>typecheck</code> tool that runs <code>tsc --noEmit</code> against the workspace inside the session DO. The TypeScript compiler and standard lib files are bundled into the Worker — no shell, no <code>npm install</code> — so the check happens without leaving the isolate. Honours the workspace's <code>tsconfig.json</code> if present, falls back to Dodo defaults (ES2022, bundler resolution, strict). Refuses projects with more than 50 <code>.ts</code>/<code>.tsx</code> files or 5 MB of source so the DO doesn't OOM on a large clone — pass <code>dir</code> to scope the check to a subdirectory. Third-party type definitions from <code>node_modules</code> aren't available, so external imports surface as "Cannot find module" — focus on diagnostics in the workspace's own code; full <code>npm test</code> still runs externally via the verify workflow.</p>
+
     <!-- ─── Git ─── -->
     <h2 id="git">Git</h2>
     <p>Full git support via <code>@cloudflare/shell</code>, running inside the Durable Object. The agent can clone repos, make commits, push and pull — all without a local machine.</p>
