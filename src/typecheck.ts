@@ -136,6 +136,17 @@ export async function runTypecheck(
 
   // Lazy-load the heavy bits. ~1.5 MB gzip for TS, ~600 KB for libs.
   // Until this point the typecheck bundle has cost zero memory.
+  //
+  // TS's published bundle has a top-level `sys = (() => { ... })()` IIFE
+  // that calls `getNodeSystem()` when `isNodeLikeSystem()` returns true.
+  // The Node-system path references `__filename` and `__dirname`, which
+  // are undefined in the Workers ESM scope even with `nodejs_compat`.
+  // Setting `process.browser = true` (the canonical sentinel for "not
+  // Node") skips the Node path: `sys` becomes `undefined`. We never
+  // touch `ts.sys` ourselves — our `createWorkspaceHost` is the host —
+  // so this is a safe no-op for our use case. Done before the import
+  // so the IIFE sees the patched flag the first time the module loads.
+  prepareTsRuntime();
   const ts = (await import("typescript")).default;
   // Load the bundled lib map. The generated file is a sibling that
   // contains a 3 MB string map; we keep it gitignored so the repo stays
@@ -180,6 +191,33 @@ export async function runTypecheck(
 }
 
 // ─── Internals ───
+
+/**
+ * Disarm the TypeScript bundle's Node-detection so its top-level IIFE
+ * doesn't try to read `__filename` / `__dirname` — both undefined in
+ * the Workers ESM scope.
+ *
+ * `isNodeLikeSystem()` inside `typescript.js` returns true when:
+ *   `process` exists AND `process.nextTick` is set AND
+ *   `process.browser` is falsy AND `require` is defined.
+ * Workers + `nodejs_compat` satisfies all four, so `getNodeSystem()`
+ * runs and crashes on the first `__filename` reference. Setting
+ * `process.browser = true` short-circuits that branch — `ts.sys`
+ * ends up undefined, and our `createWorkspaceHost` is the host
+ * the program actually uses.
+ *
+ * Idempotent: a second call just re-asserts the flag. Safe to invoke
+ * before every typecheck call (the import is cached after the first).
+ */
+function prepareTsRuntime(): void {
+  // Guard against environments without `process` (defensive — Workers
+  // with `nodejs_compat` does provide one). The cast keeps TypeScript
+  // happy when @types/node hasn't surfaced `browser` on Process.
+  const proc = (globalThis as { process?: { browser?: boolean } }).process;
+  if (proc && proc.browser !== true) {
+    proc.browser = true;
+  }
+}
 
 /**
  * Resolve the generated lib map. The sibling file is checked in (it's
