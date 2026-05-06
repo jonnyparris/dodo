@@ -1028,7 +1028,6 @@ export class UserControl extends DurableObject<Env> {
       }
 
       if (request.method === "DELETE" && url.pathname === "/browser-config") {
-        const now = nowEpoch();
         // Remove MCP config
         this.db.exec("DELETE FROM mcp_configs WHERE id = 'browser-rendering'");
         // Remove secrets

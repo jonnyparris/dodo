@@ -290,7 +290,7 @@ export async function readArtifactsFile(cache: ArtifactsFsCache, requestedPath: 
   try {
     const content = await cache.fs.readFile(fsPath);
     return { content, path };
-  } catch (err) {
+  } catch {
     // ENOENT: file doesn't exist in the artifacts working copy. Caller
     // will fall back to the workspace, which may have the file if it was
     // written but not yet flushed.

@@ -200,11 +200,11 @@ describe("Architecture gaps", () => {
     const { users } = (await usersRes!.json()) as { users: Array<{ email: string }> };
     expect(users.length).toBeGreaterThanOrEqual(1);
 
-    // 2. For the dev user, query their UserControl for sessions
-    const devUser = users.find((u) => u.email === "dev@dodo.local") ?? users.find((u) => u.email === "admin@test.local");
-    // The dev user might not be in the user registry (only admin@test.local is seeded)
-    // But sessions are created via the router which uses dev@dodo.local
-    // Let's query the dev user's UserControl directly
+    // 2. For the dev user, query their UserControl for sessions.
+    // Sessions are created via the router which uses dev@dodo.local — query
+    // that user's UserControl directly. The dev user might not be in the
+    // user registry (only admin@test.local is seeded by setup), so we
+    // don't bother resolving via /users.
     const ucStub = testEnv.USER_CONTROL.get(testEnv.USER_CONTROL.idFromName("dev@dodo.local"));
     const sessionsRes = await ucStub.fetch("https://user-control/sessions");
     expect(sessionsRes.status).toBe(200);

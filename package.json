@@ -12,6 +12,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:typecheck-smoke": "node --experimental-strip-types --experimental-detect-module --no-warnings=ExperimentalWarning scripts/smoke-typecheck.mjs",
+    "lint": "biome lint .",
+    "lint:fix": "biome lint --write .",
     "typecheck": "tsc --noEmit",
     "types": "wrangler types"
   },
@@ -61,6 +63,7 @@
     }
   },
   "devDependencies": {
+    "@biomejs/biome": "2.4.14",
     "@cloudflare/vitest-pool-workers": "^0.13.5",
     "@cloudflare/workers-types": "^4.20260207.0",
     "@types/node": "^24.5.2",

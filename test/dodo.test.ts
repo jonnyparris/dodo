@@ -706,11 +706,9 @@ describe("Dodo foundation", () => {
     });
     expect(initResponse.status).toBe(200);
 
-    // Parse session ID from SSE response
-    const initText = await initResponse.text();
+    // Extract session ID from init response headers (it's also in the
+    // SSE body but the header is the spec-blessed source).
     const sessionMatch = initResponse.headers.get("mcp-session-id");
-
-    // Extract session ID from init response headers
     const toolsHeaders: Record<string, string> = { ...mcpHeaders };
     if (sessionMatch) {
       toolsHeaders["mcp-session-id"] = sessionMatch;

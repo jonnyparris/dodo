@@ -31,6 +31,13 @@ jobs:
           cache: npm
       - name: Install
         run: npm ci
+      - name: Lint (Biome)
+        # External lint gate. Biome can't run in-isolate (8 MB gzip wasm
+        # bundle exceeds the Workers script size limit), so this job is
+        # the agent's only feedback loop for unused-imports / suspicious
+        # patterns. The in-isolate `typecheck` tool with extraStrict:true
+        # covers the TypeScript-side overlap.
+        run: npm run lint
       - name: Typecheck
         run: npm run typecheck
       - name: Test

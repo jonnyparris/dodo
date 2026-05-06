@@ -203,14 +203,6 @@ async function agentJson<T>(env: Env, sessionId: string, path: string, init?: Re
   return data as T;
 }
 
-async function patchSession(env: Env, sessionId: string, patch: { status?: string; title?: string | null }, userEmail?: string): Promise<void> {
-  await userJson(env, `/sessions/${encodeURIComponent(sessionId)}`, {
-    body: JSON.stringify(patch),
-    headers: { "content-type": "application/json" },
-    method: "PATCH",
-  }, userEmail);
-}
-
 async function createSessionWithTitle(env: Env, title: string | null, userEmail?: string): Promise<{ id: string; title: string | null }> {
   const id = crypto.randomUUID();
   const email = mcpUserEmail(env, userEmail);

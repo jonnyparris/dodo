@@ -29,10 +29,12 @@ async function fetchJson(path: string, init?: RequestInit): Promise<Response> {
 
 describe("Compaction E2E", () => {
   it("addCompaction summary appears in getHistory as system message", async () => {
-    // Create a session
+    // Create a session — exercises the /session route end-to-end. The
+    // returned id isn't used because the rest of this test runs the
+    // pipeline against synthesised history (we can't easily call DO
+    // methods from outside the DO).
     const res = await fetchJson("/session", { method: "POST" });
     expect(res.status).toBe(201);
-    const { id: sessionId } = (await res.json()) as { id: string };
 
     // Access the DO internals via the debug endpoint
     // We need to call addCompaction on the SessionManager directly.
