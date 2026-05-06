@@ -1872,6 +1872,10 @@ function buildTools(
       "Honours the workspace's `tsconfig.json` if one exists at the dir root; falls back to",
       "Dodo's defaults (ES2022 target, bundler resolution, strict, isolatedModules).",
       "",
+      "Pass `extraStrict: true` to also catch unused locals/parameters, missing returns, and",
+      "switch fall-through. This is a cheap stand-in for a real linter — no extra bundle",
+      "weight, but layered on top of the user's `tsconfig.json` for this run only.",
+      "",
       "Limits: refuses projects with more than 50 .ts/.tsx files or more than 5 MB of source.",
       "If you hit that, narrow the typecheck to a subdirectory by passing `dir`.",
     ].join("\n"),
@@ -1883,10 +1887,16 @@ function buildTools(
           .describe(
             "Subdirectory to root the typecheck in (e.g. 'my-repo'). Defaults to the workspace root.",
           ),
+        extraStrict: z
+          .boolean()
+          .optional()
+          .describe(
+            "When true, layers noUnusedLocals + noUnusedParameters + noImplicitReturns + noFallthroughCasesInSwitch on top of the user's tsconfig.json for this run.",
+          ),
       }),
     ),
-    execute: async ({ dir }) => {
-      const result = await runTypecheck(workspace, { dir });
+    execute: async ({ dir, extraStrict }) => {
+      const result = await runTypecheck(workspace, { dir, extraStrict });
       // Cap diagnostics array so a project with 1000 errors doesn't blow
       // the per-tool 32 KB budget. The model sees "+ N more — fix the
       // shown ones first, then re-run" which is the right loop anyway.

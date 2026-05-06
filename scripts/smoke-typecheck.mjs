@@ -138,6 +138,56 @@ await check("scopes typecheck to subdirectory via dir option", async () => {
   expect(result.diagnostics.length, "diag count").toBe(0);
 });
 
+await check("extraStrict catches unused locals", async () => {
+  const ws = makeWorkspace({
+    "/src/unused.ts": `export function f() { const x = 1; return 2; }\n`,
+  });
+  const cleanResult = await runTypecheck(ws);
+  expect(cleanResult.ok, "ok without extraStrict").toBe(true);
+
+  const strictResult = await runTypecheck(ws, { extraStrict: true });
+  expect(strictResult.ok, "ok with extraStrict").toBe(false);
+  const codes = strictResult.diagnostics.map((d) => d.code);
+  // 6133 = "'x' is declared but its value is never read."
+  expect(codes.includes(6133), "diagnostic 6133 surfaced").toBe(true);
+});
+
+await check("extraStrict catches implicit returns", async () => {
+  // The return-type union with `undefined` is essential — without it, TS
+  // emits TS2366 from regular type checking, which would mask the
+  // noImplicitReturns-specific TS7030 we want to assert.
+  const ws = makeWorkspace({
+    "/src/cond.ts": `export function f(x: boolean): number | undefined { if (x) { return 1; } }\n`,
+  });
+  const cleanResult = await runTypecheck(ws);
+  expect(cleanResult.ok, "ok without extraStrict").toBe(true);
+
+  const strictResult = await runTypecheck(ws, { extraStrict: true });
+  expect(strictResult.ok, "ok with extraStrict").toBe(false);
+  const codes = strictResult.diagnostics.map((d) => d.code);
+  // 7030 = "Not all code paths return a value."
+  expect(codes.includes(7030), "diagnostic 7030 surfaced").toBe(true);
+});
+
+await check("extraStrict overrides tsconfig that disables the flags", async () => {
+  const ws = makeWorkspace({
+    "/tsconfig.json": JSON.stringify({
+      compilerOptions: {
+        strict: true,
+        target: "ES2022",
+        noUnusedLocals: false,
+        noUnusedParameters: false,
+      },
+    }),
+    "/src/unused.ts": `export function f(unused: number) { const y = 1; return 2; }\n`,
+  });
+  const lax = await runTypecheck(ws);
+  expect(lax.ok, "ok without extraStrict").toBe(true);
+
+  const strict = await runTypecheck(ws, { extraStrict: true });
+  expect(strict.ok, "ok with extraStrict").toBe(false);
+});
+
 if (failures > 0) {
   console.error(`\n${failures} failure(s)`);
   process.exit(1);

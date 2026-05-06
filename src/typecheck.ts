@@ -73,7 +73,32 @@ export interface TypecheckResult {
 export interface TypecheckOptions {
   /** Subdirectory to root the typecheck in. Defaults to "/" (the workspace root). */
   dir?: string;
+  /**
+   * When true, layer extra strictness flags on top of the resolved compiler
+   * options regardless of what the user's `tsconfig.json` says. Catches the
+   * cheap-to-find bug shapes that a real linter would normally surface
+   * (unused locals/params, missing returns, switch fall-through). Off by
+   * default — agents that want lint-grade feedback opt in via the tool.
+   *
+   * Honoured even when the user has set the equivalent flag to `false` —
+   * the caller is asking for stricter analysis on this run only.
+   */
+  extraStrict?: boolean;
 }
+
+/**
+ * Extra-strict flags layered on top of the resolved compiler options when
+ * `extraStrict: true`. These are TypeScript's nearest equivalents to the
+ * common lint rules we'd otherwise need a real linter to surface — they
+ * cost nothing extra at the bundle level (the compiler is already loaded)
+ * and produce structured diagnostics the agent can act on.
+ */
+const EXTRA_STRICT_OPTIONS: Readonly<Record<string, boolean>> = {
+  noUnusedLocals: true,
+  noUnusedParameters: true,
+  noImplicitReturns: true,
+  noFallthroughCasesInSwitch: true,
+};
 
 /**
  * Run a typecheck against the workspace.
@@ -159,6 +184,11 @@ export async function runTypecheck(
   const tsconfigPath = joinPath(rootDir, "tsconfig.json");
   const tsconfigSource = await safeRead(workspace, tsconfigPath);
   const compilerOptions = resolveCompilerOptions(ts, tsconfigSource, rootDir);
+  // 2a. Layer extra strictness on top if the caller asked for it. Applied
+  //     after tsconfig merge so it overrides user values for this run only.
+  if (opts.extraStrict) {
+    Object.assign(compilerOptions, EXTRA_STRICT_OPTIONS);
+  }
 
   // 3. Build a CompilerHost wired to the workspace + bundled libs.
   const host = createWorkspaceHost(ts, fileMap, TYPECHECK_LIB_FILES, compilerOptions);
