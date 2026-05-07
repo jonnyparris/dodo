@@ -169,6 +169,44 @@ await check("extraStrict catches implicit returns", async () => {
   expect(codes.includes(7030), "diagnostic 7030 surfaced").toBe(true);
 });
 
+await check("extraStrict catches switch fall-through", async () => {
+  const ws = makeWorkspace({
+    "/src/sw.ts": `export function f(x: number): string {
+  switch (x) {
+    case 1:
+      console.log("one");
+    case 2:
+      return "two";
+    default:
+      return "other";
+  }
+}\n`,
+  });
+  const cleanResult = await runTypecheck(ws);
+  expect(cleanResult.ok, "ok without extraStrict").toBe(true);
+
+  const strictResult = await runTypecheck(ws, { extraStrict: true });
+  expect(strictResult.ok, "ok with extraStrict").toBe(false);
+  // 7029 = "Fallthrough case in switch."
+  const codes = strictResult.diagnostics.map((d) => d.code);
+  expect(codes.includes(7029), "diagnostic 7029 surfaced").toBe(true);
+});
+
+await check("extraStrict catches unused parameters", async () => {
+  const ws = makeWorkspace({
+    "/src/p.ts": `export function f(used: number, unused: string): number { return used; }\n`,
+  });
+  const cleanResult = await runTypecheck(ws);
+  expect(cleanResult.ok, "ok without extraStrict").toBe(true);
+
+  const strictResult = await runTypecheck(ws, { extraStrict: true });
+  expect(strictResult.ok, "ok with extraStrict").toBe(false);
+  // 6133 also covers parameters; both noUnusedLocals and noUnusedParameters
+  // surface as 6133 in modern TS.
+  const codes = strictResult.diagnostics.map((d) => d.code);
+  expect(codes.includes(6133), "diagnostic 6133 surfaced").toBe(true);
+});
+
 await check("extraStrict overrides tsconfig that disables the flags", async () => {
   const ws = makeWorkspace({
     "/tsconfig.json": JSON.stringify({

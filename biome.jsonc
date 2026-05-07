@@ -26,6 +26,9 @@
       "!!**/public"
     ]
   },
+  // `recommended: false` makes individual `error` entries the explicit
+  // allow-list. Anything not listed here is off — there is no point
+  // enumerating "off" entries against rules biome wouldn't run anyway.
   "linter": {
     "enabled": true,
     "rules": {
@@ -33,14 +36,12 @@
       "correctness": {
         "noUnusedImports": "error",
         "noUnusedVariables": "error",
-        "noUnusedFunctionParameters": "off",
         "noUnusedPrivateClassMembers": "error",
         "noConstAssign": "error",
         "noConstantCondition": "error",
         "noUnreachable": "error",
         "noUnsafeFinally": "error",
-        "noVoidTypeReturn": "error",
-        "useExhaustiveDependencies": "off"
+        "noVoidTypeReturn": "error"
       },
       "suspicious": {
         "noDoubleEquals": "error",
@@ -55,9 +56,7 @@
         "noSparseArray": "error",
         "noUnsafeNegation": "error",
         "useGetterReturn": "error",
-        "useIsArray": "error",
-        "noExplicitAny": "off",
-        "noEmptyBlockStatements": "off"
+        "useIsArray": "error"
       },
       "complexity": {
         "noUselessCatch": "error",
@@ -69,10 +68,5 @@
   },
   "formatter": {
     "enabled": false
-  },
-  "javascript": {
-    "linter": {
-      "enabled": true
-    }
   }
 }
