@@ -8,7 +8,7 @@
  *
  *   - Client-side `/generate` slash command regex (public/js/dodo-chat.js)
  *   - Server-side prompt schema (max 2048 chars per FLUX docs)
- *   - Shared-index catalog separation (chat models vs image models)
+ *   - model-catalog separation (chat models vs image models)
  */
 
 import { describe, expect, it } from "vitest";
@@ -20,10 +20,10 @@ import {
   WORKERS_AI_IMAGE_MODELS,
   extractGeneratePrompt,
   GENERATE_SLASH_REGEX,
-} from "../src/shared-index";
+} from "../src/model-catalog";
 
 describe("/generate slash command regex", () => {
-  // The canonical regex ships from shared-index so server handlers and the
+  // The canonical regex ships from model-catalog so server handlers and the
   // browser client use the same matcher. Guard the shape here.
   const SLASH_REGEX = GENERATE_SLASH_REGEX;
 
