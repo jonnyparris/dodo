@@ -27,7 +27,7 @@ import { sendNotification } from "./notify";
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc-transport";
-import { extractGeneratePrompt, FALLBACK_MODELS, FLUX_IMAGE_MEDIA_TYPE, FLUX_IMAGE_MODEL, FLUX_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./shared-index";
+import { extractGeneratePrompt, FALLBACK_MODELS, FLUX_IMAGE_MEDIA_TYPE, FLUX_IMAGE_MODEL, FLUX_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import {
   createPersonalSkillClient,
   mergeSkills,
@@ -66,7 +66,7 @@ import {
 /**
  * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
  *
- * Derived from the shared model catalog in shared-index.ts so the two lists
+ * Derived from the shared model catalog in model-catalog.ts so the two lists
  * cannot drift. If a model is missing from the catalog but used at runtime,
  * DEFAULT_CONTEXT_WINDOW applies. See issue #34.
  */
