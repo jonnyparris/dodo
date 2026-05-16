@@ -1,7 +1,8 @@
 import { getAgentByName } from "agents";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { canonicalizeEmail, getUserControlStub, resolveAdminEmail } from "./auth";
+import { getUserControlStub } from "./auth";
+import { errorResult, mcpUserEmail, propagateMcpDepth } from "./mcp-shared";
 import type { Env } from "./types";
 
 // ─── API Catalog ───
@@ -110,27 +111,6 @@ declare const catalog: CatalogEntry[];
 `;
 
 // ─── Helpers ───
-
-/**
- * Resolve the email to attribute MCP operations to.
- *
- * Prefers the explicit caller email (resolved upstream from the user-scoped
- * `dodo_*` token). Only falls back to ADMIN_EMAIL when no user email was
- * threaded — which now only happens for service-mode callers using the
- * shared `DODO_MCP_TOKEN` (audit finding H2).
- */
-function mcpUserEmail(env: Env, userEmail?: string): string {
-  const canonical = canonicalizeEmail(userEmail ?? null);
-  if (canonical) return canonical;
-  const admin = resolveAdminEmail(env);
-  if (!admin) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
-  console.warn("[mcp-codemode] Operation attributed to admin via service-mode fallback (no userEmail threaded).");
-  return admin;
-}
-
-function errorResult(data: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
-  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }], isError: true };
-}
 
 /** Truncate large responses to avoid blowing up the context window. */
 function truncateResponse(data: unknown, maxChars = 16_000): string {
@@ -257,7 +237,7 @@ async () => {
 // Routes requests to the appropriate internal Durable Object (UserControl or CodingAgent).
 
 function buildDodoClient(env: Env, userEmail: string | undefined, depth: number) {
-  const email = mcpUserEmail(env, userEmail);
+  const email = mcpUserEmail(env, userEmail, "mcp-codemode");
 
   return {
     async request(options: { method: string; path: string; query?: Record<string, string | number | boolean | undefined>; body?: unknown }) {
@@ -311,7 +291,7 @@ function buildDodoClient(env: Env, userEmail: string | undefined, depth: number)
         const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
         const agentHeaders = new Headers(headers);
         agentHeaders.set("x-dodo-session-id", sessionId);
-        agentHeaders.set("x-dodo-mcp-depth", String(depth + 1));
+        propagateMcpDepth(agentHeaders, depth);
         res = await agent.fetch(new Request(`https://coding-agent${targetPath}${url.search}`, { ...init, headers: agentHeaders }));
       } else {
         // Route to UserControl DO
