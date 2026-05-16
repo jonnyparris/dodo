@@ -1,34 +1,16 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
-import { canonicalizeEmail, getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
+import { getSharedIndexStub, getUserControlStub, isAdmin } from "./auth";
 import { log } from "./logger";
 import { messageLimiter, promptLimiter } from "./rate-limit";
 import { createDraftPrForRun, createGithubRepo } from "./github-pr";
 import { pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-actions";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
+import { errorResult, mcpUserEmail, propagateMcpDepth } from "./mcp-shared";
 import type { CodingAgent } from "./coding-agent";
 import type { Env, WorkerRunRecord } from "./types";
-
-/**
- * Resolve the MCP caller's email. Prefers an explicit userEmail (from a
- * user-scoped dodo_* token validated upstream), falls back to ADMIN_EMAIL
- * for service-mode callers using the shared DODO_MCP_TOKEN.
- *
- * When the fallback is taken we log a warning so operators can audit
- * operations that get attributed to the admin. In production, review the
- * log stream periodically to confirm the expected service-mode callers
- * (CI etc.) are the only ones hitting this path.
- */
-function mcpUserEmail(env: Env, userEmail?: string): string {
-  const canonical = canonicalizeEmail(userEmail ?? null);
-  if (canonical) return canonical;
-  const email = resolveAdminEmail(env);
-  if (!email) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
-  console.warn("[mcp] Operation attributed to admin via service-mode fallback (no userEmail threaded).");
-  return email;
-}
 
 /**
  * Check whether the caller has at least `required` permission on the session.
@@ -165,7 +147,7 @@ async function agentFetch(env: Env, sessionId: string, path: string, init?: Requ
   const headers = new Headers(init?.headers);
   headers.set("x-dodo-session-id", sessionId);
   headers.set("x-owner-email", email);
-  headers.set("x-dodo-mcp-depth", String(depth + 1));
+  propagateMcpDepth(headers, depth);
 
   // Inject gateway config for message/prompt routes
   if (path === "/message" || path === "/prompt") {
@@ -519,10 +501,6 @@ async function pollAndFinalize(env: Env, run: WorkerRunRecord, ownerEmail: strin
 
 function textResult(data: unknown): { content: Array<{ type: "text"; text: string }> } {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-}
-
-function errorResult(data: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
-  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }], isError: true };
 }
 
 async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: string, opts?: { sessionId?: string; init?: RequestInit; depth?: number }): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: true }> {
