@@ -1,6 +1,8 @@
-import { Workspace, createWorkspaceStateBackend } from "@cloudflare/shell";
-import { type AgentNamespace, type Connection, type ConnectionContext, type WSMessage, getAgentByName } from "agents";
-import type { ArtifactsRepo } from "./artifacts-types";
+import { createWorkspaceStateBackend, Workspace } from "@cloudflare/shell";
+import { type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type WSMessage } from "agents";
+import { type FileUIPart, generateText, type LanguageModel, type ModelMessage, streamText, type ToolSet } from "ai";
+import { z } from "zod";
+import { buildProvider, buildToolsForThink } from "./agentic";
 import { flushTurnToArtifacts } from "./artifacts-flush";
 import {
   ARTIFACTS_TOKEN_TTL_SECONDS,
@@ -10,51 +12,56 @@ import {
   readArtifactsFile,
   refreshArtifactsFs,
 } from "./artifacts-read";
-import { generateText, streamText, type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
-import { z } from "zod";
-import { buildProvider, buildToolsForThink } from "./agentic";
-import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
-import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
+import type { ArtifactsRepo } from "./artifacts-types";
 import type { AttachmentRef } from "./attachments";
 import { rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
+import { listBuiltinSkills } from "./builtin-skills";
 import { bytesToBase64Chunked } from "./crypto";
+import { runSandboxedCode } from "./executor";
+import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
+import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { log } from "./logger";
 import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { sendNotification } from "./notify";
-import { runSandboxedCode } from "./executor";
-import {
-  createPersonalSkillClient,
-  mergeSkills,
-  renderManifest as renderSkillManifest,
-  renderSkillContent,
-  scanWorkspaceSkills,
-  type Skill,
-} from "./skill-registry";
-import { listBuiltinSkills } from "./builtin-skills";
-import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc-transport";
-import { epochToIso, nowEpoch, SqlHelper } from "./sql-helpers";
+import { extractGeneratePrompt, FALLBACK_MODELS, FLUX_IMAGE_MEDIA_TYPE, FLUX_IMAGE_MODEL, FLUX_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./shared-index";
 import {
-  Think,
+  createPersonalSkillClient,
+  mergeSkills,
+  renderSkillContent,
+  renderManifest as renderSkillManifest,
+  type Skill,
+  scanWorkspaceSkills,
+} from "./skill-registry";
+import { epochToIso, nowEpoch, SqlHelper } from "./sql-helpers";
+import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
+import type { SnapshotV2 } from "./think-adapter";
+import {
   type ChatMessageOptions,
+  chatRecordToUIMessage,
   type DodoConfig,
   type FiberCompleteContext,
   type FiberRecoveryContext,
   type MessageMetadata,
-  type StreamCallback,
   type StreamableResult,
-  type UIMessage,
+  type StreamCallback,
+  Think,
 
   truncateToolOutput,
+  type UIMessage,
   uiMessageToChatRecord,
-  chatRecordToUIMessage,
 } from "./think-adapter";
-import type { SnapshotV2 } from "./think-adapter";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, TodoItem, TodoPriority, TodoStatus, TodoStore, WorkspaceEntry } from "./types";
-import { FALLBACK_MODELS, WORKERS_AI_MODELS, FLUX_IMAGE_MODEL, FLUX_IMAGE_MEDIA_TYPE, FLUX_MAX_PROMPT_LENGTH, extractGeneratePrompt } from "./shared-index";
+import {
+  DEFAULT_NUDGE_PROMPT,
+  decideWatchdog,
+  formatStallBody,
+  normaliseWatchdogConfig,
+  type WatchdogConfig,
+} from "./watchdog";
 
 /**
  * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
@@ -2315,6 +2322,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return await this.handleDeleteCron(url.pathname.split("/").at(-1) ?? "");
       }
 
+      // Session watchdog — autonomous stall detection for long-running
+      // prompts. PUT installs/replaces a watchdog; GET reports config
+      // + counters; DELETE removes the watchdog and cancels its
+      // schedule. See src/watchdog.ts for the pure decision logic.
+      if (request.method === "GET" && url.pathname === "/watchdog") {
+        return Response.json(this.readWatchdogState());
+      }
+      if (request.method === "PUT" && url.pathname === "/watchdog") {
+        return await this.handleInstallWatchdog(request);
+      }
+      if (request.method === "DELETE" && url.pathname === "/watchdog") {
+        return await this.handleDeleteWatchdog();
+      }
+
       // Phase 5 — facet transcripts surface. Two read-only endpoints
       // backing the `GET /session/:id/facets` /
       // `GET /session/:id/facets/:facetName/transcript` HTTP routes.
@@ -3474,6 +3495,162 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     await this.cancelSchedule(id);
     this.db.exec("DELETE FROM cron_jobs WHERE schedule_id = ?", id);
     return Response.json({ deleted: true, id });
+  }
+
+  // ─── Session watchdog ──────────────────────────────────────────────
+  //
+  // Each session can have at most one watchdog. The config lives in
+  // metadata under `watchdog_config` (JSON-encoded) and the recurring
+  // tick is registered as a cron schedule pointing at
+  // `runWatchdogCheck`. Counters (`watchdog_last_*`) are kept in
+  // metadata for observability. The schedule id is also stored so
+  // re-installs can cancel cleanly.
+
+  private readWatchdogConfig(): WatchdogConfig | null {
+    const raw = this.readMetadata("watchdog_config");
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as WatchdogConfig;
+    } catch {
+      return null;
+    }
+  }
+
+  private readWatchdogState(): Record<string, unknown> {
+    const config = this.readWatchdogConfig();
+    const scheduleId = this.readMetadata("watchdog_schedule_id");
+    return {
+      armed: !!config && !!scheduleId,
+      config,
+      scheduleId,
+      lastCheckedAt: this.readMetadata("watchdog_last_checked_at"),
+      lastFiredAt: this.readMetadata("watchdog_last_fired_at"),
+      lastFiredForPromptId: this.readMetadata("watchdog_last_fired_for_prompt_id"),
+      fireCount: Number(this.readMetadata("watchdog_fire_count") ?? "0"),
+    };
+  }
+
+  private async handleInstallWatchdog(request: Request): Promise<Response> {
+    let raw: unknown;
+    try {
+      raw = await request.json();
+    } catch {
+      return Response.json({ error: "Body must be JSON" }, { status: 400 });
+    }
+    let config: WatchdogConfig;
+    try {
+      config = normaliseWatchdogConfig(raw);
+    } catch (err) {
+      return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 400 });
+    }
+
+    // Cancel any existing watchdog schedule before installing the new one.
+    const prevScheduleId = this.readMetadata("watchdog_schedule_id");
+    if (prevScheduleId) {
+      try { await this.cancelSchedule(prevScheduleId); } catch { /* no-op */ }
+    }
+
+    const scheduled = await this.schedule(config.checkCron, "runWatchdogCheck", {});
+    this.writeMetadata("watchdog_config", JSON.stringify(config));
+    this.writeMetadata("watchdog_schedule_id", scheduled.id);
+    // Reset fire counters when (re)installing — a new config is a new
+    // contract; stale `lastFiredForPromptId` from a prior watchdog
+    // shouldn't block the new one.
+    this.writeMetadata("watchdog_last_fired_for_prompt_id", "");
+    this.writeMetadata("watchdog_fire_count", "0");
+    return Response.json(this.readWatchdogState(), { status: 201 });
+  }
+
+  private async handleDeleteWatchdog(): Promise<Response> {
+    const scheduleId = this.readMetadata("watchdog_schedule_id");
+    if (scheduleId) {
+      try { await this.cancelSchedule(scheduleId); } catch { /* no-op */ }
+    }
+    this.writeMetadata("watchdog_config", "");
+    this.writeMetadata("watchdog_schedule_id", "");
+    return Response.json({ deleted: true });
+  }
+
+  /** Recurring watchdog tick. Runs at the configured cron cadence;
+   *  reads current session state, decides whether to act, and either
+   *  notifies, aborts, or nudges. Safe to call when no watchdog is
+   *  installed — it just no-ops. */
+  async runWatchdogCheck(): Promise<void> {
+    const config = this.readWatchdogConfig();
+    if (!config) return;
+
+    const now = nowEpoch();
+    this.writeMetadata("watchdog_last_checked_at", String(now));
+
+    // Resolve last-activity timestamp. `updated_at` is stamped on every
+    // metadata write — we parse the ISO string back to epoch seconds.
+    const updatedIso = this.readMetadata("updated_at");
+    const updatedAtEpoch = updatedIso ? Math.floor(Date.parse(updatedIso) / 1000) : null;
+
+    const decision = decideWatchdog(config, {
+      nowEpoch: now,
+      status: this.readMetadata("status"),
+      activePromptId: this.readMetadata("active_prompt_id"),
+      updatedAtEpoch: Number.isFinite(updatedAtEpoch) ? updatedAtEpoch : null,
+      lastFiredForPromptId: this.readMetadata("watchdog_last_fired_for_prompt_id") || null,
+    });
+    if (!decision) return;
+
+    const sessionId = this.readMetadata("session_id") ?? "unknown";
+    const title = this.readMetadata("title") ?? sessionId;
+    const ownerEmail = this.readMetadata("owner_email") ?? undefined;
+
+    // Record fire BEFORE taking action so a retry of this same tick
+    // (alarm replay) won't double-fire.
+    this.writeMetadata("watchdog_last_fired_at", String(now));
+    this.writeMetadata("watchdog_last_fired_for_prompt_id", decision.activePromptId);
+    this.writeMetadata(
+      "watchdog_fire_count",
+      String(Number(this.readMetadata("watchdog_fire_count") ?? "0") + 1),
+    );
+
+    const body = formatStallBody(sessionId, decision, config.action);
+
+    if (config.action === "abort" || config.action === "nudge") {
+      try {
+        await this.handleAbort();
+      } catch (err) {
+        // Abort failures are non-fatal — fall through to the notification
+        // so the user finds out something went wrong.
+        log("warn", "watchdog: abort failed", { sessionId, err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    if (config.action === "nudge") {
+      const nudge = config.nudgePrompt ?? DEFAULT_NUDGE_PROMPT;
+      try {
+        // Dispatch the nudge as a fresh fiber-backed prompt. Same
+        // shape as runCronPrompt — no HTTP round-trip needed since
+        // we're already in the owning DO.
+        const promptId = crypto.randomUUID();
+        this.writeMetadata("active_prompt_id", promptId);
+        this.writeMetadata("status", "running");
+        this.insertPrompt(promptId, nudge, "queued", "watchdog");
+        await this.readAppConfig();
+        const fiberId = this.spawnFiber("runFiberPrompt", {
+          promptId,
+          content: nudge,
+          authorEmail: "watchdog",
+          title,
+        }, { maxRetries: 1 });
+        this.setPromptFiberId(promptId, fiberId);
+      } catch (err) {
+        log("warn", "watchdog: nudge dispatch failed", { sessionId, err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    sendNotification(this.env, this.ctx, {
+      title: `Dodo: ${title} (stalled)`,
+      body,
+      tags: "warning,robot",
+      priority: "high",
+      ownerEmail,
+    });
   }
 
   async runCronPrompt(payload: { description: string; prompt: string }): Promise<void> {

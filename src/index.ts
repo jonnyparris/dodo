@@ -1,26 +1,26 @@
+import { newRpcResponse } from "@hono/capnweb";
 import { getAgentByName } from "agents";
 import { createMcpHandler } from "agents/mcp";
-import { newRpcResponse } from "@hono/capnweb";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { fetchAttachment } from "./attachments";
 import { AuthError, canonicalizeEmail, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, resolveAdminEmail, verifyAccess } from "./auth";
 import { CodingAgent } from "./coding-agent";
 import { ExploreAgent } from "./explore-agent";
-import { TaskAgent } from "./task-agent";
 import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
 import { createDodoMcpServer } from "./mcp";
-import { createDodoCodeModeMcpServer } from "./mcp-codemode";
 import { MCP_CATALOG } from "./mcp-catalog";
-import { fetchAttachment } from "./attachments";
+import { createDodoCodeModeMcpServer } from "./mcp-codemode";
 import { AllowlistOutbound } from "./outbound";
 import { errorLimiter, maybeCleanupRateLimiters, messageLimiter, promptLimiter, shareLimiter } from "./rate-limiters";
 import { buildAuthenticatedApi } from "./rpc-api";
+import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
 import { signCookie, verifyCookie } from "./share";
 import { SharedIndex } from "./shared-index";
-import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
-import { UserControl } from "./user-control";
+import { TaskAgent } from "./task-agent";
 import type { AccessIdentity, AppConfig, Env } from "./types";
+import { UserControl } from "./user-control";
 
 // Rate limiters live in src/rate-limiters.ts so MCP tools can charge the
 // same per-user budgets as the HTTP routes (audit follow-up F3).
@@ -1792,6 +1792,12 @@ app.get("/session/:id/cron", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/cron");
 });
 
+app.get("/session/:id/watchdog", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/watchdog");
+});
+
 app.get("/session/:id/events", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;
@@ -2049,6 +2055,18 @@ app.delete("/session/:id/cron/:cronId", async (c) => {
   const denied = requirePermission(c, "write");
   if (denied) return denied;
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/cron/${encodeURIComponent(c.req.param("cronId"))}`);
+});
+
+app.put("/session/:id/watchdog", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/watchdog");
+});
+
+app.delete("/session/:id/watchdog", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/watchdog");
 });
 
 app.post("/session/:id/fork", async (c) => {
