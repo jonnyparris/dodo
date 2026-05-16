@@ -1,16 +1,24 @@
 /**
- * Cap'n Web RPC API definitions for Dodo.
+ * Scaffolding for a future Cap'n Web RPC feature.
  *
- * These classes extend RpcTarget and define the methods available to
- * RPC clients. They provide a typed, permission-scoped API surface.
+ * Only DodoAuthenticatedApi is wired today — it is constructed in the
+ * /rpc Hono route (src/index.ts) and served via @hono/capnweb's
+ * newRpcResponse().
  *
- * The API is constructed in the Hono handler (`/rpc`) directly bound to
- * the authenticated email. There is NO `authenticate(email)` factory that
- * lets a caller assert their identity — the email is fixed by the Worker's
- * auth middleware and cannot be changed by the RPC client. (audit finding H1)
+ * AgentConnectionTransport is instantiated by the WebSocket branch in
+ * coding-agent.ts when a client connects with ?protocol=capnweb, but
+ * there is currently no RpcSession that consumes the delivered messages.
+ * The transport stores messages in a queue so a future RpcSession can
+ * receive() them; for now this is a no-op pipeline that preserves the
+ * existing behaviour.
+ *
+ * DodoPublicApi is kept because it is exercised in unit tests, but it is
+ * not instantiated in production code paths.
  */
 
 import { RpcTarget } from "capnweb";
+import type { Connection } from "agents";
+import type { RpcTransport } from "capnweb";
 import type { Env } from "./types";
 import { canonicalizeEmail, getUserControlStub, isAdmin } from "./auth";
 
@@ -30,10 +38,6 @@ interface RpcSessionSummary {
 }
 
 // ─── Public API (no auth required) ───
-//
-// Retains a `health()` method that exposes nothing user-specific. Anything
-// requiring authentication MUST live on `DodoAuthenticatedApi`, which is
-// constructed from a server-validated email — never from a client claim.
 
 export class DodoPublicApi extends RpcTarget {
   private env: Env;
@@ -108,5 +112,73 @@ export class DodoAuthenticatedApi extends RpcTarget {
 
   async createSession(): Promise<string> {
     return this.createSessionFn();
+  }
+}
+
+// ─── Transport adapter ───
+
+export class AgentConnectionTransport implements RpcTransport {
+  private messageQueue: string[] = [];
+  private messageResolve?: (msg: string) => void;
+  private messageReject?: (err: Error) => void;
+  private closed = false;
+
+  constructor(private connection: Connection) {}
+
+  async send(message: string): Promise<void> {
+    if (this.closed) throw new Error("Transport closed");
+    this.connection.send(message);
+  }
+
+  async receive(): Promise<string> {
+    if (this.messageQueue.length > 0) {
+      return this.messageQueue.shift()!;
+    }
+    if (this.closed) {
+      throw new Error("Transport closed");
+    }
+    return new Promise<string>((resolve, reject) => {
+      this.messageResolve = resolve;
+      this.messageReject = reject;
+    });
+  }
+
+  /**
+   * Called by the CodingAgent's onMessage handler to feed incoming
+   * WebSocket messages into the transport's receive() pipeline.
+   */
+  deliver(message: string): void {
+    if (this.messageResolve) {
+      const resolve = this.messageResolve;
+      this.messageResolve = undefined;
+      this.messageReject = undefined;
+      resolve(message);
+    } else {
+      this.messageQueue.push(message);
+    }
+  }
+
+  /**
+   * Called when the connection closes. Rejects any pending receive().
+   */
+  close(): void {
+    this.closed = true;
+    if (this.messageReject) {
+      const reject = this.messageReject;
+      this.messageResolve = undefined;
+      this.messageReject = undefined;
+      reject(new Error("Transport closed"));
+    }
+  }
+
+  abort(reason: unknown): void {
+    this.closed = true;
+    const message = reason instanceof Error ? reason.message : "Transport aborted";
+    if (this.messageReject) {
+      const reject = this.messageReject;
+      this.messageResolve = undefined;
+      this.messageReject = undefined;
+      reject(new Error(message));
+    }
   }
 }

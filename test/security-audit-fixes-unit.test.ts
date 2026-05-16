@@ -10,7 +10,7 @@
 import { describe, expect, it } from "vitest";
 import { canonicalizeEmail, isAdmin, resolveAdminEmail } from "../src/auth";
 import { hashShareToken } from "../src/share";
-import { DodoPublicApi, buildAuthenticatedApi } from "../src/rpc-api";
+import { DodoPublicApi, buildAuthenticatedApi } from "../src/rpc";
 import { bytesToBase64, bytesToBase64Chunked } from "../src/crypto";
 
 const stubEnv = (overrides: Record<string, string | undefined> = {}) => ({
