@@ -18,7 +18,7 @@ import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from 
 import { sendNotification } from "./notify";
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
-import { AgentConnectionTransport } from "./rpc-transport";
+import { AgentConnectionTransport } from "./rpc";
 import { extractGeneratePrompt, FALLBACK_MODELS, FLUX_IMAGE_MEDIA_TYPE, FLUX_IMAGE_MODEL, FLUX_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import {
   createPersonalSkillClient,

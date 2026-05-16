@@ -3,7 +3,7 @@ import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test"
 import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 import { PresenceTracker } from "../src/presence";
-import { AgentConnectionTransport } from "../src/rpc-transport";
+import { AgentConnectionTransport } from "../src/rpc";
 
 const { sendNotificationMock } = vi.hoisted(() => ({
   sendNotificationMock: vi.fn(),
@@ -271,7 +271,7 @@ describe("Cap'n Web RPC API", () => {
     // Cap'n Web's RpcTarget may or may not work in miniflare.
     let imported = false;
     try {
-      const api = await import("../src/rpc-api");
+      const api = await import("../src/rpc");
       expect(api.DodoPublicApi).toBeDefined();
       expect(api.DodoAuthenticatedApi).toBeDefined();
       imported = true;
@@ -282,7 +282,7 @@ describe("Cap'n Web RPC API", () => {
 
     // If import succeeded, test basic instantiation
     if (imported) {
-      const { DodoPublicApi } = await import("../src/rpc-api");
+      const { DodoPublicApi } = await import("../src/rpc");
       const testEnv = env as Env;
       const api = new DodoPublicApi(testEnv);
       expect(api.health()).toEqual({ status: "ok", version: testEnv.DODO_VERSION ?? "unknown" });
@@ -290,7 +290,7 @@ describe("Cap'n Web RPC API", () => {
   });
 
   it("can import RPC transport adapter", async () => {
-    const { AgentConnectionTransport } = await import("../src/rpc-transport");
+    const { AgentConnectionTransport } = await import("../src/rpc");
     expect(AgentConnectionTransport).toBeDefined();
   });
 

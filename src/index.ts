@@ -14,7 +14,7 @@ import { MCP_CATALOG } from "./mcp-catalog";
 import { createDodoCodeModeMcpServer } from "./mcp-codemode";
 import { AllowlistOutbound } from "./outbound";
 import { errorLimiter, maybeCleanupRateLimiters, messageLimiter, promptLimiter, shareLimiter } from "./rate-limit";
-import { buildAuthenticatedApi } from "./rpc-api";
+import { buildAuthenticatedApi } from "./rpc";
 import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
 import { signCookie, verifyCookie } from "./share";
 import { SharedIndex } from "./shared-index";

@@ -5,7 +5,7 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import { PresenceTracker } from "../src/presence";
-import { AgentConnectionTransport } from "../src/rpc-transport";
+import { AgentConnectionTransport } from "../src/rpc";
 
 // ─── PresenceTracker Unit Tests ───
 
