@@ -20,7 +20,7 @@
  *   the provided value is not of type 'Fetcher'.
  */
 import { describe, expect, it } from "vitest";
-import { OWNER_ID_HEADER } from "../src/executor";
+import { OWNER_ID_HEADER } from "../src/outbound";
 
 describe("OWNER_ID_HEADER", () => {
   it("constant is preserved for compatibility / future reuse", () => {

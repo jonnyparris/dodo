@@ -1,4 +1,6 @@
+import { DynamicWorkerExecutor, type ExecuteResult, resolveProvider } from "@cloudflare/codemode";
 import { createWorkspaceStateBackend, Workspace } from "@cloudflare/shell";
+import { stateTools } from "@cloudflare/shell/workers";
 import { type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type WSMessage } from "agents";
 import { type FileUIPart, generateText, type LanguageModel, type ModelMessage, streamText, type ToolSet } from "ai";
 import { z } from "zod";
@@ -10,7 +12,6 @@ import { rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from
 import { getUserControlStub, isAdmin } from "./auth";
 import { listBuiltinSkills } from "./builtin-skills";
 import { bytesToBase64Chunked } from "./crypto";
-import { runSandboxedCode } from "./executor";
 import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { log } from "./logger";
@@ -3097,12 +3098,19 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     this.ensureMetadata(this.requireSessionId(request), ownerEmail);
 
-    const execution = await runSandboxedCode({
-      code: body.code,
-      env: this.env,
-      workspace: this.workspace,
-      ownerId: this.resolveOwnerId(ownerEmail),
+    if (!this.env.LOADER) {
+      throw new Error("Dynamic Worker loader is not configured");
+    }
+
+    const outbound = this.env.OUTBOUND ?? null;
+
+    const executor = new DynamicWorkerExecutor({
+      globalOutbound: outbound,
+      loader: this.env.LOADER,
+      timeout: 30000,
     });
+
+    const execution: ExecuteResult = await executor.execute(body.code, [resolveProvider(stateTools(this.workspace))]);
 
     this.emitEvent({ data: execution, type: "execution" });
     return Response.json(execution, { status: execution.error ? 400 : 200 });

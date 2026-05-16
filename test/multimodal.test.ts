@@ -4,14 +4,10 @@ import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 import { resetMockAgentic } from "./helpers/agentic-mock";
 
-const { runSandboxedCodeMock, sendNotificationMock } = vi.hoisted(() => ({
-  runSandboxedCodeMock: vi.fn(),
+const { sendNotificationMock } = vi.hoisted(() => ({
   sendNotificationMock: vi.fn(),
 }));
 
-vi.mock("../src/executor", () => ({
-  runSandboxedCode: runSandboxedCodeMock,
-}));
 
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 
@@ -51,8 +47,6 @@ describe("Multimodal image support", () => {
   beforeEach(async () => {
     vi.restoreAllMocks();
     resetMockAgentic();
-    runSandboxedCodeMock.mockReset();
-    runSandboxedCodeMock.mockResolvedValue({ logs: [], result: {} });
     sendNotificationMock.mockReset();
 
     await fetchJson("/api/config", {

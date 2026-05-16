@@ -1715,7 +1715,7 @@ function buildTools(
     // 'globalOutbound' field on 'WorkerCode'". AllowlistOutbound still
     // enforces the hostname allowlist for every sandbox fetch — the
     // perimeter is unchanged. Per-user token injection for raw fetch is
-    // currently unavailable (see src/executor.ts OWNER_ID_HEADER docstring);
+    // currently unavailable (see src/outbound.ts OWNER_ID_HEADER history);
     // git operations are unaffected because resolveRemoteToken() runs in
     // the parent DO and tokens are passed directly to isomorphic-git.
     void options?.ownerId; // accepted for API compat — not threaded through

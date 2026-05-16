@@ -5,9 +5,15 @@ import type { Env, SeedRecord } from "../src/types";
 
 // Stub modules that depend on packages not available in the worker test
 // runtime — same pattern used by every other top-level test file.
-vi.mock("../src/executor", () => ({
-  runSandboxedCode: vi.fn().mockResolvedValue({ logs: [], result: null }),
-}));
+vi.mock("@cloudflare/codemode", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@cloudflare/codemode")>();
+  return {
+    ...actual,
+    DynamicWorkerExecutor: vi.fn(function () {
+      return { execute: vi.fn().mockResolvedValue({ logs: [], result: null }) };
+    }) as unknown as typeof import("@cloudflare/codemode").DynamicWorkerExecutor,
+  };
+});
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/notify", () => ({
   sendNotification: vi.fn(),

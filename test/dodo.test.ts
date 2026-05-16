@@ -5,14 +5,20 @@ import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 import { releaseMockSlowPrompt, resetMockAgentic } from "./helpers/agentic-mock";
 
-const { runSandboxedCodeMock, sendNotificationMock } = vi.hoisted(() => ({
-  runSandboxedCodeMock: vi.fn(),
+const { executeMock, sendNotificationMock } = vi.hoisted(() => ({
+  executeMock: vi.fn(),
   sendNotificationMock: vi.fn(),
 }));
 
-vi.mock("../src/executor", () => ({
-  runSandboxedCode: runSandboxedCodeMock,
-}));
+vi.mock("@cloudflare/codemode", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@cloudflare/codemode")>();
+  return {
+    ...actual,
+    DynamicWorkerExecutor: vi.fn(function () {
+      return { execute: executeMock };
+    }) as unknown as typeof import("@cloudflare/codemode").DynamicWorkerExecutor,
+  };
+});
 
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 
@@ -102,8 +108,8 @@ describe("Dodo foundation", () => {
   beforeEach(async () => {
     vi.restoreAllMocks();
     resetMockAgentic();
-    runSandboxedCodeMock.mockReset();
-    runSandboxedCodeMock.mockResolvedValue({ logs: ["sandbox ok"], result: { updated: true } });
+    executeMock.mockReset();
+    executeMock.mockResolvedValue({ logs: ["sandbox ok"], result: { updated: true } });
     sendNotificationMock.mockReset();
 
     await fetchJson("/api/config", {
@@ -338,13 +344,18 @@ describe("Dodo foundation", () => {
       method: "PUT",
     });
 
-    runSandboxedCodeMock.mockImplementationOnce(async ({ code, workspace }) => {
+    executeMock.mockImplementationOnce(async (code) => {
       expect(code).toContain("state.readFile");
-      const before = await workspace.readFile("/src/demo.ts");
-      await workspace.writeFile("/src/demo.ts", String(before).replace("old", "new"));
+      const readResponse = await fetchJson(`/session/${sessionId}/file?path=/src/demo.ts`);
+      const readBody = (await readResponse.json()) as { content: string };
+      await fetchJson(`/session/${sessionId}/file?path=/src/demo.ts`, {
+        body: JSON.stringify({ content: readBody.content.replace("old", "new") }),
+        headers: { "content-type": "application/json" },
+        method: "PUT",
+      });
       return {
         logs: ["sandbox ok"],
-        result: await workspace.readFile("/src/demo.ts"),
+        result: readBody.content.replace("old", "new"),
       };
     });
 
