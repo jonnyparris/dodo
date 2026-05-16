@@ -8,7 +8,7 @@ import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBran
 import { createPullRequest } from "./github-pr";
 import { normalizePath } from "./paths";
 import { createBrowserTools } from "./browser/tools";
-import type { McpGatekeeper } from "./mcp-gatekeeper";
+import type { McpClient } from "./mcp-client";
 import { getKnownRepo, listKnownRepos, parseRemoteSpec } from "./repos";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import { runTypecheck } from "./typecheck";
@@ -31,7 +31,7 @@ interface BuildToolsOptions {
   ownerId?: string;
   ownerEmail?: string;
   stateBackend?: StateBackend;
-  mcpGatekeepers?: McpGatekeeper[];
+    mcpGatekeepers?: McpClient[];
   /**
    * OAuth MCP tools pre-fetched from the per-user hub DO. Session DOs don't
    * hold OAuth credentials locally — they pass the cached tool list here
@@ -1970,7 +1970,7 @@ export function buildToolsForThink(
   config: AppConfig,
   options?: BuildToolsOptions & {
     agent?: { mcp?: unknown };
-    mcpGatekeepers?: McpGatekeeper[];
+  mcpGatekeepers?: McpClient[];
   },
 ): Record<string, AnyTool> {
   const tools = buildTools(env, workspace, config, options);
@@ -2000,7 +2000,7 @@ export function buildToolsForThink(
  * by the gatekeeper's listTools(). We use jsonSchema() passthrough for the
  * input schema since MCP tools define JSON Schema directly, not Zod.
  */
-function buildMcpTools(gatekeepers: McpGatekeeper[], existingNames: Set<string>): Record<string, AnyTool> {
+function buildMcpTools(gatekeepers: McpClient[], existingNames: Set<string>): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
   for (const gk of gatekeepers) {

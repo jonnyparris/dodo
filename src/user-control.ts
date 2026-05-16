@@ -18,7 +18,7 @@ import {
   PBKDF2_DEFAULT_ITERATIONS,
   PBKDF2_LEGACY_ITERATIONS,
 } from "./crypto";
-import { HttpMcpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
+import { HttpMcpClient, type McpClientConfig } from "./mcp-client";
 import { log } from "./logger";
 import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
 import { sendRunNotification } from "./notify";
@@ -740,7 +740,7 @@ export class UserControl extends DurableObject<Env> {
         if (!row) return Response.json({ error: `MCP config ${id} not found` }, { status: 404 });
         const ownerEmail = request.headers.get("x-owner-email") ?? "";
         const config = await this.resolveMcpConfigHeaders(this.mapMcpConfigRow(row), ownerEmail);
-        const gatekeeper = new HttpMcpGatekeeper(config);
+        const gatekeeper = new HttpMcpClient(config);
         const result = await gatekeeper.testConnection();
         return Response.json(result);
       }
@@ -1937,7 +1937,7 @@ export class UserControl extends DurableObject<Env> {
    * Create an MCP config, storing headers as encrypted secrets.
    * The mcp_configs table stores only header key names (not values).
    */
-  private async createMcpConfigEncrypted(input: { name: string; type: string; auth_type: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
+  private async createMcpConfigEncrypted(input: { name: string; type: string; auth_type: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled: boolean }, ownerEmail: string): Promise<McpClientConfig & { headerKeys?: string[] }> {
     const id = crypto.randomUUID();
     const now = nowEpoch();
     const headerKeys = input.headers ? Object.keys(input.headers) : [];
@@ -1961,7 +1961,7 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Update an MCP config, replacing encrypted header secrets if new headers provided.
    */
-  private async updateMcpConfigEncrypted(id: string, patch: { name?: string; type?: string; auth_type?: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled?: boolean }, ownerEmail: string): Promise<McpGatekeeperConfig & { headerKeys?: string[] }> {
+  private async updateMcpConfigEncrypted(id: string, patch: { name?: string; type?: string; auth_type?: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled?: boolean }, ownerEmail: string): Promise<McpClientConfig & { headerKeys?: string[] }> {
     const current = this.getMcpConfigSafe(id);
     const now = nowEpoch();
 
@@ -2005,7 +2005,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   /** Resolve encrypted headers for actual MCP connection. */
-  private async resolveMcpConfigHeaders(config: McpGatekeeperConfig, ownerEmail: string): Promise<McpGatekeeperConfig> {
+  private async resolveMcpConfigHeaders(config: McpClientConfig, ownerEmail: string): Promise<McpClientConfig> {
     if (!config.headerKeys || config.headerKeys.length === 0) return config;
     if (!ownerEmail || !this.hasKeyEnvelope()) return config;
 
@@ -2020,7 +2020,7 @@ export class UserControl extends DurableObject<Env> {
     return { ...config, headers: Object.keys(headers).length > 0 ? headers : undefined };
   }
 
-  private getMcpConfigSafe(id: string): McpGatekeeperConfig & { headerKeys?: string[] } {
+  private getMcpConfigSafe(id: string): McpClientConfig & { headerKeys?: string[] } {
     const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id))[0] as SqlRow | null);
     if (!row) throw new Error(`MCP config ${id} not found`);
     return this.mapMcpConfigRowSafe(row);
@@ -2029,7 +2029,7 @@ export class UserControl extends DurableObject<Env> {
   /**
    * List MCP configs for display. Returns header key names but not values.
    */
-  private listMcpConfigsSafe(): Array<McpGatekeeperConfig & { headerKeys?: string[] }> {
+  private listMcpConfigsSafe(): Array<McpClientConfig & { headerKeys?: string[] }> {
     return Array.from(this.ctx.storage.sql.exec("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")).map((row) => this.mapMcpConfigRowSafe(row));
   }
 
@@ -2232,7 +2232,7 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Map a row to safe config (headers_json now stores key names array, not values).
    */
-  private mapMcpConfigRowSafe(row: SqlRow): McpGatekeeperConfig & { headerKeys?: string[] } {
+  private mapMcpConfigRowSafe(row: SqlRow): McpClientConfig & { headerKeys?: string[] } {
     const headersJsonStr = row.headers_json ? String(row.headers_json) : null;
     let headerKeys: string[] | undefined;
 
@@ -2262,7 +2262,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   /** Legacy mapper used only for internal test endpoint resolution. */
-  private mapMcpConfigRow(row: SqlRow): McpGatekeeperConfig & { headerKeys?: string[] } {
+  private mapMcpConfigRow(row: SqlRow): McpClientConfig & { headerKeys?: string[] } {
     const headersJsonStr = row.headers_json ? String(row.headers_json) : null;
     let headerKeys: string[] | undefined;
 
@@ -2313,7 +2313,7 @@ export class UserControl extends DurableObject<Env> {
     );
   }
 
-  private getEffectiveMcpConfigs(sessionId: string): Array<McpGatekeeperConfig & { overridden: boolean }> {
+  private getEffectiveMcpConfigs(sessionId: string): Array<McpClientConfig & { overridden: boolean }> {
     const configs = this.listMcpConfigsSafe();
     const overrides = this.listMcpOverrides(sessionId);
     const overrideMap = new Map(overrides.map((o) => [o.mcpConfigId, o.enabled]));

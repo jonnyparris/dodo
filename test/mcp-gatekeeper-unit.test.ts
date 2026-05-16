@@ -1,13 +1,13 @@
 /**
- * Pure unit tests for HttpMcpGatekeeper constructor validation.
+ * Pure unit tests for HttpMcpClient constructor validation.
  * Extracted from mcp-config.test.ts to avoid importing the main worker module.
  * See: https://github.com/cloudflare/workers-sdk/issues/13191
  */
 import { describe, expect, it } from "vitest";
 
-describe("HttpMcpGatekeeper interface", () => {
+describe("HttpMcpClient interface", () => {
   it("construct with valid config", async () => {
-    const { HttpMcpGatekeeper } = await import("../src/mcp-gatekeeper");
+    const { HttpMcpClient } = await import("../src/mcp-client");
 
     const config = {
       id: "test-server",
@@ -19,15 +19,15 @@ describe("HttpMcpGatekeeper interface", () => {
       enabled: true,
     };
 
-    const gatekeeper = new HttpMcpGatekeeper(config);
+    const gatekeeper = new HttpMcpClient(config);
     expect(gatekeeper).toBeTruthy();
     expect(gatekeeper.isConnected()).toBe(false);
   });
 
   it("rejects service-binding type", async () => {
-    const { HttpMcpGatekeeper } = await import("../src/mcp-gatekeeper");
+    const { HttpMcpClient } = await import("../src/mcp-client");
 
-    expect(() => new HttpMcpGatekeeper({
+    expect(() => new HttpMcpClient({
       id: "wrong-type",
       name: "Wrong Type",
       type: "service-binding",
@@ -37,9 +37,9 @@ describe("HttpMcpGatekeeper interface", () => {
   });
 
   it("rejects missing url", async () => {
-    const { HttpMcpGatekeeper } = await import("../src/mcp-gatekeeper");
+    const { HttpMcpClient } = await import("../src/mcp-client");
 
-    expect(() => new HttpMcpGatekeeper({
+    expect(() => new HttpMcpClient({
       id: "no-url",
       name: "No URL",
       type: "http",

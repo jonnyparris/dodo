@@ -203,10 +203,10 @@ describe("MCP Catalog", () => {
   });
 });
 
-describe("McpGatekeeper interface", () => {
-  it("HttpMcpGatekeeper: construct with valid config", async () => {
+describe("McpClient interface", () => {
+  it("HttpMcpClient: construct with valid config", async () => {
     // Dynamic import to avoid issues with MCP SDK in test runtime
-    const { HttpMcpGatekeeper } = await import("../src/mcp-gatekeeper");
+    const { HttpMcpClient } = await import("../src/mcp-client");
 
     const config = {
       id: "test-server",
@@ -218,15 +218,15 @@ describe("McpGatekeeper interface", () => {
       enabled: true,
     };
 
-    const gatekeeper = new HttpMcpGatekeeper(config);
+    const gatekeeper = new HttpMcpClient(config);
     expect(gatekeeper).toBeTruthy();
     expect(gatekeeper.isConnected()).toBe(false);
   });
 
-  it("HttpMcpGatekeeper: rejects service-binding type", async () => {
-    const { HttpMcpGatekeeper } = await import("../src/mcp-gatekeeper");
+  it("HttpMcpClient: rejects service-binding type", async () => {
+    const { HttpMcpClient } = await import("../src/mcp-client");
 
-    expect(() => new HttpMcpGatekeeper({
+    expect(() => new HttpMcpClient({
       id: "wrong-type",
       name: "Wrong Type",
       type: "service-binding",
@@ -235,10 +235,10 @@ describe("McpGatekeeper interface", () => {
     })).toThrow(/only supports type "http"/);
   });
 
-  it("HttpMcpGatekeeper: rejects missing url", async () => {
-    const { HttpMcpGatekeeper } = await import("../src/mcp-gatekeeper");
+  it("HttpMcpClient: rejects missing url", async () => {
+    const { HttpMcpClient } = await import("../src/mcp-client");
 
-    expect(() => new HttpMcpGatekeeper({
+    expect(() => new HttpMcpClient({
       id: "no-url",
       name: "No URL",
       type: "http",
