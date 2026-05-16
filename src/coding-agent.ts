@@ -50,11 +50,14 @@ import {
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, TodoItem, TodoPriority, TodoStatus, TodoStore, WorkspaceEntry } from "./types";
 import {
   DEFAULT_NUDGE_PROMPT,
-  decideWatchdog,
   formatStallBody,
   normaliseWatchdogConfig,
   type WatchdogConfig,
 } from "./watchdog";
+import { shouldCompact, pickCutoff } from "./compaction-policy";
+import { nextRetry } from "./overflow-retry";
+import { assembleSystemPrompt } from "./prompt-composer";
+import { evaluateSession } from "./watchdog-policy";
 
 /**
  * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
@@ -507,76 +510,50 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   override getSystemPrompt(): string {
-    let prompt = SYSTEM_PROMPT;
-
-    // Skill manifest — name + description per available skill. Bodies are
-    // not included; the model loads them on demand via the `skill` tool.
-    // Warmed by `warmSkills()` in onChatMessage before this call.
-    if (this._skillManifest) {
-      prompt = `${prompt}\n\n${this._skillManifest}`;
-    }
-
-    // Conditionally include browser tools section
+    // Gather the optional sections that depend on DO state.
     const browserEnabled = this.readMetadata("browser_enabled") === "true";
-    if (browserEnabled) {
-      prompt += [
-        "",
-        "",
-        "## Browser",
-        "",
-        "You have full browser automation via the Chrome DevTools Protocol (CDP).",
-        "",
-        "**Two tools:**",
-        "- `browser_search` — Write JS to query the CDP spec (~1.7MB, stays server-side). Use this to discover available commands, events, and types before executing them.",
-        "- `browser_execute` — Write JS using a `cdp` helper to run CDP commands against a live headless Chrome session. The session is opened fresh per call and closed after.",
-        "",
-        "**`browser_execute` pattern:**",
-        "A fresh browser with a blank page is launched per call. The CDP session is already attached to that page,",
-        "so you can send page-scoped commands directly:",
-        "1. Enable domains: `cdp.send(\"Page.enable\")`",
-        "2. Navigate: `cdp.send(\"Page.navigate\", { url: \"...\" })`",
-        "3. Wait for load, then act: `cdp.send(\"Page.captureScreenshot\", { format: \"png\" })`",
-        "",
-        "**Common tasks:**",
-        "- Navigate + get text: `Page.navigate` → `Runtime.evaluate` with `document.body.innerText`",
-        "- Screenshot: `Page.captureScreenshot` → returns base64 PNG",
-        "- Click/type: `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`",
-        "- Network: `Network.enable` → intercept/monitor requests",
-        "- DOM inspection: `DOM.getDocument` → `DOM.querySelectorAll`",
-        "",
-        "Always use `browser_search` first if you're unsure which CDP method to use.",
-      ].join("\n");
-    }
+    const browserSection = browserEnabled
+      ? [
+          "## Browser",
+          "",
+          "You have full browser automation via the Chrome DevTools Protocol (CDP).",
+          "",
+          "**Two tools:**",
+          "- `browser_search` — Write JS to query the CDP spec (~1.7MB, stays server-side). Use this to discover available commands, events, and types before executing them.",
+          "- `browser_execute` — Write JS using a `cdp` helper to run CDP commands against a live headless Chrome session. The session is opened fresh per call and closed after.",
+          "",
+          "**`browser_execute` pattern:**",
+          "A fresh browser with a blank page is launched per call. The CDP session is already attached to that page,",
+          "so you can send page-scoped commands directly:",
+          '1. Enable domains: `cdp.send("Page.enable")`',
+          '2. Navigate: `cdp.send("Page.navigate", { url: "..." })`',
+          '3. Wait for load, then act: `cdp.send("Page.captureScreenshot", { format: "png" })`',
+          "",
+          "**Common tasks:**",
+          '- Navigate + get text: `Page.navigate` → `Runtime.evaluate` with `document.body.innerText`',
+          '- Screenshot: `Page.captureScreenshot` → returns base64 PNG',
+          '- Click/type: `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`',
+          '- Network: `Network.enable` → intercept/monitor requests',
+          '- DOM inspection: `DOM.getDocument` → `DOM.querySelectorAll`',
+          "",
+          "Always use `browser_search` first if you're unsure which CDP method to use.",
+        ].join("\n")
+      : undefined;
 
     // Inject bounded workspace summary on first turn only.
-    // Use this.messages.length <= 1 because Think's chat() persists the
-    // user message before calling onChatMessage() → getSystemPrompt(),
-    // so messageCount() is already 1 on the first turn.
-    if (this.messages.length <= 1) {
-      const summary = this.getWorkspaceSummary();
-      if (summary) {
-        prompt = `${prompt}\n\n## Current workspace\n\n${summary}`;
-      }
-    }
+    const workspaceSummary =
+      this.messages.length <= 1 ? this.getWorkspaceSummary() ?? undefined : undefined;
 
-    // Inject project instructions (AGENTS.md / CLAUDE.md) if loaded.
-    // Warmed by `warmProjectInstructions()` in onChatMessage before this
-    // call, so it's safe to read synchronously. Included on every turn so
-    // compaction summaries don't lose project-specific rules.
-    if (this._projectInstructions) {
-      prompt = `${prompt}\n\n## Project instructions\n\n${this._projectInstructions}`;
-    }
-
-    // Prepend user-customisable prefix (systemPromptPrefix in DodoConfig).
-    // Placed at the very top so user rules take precedence over the default
-    // Dodo prompt when models resolve conflicts.
     const config = this.getConfig();
-    const prefix = config?.systemPromptPrefix?.trim();
-    if (prefix) {
-      prompt = `${prefix}\n\n---\n\n${prompt}`;
-    }
 
-    return prompt;
+    return assembleSystemPrompt({
+      staticBase: SYSTEM_PROMPT,
+      skillManifest: this._skillManifest ?? undefined,
+      browserSection,
+      workspaceSummary,
+      projectInstructions: this._projectInstructions ?? undefined,
+      userPrefix: config?.systemPromptPrefix?.trim(),
+    });
   }
 
   /**
@@ -1204,11 +1181,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             // Detect context overflow errors and trigger emergency compaction.
             // Only attempt once per onChatMessage() invocation to prevent infinite loops.
             const errMsg = err instanceof Error ? err.message : String(err);
-            const isOverflow = /context.*(length|limit|overflow|window|too long|exceed)/i.test(errMsg)
-              || /max.*token/i.test(errMsg)
-              || /request too large/i.test(errMsg);
+            const decision = nextRetry({
+              previousAttempts: self._overflowRecoveryAttempted ? 1 : 0,
+              maxAttempts: 1,
+              error: { message: errMsg },
+            });
 
-            if (isOverflow && !self._overflowRecoveryAttempted) {
+            if (decision.kind === "retry-with-truncation") {
               self._overflowRecoveryAttempted = true;
               log("warn", "own-loop: context overflow detected, attempting emergency compaction", {
                 sessionId,
@@ -1931,13 +1910,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
 
-    // Use the top-of-file estimateMessageTokens which is content-aware
-    // (separate chars-per-token ratios for prose / code / JSON / default).
-    // Prior versions had a shadow `estimateTokens` here using a flat 3.5
-    // ratio — that under-counted code/JSON by 15-25% and let oversized
-    // messages slip past the cutoff walk below.
-    const estimateTokens = estimateMessageTokens;
-
     // ─── Protect compaction summaries from being dropped ───
     // The compaction summary (injected above or by Think's getHistory) MUST survive
     // token-budget enforcement — it's the compressed representation of older messages.
@@ -1950,75 +1922,45 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Set the floor to the index AFTER the compaction summary so it's always included.
     const cutoffFloor = minProtectedIndex >= 0 ? minProtectedIndex : 0;
 
+    // Build CutoffMessage array with pre-computed token estimates.
+    const cutoffMessages = messages.map((msg) => ({
+      role: msg.role,
+      tokens: estimateMessageTokens(msg),
+      pinned:
+        msg.role === "system" &&
+        (typeof msg.content === "string" ? msg.content : "").startsWith(COMPACTION_MARKER),
+    }));
+
+    const anchorTokens = this._lastUsage?.inputTokens ?? 0;
+    const cutoffResult = pickCutoff({
+      messages: cutoffMessages,
+      targetTokenBudget: tokenBudget,
+      anchorTokens: anchorTokens > 0 ? anchorTokens : undefined,
+      cutoffFloor,
+    });
+
+    const totalTokens = cutoffMessages
+      .slice(cutoffResult.cutoffIndex)
+      .reduce((sum, m) => sum + m.tokens, 0);
+
     // Log compaction detection for debugging
-    if (messages.some(m => m.role === "system")) {
+    if (messages.some((m) => m.role === "system")) {
       log("info", "assembleContext: system messages found", {
         sessionId: this.sessionId(),
         totalMessages: messages.length,
-        systemCount: messages.filter(m => m.role === "system").length,
+        systemCount: messages.filter((m) => m.role === "system").length,
         minProtectedIndex,
         systemPreviews: messages
-          .map((m, i) => m.role === "system" ? { i, preview: (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 80) } : null)
+          .map((m, i) =>
+            m.role === "system"
+              ? {
+                  i,
+                  preview: (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 80),
+                }
+              : null,
+          )
           .filter(Boolean),
       });
-    }
-
-
-
-    // Hybrid approach: use provider-reported tokens as anchor if available.
-    // _lastUsage.inputTokens is the cumulative input tokens from the current
-    // onChatMessage() run. If available, it's a near-exact count for everything
-    // except the trailing messages added after the last LLM call.
-    const anchorTokens = this._lastUsage?.inputTokens ?? 0;
-    let totalTokens = 0;
-    let cutoffIndex = 0;
-
-    if (anchorTokens > 0 && messages.length > 0) {
-      // Find the last assistant message (the anchor point)
-      let anchorIndex = -1;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === "assistant") { anchorIndex = i; break; }
-      }
-      if (anchorIndex >= 0) {
-        // Estimate only trailing messages after the anchor
-        let trailingTokens = 0;
-        for (let i = anchorIndex + 1; i < messages.length; i++) {
-          trailingTokens += estimateTokens(messages[i]);
-        }
-        totalTokens = anchorTokens + trailingTokens;
-        // Walk backwards from the anchor to find cutoff if budget exceeded
-        if (totalTokens > tokenBudget) {
-          let budget = tokenBudget - trailingTokens;
-          for (let i = anchorIndex; i >= 0; i--) {
-            const msgTokens = estimateTokens(messages[i]);
-            if (budget - msgTokens < 0) {
-              cutoffIndex = Math.max(i + 1, cutoffFloor);
-              break;
-            }
-            budget -= msgTokens;
-          }
-        }
-      } else {
-        // No assistant message yet — fall back to pure estimation
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const msgTokens = estimateTokens(messages[i]);
-          if (totalTokens + msgTokens > tokenBudget) {
-            cutoffIndex = Math.max(i + 1, cutoffFloor);
-            break;
-          }
-          totalTokens += msgTokens;
-        }
-      }
-    } else {
-      // No provider-reported usage yet — pure estimation (first turn)
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msgTokens = estimateTokens(messages[i]);
-        if (totalTokens + msgTokens > tokenBudget) {
-          cutoffIndex = Math.max(i + 1, cutoffFloor);
-          break;
-        }
-        totalTokens += msgTokens;
-      }
     }
 
     // ─── Current-turn overshoot check (Phase 1.4) ───
@@ -2026,7 +1968,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // This catches the case where many tool calls in a single turn accumulate.
     if (messages.length > 0) {
       const lastMsg = messages[messages.length - 1];
-      const lastMsgTokens = estimateTokens(lastMsg);
+      const lastMsgTokens = estimateMessageTokens(lastMsg);
       if (lastMsgTokens > tokenBudget * 0.5) {
         log("warn", "assembleContext: single message uses >50% of token budget", {
           sessionId: this.sessionId(),
@@ -2050,13 +1992,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       estimatedTokens: totalTokens,
       tokenBudget,
       contextWindow,
-      dropped: cutoffIndex > 0 ? cutoffIndex : 0,
+      dropped: cutoffResult.cutoffIndex,
     });
 
-    if (cutoffIndex > 0 && cutoffIndex < messages.length) {
+    if (cutoffResult.cutoffIndex > 0 && cutoffResult.cutoffIndex < messages.length) {
       this._contextTruncated = true;
-      const droppedCount = cutoffIndex;
-      const hasCompactionSummary = minProtectedIndex >= 0 && minProtectedIndex < cutoffIndex;
+      const droppedCount = cutoffResult.cutoffIndex;
+      const hasCompactionSummary = minProtectedIndex >= 0 && minProtectedIndex < cutoffResult.cutoffIndex;
       log("warn", "assembleContext: dropping oldest messages", {
         sessionId: this.sessionId(),
         droppedCount,
@@ -2078,7 +2020,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         content: `[Earlier messages truncated — context window limit reached. ${droppedCount} message(s) dropped to stay within the ${contextWindow}-token context window.]`,
       };
 
-      return [...preserved, truncationNote, ...messages.slice(cutoffIndex)];
+      return [...preserved, truncationNote, ...messages.slice(cutoffResult.cutoffIndex)];
     }
 
     return messages;
@@ -3585,14 +3527,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const updatedIso = this.readMetadata("updated_at");
     const updatedAtEpoch = updatedIso ? Math.floor(Date.parse(updatedIso) / 1000) : null;
 
-    const decision = decideWatchdog(config, {
-      nowEpoch: now,
-      status: this.readMetadata("status"),
-      activePromptId: this.readMetadata("active_prompt_id"),
-      updatedAtEpoch: Number.isFinite(updatedAtEpoch) ? updatedAtEpoch : null,
-      lastFiredForPromptId: this.readMetadata("watchdog_last_fired_for_prompt_id") || null,
-    });
-    if (!decision) return;
+    const verdict = evaluateSession(
+      {
+        status: this.readMetadata("status"),
+        activePromptId: this.readMetadata("active_prompt_id"),
+        lastActivityAt: updatedAtEpoch ?? 0,
+        lastFiredForPromptId: this.readMetadata("watchdog_last_fired_for_prompt_id") || null,
+        config,
+      },
+      now * 1000,
+    );
+    if (verdict.kind !== "stalled") return;
 
     const sessionId = this.readMetadata("session_id") ?? "unknown";
     const title = this.readMetadata("title") ?? sessionId;
@@ -3601,15 +3546,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Record fire BEFORE taking action so a retry of this same tick
     // (alarm replay) won't double-fire.
     this.writeMetadata("watchdog_last_fired_at", String(now));
-    this.writeMetadata("watchdog_last_fired_for_prompt_id", decision.activePromptId);
+    this.writeMetadata("watchdog_last_fired_for_prompt_id", verdict.activePromptId);
     this.writeMetadata(
       "watchdog_fire_count",
       String(Number(this.readMetadata("watchdog_fire_count") ?? "0") + 1),
     );
 
-    const body = formatStallBody(sessionId, decision, config.action);
+    const body = formatStallBody(sessionId, verdict, config.action);
 
-    if (config.action === "abort" || config.action === "nudge") {
+    if (verdict.recommend === "abort" || verdict.recommend === "nudge") {
       try {
         await this.handleAbort();
       } catch (err) {
@@ -3619,7 +3564,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
     }
 
-    if (config.action === "nudge") {
+    if (verdict.recommend === "nudge") {
       const nudge = config.nudgePrompt ?? DEFAULT_NUDGE_PROMPT;
       try {
         // Dispatch the nudge as a fresh fiber-backed prompt. Same
@@ -3656,8 +3601,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.emitEvent({
       data: {
         action: config.action,
-        stallSeconds: decision.stallSeconds,
-        activePromptId: decision.activePromptId,
+        stallSeconds: verdict.stallSeconds,
+        activePromptId: verdict.activePromptId,
         firedAt: now,
       },
       type: "watchdog_fired",
@@ -4961,7 +4906,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const config = this.getConfig();
     const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
-    const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
 
     // When force=true (overflow recovery) or context was truncated by
     // assembleContext(), skip the usage threshold check. The truncation flag
@@ -4969,24 +4913,29 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // low usage → compaction threshold not met → messages stay dropped forever.
     const contextWasTruncated = this._contextTruncated;
     this._contextTruncated = false; // Reset for next turn
-    let usagePercent = 100; // Default to high for forced/truncated compaction
-    if (!options?.force && !contextWasTruncated) {
-      const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
-        "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-      ))[0] as SqlRow | null);
-      const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
-      if (lastInputTokens === 0) return;
 
-      usagePercent = Math.round((lastInputTokens / contextBudget) * 100);
-      if (usagePercent < COMPACTION_TRIGGER_PERCENT) return;
-    }
+    const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
+      "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+    ))[0] as SqlRow | null);
+    const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
+    if (!options?.force && !contextWasTruncated && lastInputTokens === 0) return;
 
     const history = this.sessions.getHistory(thinkSessionId);
-    if (history.length < 6) return;
-
-    // Filter out synthetic compaction summary messages (IDs like "compaction_<uuid>")
     const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
-    if (realMessages.length < 6) return;
+
+    if (
+      !shouldCompact({
+        messageCount: history.length,
+        realMessageCount: realMessages.length,
+        estimatedTokens: lastInputTokens,
+        modelContextWindow: contextWindow,
+        thresholdRatio: COMPACTION_TRIGGER_PERCENT / 100,
+        force: options?.force,
+        contextWasTruncated,
+      })
+    ) {
+      return;
+    }
 
     // ─── Turn-aware cut point (Tactic 4) ───
     // Find the cut point that doesn't split tool-call/result pairs.
@@ -5249,7 +5198,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       log("info", "compaction complete", {
         sessionId: this.sessionId(),
         compactedMessages: compactCount,
-        usagePercent,
         summaryChars: summary.length,
         model: compactionModelUsed,
         readFiles: readFileList.length,
