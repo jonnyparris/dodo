@@ -21,7 +21,7 @@ import {
   buildArtifactsCloneUrl,
   listArtifactsTree,
   readArtifactsFile,
-} from "../src/artifacts-read";
+} from "../src/artifacts";
 
 function makeCache(): ArtifactsFsCache {
   const fs = new InMemoryFs();

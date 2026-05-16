@@ -1,36 +1,26 @@
 /**
- * Artifacts read path — fast file-tree and file-content reads served from
- * an in-DO clone of the per-session Artifacts repo.
+ * Artifacts — per-session repo flush + read path.
  *
- * Why: `Workspace.readDir` round-trips into the workspace shell binding
- * for every directory expand. After a turn flushes to Artifacts, we
- * already have the canonical state in git form. Cloning it once into an
- * `InMemoryFs` lets file-tree expansions complete in microseconds — pure
- * RAM lookups against the cloned working copy and `git.walk` against the
- * tree at HEAD.
+ * Why one file: the previous split (artifacts-flush.ts / artifacts-read.ts)
+ * was by verb, not by responsibility. Both were imported only by
+ * coding-agent.ts, shared the same domain concept, and duplicated the
+ * tokenSecret() helper / ARTIFACTS_TOKEN_TTL_SECONDS constant.
  *
- * Lifecycle:
- *   1. First call after artifacts repo creation → shallow clone into a
- *      cached `InMemoryFs` on the agent.
- *   2. After every successful `flushTurnToArtifacts`, the agent flips a
- *      dirty flag.
- *   3. Next read sees the flag, runs `git.fetch + checkout` on the
- *      cached fs, clears the flag.
- *   4. Reads (`listArtifactsTree`, `readArtifactsFile`) work against the
- *      live fs; isomorphic-git is only invoked on refresh.
+ * Flush path:
+ *   `flushTurnToArtifacts` commits/pushes the workspace at end of turn.
  *
- * Failures bubble back to the caller as `null` so the existing workspace
- * fallback path can take over. Never throws into request handling.
- *
- * Inspired by apeacock1991/artifacts-demo's read-side primitives, but
- * uses @cloudflare/shell's InMemoryFs (which we already have) instead of
- * pulling in `memfs`.
+ * Read path:
+ *   `refreshArtifactsFs` keeps an in-DO clone of the repo in an InMemoryFs.
+ *   `listArtifactsTree` / `readArtifactsFile` serve file-tree and content
+ *   from that cached working copy.
  */
 
 import { InMemoryFs } from "@cloudflare/shell";
 import git from "isomorphic-git";
 import http from "isomorphic-git/http/web";
+import { createWorkspaceGit } from "./git";
 import { log } from "./logger";
+import type { Workspace } from "@cloudflare/shell";
 
 const ARTIFACTS_DIR = "/repo";
 const ARTIFACTS_DEFAULT_DEPTH = 50;
@@ -39,10 +29,58 @@ const ARTIFACTS_DEFAULT_DEPTH = 50;
  * Token TTL for short-lived artifacts repo tokens. Used by both the
  * agent's getOrCreateArtifactsContext (when minting fresh tokens) and
  * the /artifacts route handler (so the UI can surface an accurate
- * expiry hint). Hoisted to a single source of truth so the two stay
- * in sync.
+ * expiry hint).
  */
 export const ARTIFACTS_TOKEN_TTL_SECONDS = 3600;
+
+// ── Flush ─────────────────────────────────────────────────────────────
+
+export interface FlushInput {
+  workspace: Workspace;
+  remote: string;
+  tokenSecret: string;
+  message: string;
+  author?: { name: string; email: string };
+}
+
+/**
+ * Commit all workspace changes and push them to the session's Artifacts remote.
+ * Fire-and-forget: never throws. Returns true if a commit was pushed, false otherwise.
+ */
+export async function flushTurnToArtifacts(input: FlushInput): Promise<boolean> {
+  try {
+    const git = createWorkspaceGit(input.workspace);
+
+    // Ensure the workspace is a git repo. isomorphic-git's init is idempotent.
+    try {
+      await git.status();
+    } catch {
+      await git.init({ defaultBranch: "main" });
+    }
+
+    // Add the artifacts remote if not already configured.
+    const remotes = (await git.remote({ list: true })) as unknown as Array<{ remote: string; url: string }>;
+    if (!remotes.some((r) => r.remote === "artifacts")) {
+      await git.remote({ add: { name: "artifacts", url: input.remote } });
+    }
+
+    // Stage everything, bail if nothing changed.
+    await git.add({ filepath: "." });
+    const status = await git.status();
+    if (status.length === 0) return false;
+
+    // Commit + push.
+    const author = input.author ?? { name: "Dodo", email: "dodo@workers.dev" };
+    await git.commit({ message: input.message, author });
+    await git.push({ remote: "artifacts", ref: "main", token: input.tokenSecret });
+    return true;
+  } catch (err) {
+    log("warn", "[artifacts flush] failed", { err: String(err) });
+    return false;
+  }
+}
+
+// ── Read cache ────────────────────────────────────────────────────────
 
 /**
  * Cached state that lives on the CodingAgent instance for the lifetime
@@ -63,10 +101,9 @@ interface RefreshInput {
 }
 
 /**
- * Strip token expiry suffix the same way artifacts-flush.ts does. Tokens
- * minted by `repo.createToken` have a `?expires=…` query string that
- * isomorphic-git's onAuth helper doesn't strip — leaving it on the URL
- * makes the basic-auth header invalid.
+ * Strip token expiry suffix. Tokens minted by `repo.createToken` have a
+ * `?expires=…` query string that isomorphic-git's onAuth helper doesn't
+ * strip — leaving it on the URL makes the basic-auth header invalid.
  */
 function tokenSecret(token: string): string {
   return token.split("?")[0];
@@ -101,7 +138,7 @@ async function cloneIntoMemfs(remote: string, token: string): Promise<ArtifactsF
 
     return { fs, dir: ARTIFACTS_DIR, dirty: false };
   } catch (err) {
-    log("warn", "[artifacts-read] clone failed", { err: err instanceof Error ? err.message : String(err) });
+    log("warn", "[artifacts read] clone failed", { err: err instanceof Error ? err.message : String(err) });
     return null;
   }
 }
@@ -133,7 +170,7 @@ async function fetchAndCheckout(cache: ArtifactsFsCache, remote: string, token: 
     await git.checkout({ fs: fsAdapter, dir: cache.dir, ref: "main", force: true });
     return { ...cache, dirty: false };
   } catch (err) {
-    log("warn", "[artifacts-read] fetch failed", { err: err instanceof Error ? err.message : String(err) });
+    log("warn", "[artifacts read] fetch failed", { err: err instanceof Error ? err.message : String(err) });
     return null;
   }
 }
@@ -278,7 +315,7 @@ export async function listArtifactsTree(cache: ArtifactsFsCache, requestedPath: 
     });
     return { entries };
   } catch (err) {
-    log("warn", "[artifacts-read] listTree failed", { path, err: err instanceof Error ? err.message : String(err) });
+    log("warn", "[artifacts read] listTree failed", { path, err: err instanceof Error ? err.message : String(err) });
     return null;
   }
 }

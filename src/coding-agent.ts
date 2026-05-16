@@ -3,15 +3,7 @@ import { type AgentNamespace, type Connection, type ConnectionContext, getAgentB
 import { type FileUIPart, generateText, type LanguageModel, type ModelMessage, streamText, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
-import { flushTurnToArtifacts } from "./artifacts-flush";
-import {
-  ARTIFACTS_TOKEN_TTL_SECONDS,
-  type ArtifactsFsCache,
-  buildArtifactsCloneUrl,
-  listArtifactsTree,
-  readArtifactsFile,
-  refreshArtifactsFs,
-} from "./artifacts-read";
+import { flushTurnToArtifacts, ARTIFACTS_TOKEN_TTL_SECONDS, type ArtifactsFsCache, buildArtifactsCloneUrl, listArtifactsTree, readArtifactsFile, refreshArtifactsFs } from "./artifacts";
 import type { ArtifactsRepo } from "./artifacts-types";
 import type { AttachmentRef } from "./attachments";
 import { rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
@@ -3380,7 +3372,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     // Ensure the workspace is a git repo. If `flushTurnToArtifacts` already
     // ran this turn, it is. Otherwise initialise it, mirroring the auto-init
-    // path in artifacts-flush.ts so we never publish a repo with no history.
+    // path in artifacts.ts so we never publish a repo with no history.
     try {
       await git.status({ dir });
     } catch {
@@ -3392,7 +3384,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
 
     // Resolve the branch to push. Prefer the explicit ref, then current
-    // branch, then fall back to `main` (which is what artifacts-flush uses).
+    // branch, then fall back to `main` (which is what artifacts.ts uses).
     let ref = body.ref;
     if (!ref) {
       try {
