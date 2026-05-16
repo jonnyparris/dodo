@@ -26,7 +26,7 @@ vi.mock("../src/notify", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/notify")>();
   return {
     ...actual,
-    sendNotification: sendNotificationMock,
+    dispatchNotification: sendNotificationMock,
   };
 });
 
@@ -1392,7 +1392,7 @@ describe("createGithubRepo (publish_to_github helper)", () => {
 });
 
 describe("Worker run notifications", () => {
-  // `sendRunNotification` calls `sendNotification` via a module-internal
+  // `sendRunNotification` calls `dispatchNotification` via a module-internal
   // reference that vitest's `vi.mock` cannot intercept. Instead we observe
   // the real side effect: the call to `waitUntil` with a promise that
   // eventually fetches ntfy.sh. Zero calls to waitUntil ⇒ no notification.

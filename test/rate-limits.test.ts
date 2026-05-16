@@ -15,7 +15,7 @@ vi.mock("@cloudflare/codemode", async (importOriginal) => {
 });
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/notify", () => ({
-  sendNotification: vi.fn(),
+  dispatchNotification: vi.fn(),
 }));
 
 import { RateLimiter } from "../src/rate-limit";

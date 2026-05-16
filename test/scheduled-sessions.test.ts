@@ -11,7 +11,7 @@ const { sendNotificationMock } = vi.hoisted(() => ({
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/notify", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/notify")>();
-  return { ...actual, sendNotification: sendNotificationMock };
+  return { ...actual, dispatchNotification: sendNotificationMock };
 });
 
 import worker from "../src/index";

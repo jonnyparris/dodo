@@ -16,7 +16,7 @@ import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { log } from "./logger";
 import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
-import { sendNotification } from "./notify";
+import { dispatchNotification } from "./notify";
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc";
@@ -3642,7 +3642,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
     }
 
-    sendNotification(this.env, this.ctx, {
+    dispatchNotification(this.env, this.ctx, {
+      kind: "watchdog-stalled",
       title: `Dodo: ${title} (stalled)`,
       body,
       tags: "warning,robot",
@@ -3905,7 +3906,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         await this.syncSessionIndex({ status: "idle", title });
         this.emitEvent({ data: { message }, type: "error_message" });
         this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+        dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
         return Response.json({ error: message, sessionId }, { status: 502 });
       }
 
@@ -3919,7 +3920,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       await this.syncSessionIndex({ status: "idle", title });
       this.emitEvent({ data: assistantRecord, type: "message" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-      sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+      dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
 
       return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, sessionId, steps: 0, toolCalls: [] });
     } catch (error) {
@@ -3928,7 +3929,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       const message = error instanceof Error ? error.message : "Unknown LLM failure";
       this.emitEvent({ data: { message }, type: "error_message" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+      dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
       return Response.json({ error: message, sessionId }, { status: 502 });
     }
   }
@@ -4348,7 +4349,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
         this.emitEvent({ data: { message }, type: "error_message" });
         await this.finishPrompt(promptId, { error: message, status: "failed" });
-        sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+        dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
         return;
       }
 
@@ -4376,7 +4377,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       const message = error instanceof Error ? error.message : "Prompt failed";
       this.emitEvent({ data: { message }, type: "error_message" });
       await this.finishPrompt(promptId, { error: message, status: "failed" });
-      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+      dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
     } finally {
       this._fiberAbortController = null;
       await this.syncSessionIndex({ status: "idle", title });
@@ -4400,7 +4401,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     await this.finishPrompt(promptId, { resultMessageId: snapshot.assistantMessageId, status: "completed" });
     this.emitEvent({ data: assistantRecord, type: "message" });
-    sendNotification(this.env, this.ctx, { title: `Dodo: ${title}`, body: text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+    dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
   }
 
   /** Read the fiber_id from a prompt row. */
@@ -4448,12 +4449,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (fiber?.status === "cancelled") {
       await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
       const title = this.readMetadata("title") ?? "Dodo prompt";
-      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (aborted)`, body: "Prompt was cancelled", tags: "stop_sign,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+      dispatchNotification(this.env, this.ctx, { kind: "prompt-aborted", title: `Dodo: ${title} (aborted)`, body: "Prompt was cancelled", tags: "stop_sign,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
     } else if (fiber?.status === "failed") {
       const error = fiber.error ?? "Prompt failed after max retries";
       await this.finishPrompt(promptId, { error, status: "failed" });
       const title = this.readMetadata("title") ?? "Dodo prompt";
-      sendNotification(this.env, this.ctx, { title: `Dodo: ${title} (failed)`, body: error, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+      dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: error, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
     }
 
     await this.syncSessionIndex({ status: "idle" });

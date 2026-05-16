@@ -18,7 +18,7 @@ vi.mock("@cloudflare/codemode", async (importOriginal) => {
   };
 });
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
-vi.mock("../src/notify", () => ({ sendNotification: vi.fn() }));
+vi.mock("../src/notify", () => ({ dispatchNotification: vi.fn() }));
 
 import worker from "../src/index";
 
