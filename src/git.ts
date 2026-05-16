@@ -1,10 +1,10 @@
 import { WorkspaceFileSystem } from "@cloudflare/shell";
 import { createGit } from "@cloudflare/shell/git";
 import type { Workspace } from "@cloudflare/shell";
-import { getUserControlStub, isAdmin } from "./auth";
 import { isGitHubHost, isGitLabHost } from "./hosts";
 import { log } from "./logger";
 import { parseRemoteSpec } from "./repos";
+import { resolveProviderToken } from "./git-auth";
 import type { AppConfig, Env } from "./types";
 
 function hostFromUrl(url: string): string {
@@ -15,50 +15,9 @@ function hostFromUrl(url: string): string {
   }
 }
 
-/** Map a git remote URL hostname to the secret key name in UserControl. */
-function secretKeyForHost(host: string): string | null {
-  if (isGitHubHost(host)) return "github_token";
-  if (isGitLabHost(host)) return "gitlab_token";
-  return null;
-}
-
-/**
- * Try to fetch a token from UserControl's encrypted secrets.
- * Returns undefined (with a warning log) if the lookup fails.
- */
-async function fetchUserToken(secretKey: string, env: Env, ownerEmail?: string): Promise<string | undefined> {
-  if (!ownerEmail) {
-    log("warn", "git: no ownerEmail provided, skipping per-user secret lookup", { secretKey });
-    return undefined;
-  }
-
-  try {
-    const stub = getUserControlStub(env, ownerEmail);
-    const response = await stub.fetch(`https://user-control/internal/secret/${encodeURIComponent(secretKey)}`, {
-      headers: { "x-owner-email": ownerEmail },
-    });
-    if (response.ok) {
-      const { value } = (await response.json()) as { value: string };
-      if (value) {
-        log("info", "git: resolved per-user secret", { secretKey, ownerEmail });
-        return value;
-      }
-      log("warn", "git: per-user secret exists but value is empty", { secretKey, ownerEmail });
-    } else {
-      const body = await response.text().catch(() => "");
-      log("warn", "git: per-user secret lookup failed", { secretKey, ownerEmail, status: response.status, body: body.slice(0, 200) });
-    }
-  } catch (error) {
-    log("error", "git: per-user secret lookup threw", { secretKey, ownerEmail, error: error instanceof Error ? error.message : String(error) });
-  }
-
-  return undefined;
-}
-
-function chooseTokenForUrl(url: string, env: Env): string | undefined {
-  const host = hostFromUrl(url);
-  if (isGitHubHost(host)) return env.GITHUB_TOKEN;
-  if (isGitLabHost(host)) return env.GITLAB_TOKEN;
+function providerForHost(host: string): "github" | "gitlab" | undefined {
+  if (isGitHubHost(host)) return "github";
+  if (isGitLabHost(host)) return "gitlab";
   return undefined;
 }
 
@@ -93,30 +52,17 @@ export async function resolveRemoteToken(input: {
   }
 
   const host = hostFromUrl(resolvedUrl);
-  const secretKey = secretKeyForHost(host);
-
-  // Try per-user secret first
-  if (secretKey && input.ownerEmail) {
-    const userToken = await fetchUserToken(secretKey, input.env, input.ownerEmail);
-    if (userToken) {
-      log("info", "git: using per-user secret for auth", { host, secretKey });
-      return userToken;
-    }
+  const provider = providerForHost(host);
+  if (!provider) {
+    log("warn", "git: unsupported host for token resolution", { host });
+    return undefined;
   }
 
-  // Restricted env var fallback — admin account only.
-  // Mirrors the policy in src/outbound.ts to prevent non-admin tenants from
-  // accidentally sending the admin's tokens to the configured provider.
-  if (input.ownerEmail && isAdmin(input.ownerEmail, input.env)) {
-    const envToken = chooseTokenForUrl(resolvedUrl, input.env);
-    if (envToken) {
-      log("info", "git: using env var fallback for auth (admin)", { host });
-      return envToken;
-    }
+  const token = await resolveProviderToken(input.env, provider, input.ownerEmail, host);
+  if (!token) {
+    log("warn", "git: no token found — request will be unauthenticated", { host, provider, hasOwnerEmail: !!input.ownerEmail });
   }
-
-  log("warn", "git: no token found — request will be unauthenticated", { host, secretKey, hasOwnerEmail: !!input.ownerEmail });
-  return undefined;
+  return token;
 }
 
 async function resolveRemoteUrl(git: ReturnType<typeof createGit>, dir?: string, remote?: string): Promise<string | undefined> {

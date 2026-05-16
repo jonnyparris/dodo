@@ -934,7 +934,7 @@ describe("auto-PR creation", () => {
   };
 
   it("parses github.com URLs", async () => {
-    const { parseGithubRepo } = await import("../src/github-pr");
+    const { parseGithubRepo } = await import("../src/github-api");
     expect(parseGithubRepo("https://github.com/foo/bar")).toEqual({ owner: "foo", repo: "bar" });
     expect(parseGithubRepo("https://github.com/foo/bar.git")).toEqual({ owner: "foo", repo: "bar" });
     expect(parseGithubRepo("https://gitlab.com/foo/bar")).toBeNull();
@@ -942,7 +942,7 @@ describe("auto-PR creation", () => {
   });
 
   it("builds a PR body from run metadata", async () => {
-    const { buildPrBody } = await import("../src/github-pr");
+    const { buildPrBody } = await import("../src/github-api");
     const body = buildPrBody({
       ...baseRun,
       commitMessage: "feat: ship it",
@@ -962,7 +962,7 @@ describe("auto-PR creation", () => {
     const fetchSpy = vi.fn();
     globalThis.fetch = fetchSpy as typeof fetch;
     try {
-      const { createDraftPrForRun } = await import("../src/github-pr");
+      const { createDraftPrForRun } = await import("../src/github-api");
       const result = await createDraftPrForRun(env as Env, baseRun as any);
       expect(result).toBeNull();
       expect(fetchSpy).not.toHaveBeenCalled();
@@ -984,7 +984,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
   };
 
   it("rejects unsupported remotes", async () => {
-    const { createPullRequest } = await import("../src/github-pr");
+    const { createPullRequest } = await import("../src/github-api");
     const result = await createPullRequest(env as Env, {
       remoteUrl: "https://example.com/foo/bar",
       head: "feat/x",
@@ -1005,7 +1005,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "secret-admin-token" };
     try {
-      const { createPullRequest } = await import("../src/github-pr");
+      const { createPullRequest } = await import("../src/github-api");
       const result = await createPullRequest(envWithToken, {
         remoteUrl: "https://github.com.attacker.example/foo/bar",
         head: "feat/x",
@@ -1029,7 +1029,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "secret-admin-token" };
     try {
-      const { createPullRequest } = await import("../src/github-pr");
+      const { createPullRequest } = await import("../src/github-api");
       const result = await createPullRequest(envWithToken, {
         remoteUrl: "https://github.com/foo/bar",
         head: "feat/x",
@@ -1049,7 +1049,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
     const fetchSpy = vi.fn();
     globalThis.fetch = fetchSpy as typeof fetch;
     try {
-      const { createPullRequest } = await import("../src/github-pr");
+      const { createPullRequest } = await import("../src/github-api");
       const result = await createPullRequest(env as Env, {
         remoteUrl: "https://github.com/foo/bar",
         head: "feat/x",
@@ -1072,7 +1072,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
     const fetchSpy = vi.fn();
     globalThis.fetch = fetchSpy as typeof fetch;
     try {
-      const { createPullRequest } = await import("../src/github-pr");
+      const { createPullRequest } = await import("../src/github-api");
       const result = await createPullRequest(env as Env, {
         remoteUrl: "https://gitlab.com/foo/bar",
         head: "feat/x",
@@ -1112,7 +1112,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
     try {
-      const { createPullRequest } = await import("../src/github-pr");
+      const { createPullRequest } = await import("../src/github-api");
       const result = await createPullRequest(envWithToken, {
         remoteUrl: "https://github.com/foo/bar",
         head: "feat/x",
@@ -1153,7 +1153,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITLAB_TOKEN: "test-token" };
     try {
-      const { createPullRequest } = await import("../src/github-pr");
+      const { createPullRequest } = await import("../src/github-api");
       const result = await createPullRequest(envWithToken, {
         remoteUrl: "https://gitlab.com/foo/bar",
         head: "feat/x",
@@ -1182,7 +1182,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
     try {
-      const { createPullRequest } = await import("../src/github-pr");
+      const { createPullRequest } = await import("../src/github-api");
       const result = await createPullRequest(envWithToken, {
         remoteUrl: "https://github.com/foo/bar",
         head: "feat/x",
@@ -1211,7 +1211,7 @@ describe("createPullRequest (interactive PR/MR tool)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
     try {
-      const { createPullRequest } = await import("../src/github-pr");
+      const { createPullRequest } = await import("../src/github-api");
       const result = await createPullRequest(envWithToken, {
         remoteUrl: "https://github.com/foo/bar",
         head: "feat/x",
@@ -1240,7 +1240,7 @@ describe("createGithubRepo (publish_to_github helper)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
     try {
-      const { createGithubRepo } = await import("../src/github-pr");
+      const { createGithubRepo } = await import("../src/github-api");
       const result = await createGithubRepo(envWithToken, { name: "bad name with spaces" }, ADMIN_EMAIL);
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error).toContain("Invalid repo name");
@@ -1259,7 +1259,7 @@ describe("createGithubRepo (publish_to_github helper)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "secret-admin-token" };
     try {
-      const { createGithubRepo } = await import("../src/github-pr");
+      const { createGithubRepo } = await import("../src/github-api");
       const result = await createGithubRepo(envWithToken, { name: "ok-name" }, NON_ADMIN_EMAIL);
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error).toContain("No github token");
@@ -1295,7 +1295,7 @@ describe("createGithubRepo (publish_to_github helper)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
     try {
-      const { createGithubRepo } = await import("../src/github-pr");
+      const { createGithubRepo } = await import("../src/github-api");
       const result = await createGithubRepo(envWithToken, { name: "my-project" }, ADMIN_EMAIL);
       expect(result.ok).toBe(true);
       if (result.ok) {
@@ -1329,7 +1329,7 @@ describe("createGithubRepo (publish_to_github helper)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
     try {
-      const { createGithubRepo } = await import("../src/github-pr");
+      const { createGithubRepo } = await import("../src/github-api");
       const result = await createGithubRepo(envWithToken, {
         name: "my-project",
         owner: "cloudflare",
@@ -1355,7 +1355,7 @@ describe("createGithubRepo (publish_to_github helper)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
     try {
-      const { createGithubRepo } = await import("../src/github-pr");
+      const { createGithubRepo } = await import("../src/github-api");
       const result = await createGithubRepo(envWithToken, { name: "taken" }, ADMIN_EMAIL);
       expect(result.ok).toBe(false);
       if (!result.ok) {
@@ -1378,7 +1378,7 @@ describe("createGithubRepo (publish_to_github helper)", () => {
     globalThis.fetch = fetchSpy as typeof fetch;
     const envWithToken = { ...(env as Env), GITHUB_TOKEN: "test-token" };
     try {
-      const { createGithubRepo } = await import("../src/github-pr");
+      const { createGithubRepo } = await import("../src/github-api");
       const result = await createGithubRepo(envWithToken, { name: "scope-test" }, ADMIN_EMAIL);
       expect(result.ok).toBe(false);
       if (!result.ok) {
