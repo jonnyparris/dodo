@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { triggerVerifyWorkflow, pollVerifyWorkflow } from "../src/github-actions";
+import { triggerVerifyWorkflow, pollVerifyWorkflow } from "../src/github-api";
 import type { Env, WorkerRunRecord } from "../src/types";
 
 const baseRun: WorkerRunRecord = {
@@ -27,8 +27,10 @@ const baseRun: WorkerRunRecord = {
   verifyWorkflowHtmlUrl: null,
 };
 
+const ADMIN_EMAIL = "admin@test.local";
+
 function makeEnv(token = "test-token"): Env {
-  return { GITHUB_TOKEN: token } as unknown as Env;
+  return { GITHUB_TOKEN: token, ADMIN_EMAIL } as unknown as Env;
 }
 
 describe("triggerVerifyWorkflow", () => {
@@ -79,7 +81,7 @@ describe("triggerVerifyWorkflow", () => {
       }), { status: 200, headers: { "content-type": "application/json" } }));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun });
+    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun, ownerEmail: ADMIN_EMAIL });
     await vi.advanceTimersByTimeAsync(600);
 
     const result = await promise;
@@ -110,7 +112,7 @@ describe("triggerVerifyWorkflow", () => {
       }), { status: 200, headers: { "content-type": "application/json" } }));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun });
+    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun, ownerEmail: ADMIN_EMAIL });
     await vi.advanceTimersByTimeAsync(600);
 
     const result = await promise;
@@ -129,7 +131,7 @@ describe("triggerVerifyWorkflow", () => {
       .mockImplementation(async () => makeListResponse());
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun });
+    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun, ownerEmail: ADMIN_EMAIL });
     await vi.advanceTimersByTimeAsync(60_000);
 
     const result = await promise;
@@ -150,7 +152,7 @@ describe("triggerVerifyWorkflow", () => {
       .mockImplementation(async () => makeStaleResponse());
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun });
+    const promise = triggerVerifyWorkflow({ env: makeEnv(), run: baseRun, ownerEmail: ADMIN_EMAIL });
     await vi.advanceTimersByTimeAsync(60_000);
 
     const result = await promise;
@@ -182,6 +184,7 @@ describe("pollVerifyWorkflow", () => {
     const result = await pollVerifyWorkflow({
       env: makeEnv(),
       run: { ...baseRun, verifyWorkflowRunId: "42" },
+      ownerEmail: ADMIN_EMAIL,
     });
     expect(result).toBeNull();
   });
@@ -199,6 +202,7 @@ describe("pollVerifyWorkflow", () => {
     const result = await pollVerifyWorkflow({
       env: makeEnv(),
       run: { ...baseRun, verifyWorkflowRunId: "42" },
+      ownerEmail: ADMIN_EMAIL,
     });
     expect(result).toEqual({
       conclusion: "success",
@@ -220,6 +224,7 @@ describe("pollVerifyWorkflow", () => {
     const result = await pollVerifyWorkflow({
       env: makeEnv(),
       run: { ...baseRun, verifyWorkflowRunId: "99" },
+      ownerEmail: ADMIN_EMAIL,
     });
     expect(result?.conclusion).toBe("failure");
   });

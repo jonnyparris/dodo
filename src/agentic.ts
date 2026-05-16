@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import type { AttachmentRef } from "./attachments";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
-import { createPullRequest } from "./github-pr";
+import { createPullRequest } from "./github-api";
 import { normalizePath } from "./paths";
 import { createBrowserTools } from "./browser/tools";
 import type { McpClient } from "./mcp-client";
