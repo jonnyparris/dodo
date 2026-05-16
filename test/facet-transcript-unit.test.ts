@@ -18,9 +18,15 @@ import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test"
 import { env } from "cloudflare:workers";
 import type { Env, AppConfig } from "../src/types";
 
-vi.mock("../src/executor", () => ({
-  runSandboxedCode: vi.fn().mockResolvedValue({ logs: [], result: null }),
-}));
+vi.mock("@cloudflare/codemode", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@cloudflare/codemode")>();
+  return {
+    ...actual,
+    DynamicWorkerExecutor: vi.fn(function () {
+      return { execute: vi.fn().mockResolvedValue({ logs: [], result: null }) };
+    }) as unknown as typeof import("@cloudflare/codemode").DynamicWorkerExecutor,
+  };
+});
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/notify", () => ({
   sendNotification: vi.fn(),

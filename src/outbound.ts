@@ -1,8 +1,9 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { getSharedIndexStub } from "./auth";
-import { OWNER_ID_HEADER } from "./executor";
 import { MCP_CATALOG } from "./mcp-catalog";
 import type { Env } from "./types";
+
+export const OWNER_ID_HEADER = "x-dodo-owner-id";
 
 // Catalog knownHosts are implicitly allowed at runtime so codemode fetches
 // to (e.g.) `api.githubcopilot.com` don't require an admin to also add

@@ -4,12 +4,10 @@ import { env } from "cloudflare:workers";
 import type { Env, ScheduledSessionRecord } from "../src/types";
 import { resetMockAgentic } from "./helpers/agentic-mock";
 
-const { runSandboxedCodeMock, sendNotificationMock } = vi.hoisted(() => ({
-  runSandboxedCodeMock: vi.fn(),
+const { sendNotificationMock } = vi.hoisted(() => ({
   sendNotificationMock: vi.fn(),
 }));
 
-vi.mock("../src/executor", () => ({ runSandboxedCode: runSandboxedCodeMock }));
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/notify", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/notify")>();
@@ -62,7 +60,6 @@ async function clearScheduledSessions(): Promise<void> {
 beforeEach(async () => {
   resetMockAgentic();
   sendNotificationMock.mockReset();
-  runSandboxedCodeMock.mockReset();
   await clearScheduledSessions();
 });
 
