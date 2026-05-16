@@ -82,15 +82,155 @@ async function buildNtfyChannel(env: Env, ownerEmail?: string): Promise<Notifica
 }
 
 /**
- * Resolve all enabled notification channels for an owner. Today this
- * is just ntfy; future channels (generic webhook, email, etc.) plug
- * in here. Channels are independent — one returning undefined doesn't
- * stop the others.
+ * Priority ordering, low → high. Used by webhook channels with a
+ * `minPriority` filter.
+ */
+const PRIORITY_ORDER = ["min", "low", "default", "high", "urgent"] as const;
+type Priority = (typeof PRIORITY_ORDER)[number];
+
+function priorityRank(p: Priority | undefined): number {
+  return PRIORITY_ORDER.indexOf(p ?? "default");
+}
+
+/**
+ * Per-webhook configuration stored as JSON inside the encrypted secret
+ * `notification_webhooks`. The blob is an array — each entry creates
+ * one outbound channel.
+ *
+ * Body templates use `{{field}}` placeholders for `title`, `body`,
+ * `priority`, `tags`, `url`. When the request body is JSON
+ * (the default), values are JSON-escaped automatically so the
+ * template stays valid post-substitution. For non-JSON content types,
+ * values are substituted as-is.
+ *
+ * Header values can be inline (`headers`) or resolved from another
+ * encrypted secret (`headerSecrets` maps header name → secret key).
+ * This keeps auth tokens out of the channel config blob itself.
+ */
+type WebhookConfig = {
+  id: string;
+  url: string;
+  method?: "POST" | "PUT";
+  headers?: Record<string, string>;
+  headerSecrets?: Record<string, string>;
+  bodyTemplate: string;
+  contentType?: string;
+  minPriority?: Priority;
+};
+
+/** Render `{{field}}` placeholders. When `jsonEscape` is true (the
+ *  default for JSON bodies), substitutes JSON-escaped string contents
+ *  so the surrounding template stays parseable. Exported for unit
+ *  testing — production code uses it via the webhook channel. */
+export function renderTemplate(
+  template: string,
+  payload: NotificationPayload,
+  jsonEscape: boolean,
+): string {
+  const fields: Record<string, string> = {
+    title: payload.title,
+    body: payload.body,
+    priority: payload.priority ?? "default",
+    tags: payload.tags ?? "",
+    url: payload.url ?? "",
+  };
+  return template.replace(/\{\{(\w+)\}\}/g, (_, key) => {
+    const value = fields[key] ?? "";
+    if (!jsonEscape) return value;
+    // JSON.stringify wraps in quotes — slice them off so the template
+    // can decide its own quoting.
+    return JSON.stringify(value).slice(1, -1);
+  });
+}
+
+/** Resolve a header map by merging literal headers with secret-backed
+ *  ones. Header secrets that fail to resolve are silently dropped so a
+ *  missing token doesn't surface as a notification crash — the
+ *  resulting request just goes out without that header. */
+async function resolveWebhookHeaders(
+  env: Env,
+  ownerEmail: string | undefined,
+  config: WebhookConfig,
+): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { ...(config.headers ?? {}) };
+  headers["Content-Type"] ??= config.contentType ?? "application/json";
+  if (config.headerSecrets && ownerEmail) {
+    for (const [headerName, secretKey] of Object.entries(config.headerSecrets)) {
+      const value = await readUserSecret(env, ownerEmail, secretKey);
+      if (value) headers[headerName] = value;
+    }
+  }
+  return headers;
+}
+
+/** Build a single webhook channel from its config. The returned
+ *  channel renders the body template per-call and respects
+ *  `minPriority` if set. */
+function buildWebhookChannel(
+  env: Env,
+  ownerEmail: string | undefined,
+  config: WebhookConfig,
+): NotificationChannel {
+  return {
+    id: `webhook:${config.id}`,
+    async send(payload) {
+      if (config.minPriority && priorityRank(payload.priority) < priorityRank(config.minPriority)) {
+        return;
+      }
+      const contentType = config.contentType ?? "application/json";
+      const jsonEscape = contentType.includes("json");
+      const body = renderTemplate(config.bodyTemplate, payload, jsonEscape);
+      const headers = await resolveWebhookHeaders(env, ownerEmail, config);
+      await fetch(config.url, {
+        method: config.method ?? "POST",
+        headers,
+        body,
+      }).catch(() => {
+        // Silently ignore — notification failures are non-fatal.
+      });
+    },
+  };
+}
+
+/** Load configured webhooks from the encrypted secret
+ *  `notification_webhooks`. Malformed JSON or missing required fields
+ *  on individual entries are ignored — a broken entry must not stop
+ *  other channels from delivering. */
+async function loadWebhookConfigs(env: Env, ownerEmail?: string): Promise<WebhookConfig[]> {
+  if (!ownerEmail) return [];
+  const raw = await readUserSecret(env, ownerEmail, "notification_webhooks");
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry): entry is WebhookConfig => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const e = entry as Record<string, unknown>;
+      return typeof e.id === "string" && typeof e.url === "string" && typeof e.bodyTemplate === "string";
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Resolve all enabled notification channels for an owner. Channels
+ * are independent — one returning undefined doesn't stop the others.
+ *
+ * Channel order today:
+ *   1. ntfy (per-user secret or env fallback)
+ *   2. generic webhooks (zero or more, from `notification_webhooks` secret)
+ *
+ * Future channels (email, etc.) plug in here.
  */
 async function resolveChannels(env: Env, ownerEmail?: string): Promise<NotificationChannel[]> {
   const channels: NotificationChannel[] = [];
   const ntfy = await buildNtfyChannel(env, ownerEmail);
   if (ntfy) channels.push(ntfy);
+  const webhookConfigs = await loadWebhookConfigs(env, ownerEmail);
+  for (const config of webhookConfigs) {
+    channels.push(buildWebhookChannel(env, ownerEmail, config));
+  }
   return channels;
 }
 
