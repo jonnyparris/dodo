@@ -1,6 +1,5 @@
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { StateBackend } from "@cloudflare/shell";
-import { generateText, jsonSchema, stepCountIs, tool, zodSchema, type ModelMessage } from "ai";
+import { jsonSchema, tool, zodSchema } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import type { AttachmentRef } from "./attachments";
@@ -10,6 +9,18 @@ import { normalizePath } from "./paths";
 import { createBrowserTools } from "./browser/tools";
 import type { McpClient } from "./mcp-client";
 import { getKnownRepo, listKnownRepos, parseRemoteSpec } from "./repos";
+import {
+  buildProviderForModel,
+  capToolOutputs,
+  EXPLORE_MAX_STEPS,
+  EXPLORE_SYSTEM_PROMPT,
+  EXPLORE_TIMEOUT_MS,
+  resolveSubagentModel,
+  runSubagent,
+  TASK_MAX_STEPS,
+  TASK_SYSTEM_PROMPT,
+  TASK_TIMEOUT_MS,
+} from "./subagent-runner";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import { runTypecheck } from "./typecheck";
 import type { AppConfig, Env, TodoStore } from "./types";
@@ -106,130 +117,6 @@ interface BuildToolsOptions {
   };
 }
 
-// ─── Tool Output Caps (OpenCode Pattern #1) ───
-// Cap tool output AT THE TOOL LEVEL before it enters the AI SDK message history.
-// This is more effective than truncating in assembleContext/prepareStep because
-// the tokens never enter the step-level accumulation in the first place.
-
-/**
- * Per-tool output limits. Applied before results enter the AI SDK message
- * history — prevents large results from accumulating across multi-step loops.
- *
- * Note: Think's tools already have internal caps (read: 2000 lines,
- * find/grep: 200 results). These are stricter secondary caps that match
- * OpenCode's proven values. The read tool's internal 2000-line cap makes
- * an external cap redundant, so only entry-based caps are defined here.
- */
-const TOOL_OUTPUT_CAPS: Record<string, { maxLines?: number; maxBytes?: number; maxEntries?: number }> = {
-  grep:   { maxEntries: 100 },  // Think caps at 200; we cap at 100
-  find:   { maxEntries: 100 },  // Think caps at 200; we cap at 100
-  list:   { maxEntries: 100 },  // Think's list accepts a limit param; we cap the output
-  read:   { maxLines: 200 },    // Force the model to use offset/limit for large files.
-                                // Think caps at 2000 lines but that's ~60k tokens — too
-                                // much for discovery. 200 lines is enough for a preview;
-                                // the truncation hint tells the model to use offset/limit.
-  // codemode — 32 KB soft cap. codemode lets the model call arbitrary JS
-  // including fetch() against external APIs; without a cap, a single
-  // GitHub-API-style response can burn 200k+ input tokens. Enforced in
-  // capCodemodeResult() below because codemode's result shape is
-  // `{ code, result, logs? }` rather than the generic shapes handled by
-  // capResult(). Pairs with the `select` schema projection (described in
-  // the tool's prompt) so the model can pre-narrow before output hits here.
-  codemode: { maxBytes: 32_000 },
-  // write, edit, delete — already produce small output, no cap needed
-};
-
-/** Max bytes for a codemode `logs` field; kept separate from result. */
-const CODEMODE_LOGS_MAX_BYTES = 4_000;
-
-/**
- * Wrap a tool set to enforce per-tool output caps.
- * Each tool's execute function is intercepted: the result is serialized,
- * checked against its cap, and truncated with an actionable hint if exceeded.
- */
-export function capToolOutputs(tools: Record<string, AnyTool>): Record<string, AnyTool> {
-  const wrapped: Record<string, AnyTool> = {};
-  for (const [name, t] of Object.entries(tools)) {
-    const caps = TOOL_OUTPUT_CAPS[name];
-    if (!caps) {
-      wrapped[name] = t;
-      continue;
-    }
-    // Clone the tool with a wrapped execute
-    const original = t as AnyTool & { execute?: (...args: unknown[]) => unknown };
-    if (!original.execute) {
-      wrapped[name] = t;
-      continue;
-    }
-    const origExecute = original.execute;
-    wrapped[name] = {
-      ...original,
-      execute: async (...args: unknown[]) => {
-        const result = await (origExecute as (...a: unknown[]) => Promise<unknown>)(...args);
-        return capResult(name, result, caps);
-      },
-    } as AnyTool;
-  }
-  return wrapped;
-}
-
-/** Apply output caps to a single tool result. */
-function capResult(
-  toolName: string,
-  result: unknown,
-  caps: { maxLines?: number; maxBytes?: number; maxEntries?: number },
-): unknown {
-  if (result === null || result === undefined) return result;
-
-  // Handle structured results (objects with entries arrays — list, find, grep)
-  if (typeof result === "object" && !Array.isArray(result)) {
-    const obj = result as Record<string, unknown>;
-
-    // Cap entries arrays (list, find, grep return { entries: [...] } or { matches: [...] })
-    if (caps.maxEntries) {
-      for (const key of ["entries", "matches", "files"]) {
-        if (Array.isArray(obj[key]) && (obj[key] as unknown[]).length > caps.maxEntries) {
-          const original = obj[key] as unknown[];
-          const capped = original.slice(0, caps.maxEntries);
-          return {
-            ...obj,
-            [key]: capped,
-            _truncated: `Showing ${caps.maxEntries} of ${original.length} results. Use a more specific pattern to narrow results.`,
-          };
-        }
-      }
-    }
-
-    // Cap text content in read results
-    if (caps.maxLines || caps.maxBytes) {
-      // The read tool returns { content: string, ... } or just a string
-      const content = typeof obj.content === "string" ? obj.content : null;
-      if (content) {
-        const capped = capText(content, caps.maxLines ?? Infinity, caps.maxBytes ?? Infinity);
-        if (capped !== content) {
-          const lines = content.split("\n").length;
-          return {
-            ...obj,
-            content: capped,
-            _truncated: `Output capped. Showing partial content of ${lines} total lines. Use read with offset/limit to view specific sections.`,
-          };
-        }
-      }
-    }
-  }
-
-  // Handle plain string results
-  if (typeof result === "string" && (caps.maxLines || caps.maxBytes)) {
-    const capped = capText(result, caps.maxLines ?? Infinity, caps.maxBytes ?? Infinity);
-    if (capped !== result) {
-      const lines = result.split("\n").length;
-      return capped + `\n\n[Output capped. ${lines} total lines. Use read with offset/limit to view specific sections.]`;
-    }
-  }
-
-  return result;
-}
-
 /**
  * Middle-truncate a string to fit within a byte budget. Keeps head and tail
  * so both the shape of the value and its end (often the most recent /
@@ -259,6 +146,9 @@ function middleTruncate(text: string, maxBytes: number): string {
  * The `code` field is left untouched — it's typically small, and we want the
  * model to be able to diff what it sent vs what came back.
  */
+/** Max bytes for a codemode `logs` field; kept separate from result. */
+const CODEMODE_LOGS_MAX_BYTES = 4_000;
+
 export function capCodemodeResult(result: unknown, maxBytes: number): unknown {
   if (!result || typeof result !== "object") return result;
   const obj = result as { code?: unknown; result?: unknown; logs?: unknown };
@@ -334,337 +224,8 @@ function getByPath(value: unknown, path: string): unknown {
   return current;
 }
 
-/** Truncate text by line count and byte size, keeping the head. */
-function capText(text: string, maxLines: number, maxBytes: number): string {
-  const lines = text.split("\n");
-  if (lines.length <= maxLines && text.length <= maxBytes) return text;
-
-  const kept: string[] = [];
-  let bytes = 0;
-  for (let i = 0; i < lines.length && i < maxLines; i++) {
-    const line = lines[i];
-    if (bytes + line.length + 1 > maxBytes) break;
-    kept.push(line);
-    bytes += line.length + 1;
-  }
-  return kept.join("\n");
-}
-
-function trimBaseUrl(url: string): string {
-  return url.endsWith("/") ? url.slice(0, -1) : url;
-}
-
-// ─── Subagent message-history pruning ───
-// Tool-level output caps (capToolOutputs above) bound the size of ANY single
-// tool result. But inside a multi-step subagent run, every prior tool result
-// stays pinned in the `messages` array and gets re-fed to the model every step.
-// A 12-step explore that reads five 200-line snippets still ships ~50k tokens
-// of stale tool output at step 12 — because steps 1-11 are still present.
-//
-// Observed in the 2026-04-24 prod A/B: a single explore facet accumulated
-// ~301k input tokens across 12 steps, within shouting distance of Haiku's
-// 200k window. No single step was over the per-tool cap; the sum was.
-//
-// `pruneSubagentHistory` plugs into `generateText`'s `prepareStep` callback.
-// It keeps:
-//   - the system message (injected by generateText, not in our `messages`)
-//   - the initial user message (the query/prompt)
-//   - the most recent N assistant+tool_result pairs
-// and replaces the dropped middle with a single marker message so the model
-// knows history was compacted, not corrupted.
-//
-// N defaults to 4. That's aggressive — two full tool-call cycles in working
-// memory plus the current turn. Subagents are supposed to do ONE bounded
-// thing; they don't need long-term conversational context. If the model
-// needed information from an earlier step, it should have summarised it
-// into its own reasoning before now.
-
-/**
- * Keep this many trailing message groups (each group = one assistant msg
- * plus any tool_result messages tied to it). Chosen empirically: smaller
- * values risk dropping useful context the model hasn't condensed yet;
- * larger values defeat the point. 4 is enough for the model to remember
- * its last ~2 tool-call cycles plus the current turn.
- */
-const SUBAGENT_MSG_WINDOW = 4;
-
-/**
- * Compact tool-result marker used when we drop the middle of the message
- * history. Surfaces a rough count so the model can self-explain if asked.
- */
-function makePruneMarker(droppedCount: number): ModelMessage {
-  return {
-    role: "user",
-    content: `[system: ${droppedCount} earlier assistant/tool messages were pruned to keep your input token count bounded. If you need information from those steps, call the relevant tool again — don't try to reconstruct the content.]`,
-  };
-}
-
-/**
- * Return a pruned copy of `messages` keeping the initial user prompt and the
- * most recent `windowSize` assistant+tool_result groups. Stable when the
- * history is already short enough.
- *
- * Intended for use inside `generateText({ prepareStep })`.
- */
-export function pruneSubagentHistory(
-  messages: Array<ModelMessage>,
-  windowSize: number = SUBAGENT_MSG_WINDOW,
-): Array<ModelMessage> {
-  if (messages.length <= windowSize + 1) return messages;
-
-  // Find the first user message — this is the original query we must preserve
-  // across pruning so the model retains its goal.
-  const firstUserIdx = messages.findIndex((m) => m.role === "user");
-  if (firstUserIdx < 0) return messages; // defensive — shouldn't happen
-
-  // Walk from the end of the list backwards and group: every assistant
-  // message and the tool_result messages that follow it are one "group".
-  // We keep the last `windowSize` groups.
-  const groups: Array<{ start: number; end: number }> = [];
-  let cursor = messages.length;
-  while (cursor > firstUserIdx + 1 && groups.length < windowSize) {
-    const end = cursor;
-    let start = cursor - 1;
-    // Walk backwards through any leading non-assistant messages (tool results)
-    // until we find the assistant message that emitted them.
-    while (start > firstUserIdx + 1 && messages[start].role !== "assistant") {
-      start--;
-    }
-    groups.unshift({ start, end });
-    cursor = start;
-  }
-
-  if (groups.length === 0) return messages;
-
-  // Keep: [0 .. firstUserIdx], marker, messages[groups[0].start ..]
-  const head = messages.slice(0, firstUserIdx + 1);
-  const tailStart = groups[0].start;
-  const dropped = tailStart - (firstUserIdx + 1);
-  if (dropped <= 0) return messages;
-  const tail = messages.slice(tailStart);
-  return [...head, makePruneMarker(dropped), ...tail];
-}
-
-/**
- * Convenience: build a `prepareStep` callback suitable for passing into
- * `generateText` in both explore and task subagent call sites. Returns a
- * message override only when pruning actually happens.
- */
-export function subagentPrepareStep(options?: { windowSize?: number }) {
-  const windowSize = options?.windowSize ?? SUBAGENT_MSG_WINDOW;
-  return ({ messages }: { messages: Array<ModelMessage> }) => {
-    const pruned = pruneSubagentHistory(messages, windowSize);
-    return pruned === messages ? {} : { messages: pruned };
-  };
-}
-
-/**
- * Add Anthropic prompt-caching cache_control markers to an OpenAI-compatible
- * request body. Invoked by @ai-sdk/openai-compatible as transformRequestBody,
- * so this runs once per outbound request (per call to streamText / generateText).
- *
- * Strategy — place markers at the boundaries Anthropic expects:
- *   1. System prompt   → cache (static per session after turn 1)
- *   2. Tool definitions → cache (stable per session)
- *   3. Last user message → cache (reuses cached context on retries)
- *
- * Anthropic allows up to 4 cache_control markers per request. We use 3 to
- * leave one spare for future extensions (e.g. caching a compaction summary).
- *
- * The OpenAI-compatible wire format allows system to be a string; when
- * routed to Anthropic the gateway re-shapes it. We upgrade to the Anthropic
- * array-of-content-blocks shape at the wire level — most gateways that route
- * to Anthropic pass this through unchanged; those that don't strip the
- * cache_control field silently (no error).
- *
- * All modifications are idempotent: if cache_control markers already exist,
- * we leave them alone.
- */
-export function addAnthropicCacheMarkers(body: Record<string, unknown>): Record<string, unknown> {
-  // No-op for non-Anthropic requests. The transform is installed on every
-  // provider instance so calls that override the session model (e.g. the
-  // compaction step pinned to claude-haiku-4-5) get caching too. Detect
-  // Anthropic by checking the outbound model field — it's already been
-  // translated to the wire format (e.g. "anthropic/claude-opus-4-7") by
-  // the time transformRequestBody runs.
-  const modelId = typeof body.model === "string" ? body.model : "";
-  if (!modelId.startsWith("anthropic/") && !modelId.startsWith("claude-")) {
-    return body;
-  }
-
-  // Shallow clone so we don't mutate the caller's object
-  const out: Record<string, unknown> = { ...body };
-
-  // 1. System prompt — upgrade string → array with cache_control
-  if (typeof out.system === "string" && out.system.length > 0) {
-    out.system = [
-      { type: "text", text: out.system, cache_control: { type: "ephemeral" } },
-    ];
-  } else if (Array.isArray(out.system) && out.system.length > 0) {
-    // Already array form — mark the last block if none has cache_control yet
-    const hasMarker = out.system.some(
-      (block) => block && typeof block === "object" && "cache_control" in (block as object),
-    );
-    if (!hasMarker) {
-      const last = out.system[out.system.length - 1];
-      if (last && typeof last === "object") {
-        out.system = [
-          ...out.system.slice(0, -1),
-          { ...(last as object), cache_control: { type: "ephemeral" } },
-        ];
-      }
-    }
-  }
-
-  // 2. Tools — attach cache_control to the last tool definition so the
-  //    whole tool-schema block is cached. Tools are stable per session, so
-  //    this produces a reliable cache hit on every subsequent step.
-  if (Array.isArray(out.tools) && out.tools.length > 0) {
-    const tools = out.tools as unknown[];
-    const hasMarker = tools.some(
-      (t) => t && typeof t === "object" && "cache_control" in (t as object),
-    );
-    if (!hasMarker) {
-      const lastIdx = tools.length - 1;
-      const last = tools[lastIdx];
-      if (last && typeof last === "object") {
-        out.tools = [
-          ...tools.slice(0, lastIdx),
-          { ...(last as object), cache_control: { type: "ephemeral" } },
-        ];
-      }
-    }
-  }
-
-  // 3. Last user message — place a cache marker so that between-step
-  //    reruns can reuse the cached input. Conservative: only upgrade if
-  //    the content is a string (don't touch multimodal arrays to avoid
-  //    accidentally breaking image-bearing messages).
-  if (Array.isArray(out.messages) && out.messages.length > 0) {
-    const messages = out.messages as Array<Record<string, unknown>>;
-    // Walk from the end to find the last user message
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role !== "user") continue;
-      if (typeof msg.content === "string" && msg.content.length > 0) {
-        const updated: Record<string, unknown> = {
-          ...msg,
-          content: [
-            {
-              type: "text",
-              text: msg.content,
-              cache_control: { type: "ephemeral" },
-            },
-          ],
-        };
-        out.messages = [...messages.slice(0, i), updated, ...messages.slice(i + 1)];
-      }
-      break;
-    }
-  }
-
-  return out;
-}
-
-/** Some model IDs need rewriting before they're sent to the upstream gateway.
- *  - Workers AI models (`@cf/…`) need the `workers-ai/` prefix per AI Gateway
- *    unified-API docs: https://developers.cloudflare.com/ai-gateway/chat-completion/
- *    They only work when the active gateway is `ai-gateway`.
- *  Returns the wire-format model ID, or throws if the combination is invalid. */
-export function resolveWireModelId(modelId: string, activeGateway: "opencode" | "ai-gateway"): string {
-  if (modelId.startsWith("@cf/")) {
-    if (activeGateway !== "ai-gateway") {
-      throw new Error(
-        `Workers AI model "${modelId}" requires the AI Gateway. ` +
-        `Switch gateway to "ai-gateway" in Settings (or via update_config).`,
-      );
-    }
-    return `workers-ai/${modelId}`;
-  }
-  return modelId;
-}
-
-/**
- * Pick the right gateway for a given model ID.
- *
- *  - `@cf/*` (Workers AI) → always ai-gateway
- *  - Everything else → respect whatever `config.activeGateway` says
- *
- * This lets a subagent run on a Workers AI model (e.g. Kimi K2.6) even if
- * the main session uses the opencode gateway. Without this, asking Kimi
- * to do explore work from an opencode-gateway session would fail because
- * the provider baseURL would be wrong.
- */
-function resolveGatewayForModel(
-  modelId: string,
-  mainGateway: "opencode" | "ai-gateway",
-): "opencode" | "ai-gateway" {
-  if (modelId.startsWith("@cf/")) return "ai-gateway";
-  return mainGateway;
-}
-
 export function buildProvider(config: AppConfig, env: Env) {
   return buildProviderForModel(config.model, config, env);
-}
-
-/**
- * Build a provider for a specific model — picks the right gateway and
- * base URL even if that differs from the session's main gateway. Used by
- * subagents that run on a cheaper/different model than the main session.
- */
-export function buildProviderForModel(modelId: string, config: AppConfig, env: Env) {
-  const effectiveGateway = resolveGatewayForModel(modelId, config.activeGateway);
-  const isOpencode = effectiveGateway === "opencode";
-  const baseURL = isOpencode
-    ? `${trimBaseUrl(config.opencodeBaseURL)}`
-    : `${trimBaseUrl(config.aiGatewayBaseURL)}`;
-
-  const headers: Record<string, string> = isOpencode
-    ? { "cf-access-token": env.OPENCODE_GATEWAY_TOKEN ?? "" }
-    : {
-        // AI Gateway unified API: auth with `cf-aig-authorization` bearer.
-        // We keep `x-api-key` for back-compat with existing deployments.
-        "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
-        "x-api-key": env.AI_GATEWAY_KEY ?? "",
-      };
-
-  // Anthropic prompt caching. The transform checks the outbound model per
-  // request and only acts when the wire-format model ID starts with
-  // "anthropic/" (or "claude-"). Always installing it ensures we still get
-  // caching on calls that use a different model than the session default —
-  // most importantly the compaction step, which hardcodes
-  // anthropic/claude-haiku-4-5 regardless of the session model.
-  // For non-Anthropic requests the transform is a no-op.
-  const provider = createOpenAICompatible({
-    baseURL,
-    headers,
-    includeUsage: true,
-    name: effectiveGateway,
-    transformRequestBody: addAnthropicCacheMarkers,
-  });
-
-  // Wrap `chatModel` / `languageModel` / the callable provider so callers can pass
-  // the user-facing id (e.g. `@cf/moonshotai/kimi-k2.6`) and we translate it to the
-  // wire format (`workers-ai/@cf/moonshotai/kimi-k2.6`) exactly once, at the edge.
-  // Use the *effective* gateway (the one we actually picked for this provider)
-  // so @cf/* models don't trip resolveWireModelId's activeGateway check when
-  // the main session is on opencode but the subagent wants Workers AI.
-  const translate = (m: string) => resolveWireModelId(m, effectiveGateway);
-  const originalChatModel = provider.chatModel.bind(provider);
-  const originalLanguageModel = provider.languageModel.bind(provider);
-
-  return new Proxy(provider, {
-    // Intercept `provider("model-id")` (the callable form).
-    apply(_target, _thisArg, args: [string, ...unknown[]]) {
-      const [modelId, ...rest] = args;
-      return originalLanguageModel(translate(modelId), ...(rest as []));
-    },
-    get(target, prop, receiver) {
-      if (prop === "chatModel") return (modelId: string) => originalChatModel(translate(modelId));
-      if (prop === "languageModel") return (modelId: string, cfg?: unknown) => originalLanguageModel(translate(modelId), cfg as Parameters<typeof originalLanguageModel>[1]);
-      return Reflect.get(target, prop, receiver);
-    },
-  });
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1037,112 +598,6 @@ function buildGitTools(
   };
 }
 
-// ─── Explore Subagent (Phase 3) ───
-// Offloads open-ended file search to a worker generateText call with its own
-// context window. Returns a compact summary (~500-1000 tokens) instead of
-// raw file contents (~5000-20000 tokens), saving 5-20× tokens per search.
-
-/** Max steps for the explore subagent.
- *  History:
- *   - Bumped 5 → 12 after the 2026-04-24 demo sessions
- *     (`877cefcc`, `197cc126`, `fdad8393`) showed 5 steps was routinely
- *     consumed by tool-calling before the model got a chance to summarise.
- *   - Bumped 12 → 16 after a 2026-04-25 prod A/B surfaced the same
- *     exhaustion pattern: multiple facet runs hit step 12 with ~25k of
- *     accumulated grep/read context and emitted empty summaries, forcing
- *     the parent (Opus) to retry — doubling the tokens that were supposed
- *     to be saved. 16 + the explicit "reserve 2 for summary" rule in the
- *     system prompt hits the same observed tool-call volume without
- *     starving the summary. */
-export const EXPLORE_MAX_STEPS = 16;
-
-export const EXPLORE_SYSTEM_PROMPT = [
-  "You are a search assistant. Your job is to find files and code relevant to the user's query.",
-  "",
-  "## Rules",
-  "- Use grep, find, list, and read to search the workspace.",
-  "- Be thorough: try multiple search terms if the first doesn't find results.",
-  `- You have a hard budget of ${EXPLORE_MAX_STEPS} steps. **Reserve the last 2 steps for your summary** — at step ${EXPLORE_MAX_STEPS - 2} or earlier, stop calling tools and write your findings.`,
-  "- Return a concise summary when done: file paths, relevant line numbers, and key observations.",
-  "- Do NOT return full file contents — only the relevant snippets (max 10 lines per file).",
-  "- If you find too many results, narrow your search with more specific patterns.",
-  "- Focus on answering the user's specific question, not cataloguing everything.",
-  "- Emitting SOME summary beats hitting the step limit silent. A rough summary is recoverable; no summary wastes the caller's retry budget.",
-].join("\n");
-
-/** Cheap model for the explore subagent, keyed by provider prefix.
- *  Falls back to the main model if no match (still works, just costs more). */
-const EXPLORE_MODELS: Record<string, string> = {
-  "anthropic/": "anthropic/claude-haiku-4-5",
-  "openai/": "openai/gpt-4.1-mini",
-  "google/": "google/gemini-2.5-flash",
-  "deepseek/": "deepseek/deepseek-chat",
-};
-export function getExploreModel(mainModel: string): string {
-  for (const [prefix, model] of Object.entries(EXPLORE_MODELS)) {
-    if (mainModel.startsWith(prefix)) return model;
-  }
-  return mainModel; // fallback: use the main model itself
-}
-
-/** Timeout for the explore subagent (ms). Prevents indefinite blocking. */
-export const EXPLORE_TIMEOUT_MS = 60_000;
-
-/** Max steps for the generic task subagent.
- *  Bumped 15 → 20 alongside EXPLORE_MAX_STEPS 12 → 16 on 2026-04-25
- *  to leave room for the "reserve 2 for summary" pacing rule in
- *  TASK_SYSTEM_PROMPT. Task is write-capable and typically uses more
- *  tool calls per run than explore. */
-export const TASK_MAX_STEPS = 20;
-
-/** Timeout for the generic task subagent (ms).
- *  Raised to 600s when the task runs inside a facet — the facet has its
- *  own DO request lifetime and isn't bound by the parent's turn budget. */
-export const TASK_TIMEOUT_MS = 180_000;
-export const TASK_FACET_TIMEOUT_MS = 600_000;
-
-export const TASK_SYSTEM_PROMPT = [
-  "You are a focused subagent dispatched by the main Dodo agent to handle one bounded task.",
-  "",
-  "## Rules",
-  "- You have a subset of the main agent's tools. Use them to complete the task and ONLY the task.",
-  "- Do not ask clarifying questions — make a best-effort attempt with the info given.",
-  `- You have a hard budget of ${TASK_MAX_STEPS} steps. **Reserve the last 2 steps for your summary** — at step ${TASK_MAX_STEPS - 2} or earlier, stop calling tools and write your summary.`,
-  "- Return a compact text summary when done. Include: what you did, paths/line numbers touched, test results if any.",
-  "- Do NOT dump large tool outputs into your final message — summarize in 5-15 lines.",
-  "- If you hit your step budget without finishing, report what was done and what remains. Your caller will retry.",
-  "- Emitting SOME summary beats hitting the step limit silent. A rough summary is recoverable; no summary wastes the caller's retry budget.",
-].join("\n");
-
-/**
- * Pick the model a subagent should use.
- *
- * Precedence:
- *   1. Per-call override — `args.model` on the tool call
- *   2. Per-session default — `config.exploreModel` / `config.taskModel`
- *      (sourced from DodoConfig, ultimately from the env defaults
- *       DEFAULT_EXPLORE_MODEL / DEFAULT_TASK_MODEL on wrangler.jsonc)
- *   3. Built-in heuristic — `getExploreModel(config.model)` which picks a
- *      cheap model by provider family, falling back to the main model itself
- *
- * Each level is only used if the one above is unset/blank, so users can
- * configure globally but still override on a hot path.
- */
-export function resolveSubagentModel(
-  args: Record<string, unknown>,
-  sessionDefault: string | undefined,
-  mainModel: string,
-): string {
-  const rawArgModel = args.model;
-  if (typeof rawArgModel === "string" && rawArgModel.trim().length > 0) {
-    return rawArgModel.trim();
-  }
-  if (typeof sessionDefault === "string" && sessionDefault.trim().length > 0) {
-    return sessionDefault.trim();
-  }
-  return getExploreModel(mainModel);
-}
-
 /**
  * Build a subagent tool with a configurable name, description, system prompt,
  * tool subset, and step/timeout budgets. Both `explore` and `task` are
@@ -1212,56 +667,30 @@ function buildSubagentTool(spec: {
     inputSchema: spec.inputSchema,
     execute: async (args: Record<string, unknown>) => {
       const modelId = resolveSubagentModel(args, spec.sessionDefaultModel, spec.config.model);
-      const provider = buildProviderForModel(modelId, spec.config, spec.env);
-      const model = provider.chatModel(modelId);
       const userMessage = spec.getUserMessage(args);
 
       try {
-        const result = await generateText({
-          model,
-          system: spec.systemPrompt,
-          messages: [{ role: "user" as const, content: userMessage }],
-          tools: spec.getTools(),
-          stopWhen: stepCountIs(spec.maxSteps),
-          // Bumped from 2000 → 4000. The explore/task subagents frequently
-          // summarize 5-10 files' worth of findings; 2000 tokens was clipping
-          // the summary mid-sentence after the model ran its tool budget.
-          // 4000 still small enough to keep the subagent's turn compact.
-          maxOutputTokens: 4000,
-          // Prune older assistant/tool message groups between steps so a long
-          // investigation doesn't ship its entire tool-result history back to
-          // the model on every call. Tool-level caps bound single results; this
-          // bounds the sum across steps.
-          prepareStep: subagentPrepareStep(),
-          abortSignal: AbortSignal.timeout(spec.timeoutMs),
+        const result = await runSubagent({
+          kind: spec.name.toLowerCase() as "explore" | "task",
+          prompt: userMessage,
+          model: modelId,
+          config: spec.config,
+          toolset: spec.getTools(),
+          systemPrompt: spec.systemPrompt,
+          maxSteps: spec.maxSteps,
+          timeoutMs: spec.timeoutMs,
+          env: spec.env,
         });
 
-        const summary = result.text;
-        const steps = result.steps.length;
-        const toolCalls = result.steps.flatMap((s) =>
-          (s.toolCalls ?? []).map((tc) => tc.toolName),
-        );
-        // Sum per-step usage into a single subagent cost line. Surfacing
-        // this matters for observability — "explore used 40k tokens" is a
-        // cost the parent can't see otherwise since the subagent's LLM
-        // calls don't touch the parent's message_metadata totals.
-        const totalInput = result.steps.reduce(
-          (sum, s) => sum + (s.usage?.inputTokens ?? 0),
-          0,
-        );
-        const totalOutput = result.steps.reduce(
-          (sum, s) => sum + (s.usage?.outputTokens ?? 0),
-          0,
-        );
-        const usageLine = totalInput > 0 || totalOutput > 0
-          ? `**Tokens:** ${totalInput} in / ${totalOutput} out | `
+        const usageLine = result.tokenInput > 0 || result.tokenOutput > 0
+          ? `**Tokens:** ${result.tokenInput} in / ${result.tokenOutput} out | `
           : "";
 
         return [
           `## ${spec.name} results (model: ${modelId})`,
-          `${usageLine}**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
+          `${usageLine}**Steps:** ${result.steps} | **Tools used:** ${result.toolCalls.join(", ") || "none"}`,
           "",
-          summary || "(No output — subagent ran its tool budget without emitting a summary. Try a narrower query or a higher-capability model via the `model` arg.)",
+          result.finalText || "(No output — subagent ran its tool budget without emitting a summary. Try a narrower query or a higher-capability model via the `model` arg.)",
         ].filter(Boolean).join("\n");
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -1735,8 +1164,7 @@ function buildTools(
     // schema projection. Without this, a single `await fetch(...)` against
     // a large API in codemode can one-shot the input-token budget before
     // any downstream safeguard can react (see dodo session 56a7a597).
-    const caps = TOOL_OUTPUT_CAPS.codemode ?? { maxBytes: 32_000 };
-    const maxBytes = caps.maxBytes ?? 32_000;
+    const maxBytes = 32_000;
 
     const originalExecute = (codemodeTool as AnyTool).execute as
       | ((args: unknown, ...rest: unknown[]) => Promise<unknown>)

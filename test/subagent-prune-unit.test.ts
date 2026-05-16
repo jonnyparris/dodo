@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { ModelMessage } from "ai";
-import { pruneSubagentHistory, subagentPrepareStep } from "../src/agentic";
+import { pruneSubagentHistory, subagentPrepareStep } from "../src/subagent-runner";
 
 /**
  * `pruneSubagentHistory` is the inter-step message-compaction used by the
