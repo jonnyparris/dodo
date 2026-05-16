@@ -26,7 +26,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 import { checkSessionPermission, ensureSessionAccess } from "../src/mcp";
-import { messageLimiter, promptLimiter } from "../src/rate-limiters";
+import { messageLimiter, promptLimiter } from "../src/rate-limit";
 
 // MCP module pulls in agentic via the prompt-dispatch tools — mock the
 // expensive bits the same way the other test suites do.

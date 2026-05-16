@@ -3,7 +3,7 @@ import { getAgentByName } from "agents";
 import { z } from "zod";
 import { canonicalizeEmail, getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
 import { log } from "./logger";
-import { messageLimiter, promptLimiter } from "./rate-limiters";
+import { messageLimiter, promptLimiter } from "./rate-limit";
 import { createDraftPrForRun, createGithubRepo } from "./github-pr";
 import { pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-actions";
 import { getKnownRepo, listKnownRepos } from "./repos";
