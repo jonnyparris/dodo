@@ -22,7 +22,7 @@ import { HttpMcpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
 import { log } from "./logger";
 import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
 import { sendRunNotification } from "./notify";
-import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
+import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import type {
   AppConfig,
   Env,
@@ -230,7 +230,6 @@ function toAgentMode(value: string | undefined): "inprocess" | "facet" {
  * MCP configs, and fork snapshots.
  */
 export class UserControl extends DurableObject<Env> {
-  private readonly db: SqlHelper;
   /** SSE clients for user-level events (session list changes, etc.) */
   private readonly sseClients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
   /**
@@ -253,7 +252,6 @@ export class UserControl extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.db = new SqlHelper(ctx.storage.sql);
     ctx.blockConcurrencyWhile(async () => {
       this.initializeSchema();
       await this.seedDefaults();
@@ -348,14 +346,14 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "GET" && url.pathname.match(/^\/sessions\/[^/]+\/check$/)) {
         const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const row = this.db.one("SELECT id FROM sessions WHERE id = ?", sessionId);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM sessions WHERE id = ?", sessionId))[0] as SqlRow | null);
         if (!row) return Response.json({ error: "Session not found" }, { status: 404 });
         return Response.json({ found: true });
       }
 
       if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/[^/]+$/) && !url.pathname.includes("/mcp-overrides") && !url.pathname.includes("/soft-delete") && !url.pathname.includes("/restore")) {
         const sessionId = url.pathname.split("/").at(-1) ?? "";
-        this.db.exec("DELETE FROM sessions WHERE id = ?", sessionId);
+        this.ctx.storage.sql.exec("DELETE FROM sessions WHERE id = ?", sessionId);
         this.emitUserEvent({ type: "sessions_changed", reason: "deleted", sessionId });
         return Response.json({ deleted: true, sessionId });
       }
@@ -363,10 +361,10 @@ export class UserControl extends DurableObject<Env> {
       // Soft-delete: mark session as deleted with a TTL for recovery
       if (request.method === "POST" && url.pathname.match(/^\/sessions\/[^/]+\/soft-delete$/)) {
         const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const row = this.db.one("SELECT id FROM sessions WHERE id = ?", sessionId);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM sessions WHERE id = ?", sessionId))[0] as SqlRow | null);
         if (!row) return Response.json({ error: `Session '${sessionId}' not found` }, { status: 404 });
         const deleteExpiry = nowEpoch() + 300; // 5 minutes
-        this.db.exec("UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?", deleteExpiry, nowEpoch(), sessionId);
+        this.ctx.storage.sql.exec("UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?", deleteExpiry, nowEpoch(), sessionId);
         this.emitUserEvent({ type: "sessions_changed", reason: "deleted", sessionId });
         return Response.json({ deleted: true, sessionId, recoverable: true, recoverableUntil: epochToIso(deleteExpiry) });
       }
@@ -374,16 +372,16 @@ export class UserControl extends DurableObject<Env> {
       // Restore a soft-deleted session
       if (request.method === "POST" && url.pathname.match(/^\/sessions\/[^/]+\/restore$/)) {
         const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const row = this.db.one("SELECT id, status, deleted_at FROM sessions WHERE id = ?", sessionId);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, status, deleted_at FROM sessions WHERE id = ?", sessionId))[0] as SqlRow | null);
         if (!row) return Response.json({ error: `Session '${sessionId}' not found. It may have been permanently deleted.` }, { status: 404 });
         if (String(row.status) !== "deleted") return Response.json({ error: `Session '${sessionId}' is not deleted.` }, { status: 400 });
         const expiry = Number(row.deleted_at ?? 0);
         if (expiry > 0 && nowEpoch() > expiry) {
           // Past recovery window — permanently delete
-          this.db.exec("DELETE FROM sessions WHERE id = ?", sessionId);
+          this.ctx.storage.sql.exec("DELETE FROM sessions WHERE id = ?", sessionId);
           return Response.json({ error: `Recovery window expired. Session '${sessionId}' has been permanently deleted.` }, { status: 410 });
         }
-        this.db.exec("UPDATE sessions SET status = 'idle', deleted_at = NULL, updated_at = ? WHERE id = ?", nowEpoch(), sessionId);
+        this.ctx.storage.sql.exec("UPDATE sessions SET status = 'idle', deleted_at = NULL, updated_at = ? WHERE id = ?", nowEpoch(), sessionId);
         this.emitUserEvent({ type: "sessions_changed", reason: "restored", sessionId });
         return Response.json(this.getSession(sessionId));
       }
@@ -412,7 +410,7 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "DELETE" && url.pathname.startsWith("/memory/")) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        this.db.exec("DELETE FROM memory_entries WHERE id = ?", id);
+        this.ctx.storage.sql.exec("DELETE FROM memory_entries WHERE id = ?", id);
         return Response.json({ deleted: true, id });
       }
 
@@ -481,16 +479,16 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "GET" && url.pathname.match(/^\/tasks\/[^/]+\/check$/)) {
         const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const row = this.db.one("SELECT id FROM tasks WHERE id = ?", id);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM tasks WHERE id = ?", id))[0] as SqlRow | null);
         if (!row) return Response.json({ error: "Task not found" }, { status: 404 });
         return Response.json({ found: true });
       }
 
       if (request.method === "DELETE" && url.pathname.startsWith("/tasks/")) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        const row = this.db.one("SELECT id FROM tasks WHERE id = ?", id);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM tasks WHERE id = ?", id))[0] as SqlRow | null);
         if (!row) return Response.json({ error: `Task '${id}' not found. Run list tasks to see available tasks.` }, { status: 404 });
-        this.db.exec("DELETE FROM tasks WHERE id = ?", id);
+        this.ctx.storage.sql.exec("DELETE FROM tasks WHERE id = ?", id);
         return Response.json({ deleted: true, id });
       }
 
@@ -603,7 +601,7 @@ export class UserControl extends DurableObject<Env> {
           // payload is NOT NULL on the legacy schema; pass an empty string
           // for R2-backed rows so the migration stays additive (no table
           // rebuild required). Real bytes live at `r2_key`.
-          this.db.exec(
+          this.ctx.storage.sql.exec(
             "INSERT INTO fork_snapshots (id, payload, created_at, backend, r2_key, size_bytes) VALUES (?, '', ?, 'r2', ?, ?)",
             id,
             nowEpoch(),
@@ -636,7 +634,7 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "GET" && url.pathname.startsWith("/fork-snapshots/")) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        const row = this.db.one("SELECT payload, backend, r2_key FROM fork_snapshots WHERE id = ?", id);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT payload, backend, r2_key FROM fork_snapshots WHERE id = ?", id))[0] as SqlRow | null);
         if (!row) return Response.json({ error: `Fork snapshot ${id} not found` }, { status: 404 });
         const backend = row.backend === null || row.backend === undefined ? "sqlite" : String(row.backend);
         if (backend === "r2") {
@@ -667,7 +665,7 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "DELETE" && url.pathname.startsWith("/fork-snapshots/")) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        const row = this.db.one("SELECT backend, r2_key FROM fork_snapshots WHERE id = ?", id);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT backend, r2_key FROM fork_snapshots WHERE id = ?", id))[0] as SqlRow | null);
         if (row && row.backend === "r2" && row.r2_key) {
           const r2 = this.env.FORK_SNAPSHOTS;
           if (r2) {
@@ -683,7 +681,7 @@ export class UserControl extends DurableObject<Env> {
             });
           }
         }
-        this.db.exec("DELETE FROM fork_snapshots WHERE id = ?", id);
+        this.ctx.storage.sql.exec("DELETE FROM fork_snapshots WHERE id = ?", id);
         return Response.json({ deleted: true, id });
       }
 
@@ -711,7 +709,7 @@ export class UserControl extends DurableObject<Env> {
       if (request.method === "DELETE" && url.pathname.match(/^\/mcp-configs\/[^/]+$/)) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
         this.deleteMcpConfigSecrets(id);
-        this.db.exec("DELETE FROM mcp_configs WHERE id = ?", id);
+        this.ctx.storage.sql.exec("DELETE FROM mcp_configs WHERE id = ?", id);
         return Response.json({ deleted: true, id });
       }
 
@@ -738,7 +736,7 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "POST" && url.pathname.match(/^\/mcp-configs\/[^/]+\/test$/)) {
         const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const row = this.db.one("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id))[0] as SqlRow | null);
         if (!row) return Response.json({ error: `MCP config ${id} not found` }, { status: 404 });
         const ownerEmail = request.headers.get("x-owner-email") ?? "";
         const config = await this.resolveMcpConfigHeaders(this.mapMcpConfigRow(row), ownerEmail);
@@ -788,7 +786,7 @@ export class UserControl extends DurableObject<Env> {
         const parts = url.pathname.split("/");
         const mcpConfigId = decodeURIComponent(parts.at(-1) ?? "");
         const sessionId = decodeURIComponent(parts.at(-3) ?? "");
-        this.db.exec("DELETE FROM session_mcp_overrides WHERE session_id = ? AND mcp_config_id = ?", sessionId, mcpConfigId);
+        this.ctx.storage.sql.exec("DELETE FROM session_mcp_overrides WHERE session_id = ? AND mcp_config_id = ?", sessionId, mcpConfigId);
         return Response.json({ deleted: true, sessionId, mcpConfigId });
       }
 
@@ -825,7 +823,7 @@ export class UserControl extends DurableObject<Env> {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
         const row = this.readScheduledSessionRow(id);
         if (!row) return Response.json({ error: `Scheduled session '${id}' not found` }, { status: 404 });
-        this.db.exec("DELETE FROM scheduled_sessions WHERE id = ?", id);
+        this.ctx.storage.sql.exec("DELETE FROM scheduled_sessions WHERE id = ?", id);
         await this.rearmScheduledSessionAlarm();
         return Response.json({ deleted: true, id });
       }
@@ -835,7 +833,7 @@ export class UserControl extends DurableObject<Env> {
         const row = this.readScheduledSessionRow(id);
         if (!row) return Response.json({ error: `Scheduled session '${id}' not found` }, { status: 404 });
         const nextRun = this.computeNextRun(row);
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           "UPDATE scheduled_sessions SET failure_count = 0, stalled_at = NULL, last_error = NULL, next_run_epoch = ? WHERE id = ?",
           nextRun,
           id,
@@ -883,9 +881,9 @@ export class UserControl extends DurableObject<Env> {
         // Surface created_at / rotated_at so the security UI can show
         // when the encryption envelope was set up and last rotated.
         // (audit follow-up: previously dead columns.)
-        const row = this.db.one(
+        const row = (Array.from(this.ctx.storage.sql.exec(
           "SELECT id, created_at, rotated_at FROM key_envelope WHERE id = 'default'",
-        );
+        ))[0] as SqlRow | null);
         if (!row) return Response.json({ initialized: false });
         return Response.json({
           initialized: true,
@@ -900,9 +898,9 @@ export class UserControl extends DurableObject<Env> {
         // Surface created_at / updated_at so the settings UI can show
         // when each secret was added and last edited — useful for spotting
         // stale tokens. (audit follow-up: previously dead columns.)
-        const rows = this.db.all(
+        const rows = Array.from(this.ctx.storage.sql.exec(
           "SELECT key, created_at, updated_at FROM encrypted_secrets ORDER BY key ASC",
-        );
+        ));
         const secrets = rows.map((row) => ({
           key: String(row.key),
           createdAt: epochToIso(Number(row.created_at)),
@@ -922,13 +920,13 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "DELETE" && url.pathname.startsWith("/secrets/") && !url.pathname.includes("/test")) {
         const key = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        this.db.exec("DELETE FROM encrypted_secrets WHERE key = ?", key);
+        this.ctx.storage.sql.exec("DELETE FROM encrypted_secrets WHERE key = ?", key);
         return Response.json({ deleted: true, key });
       }
 
       if (request.method === "GET" && url.pathname.match(/^\/secrets\/[^/]+\/test$/)) {
         const key = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const exists = !!this.db.one("SELECT key FROM encrypted_secrets WHERE key = ?", key);
+        const exists = !!(Array.from(this.ctx.storage.sql.exec("SELECT key FROM encrypted_secrets WHERE key = ?", key))[0] as SqlRow | null);
         return Response.json({ key, exists });
       }
 
@@ -954,7 +952,7 @@ export class UserControl extends DurableObject<Env> {
           skip: z.boolean().optional(),
           data: z.record(z.string(), z.unknown()).optional(),
         }).parse(await request.json());
-        const hasKeyEnvelope = !!this.db.one("SELECT id FROM key_envelope WHERE id = 'default'");
+        const hasKeyEnvelope = !!(Array.from(this.ctx.storage.sql.exec("SELECT id FROM key_envelope WHERE id = 'default'"))[0] as SqlRow | null);
         const current = this.getOnboardingState();
         const next = advanceStep(current, body.step as OnboardingState["currentStep"], body.skip ?? false, hasKeyEnvelope);
         this.saveOnboardingState(next);
@@ -976,8 +974,8 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "GET" && url.pathname === "/browser-config") {
         const cfAccountId = this.readUserConfigKey("cf_account_id");
-        const hasApiToken = !!this.db.one("SELECT key FROM encrypted_secrets WHERE key = 'mcp:browser-rendering:Authorization'");
-        const mcpConfig = this.db.one("SELECT id, enabled FROM mcp_configs WHERE id = 'browser-rendering'");
+        const hasApiToken = !!(Array.from(this.ctx.storage.sql.exec("SELECT key FROM encrypted_secrets WHERE key = 'mcp:browser-rendering:Authorization'"))[0] as SqlRow | null);
+        const mcpConfig = (Array.from(this.ctx.storage.sql.exec("SELECT id, enabled FROM mcp_configs WHERE id = 'browser-rendering'"))[0] as SqlRow | null);
         return Response.json({
           cfAccountId: cfAccountId ?? null,
           hasApiToken,
@@ -996,7 +994,7 @@ export class UserControl extends DurableObject<Env> {
 
         // Store account ID in user_config
         const now = nowEpoch();
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           "INSERT INTO user_config (key, value, updated_at) VALUES ('cf_account_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
           body.cfAccountId, now,
         );
@@ -1005,14 +1003,14 @@ export class UserControl extends DurableObject<Env> {
         // headers_json must list the header names so connectMcpServers resolves them from encrypted_secrets
         const mcpUrl = "https://browser.mcp.cloudflare.com/mcp";
         const headerKeys = JSON.stringify(["Authorization", "cf-account-id"]);
-        const existing = this.db.one("SELECT id FROM mcp_configs WHERE id = 'browser-rendering'");
+        const existing = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM mcp_configs WHERE id = 'browser-rendering'"))[0] as SqlRow | null);
         if (existing) {
-          this.db.exec(
+          this.ctx.storage.sql.exec(
             "UPDATE mcp_configs SET url = ?, auth_type = 'static_headers', headers_json = ?, enabled = 1, updated_at = ? WHERE id = 'browser-rendering'",
             mcpUrl, headerKeys, now,
           );
         } else {
-          this.db.exec(
+          this.ctx.storage.sql.exec(
             "INSERT INTO mcp_configs (id, name, type, auth_type, url, headers_json, enabled, created_at, updated_at) VALUES ('browser-rendering', 'Browser Rendering', 'http', 'static_headers', ?, ?, 1, ?, ?)",
             mcpUrl, headerKeys, now, now,
           );
@@ -1029,11 +1027,11 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "DELETE" && url.pathname === "/browser-config") {
         // Remove MCP config
-        this.db.exec("DELETE FROM mcp_configs WHERE id = 'browser-rendering'");
+        this.ctx.storage.sql.exec("DELETE FROM mcp_configs WHERE id = 'browser-rendering'");
         // Remove secrets
-        this.db.exec("DELETE FROM encrypted_secrets WHERE key IN ('mcp:browser-rendering:Authorization', 'mcp:browser-rendering:cf-account-id')");
+        this.ctx.storage.sql.exec("DELETE FROM encrypted_secrets WHERE key IN ('mcp:browser-rendering:Authorization', 'mcp:browser-rendering:cf-account-id')");
         // Remove config key
-        this.db.exec("DELETE FROM user_config WHERE key = 'cf_account_id'");
+        this.ctx.storage.sql.exec("DELETE FROM user_config WHERE key = 'cf_account_id'");
         return Response.json({ deleted: true });
       }
 
@@ -1056,7 +1054,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private initializeSchema(): void {
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS user_config (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
@@ -1068,9 +1066,9 @@ export class UserControl extends DurableObject<Env> {
     // older bug that called `String(undefined)` on optional fields. Cheap
     // SQL even when the table is large; readConfig still defensively
     // treats those as blank if anything slips through. (audit finding L5)
-    this.db.exec("DELETE FROM user_config WHERE value IN ('undefined', 'null')");
+    this.ctx.storage.sql.exec("DELETE FROM user_config WHERE value IN ('undefined', 'null')");
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
         title TEXT,
@@ -1086,7 +1084,7 @@ export class UserControl extends DurableObject<Env> {
 
     // Add deleted_at column if missing (migration for existing DBs)
     try {
-      this.db.exec("ALTER TABLE sessions ADD COLUMN deleted_at INTEGER");
+      this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN deleted_at INTEGER");
     } catch { /* column already exists */ }
 
     // Add kind column for seed-session caching. 'user' is a normal user
@@ -1094,10 +1092,10 @@ export class UserControl extends DurableObject<Env> {
     // an admin-owned warm-clone used as a fork source — hidden from the
     // session list and exempt from idle cleanup. (audit follow-up: seed cache)
     try {
-      this.db.exec("ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'");
+      this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'");
     } catch { /* column already exists */ }
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS memory_entries (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -1108,7 +1106,7 @@ export class UserControl extends DurableObject<Env> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -1121,7 +1119,7 @@ export class UserControl extends DurableObject<Env> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS key_envelope (
         id TEXT PRIMARY KEY DEFAULT 'default',
         pbkdf2_salt TEXT NOT NULL,
@@ -1135,12 +1133,12 @@ export class UserControl extends DurableObject<Env> {
     // Additive migration for existing envelopes — SQLite ignores the column
     // if it already exists. (audit finding M2)
     try {
-      this.db.exec("ALTER TABLE key_envelope ADD COLUMN pbkdf2_iterations INTEGER");
+      this.ctx.storage.sql.exec("ALTER TABLE key_envelope ADD COLUMN pbkdf2_iterations INTEGER");
     } catch {
       // Column already exists, fine.
     }
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS encrypted_secrets (
         key TEXT PRIMARY KEY,
         encrypted_value TEXT NOT NULL,
@@ -1149,7 +1147,7 @@ export class UserControl extends DurableObject<Env> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS fork_snapshots (
         id TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
@@ -1162,16 +1160,16 @@ export class UserControl extends DurableObject<Env> {
     // New rows write payload='' and store the actual bytes in R2 under
     // `r2_key`; legacy rows keep `backend` NULL (treated as 'sqlite' on read).
     try {
-      this.db.exec("ALTER TABLE fork_snapshots ADD COLUMN backend TEXT");
+      this.ctx.storage.sql.exec("ALTER TABLE fork_snapshots ADD COLUMN backend TEXT");
     } catch { /* already added */ }
     try {
-      this.db.exec("ALTER TABLE fork_snapshots ADD COLUMN r2_key TEXT");
+      this.ctx.storage.sql.exec("ALTER TABLE fork_snapshots ADD COLUMN r2_key TEXT");
     } catch { /* already added */ }
     try {
-      this.db.exec("ALTER TABLE fork_snapshots ADD COLUMN size_bytes INTEGER");
+      this.ctx.storage.sql.exec("ALTER TABLE fork_snapshots ADD COLUMN size_bytes INTEGER");
     } catch { /* already added */ }
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS worker_runs (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -1199,7 +1197,7 @@ export class UserControl extends DurableObject<Env> {
     `);
 
     try {
-      this.db.exec("ALTER TABLE worker_runs ADD COLUMN pr_url TEXT");
+      this.ctx.storage.sql.exec("ALTER TABLE worker_runs ADD COLUMN pr_url TEXT");
     } catch {
       // Column already exists.
     }
@@ -1209,10 +1207,10 @@ export class UserControl extends DurableObject<Env> {
       "ALTER TABLE worker_runs ADD COLUMN verify_workflow_run_id TEXT",
       "ALTER TABLE worker_runs ADD COLUMN verify_workflow_html_url TEXT",
     ]) {
-      try { this.db.exec(ddl); } catch { /* column already exists */ }
+      try { this.ctx.storage.sql.exec(ddl); } catch { /* column already exists */ }
     }
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS failure_snapshots (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -1221,7 +1219,7 @@ export class UserControl extends DurableObject<Env> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS mcp_configs (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -1235,13 +1233,13 @@ export class UserControl extends DurableObject<Env> {
       )
     `);
     try {
-      this.db.exec("ALTER TABLE mcp_configs ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'static_headers'");
+      this.ctx.storage.sql.exec("ALTER TABLE mcp_configs ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'static_headers'");
     } catch {
       // Column already exists.
     }
-    this.db.exec("UPDATE mcp_configs SET auth_type = 'static_headers' WHERE auth_type IS NULL OR auth_type = ''");
+    this.ctx.storage.sql.exec("UPDATE mcp_configs SET auth_type = 'static_headers' WHERE auth_type IS NULL OR auth_type = ''");
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS approved_mcps (
         mcp_url TEXT PRIMARY KEY,
         id TEXT NOT NULL,
@@ -1257,7 +1255,7 @@ export class UserControl extends DurableObject<Env> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS session_mcp_overrides (
         session_id TEXT NOT NULL,
         mcp_config_id TEXT NOT NULL,
@@ -1266,7 +1264,7 @@ export class UserControl extends DurableObject<Env> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS scheduled_sessions (
         id                TEXT PRIMARY KEY,
         description       TEXT NOT NULL,
@@ -1290,11 +1288,11 @@ export class UserControl extends DurableObject<Env> {
         created_by        TEXT NOT NULL
       )
     `);
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_scheduled_sessions_next_run ON scheduled_sessions(next_run_epoch) WHERE next_run_epoch IS NOT NULL",
     );
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS user_mcp_tokens (
         token TEXT PRIMARY KEY,
         email TEXT NOT NULL,
@@ -1306,16 +1304,16 @@ export class UserControl extends DurableObject<Env> {
     `);
     // Additive migration for existing tables (audit finding M15)
     try {
-      this.db.exec("ALTER TABLE user_mcp_tokens ADD COLUMN synced_to_index INTEGER NOT NULL DEFAULT 1");
+      this.ctx.storage.sql.exec("ALTER TABLE user_mcp_tokens ADD COLUMN synced_to_index INTEGER NOT NULL DEFAULT 1");
     } catch { /* column already exists */ }
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_email ON user_mcp_tokens (email)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_synced ON user_mcp_tokens (synced_to_index) WHERE synced_to_index = 0");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_email ON user_mcp_tokens (email)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_user_mcp_tokens_synced ON user_mcp_tokens (synced_to_index) WHERE synced_to_index = 0");
 
     // Skills — Claude/OpenCode-compatible SKILL.md store. Personal skills
     // are user-curated and overridable; the workspace and built-in sources
     // live elsewhere (filesystem scan + bundled markdown). See
     // src/skill-registry.ts for the loader.
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS skills (
         name TEXT PRIMARY KEY,
         description TEXT NOT NULL,
@@ -1329,7 +1327,7 @@ export class UserControl extends DurableObject<Env> {
         updated_at INTEGER NOT NULL
       )
     `);
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_skills_enabled ON skills(enabled, name)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_skills_enabled ON skills(enabled, name)");
 
     // TTL cleanup: remove fork snapshots older than 1 hour. Reap R2
     // objects in the same pass — a failed DELETE during the normal
@@ -1337,10 +1335,10 @@ export class UserControl extends DurableObject<Env> {
     // catches. We swallow R2 delete errors per-row so one stuck object
     // doesn't block the rest.
     const oneHourAgo = nowEpoch() - 3600;
-    const stale = this.db.all(
+    const stale = Array.from(this.ctx.storage.sql.exec(
       "SELECT id, backend, r2_key FROM fork_snapshots WHERE created_at < ?",
       oneHourAgo,
-    );
+    ));
     if (stale.length > 0 && this.env.FORK_SNAPSHOTS) {
       const r2 = this.env.FORK_SNAPSHOTS;
       const r2Keys = stale
@@ -1357,9 +1355,9 @@ export class UserControl extends DurableObject<Env> {
         });
       }
     }
-    this.db.exec("DELETE FROM fork_snapshots WHERE created_at < ?", oneHourAgo);
+    this.ctx.storage.sql.exec("DELETE FROM fork_snapshots WHERE created_at < ?", oneHourAgo);
     // Keep failure snapshots for 7 days
-    this.db.exec("DELETE FROM failure_snapshots WHERE created_at < ?", nowEpoch() - 604800);
+    this.ctx.storage.sql.exec("DELETE FROM failure_snapshots WHERE created_at < ?", nowEpoch() - 604800);
   }
 
   private async seedDefaults(): Promise<void> {
@@ -1374,15 +1372,15 @@ export class UserControl extends DurableObject<Env> {
     };
 
     for (const [key, value] of Object.entries(defaults)) {
-      this.db.exec("INSERT OR IGNORE INTO user_config (key, value, updated_at) VALUES (?, ?, ?)", key, String(value), now);
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO user_config (key, value, updated_at) VALUES (?, ?, ?)", key, String(value), now);
     }
 
-    const existingCount = this.db.one("SELECT COUNT(*) AS n FROM approved_mcps WHERE is_deleted = 0");
+    const existingCount = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM approved_mcps WHERE is_deleted = 0"))[0] as SqlRow | null);
     if (Number(existingCount?.n ?? 0) === 0) {
       const { getDeployMcpCatalog } = await import("./mcp-catalog");
       const seedNow = Date.now();
       for (const entry of getDeployMcpCatalog(this.env)) {
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           `INSERT INTO approved_mcps (mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status, is_deleted, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'enabled', 0, ?, ?)`,
           entry.url,
@@ -1402,12 +1400,12 @@ export class UserControl extends DurableObject<Env> {
   // ─── Owner Email ───
 
   private getOwnerEmail(): string | null {
-    const row = this.db.one("SELECT value FROM user_config WHERE key = 'owner_email'");
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT value FROM user_config WHERE key = 'owner_email'"))[0] as SqlRow | null);
     return row ? String(row.value) : null;
   }
 
   private setOwnerEmail(email: string): void {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO user_config (key, value, updated_at) VALUES ('owner_email', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
       email,
       nowEpoch(),
@@ -1417,12 +1415,12 @@ export class UserControl extends DurableObject<Env> {
   // ─── Config ───
 
   private readUserConfigKey(key: string): string | null {
-    const row = this.db.one("SELECT value FROM user_config WHERE key = ?", key);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT value FROM user_config WHERE key = ?", key))[0] as SqlRow | null);
     return row ? String(row.value) : null;
   }
 
   private readConfig(): AppConfig {
-    const rows = this.db.all("SELECT key, value FROM user_config");
+    const rows = Array.from(this.ctx.storage.sql.exec("SELECT key, value FROM user_config"));
     const values = Object.fromEntries(rows.map((row) => [String(row.key), String(row.value)]));
     // Recover from rows poisoned by the pre-fix updateConfig that called
     // `String(undefined)` — treat the literal strings "undefined" and
@@ -1481,10 +1479,10 @@ export class UserControl extends DurableObject<Env> {
       // `| undefined` in the type (e.g. systemPromptPrefix): every config
       // update would otherwise poison the key with the string "undefined".
       if (value === undefined || value === null) {
-        this.db.exec("DELETE FROM user_config WHERE key = ?", key);
+        this.ctx.storage.sql.exec("DELETE FROM user_config WHERE key = ?", key);
         continue;
       }
-      this.db.exec(
+      this.ctx.storage.sql.exec(
         "INSERT INTO user_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         key,
         String(value),
@@ -1498,7 +1496,7 @@ export class UserControl extends DurableObject<Env> {
 
   private registerSession(id: string, title: string | null, ownerEmail: string, createdBy: string, kind: "user" | "seed" = "user"): SessionIndexRecord {
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO sessions (id, title, status, owner_email, created_by, created_at, updated_at, kind) VALUES (?, ?, 'idle', ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
       id,
       title,
@@ -1520,30 +1518,28 @@ export class UserControl extends DurableObject<Env> {
     const nextTitle = patch.title === undefined ? current.title : patch.title;
     const nextStatus = patch.status ?? current.status;
     const now = nowEpoch();
-    this.db.exec("UPDATE sessions SET title = ?, status = ?, updated_at = ? WHERE id = ?", nextTitle, nextStatus, now, id);
+    this.ctx.storage.sql.exec("UPDATE sessions SET title = ?, status = ?, updated_at = ? WHERE id = ?", nextTitle, nextStatus, now, id);
     return this.getSession(id);
   }
 
   private listSessions(includeSeeds = false): SessionIndexRecord[] {
     // Purge expired soft-deleted sessions
-    this.db.exec("DELETE FROM sessions WHERE status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at < ?", nowEpoch());
+    this.ctx.storage.sql.exec("DELETE FROM sessions WHERE status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at < ?", nowEpoch());
     // Seed sessions are admin-owned warm clones; they live in the same
     // table so the existing fork-by-snapshot pipeline keeps working, but
     // we hide them from the regular list so they don't clog up the user
     // sidebar. Callers that need them (admin UI, seed registry lookup)
     // pass includeSeeds=true.
     const kindFilter = includeSeeds ? "" : " AND kind != 'seed'";
-    return this.db.all(`SELECT id, title, status, owner_email, created_by, created_at, updated_at, kind FROM sessions WHERE status != 'deleted'${kindFilter} ORDER BY updated_at DESC`)
-      .map((row) => this.mapSessionRow(row));
+    return Array.from(this.ctx.storage.sql.exec(`SELECT id, title, status, owner_email, created_by, created_at, updated_at, kind FROM sessions WHERE status != 'deleted'${kindFilter} ORDER BY updated_at DESC`)).map((row) => this.mapSessionRow(row));
   }
 
   private listSeedSessions(): SessionIndexRecord[] {
-    return this.db.all("SELECT id, title, status, owner_email, created_by, created_at, updated_at, kind FROM sessions WHERE kind = 'seed' AND status != 'deleted' ORDER BY updated_at DESC")
-      .map((row) => this.mapSessionRow(row));
+    return Array.from(this.ctx.storage.sql.exec("SELECT id, title, status, owner_email, created_by, created_at, updated_at, kind FROM sessions WHERE kind = 'seed' AND status != 'deleted' ORDER BY updated_at DESC")).map((row) => this.mapSessionRow(row));
   }
 
   private getSession(id: string): SessionIndexRecord {
-    const row = this.db.one("SELECT id, title, status, owner_email, created_by, created_at, updated_at, kind FROM sessions WHERE id = ?", id);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, title, status, owner_email, created_by, created_at, updated_at, kind FROM sessions WHERE id = ?", id))[0] as SqlRow | null);
     if (!row) throw new Error(`Session ${id} not found`);
     return this.mapSessionRow(row);
   }
@@ -1567,7 +1563,7 @@ export class UserControl extends DurableObject<Env> {
   private createWorkerRun(input: z.infer<typeof workerRunCreateSchema>): WorkerRunRecord {
     const id = crypto.randomUUID();
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `INSERT INTO worker_runs (
         id, session_id, parent_session_id, repo_id, repo_url, repo_dir, branch, base_branch,
         strategy, title, commit_message, expected_files_json, verification_json, last_error,
@@ -1603,7 +1599,7 @@ export class UserControl extends DurableObject<Env> {
   private updateWorkerRun(id: string, patch: z.infer<typeof workerRunUpdateSchema>): WorkerRunRecord {
     const current = this.getWorkerRun(id);
     const previousStatus = current.status;
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `UPDATE worker_runs
        SET status = ?,
            last_error = ?,
@@ -1633,13 +1629,13 @@ export class UserControl extends DurableObject<Env> {
 
   private listWorkerRuns(sessionId?: string): WorkerRunRecord[] {
     const rows = sessionId
-      ? this.db.all("SELECT * FROM worker_runs WHERE session_id = ? OR parent_session_id = ? ORDER BY created_at DESC", sessionId, sessionId)
-      : this.db.all("SELECT * FROM worker_runs ORDER BY created_at DESC");
+      ? Array.from(this.ctx.storage.sql.exec("SELECT * FROM worker_runs WHERE session_id = ? OR parent_session_id = ? ORDER BY created_at DESC", sessionId, sessionId))
+      : Array.from(this.ctx.storage.sql.exec("SELECT * FROM worker_runs ORDER BY created_at DESC"));
     return rows.map((row) => this.mapWorkerRunRow(row));
   }
 
   private getWorkerRun(id: string): WorkerRunRecord {
-    const row = this.db.one("SELECT * FROM worker_runs WHERE id = ?", id);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT * FROM worker_runs WHERE id = ?", id))[0] as SqlRow | null);
     if (!row) throw new Error(`Worker run ${id} not found`);
     return this.mapWorkerRunRow(row);
   }
@@ -1674,7 +1670,7 @@ export class UserControl extends DurableObject<Env> {
   private createFailureSnapshot(runId: string, payload: Record<string, unknown>): FailureSnapshotRecord {
     const id = crypto.randomUUID();
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO failure_snapshots (id, run_id, payload, created_at) VALUES (?, ?, ?, ?)",
       id,
       runId,
@@ -1685,7 +1681,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private getFailureSnapshot(id: string): FailureSnapshotRecord {
-    const row = this.db.one("SELECT id, run_id, payload, created_at FROM failure_snapshots WHERE id = ?", id);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, run_id, payload, created_at FROM failure_snapshots WHERE id = ?", id))[0] as SqlRow | null);
     if (!row) throw new Error(`Failure snapshot ${id} not found`);
     return {
       createdAt: epochToIso(row.created_at),
@@ -1700,7 +1696,7 @@ export class UserControl extends DurableObject<Env> {
   private createMemoryEntry(input: { content: string; tags: string[]; title: string }): MemoryEntry {
     const id = crypto.randomUUID();
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO memory_entries (id, title, content, tags_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
       id, input.title, input.content, JSON.stringify(input.tags), now, now,
     );
@@ -1708,7 +1704,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private updateMemoryEntry(id: string, input: { content: string; tags: string[]; title: string }): MemoryEntry {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "UPDATE memory_entries SET title = ?, content = ?, tags_json = ?, updated_at = ? WHERE id = ?",
       input.title, input.content, JSON.stringify(input.tags), nowEpoch(), id,
     );
@@ -1716,25 +1712,25 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private getMemoryEntry(id: string): MemoryEntry {
-    const row = this.db.one("SELECT id, title, content, tags_json, created_at, updated_at FROM memory_entries WHERE id = ?", id);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, title, content, tags_json, created_at, updated_at FROM memory_entries WHERE id = ?", id))[0] as SqlRow | null);
     if (!row) throw new Error(`Memory entry ${id} not found`);
     return this.mapMemoryRow(row);
   }
 
   private searchMemory(query: string): MemoryEntry[] {
     if (!query.trim()) {
-      return this.db.all(
+      return Array.from(this.ctx.storage.sql.exec(
         "SELECT id, title, content, tags_json, created_at, updated_at FROM memory_entries ORDER BY updated_at DESC LIMIT 25",
-      ).map((row) => this.mapMemoryRow(row));
+      )).map((row) => this.mapMemoryRow(row));
     }
     const escaped = query.toLowerCase().replace(/[%_\\]/g, "\\$&");
     const pattern = `%${escaped}%`;
-    return this.db.all(
+    return Array.from(this.ctx.storage.sql.exec(
       "SELECT id, title, content, tags_json, created_at, updated_at FROM memory_entries WHERE lower(title) LIKE ? ESCAPE '\\' OR lower(content) LIKE ? ESCAPE '\\' OR lower(tags_json) LIKE ? ESCAPE '\\' ORDER BY updated_at DESC LIMIT 25",
       pattern,
       pattern,
       pattern,
-    ).map((row) => this.mapMemoryRow(row));
+    )).map((row) => this.mapMemoryRow(row));
   }
 
   private mapMemoryRow(row: SqlRow): MemoryEntry {
@@ -1767,11 +1763,11 @@ export class UserControl extends DurableObject<Env> {
     const sql = enabledOnly
       ? "SELECT * FROM skills WHERE enabled = 1 ORDER BY name"
       : "SELECT * FROM skills ORDER BY name";
-    return this.db.all(sql).map((row) => this.mapSkillRow(row));
+    return Array.from(this.ctx.storage.sql.exec(sql)).map((row) => this.mapSkillRow(row));
   }
 
   private getSkill(name: string): ReturnType<UserControl["mapSkillRow"]> | null {
-    const row = this.db.one("SELECT * FROM skills WHERE name = ?", name);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT * FROM skills WHERE name = ?", name))[0] as SqlRow | null);
     return row ? this.mapSkillRow(row) : null;
   }
 
@@ -1789,7 +1785,7 @@ export class UserControl extends DurableObject<Env> {
     const fm = input.rawFrontmatter ? JSON.stringify(input.rawFrontmatter) : null;
     const origin = input.sourceOrigin ?? "manual";
     // SQLite UPSERT — preserve created_at on update.
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `INSERT INTO skills (name, description, body, raw_frontmatter, enabled, source_origin, source_url, asset_keys_json, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)
        ON CONFLICT(name) DO UPDATE SET
@@ -1816,9 +1812,9 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private setSkillEnabled(name: string, enabled: boolean): boolean {
-    const row = this.db.one("SELECT name FROM skills WHERE name = ?", name);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT name FROM skills WHERE name = ?", name))[0] as SqlRow | null);
     if (!row) return false;
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "UPDATE skills SET enabled = ?, updated_at = ? WHERE name = ?",
       enabled ? 1 : 0,
       nowEpoch(),
@@ -1828,7 +1824,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private deleteSkill(name: string): void {
-    this.db.exec("DELETE FROM skills WHERE name = ?", name);
+    this.ctx.storage.sql.exec("DELETE FROM skills WHERE name = ?", name);
   }
 
   private mapSkillRow(row: SqlRow): {
@@ -1881,7 +1877,7 @@ export class UserControl extends DurableObject<Env> {
   private createTask(input: { title: string; description: string; priority: string }): { id: string; title: string; description: string; status: string; priority: string; sessionId: string | null; createdAt: string; updatedAt: string } {
     const id = crypto.randomUUID();
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO tasks (id, title, description, status, priority, created_at, updated_at) VALUES (?, ?, ?, 'backlog', ?, ?, ?)",
       id, input.title, input.description, input.priority, now, now,
     );
@@ -1891,7 +1887,7 @@ export class UserControl extends DurableObject<Env> {
   private updateTask(id: string, patch: { title?: string; description?: string; status?: string; priority?: string; session_id?: string | null }): { id: string; title: string; description: string; status: string; priority: string; sessionId: string | null; createdAt: string; updatedAt: string } {
     const current = this.getTask(id);
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?, session_id = ?, updated_at = ? WHERE id = ?",
       patch.title ?? current.title,
       patch.description ?? current.description,
@@ -1905,7 +1901,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private getTask(id: string): { id: string; title: string; description: string; status: string; priority: string; sessionId: string | null; createdAt: string; updatedAt: string } {
-    const row = this.db.one("SELECT id, title, description, status, priority, session_id, created_at, updated_at FROM tasks WHERE id = ?", id);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, title, description, status, priority, session_id, created_at, updated_at FROM tasks WHERE id = ?", id))[0] as SqlRow | null);
     if (!row) throw new Error(`Task ${id} not found`);
     return {
       id: String(row.id),
@@ -1921,8 +1917,8 @@ export class UserControl extends DurableObject<Env> {
 
   private listTasks(statusFilter?: string): Array<{ id: string; title: string; description: string; status: string; priority: string; sessionId: string | null; createdAt: string; updatedAt: string }> {
     const rows = statusFilter
-      ? this.db.all("SELECT id, title, description, status, priority, session_id, created_at, updated_at FROM tasks WHERE status = ? ORDER BY updated_at DESC", statusFilter)
-      : this.db.all("SELECT id, title, description, status, priority, session_id, created_at, updated_at FROM tasks ORDER BY updated_at DESC");
+      ? Array.from(this.ctx.storage.sql.exec("SELECT id, title, description, status, priority, session_id, created_at, updated_at FROM tasks WHERE status = ? ORDER BY updated_at DESC", statusFilter))
+      : Array.from(this.ctx.storage.sql.exec("SELECT id, title, description, status, priority, session_id, created_at, updated_at FROM tasks ORDER BY updated_at DESC"));
     return rows.map((row) => ({
       id: String(row.id),
       title: String(row.title),
@@ -1946,7 +1942,7 @@ export class UserControl extends DurableObject<Env> {
     const now = nowEpoch();
     const headerKeys = input.headers ? Object.keys(input.headers) : [];
 
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO mcp_configs (id, name, type, auth_type, url, headers_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       id, input.name, input.type, input.auth_type, input.url ?? null, headerKeys.length > 0 ? JSON.stringify(headerKeys) : null, input.enabled ? 1 : 0, now, now,
     );
@@ -1984,7 +1980,7 @@ export class UserControl extends DurableObject<Env> {
       headerKeys = current.headerKeys ?? [];
     }
 
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "UPDATE mcp_configs SET name = ?, type = ?, auth_type = ?, url = ?, headers_json = ?, enabled = ?, updated_at = ? WHERE id = ?",
       patch.name ?? current.name,
       patch.type ?? current.type,
@@ -2002,9 +1998,9 @@ export class UserControl extends DurableObject<Env> {
 
   /** Delete all encrypted secrets associated with an MCP config. */
   private deleteMcpConfigSecrets(configId: string): void {
-    const rows = this.db.all("SELECT key FROM encrypted_secrets WHERE key LIKE ?", `mcp:${configId}:%`);
+    const rows = Array.from(this.ctx.storage.sql.exec("SELECT key FROM encrypted_secrets WHERE key LIKE ?", `mcp:${configId}:%`));
     for (const row of rows) {
-      this.db.exec("DELETE FROM encrypted_secrets WHERE key = ?", String(row.key));
+      this.ctx.storage.sql.exec("DELETE FROM encrypted_secrets WHERE key = ?", String(row.key));
     }
   }
 
@@ -2025,7 +2021,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private getMcpConfigSafe(id: string): McpGatekeeperConfig & { headerKeys?: string[] } {
-    const row = this.db.one("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id))[0] as SqlRow | null);
     if (!row) throw new Error(`MCP config ${id} not found`);
     return this.mapMcpConfigRowSafe(row);
   }
@@ -2034,8 +2030,7 @@ export class UserControl extends DurableObject<Env> {
    * List MCP configs for display. Returns header key names but not values.
    */
   private listMcpConfigsSafe(): Array<McpGatekeeperConfig & { headerKeys?: string[] }> {
-    return this.db.all("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")
-      .map((row) => this.mapMcpConfigRowSafe(row));
+    return Array.from(this.ctx.storage.sql.exec("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")).map((row) => this.mapMcpConfigRowSafe(row));
   }
 
   public async createUserMcpToken(email: string, label?: string): Promise<{ token: string; created_at: number }> {
@@ -2045,7 +2040,7 @@ export class UserControl extends DurableObject<Env> {
     // Insert with synced_to_index=0 first; flip to 1 only after the
     // SharedIndex write succeeds. Background reconciliation
     // (`reconcileUnsyncedMcpTokens`) replays unsynced rows. (audit finding M15)
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO user_mcp_tokens (token, email, label, created_at, last_used_at, synced_to_index) VALUES (?, ?, ?, ?, NULL, 0)",
       token, normalisedEmail, label ?? null, now,
     );
@@ -2057,7 +2052,7 @@ export class UserControl extends DurableObject<Env> {
         body: JSON.stringify({ token, email: normalisedEmail }),
       });
       if (res.ok) {
-        this.db.exec("UPDATE user_mcp_tokens SET synced_to_index = 1 WHERE token = ?", token);
+        this.ctx.storage.sql.exec("UPDATE user_mcp_tokens SET synced_to_index = 1 WHERE token = ?", token);
       } else {
         log("warn", "user-control: SharedIndex token sync returned non-OK", { status: res.status, token: token.slice(0, 12) });
       }
@@ -2075,7 +2070,7 @@ export class UserControl extends DurableObject<Env> {
    * side and a no-op when there's nothing to reconcile. (audit finding M15)
    */
   private async reconcileUnsyncedMcpTokens(): Promise<void> {
-    const rows = this.db.all("SELECT token, email FROM user_mcp_tokens WHERE synced_to_index = 0 LIMIT 50");
+    const rows = Array.from(this.ctx.storage.sql.exec("SELECT token, email FROM user_mcp_tokens WHERE synced_to_index = 0 LIMIT 50"));
     if (rows.length === 0) return;
     const sharedIndex = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
     for (const row of rows) {
@@ -2088,7 +2083,7 @@ export class UserControl extends DurableObject<Env> {
           body: JSON.stringify({ token, email }),
         });
         if (res.ok) {
-          this.db.exec("UPDATE user_mcp_tokens SET synced_to_index = 1 WHERE token = ?", token);
+          this.ctx.storage.sql.exec("UPDATE user_mcp_tokens SET synced_to_index = 1 WHERE token = ?", token);
         }
       } catch {
         // Try again next sweep.
@@ -2097,9 +2092,9 @@ export class UserControl extends DurableObject<Env> {
   }
 
   public lookupUserMcpToken(token: string): { email: string; label: string | null; created_at: number } | null {
-    const row = this.db.one("SELECT email, label, created_at FROM user_mcp_tokens WHERE token = ?", token);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT email, label, created_at FROM user_mcp_tokens WHERE token = ?", token))[0] as SqlRow | null);
     if (!row) return null;
-    this.db.exec("UPDATE user_mcp_tokens SET last_used_at = ? WHERE token = ?", Date.now(), token);
+    this.ctx.storage.sql.exec("UPDATE user_mcp_tokens SET last_used_at = ? WHERE token = ?", Date.now(), token);
     return {
       email: String(row.email),
       label: row.label as string | null,
@@ -2108,10 +2103,10 @@ export class UserControl extends DurableObject<Env> {
   }
 
   public listUserMcpTokens(email: string): Array<{ token_prefix: string; label: string | null; created_at: number; last_used_at: number | null }> {
-    const rows = this.db.all(
+    const rows = Array.from(this.ctx.storage.sql.exec(
       "SELECT token, label, created_at, last_used_at FROM user_mcp_tokens WHERE email = ? ORDER BY created_at DESC",
       email.trim().toLowerCase(),
-    );
+    ));
     return rows.map((r) => ({
       token_prefix: String(r.token).slice(0, 12) + "…",
       label: r.label as string | null,
@@ -2121,11 +2116,11 @@ export class UserControl extends DurableObject<Env> {
   }
 
   public async deleteUserMcpToken(email: string, token: string): Promise<boolean> {
-    const existing = this.db.one("SELECT email FROM user_mcp_tokens WHERE token = ?", token);
+    const existing = (Array.from(this.ctx.storage.sql.exec("SELECT email FROM user_mcp_tokens WHERE token = ?", token))[0] as SqlRow | null);
     if (!existing) return false;
     const normalisedEmail = email.trim().toLowerCase();
     if (String(existing.email).trim().toLowerCase() !== normalisedEmail) return false;
-    this.db.exec("DELETE FROM user_mcp_tokens WHERE token = ?", token);
+    this.ctx.storage.sql.exec("DELETE FROM user_mcp_tokens WHERE token = ?", token);
     // Remove the pointer from the global index too
     try {
       const sharedIndex = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
@@ -2146,9 +2141,9 @@ export class UserControl extends DurableObject<Env> {
     auth_type: "oauth" | "static_headers";
     status: "enabled" | "disabled";
   }> {
-    const rows = this.db.all(
+    const rows = Array.from(this.ctx.storage.sql.exec(
       "SELECT mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status FROM approved_mcps WHERE is_deleted = 0 ORDER BY display_name ASC",
-    );
+    ));
     return rows.map((r) => ({
       mcp_url: String(r.mcp_url),
       id: String(r.id),
@@ -2172,9 +2167,9 @@ export class UserControl extends DurableObject<Env> {
     status?: "enabled" | "disabled";
   }): void {
     const now = Date.now();
-    const existing = this.db.one("SELECT mcp_url, is_deleted FROM approved_mcps WHERE mcp_url = ?", entry.mcp_url);
+    const existing = (Array.from(this.ctx.storage.sql.exec("SELECT mcp_url, is_deleted FROM approved_mcps WHERE mcp_url = ?", entry.mcp_url))[0] as SqlRow | null);
     if (existing) {
-      this.db.exec(
+      this.ctx.storage.sql.exec(
         `UPDATE approved_mcps
          SET id = ?, display_name = ?, description = ?, setup_guide = ?, known_hosts = ?, auth_type = ?, status = ?, is_deleted = 0, updated_at = ?
          WHERE mcp_url = ?`,
@@ -2190,7 +2185,7 @@ export class UserControl extends DurableObject<Env> {
       );
       return;
     }
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `INSERT INTO approved_mcps (mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status, is_deleted, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
       entry.mcp_url,
@@ -2207,7 +2202,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   public updateApprovedMcp(mcp_url: string, updates: { display_name?: string; description?: string; setup_guide?: string; status?: "enabled" | "disabled" }): boolean {
-    const existing = this.db.one("SELECT mcp_url FROM approved_mcps WHERE mcp_url = ? AND is_deleted = 0", mcp_url);
+    const existing = (Array.from(this.ctx.storage.sql.exec("SELECT mcp_url FROM approved_mcps WHERE mcp_url = ? AND is_deleted = 0", mcp_url))[0] as SqlRow | null);
     if (!existing) return false;
     const setClauses: string[] = [];
     const values: unknown[] = [];
@@ -2219,19 +2214,19 @@ export class UserControl extends DurableObject<Env> {
     setClauses.push("updated_at = ?");
     values.push(Date.now());
     values.push(mcp_url);
-    this.db.exec(`UPDATE approved_mcps SET ${setClauses.join(", ")} WHERE mcp_url = ?`, ...values);
+    this.ctx.storage.sql.exec(`UPDATE approved_mcps SET ${setClauses.join(", ")} WHERE mcp_url = ?`, ...values);
     return true;
   }
 
   public softDeleteApprovedMcp(mcp_url: string): boolean {
-    const existing = this.db.one("SELECT mcp_url FROM approved_mcps WHERE mcp_url = ? AND is_deleted = 0", mcp_url);
+    const existing = (Array.from(this.ctx.storage.sql.exec("SELECT mcp_url FROM approved_mcps WHERE mcp_url = ? AND is_deleted = 0", mcp_url))[0] as SqlRow | null);
     if (!existing) return false;
-    this.db.exec("UPDATE approved_mcps SET is_deleted = 1, updated_at = ? WHERE mcp_url = ?", Date.now(), mcp_url);
+    this.ctx.storage.sql.exec("UPDATE approved_mcps SET is_deleted = 1, updated_at = ? WHERE mcp_url = ?", Date.now(), mcp_url);
     return true;
   }
 
   private hasKeyEnvelope(): boolean {
-    return !!this.db.one("SELECT id FROM key_envelope WHERE id = 'default'");
+    return !!(Array.from(this.ctx.storage.sql.exec("SELECT id FROM key_envelope WHERE id = 'default'"))[0] as SqlRow | null);
   }
 
   /**
@@ -2297,10 +2292,10 @@ export class UserControl extends DurableObject<Env> {
   // ─── Session MCP Overrides ───
 
   private listMcpOverrides(sessionId: string): Array<{ sessionId: string; mcpConfigId: string; enabled: boolean }> {
-    return this.db.all(
+    return Array.from(this.ctx.storage.sql.exec(
       "SELECT session_id, mcp_config_id, enabled FROM session_mcp_overrides WHERE session_id = ? ORDER BY mcp_config_id ASC",
       sessionId,
-    ).map((row) => ({
+    )).map((row) => ({
       sessionId: String(row.session_id),
       mcpConfigId: String(row.mcp_config_id),
       enabled: Number(row.enabled) === 1,
@@ -2308,7 +2303,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private setMcpOverride(sessionId: string, mcpConfigId: string, enabled: boolean): void {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `INSERT INTO session_mcp_overrides (session_id, mcp_config_id, enabled)
        VALUES (?, ?, ?)
        ON CONFLICT(session_id, mcp_config_id) DO UPDATE SET enabled = excluded.enabled`,
@@ -2333,7 +2328,7 @@ export class UserControl extends DurableObject<Env> {
   // ─── Onboarding ───
 
   private getOnboardingState(): OnboardingState {
-    const row = this.db.one("SELECT value FROM user_config WHERE key = 'onboarding_state'");
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT value FROM user_config WHERE key = 'onboarding_state'"))[0] as SqlRow | null);
     if (!row) {
       const initial = getInitialState();
       this.saveOnboardingState(initial);
@@ -2344,7 +2339,7 @@ export class UserControl extends DurableObject<Env> {
 
   private saveOnboardingState(state: OnboardingState): void {
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO user_config (key, value, updated_at) VALUES ('onboarding_state', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
       JSON.stringify(state),
       now,
@@ -2354,8 +2349,8 @@ export class UserControl extends DurableObject<Env> {
   // ─── Status ───
 
   private getStatus(): { version: string; commit: string; sessionCount: number; hasPasskey: boolean } {
-    const sessionCount = Number(this.db.one("SELECT COUNT(*) AS count FROM sessions")?.count ?? 0);
-    const hasPasskey = !!this.db.one("SELECT id FROM key_envelope WHERE id = 'default'");
+    const sessionCount = Number((Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM sessions"))[0] as SqlRow | null)?.count ?? 0);
+    const hasPasskey = !!(Array.from(this.ctx.storage.sql.exec("SELECT id FROM key_envelope WHERE id = 'default'"))[0] as SqlRow | null);
     return {
       version: this.env.DODO_VERSION ?? "dev",
       commit: this.env.DODO_COMMIT ?? "",
@@ -2367,7 +2362,7 @@ export class UserControl extends DurableObject<Env> {
   // ─── Key Envelope / Encryption ───
 
   private async initKeyEnvelope(passkey: string, ownerEmail: string): Promise<void> {
-    const existing = this.db.one("SELECT id FROM key_envelope WHERE id = 'default'");
+    const existing = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM key_envelope WHERE id = 'default'"))[0] as SqlRow | null);
     if (existing) throw new Error("Key envelope already initialized. Use passkey/change to update.");
 
     const masterKeyHex = this.env.SECRETS_MASTER_KEY;
@@ -2383,7 +2378,7 @@ export class UserControl extends DurableObject<Env> {
     const wrappedPasskey = await wrapDEK(dek, pdk);
     const wrappedServer = await wrapDEK(dek, sdk);
 
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO key_envelope (id, pbkdf2_salt, wrapped_dek_passkey, wrapped_dek_server, created_at, pbkdf2_iterations) VALUES ('default', ?, ?, ?, ?, ?)",
       bytesToBase64(salt),
       wrappedPasskey,
@@ -2397,14 +2392,14 @@ export class UserControl extends DurableObject<Env> {
     const masterKeyHex = this.env.SECRETS_MASTER_KEY;
     if (!masterKeyHex) throw new Error("Server encryption not configured");
 
-    const envelope = this.db.one("SELECT wrapped_dek_server FROM key_envelope WHERE id = 'default'");
+    const envelope = (Array.from(this.ctx.storage.sql.exec("SELECT wrapped_dek_server FROM key_envelope WHERE id = 'default'"))[0] as SqlRow | null);
     if (!envelope) throw new Error("No key envelope. User must complete onboarding.");
     const sdk = await deriveSDK(masterKeyHex, ownerEmail);
     return unwrapDEK(String(envelope.wrapped_dek_server), sdk);
   }
 
   private async unwrapDEKWithPasskey(passkey: string): Promise<Uint8Array> {
-    const envelope = this.db.one("SELECT pbkdf2_salt, wrapped_dek_passkey, pbkdf2_iterations FROM key_envelope WHERE id = 'default'");
+    const envelope = (Array.from(this.ctx.storage.sql.exec("SELECT pbkdf2_salt, wrapped_dek_passkey, pbkdf2_iterations FROM key_envelope WHERE id = 'default'"))[0] as SqlRow | null);
     if (!envelope) throw new Error("No key envelope.");
     const salt = base64ToBytes(String(envelope.pbkdf2_salt));
     // Legacy envelopes (pre-M2) have a NULL iteration count and were derived
@@ -2426,7 +2421,7 @@ export class UserControl extends DurableObject<Env> {
         const newSalt = generateSalt();
         const newPdk = await derivePDK(passkey, newSalt, PBKDF2_DEFAULT_ITERATIONS);
         const newWrapped = await wrapDEK(dek, newPdk);
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           "UPDATE key_envelope SET pbkdf2_salt = ?, wrapped_dek_passkey = ?, pbkdf2_iterations = ?, rotated_at = ? WHERE id = 'default'",
           bytesToBase64(newSalt),
           newWrapped,
@@ -2446,7 +2441,7 @@ export class UserControl extends DurableObject<Env> {
     try {
       const encrypted = await encryptSecret(plaintext, dek);
       const now = nowEpoch();
-      this.db.exec(
+      this.ctx.storage.sql.exec(
         "INSERT INTO encrypted_secrets (key, encrypted_value, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET encrypted_value = excluded.encrypted_value, updated_at = excluded.updated_at",
         key,
         encrypted,
@@ -2459,7 +2454,7 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private async getSecret(key: string, ownerEmail: string): Promise<string | null> {
-    const row = this.db.one("SELECT encrypted_value FROM encrypted_secrets WHERE key = ?", key);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT encrypted_value FROM encrypted_secrets WHERE key = ?", key))[0] as SqlRow | null);
     if (!row) return null;
     const dek = await this.unwrapDEKWithServer(ownerEmail);
     try {
@@ -2477,7 +2472,7 @@ export class UserControl extends DurableObject<Env> {
       const newSalt = generateSalt();
       const newPdk = await derivePDK(newPasskey, newSalt, PBKDF2_DEFAULT_ITERATIONS);
       const newWrappedPasskey = await wrapDEK(dek, newPdk);
-      this.db.exec(
+      this.ctx.storage.sql.exec(
         "UPDATE key_envelope SET pbkdf2_salt = ?, wrapped_dek_passkey = ?, pbkdf2_iterations = ?, rotated_at = ? WHERE id = 'default'",
         bytesToBase64(newSalt),
         newWrappedPasskey,
@@ -2506,7 +2501,7 @@ export class UserControl extends DurableObject<Env> {
       // Derive new SDK from the current (new) SECRETS_MASTER_KEY
       const newSdk = await deriveSDK(masterKeyHex, ownerEmail);
       const newWrappedServer = await wrapDEK(dek, newSdk);
-      this.db.exec(
+      this.ctx.storage.sql.exec(
         "UPDATE key_envelope SET wrapped_dek_server = ?, rotated_at = ? WHERE id = 'default'",
         newWrappedServer,
         nowEpoch(),
@@ -2524,7 +2519,7 @@ export class UserControl extends DurableObject<Env> {
     sourceInput: z.infer<typeof sourceShapeSchema>,
   ): ScheduledSessionRecord {
     // Enforce the per-user cap
-    const existing = Number(this.db.one("SELECT COUNT(*) AS count FROM scheduled_sessions")?.count ?? 0);
+    const existing = Number((Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM scheduled_sessions"))[0] as SqlRow | null)?.count ?? 0);
     if (existing >= MAX_SCHEDULES_PER_USER) {
       throw new Error(`You have reached the maximum of ${MAX_SCHEDULES_PER_USER} scheduled sessions. Delete some to add more.`);
     }
@@ -2585,7 +2580,7 @@ export class UserControl extends DurableObject<Env> {
     const sessionTitle = sourceInput.title ?? null;
     const sourceSessionId = sourceInput.source === "fork" ? sourceInput.sourceSessionId : null;
 
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `INSERT INTO scheduled_sessions (
         id, description, prompt, schedule_type,
         delay_seconds, target_epoch, cron_expression, interval_seconds,
@@ -2623,13 +2618,13 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private listScheduledSessions(): ScheduledSessionRecord[] {
-    return this.db.all(
+    return Array.from(this.ctx.storage.sql.exec(
       "SELECT * FROM scheduled_sessions ORDER BY created_at DESC",
-    ).map((row) => this.mapScheduledSessionRow(row));
+    )).map((row) => this.mapScheduledSessionRow(row));
   }
 
   private readScheduledSessionRow(id: string): SqlRow | null {
-    const row = this.db.one("SELECT * FROM scheduled_sessions WHERE id = ?", id);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT * FROM scheduled_sessions WHERE id = ?", id))[0] as SqlRow | null);
     return row ?? null;
   }
 
@@ -2701,18 +2696,18 @@ export class UserControl extends DurableObject<Env> {
   private async rearmAlarm(): Promise<void> {
     const candidates: number[] = [];
 
-    const nextSched = this.db.one(
+    const nextSched = (Array.from(this.ctx.storage.sql.exec(
       "SELECT MIN(next_run_epoch) AS t FROM scheduled_sessions WHERE next_run_epoch IS NOT NULL",
-    );
+    ))[0] as SqlRow | null);
     if (nextSched?.t != null) {
       candidates.push(Number(nextSched.t) * 1000);
     }
 
     // Only keep the idle sweep armed while there are idle sessions to
     // watch. Empty userbases shouldn't pay for periodic wake-ups.
-    const idle = this.db.one(
+    const idle = (Array.from(this.ctx.storage.sql.exec(
       "SELECT 1 AS has FROM sessions WHERE status = 'idle' LIMIT 1",
-    );
+    ))[0] as SqlRow | null);
     if (idle?.has != null) {
       candidates.push(Date.now() + IDLE_SWEEP_INTERVAL_SECONDS * 1000);
     }
@@ -2746,13 +2741,11 @@ export class UserControl extends DurableObject<Env> {
   async alarm(): Promise<void> {
     const ALARM_BATCH_SIZE = 10;
     const now = nowEpoch();
-    const dueIds = this.db
-      .all(
+    const dueIds = Array.from(this.ctx.storage.sql.exec(
         "SELECT id FROM scheduled_sessions WHERE next_run_epoch IS NOT NULL AND next_run_epoch <= ? ORDER BY next_run_epoch LIMIT ?",
         now,
         ALARM_BATCH_SIZE,
-      )
-      .map((row) => String(row.id));
+      )).map((row) => String(row.id));
 
     // alarm() already holds the DO input gate, so fetch handlers can't
     // interleave between rows. Re-read the row each iteration to guard
@@ -2767,10 +2760,10 @@ export class UserControl extends DurableObject<Env> {
     }
 
     // Re-arm: if more rows are overdue beyond the batch, fire again in ~1s.
-    const remainingOverdue = this.db.one(
+    const remainingOverdue = (Array.from(this.ctx.storage.sql.exec(
       "SELECT MIN(next_run_epoch) AS t FROM scheduled_sessions WHERE next_run_epoch IS NOT NULL AND next_run_epoch <= ?",
       nowEpoch(),
-    );
+    ))[0] as SqlRow | null);
     if (remainingOverdue?.t != null) {
       this.ctx.storage.setAlarm(Date.now() + 1000);
       return;
@@ -2805,11 +2798,11 @@ export class UserControl extends DurableObject<Env> {
     // cleanup — they intentionally have no prompts and exist precisely
     // so they outlive a normal idle window. Cleaning them up would
     // defeat the cache.
-    const candidates = this.db.all(
+    const candidates = Array.from(this.ctx.storage.sql.exec(
       "SELECT id FROM sessions WHERE status = 'idle' AND kind != 'seed' AND updated_at < ? ORDER BY updated_at ASC LIMIT ?",
       cutoff,
       IDLE_SWEEP_BATCH_SIZE,
-    );
+    ));
 
     for (const row of candidates) {
       const sessionId = String(row.id);
@@ -2831,7 +2824,7 @@ export class UserControl extends DurableObject<Env> {
       // Reuse the same soft-delete primitive as the manual DELETE path
       // so the 5-min recovery window behaves identically.
       const deleteExpiry = nowEpoch() + 300;
-      this.db.exec(
+      this.ctx.storage.sql.exec(
         "UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?",
         deleteExpiry,
         nowEpoch(),
@@ -2876,7 +2869,7 @@ export class UserControl extends DurableObject<Env> {
       // Can't fire without an owner email to attribute the session to.
       // Mark stalled so the user notices — probably onboarding hasn't
       // completed yet.
-      this.db.exec(
+      this.ctx.storage.sql.exec(
         "UPDATE scheduled_sessions SET failure_count = failure_count + 1, last_error = ?, stalled_at = ?, next_run_epoch = NULL WHERE id = ?",
         "owner_email not established",
         nowEpoch(),
@@ -2900,7 +2893,7 @@ export class UserControl extends DurableObject<Env> {
       // the same tick once the window opens.
       const jitter = Math.floor(Math.random() * 30);
       const nextRun = nowEpoch() + retryAfter + jitter;
-      this.db.exec(
+      this.ctx.storage.sql.exec(
         "UPDATE scheduled_sessions SET next_run_epoch = ?, last_error = ?, failure_count = failure_count + 1 WHERE id = ?",
         nextRun,
         "rate_limited",
@@ -2979,7 +2972,7 @@ export class UserControl extends DurableObject<Env> {
   private registerScheduledFreshSession(ownerEmail: string, title: string | null): string {
     const sessionId = crypto.randomUUID();
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO sessions (id, title, status, owner_email, created_by, created_at, updated_at) VALUES (?, ?, 'idle', ?, ?, ?, ?)",
       sessionId,
       title,
@@ -3003,7 +2996,7 @@ export class UserControl extends DurableObject<Env> {
     // Verify the source session exists in THIS DO. Scheduled sessions can
     // only fork from sessions owned by the same user — the create-time
     // permission check already ensured the caller had write on the source.
-    const sourceRow = this.db.one("SELECT id FROM sessions WHERE id = ?", sourceSessionId);
+    const sourceRow = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM sessions WHERE id = ?", sourceSessionId))[0] as SqlRow | null);
     if (!sourceRow) {
       throw new SourceSessionMissingError(sourceSessionId);
     }
@@ -3033,7 +3026,7 @@ export class UserControl extends DurableObject<Env> {
       httpMetadata: { contentType: "application/json" },
       customMetadata: { ownerEmail },
     });
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO fork_snapshots (id, payload, created_at, backend, r2_key, size_bytes) VALUES (?, '', ?, 'r2', ?, ?)",
       snapshotId,
       nowEpoch(),
@@ -3076,7 +3069,7 @@ export class UserControl extends DurableObject<Env> {
           error: err instanceof Error ? err.message : String(err),
         });
       });
-      this.db.exec("DELETE FROM fork_snapshots WHERE id = ?", snapshotId);
+      this.ctx.storage.sql.exec("DELETE FROM fork_snapshots WHERE id = ?", snapshotId);
     }
 
     if (!importOk) throw new Error("fork import did not complete");
@@ -3092,7 +3085,7 @@ export class UserControl extends DurableObject<Env> {
     const now = nowEpoch();
     if (scheduleType === "delayed" || scheduleType === "scheduled") {
       // One-shot complete — delete the row entirely.
-      this.db.exec("DELETE FROM scheduled_sessions WHERE id = ?", id);
+      this.ctx.storage.sql.exec("DELETE FROM scheduled_sessions WHERE id = ?", id);
       return;
     }
 
@@ -3110,7 +3103,7 @@ export class UserControl extends DurableObject<Env> {
       nextRun = now + Number(row.interval_seconds ?? MIN_INTERVAL_SECONDS);
     }
 
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `UPDATE scheduled_sessions
          SET last_run_epoch = ?,
              last_session_id = ?,
@@ -3136,7 +3129,7 @@ export class UserControl extends DurableObject<Env> {
 
     if (failureCount >= MAX_FAILURES) {
       // Stall — next_run_epoch NULL so alarm() skips it until manual retry.
-      this.db.exec(
+      this.ctx.storage.sql.exec(
         "UPDATE scheduled_sessions SET failure_count = ?, last_error = ?, stalled_at = ?, next_run_epoch = NULL WHERE id = ?",
         failureCount,
         errorMessage.slice(0, 500),
@@ -3148,7 +3141,7 @@ export class UserControl extends DurableObject<Env> {
 
     // Exponential backoff: 60s, 120s, 240s, 480s, capped at 3600s.
     const backoff = Math.min(60 * 2 ** failureCount, 3600);
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "UPDATE scheduled_sessions SET failure_count = ?, last_error = ?, next_run_epoch = ? WHERE id = ?",
       failureCount,
       errorMessage.slice(0, 500),

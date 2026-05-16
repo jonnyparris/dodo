@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { resolveAdminEmail } from "./auth";
 import { hashShareToken } from "./share";
-import { epochToIso, nowEpoch, SqlHelper, type SqlRow } from "./sql-helpers";
+import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import type { AllowlistEntry, Env, SeedRecord } from "./types";
 
 function normalizeHostname(hostname: string): string {
@@ -98,11 +98,9 @@ function isRoutableByOpencodeGateway(id: string): boolean {
  * models cache, and (Phase 2) session shares/permissions.
  */
 export class SharedIndex extends DurableObject<Env> {
-  private readonly db: SqlHelper;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.db = new SqlHelper(ctx.storage.sql);
     ctx.blockConcurrencyWhile(async () => {
       this.initializeSchema();
       this.seedAdmin();
@@ -121,7 +119,7 @@ export class SharedIndex extends DurableObject<Env> {
         const user = this.getUser(email);
         if (!user || user.blockedAt) return Response.json({ allowed: false }, { status: 403 });
         // Update last_seen_at
-        this.db.exec("UPDATE users SET last_seen_at = ? WHERE email = ?", nowEpoch(), email);
+        this.ctx.storage.sql.exec("UPDATE users SET last_seen_at = ? WHERE email = ?", nowEpoch(), email);
         return Response.json({ allowed: true, role: user.role });
       }
 
@@ -140,19 +138,19 @@ export class SharedIndex extends DurableObject<Env> {
 
       if (request.method === "DELETE" && url.pathname.match(/^\/users\/[^/]+$/)) {
         const email = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        this.db.exec("DELETE FROM users WHERE email = ?", email);
+        this.ctx.storage.sql.exec("DELETE FROM users WHERE email = ?", email);
         return Response.json({ deleted: true, email });
       }
 
       if (request.method === "POST" && url.pathname.match(/^\/users\/[^/]+\/block$/)) {
         const email = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        this.db.exec("UPDATE users SET blocked_at = ? WHERE email = ?", nowEpoch(), email);
+        this.ctx.storage.sql.exec("UPDATE users SET blocked_at = ? WHERE email = ?", nowEpoch(), email);
         return Response.json({ blocked: true, email });
       }
 
       if (request.method === "DELETE" && url.pathname.match(/^\/users\/[^/]+\/block$/)) {
         const email = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        this.db.exec("UPDATE users SET blocked_at = NULL WHERE email = ?", email);
+        this.ctx.storage.sql.exec("UPDATE users SET blocked_at = NULL WHERE email = ?", email);
         return Response.json({ unblocked: true, email });
       }
 
@@ -160,19 +158,19 @@ export class SharedIndex extends DurableObject<Env> {
 
       if (request.method === "POST" && url.pathname.match(/^\/users\/[^/]+\/browser$/)) {
         const email = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        this.db.exec("UPDATE users SET browser_enabled = 1 WHERE email = ?", email);
+        this.ctx.storage.sql.exec("UPDATE users SET browser_enabled = 1 WHERE email = ?", email);
         return Response.json({ browserEnabled: true, email });
       }
 
       if (request.method === "DELETE" && url.pathname.match(/^\/users\/[^/]+\/browser$/)) {
         const email = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        this.db.exec("UPDATE users SET browser_enabled = 0 WHERE email = ?", email);
+        this.ctx.storage.sql.exec("UPDATE users SET browser_enabled = 0 WHERE email = ?", email);
         return Response.json({ browserEnabled: false, email });
       }
 
       if (request.method === "GET" && url.pathname.match(/^\/users\/[^/]+\/browser$/)) {
         const email = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const row = this.db.one("SELECT browser_enabled FROM users WHERE email = ?", email);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT browser_enabled FROM users WHERE email = ?", email))[0] as SqlRow | null);
         if (!row) return Response.json({ error: "User not found" }, { status: 404 });
         return Response.json({ browserEnabled: Number(row.browser_enabled) === 1, email });
       }
@@ -190,7 +188,7 @@ export class SharedIndex extends DurableObject<Env> {
 
       if (request.method === "DELETE" && url.pathname.startsWith("/allowlist/") && !url.pathname.includes("/check")) {
         const hostname = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        this.db.exec("DELETE FROM host_allowlist WHERE hostname = ?", normalizeHostname(hostname));
+        this.ctx.storage.sql.exec("DELETE FROM host_allowlist WHERE hostname = ?", normalizeHostname(hostname));
         return Response.json({ deleted: true, hostname: normalizeHostname(hostname) });
       }
 
@@ -204,7 +202,7 @@ export class SharedIndex extends DurableObject<Env> {
       if (request.method === "GET" && url.pathname === "/models") {
         const refresh = url.searchParams.get("refresh") === "1";
         if (refresh) {
-          this.db.exec("DELETE FROM models_cache");
+          this.ctx.storage.sql.exec("DELETE FROM models_cache");
         }
         // `gateway` query param filters the list for the active gateway.
         // "opencode" → only providers the opencode gateway can actually route.
@@ -253,7 +251,7 @@ export class SharedIndex extends DurableObject<Env> {
 
       if (request.method === "DELETE" && url.pathname.match(/^\/shares\/[^/]+$/)) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        this.db.exec("UPDATE session_shares SET revoked_at = ? WHERE id = ?", nowEpoch(), id);
+        this.ctx.storage.sql.exec("UPDATE session_shares SET revoked_at = ? WHERE id = ?", nowEpoch(), id);
         return Response.json({ revoked: true, id });
       }
 
@@ -293,8 +291,8 @@ export class SharedIndex extends DurableObject<Env> {
 
       if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/([^/]+)\/cleanup$/)) {
         const sessionId = decodeURIComponent(url.pathname.split("/")[2]);
-        this.db.exec("DELETE FROM session_shares WHERE session_id = ?", sessionId);
-        this.db.exec("DELETE FROM session_permissions WHERE session_id = ?", sessionId);
+        this.ctx.storage.sql.exec("DELETE FROM session_shares WHERE session_id = ?", sessionId);
+        this.ctx.storage.sql.exec("DELETE FROM session_permissions WHERE session_id = ?", sessionId);
         return Response.json({ cleaned: true }, { headers: { "content-type": "application/json" } });
       }
 
@@ -302,7 +300,7 @@ export class SharedIndex extends DurableObject<Env> {
         const parts = url.pathname.split("/");
         const sessionId = decodeURIComponent(parts[2]);
         const email = decodeURIComponent(parts[3]);
-        this.db.exec("DELETE FROM session_permissions WHERE session_id = ? AND grantee_email = ?", sessionId, email);
+        this.ctx.storage.sql.exec("DELETE FROM session_permissions WHERE session_id = ? AND grantee_email = ?", sessionId, email);
         return Response.json({ revoked: true, sessionId, email });
       }
 
@@ -335,7 +333,7 @@ export class SharedIndex extends DurableObject<Env> {
         const parts = url.pathname.split("/");
         const owner = decodeURIComponent(parts[2]);
         const email = decodeURIComponent(parts[3]);
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           "UPDATE account_permissions SET revoked_at = ? WHERE account_owner = ? AND grantee_email = ?",
           nowEpoch(), owner, email,
         );
@@ -378,20 +376,20 @@ export class SharedIndex extends DurableObject<Env> {
         // here is a global ceiling that protects R2 / SQLite. Errors
         // older than 7 days are auto-pruned below. (audit follow-up F5)
         const oneHourAgo = nowEpoch() - 3600;
-        const countRow = this.db.one(
+        const countRow = (Array.from(this.ctx.storage.sql.exec(
           "SELECT COUNT(*) AS c FROM client_errors WHERE created_at > ?",
           oneHourAgo,
-        );
+        ))[0] as SqlRow | null);
         if (Number(countRow?.c ?? 0) >= 1000) {
           return Response.json({ error: "Rate limit exceeded (global)" }, { status: 429 });
         }
 
         // Auto-prune errors older than 7 days
         const sevenDaysAgo = nowEpoch() - 7 * 24 * 3600;
-        this.db.exec("DELETE FROM client_errors WHERE created_at < ?", sevenDaysAgo);
+        this.ctx.storage.sql.exec("DELETE FROM client_errors WHERE created_at < ?", sevenDaysAgo);
 
         const id = crypto.randomUUID();
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           "INSERT INTO client_errors (id, message, source, lineno, colno, stack, user_agent, email, url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           id,
           body.message,
@@ -422,7 +420,7 @@ export class SharedIndex extends DurableObject<Env> {
         query += " ORDER BY created_at DESC LIMIT ?";
         bindings.push(limit);
 
-        const errors = this.db.all(query, ...bindings).map((row) => ({
+        const errors = Array.from(this.ctx.storage.sql.exec(query, ...bindings)).map((row) => ({
           id: String(row.id),
           message: String(row.message),
           source: row.source === null ? null : String(row.source),
@@ -435,21 +433,19 @@ export class SharedIndex extends DurableObject<Env> {
           createdAt: epochToIso(row.created_at),
         }));
 
-        const totalRow = this.db.one(
+        const totalRow = (Array.from(this.ctx.storage.sql.exec(
           "SELECT COUNT(*) AS c FROM client_errors WHERE created_at > ?",
           since,
-        );
+        ))[0] as SqlRow | null);
         return Response.json({ errors, total: Number(totalRow?.c ?? 0) });
       }
 
       if (request.method === "GET" && url.pathname === "/errors/summary") {
         const since = nowEpoch() - 24 * 3600;
-        const groups = this.db
-          .all(
+        const groups = Array.from(this.ctx.storage.sql.exec(
             "SELECT message, COUNT(*) AS count, MAX(created_at) AS last_seen, source FROM client_errors WHERE created_at > ? GROUP BY message ORDER BY count DESC",
             since,
-          )
-          .map((row) => ({
+          )).map((row) => ({
             message: String(row.message),
             count: Number(row.count),
             lastSeen: epochToIso(row.last_seen),
@@ -459,7 +455,7 @@ export class SharedIndex extends DurableObject<Env> {
       }
 
       if (request.method === "DELETE" && url.pathname === "/errors") {
-        this.db.exec("DELETE FROM client_errors");
+        this.ctx.storage.sql.exec("DELETE FROM client_errors");
         return Response.json({ cleared: true });
       }
 
@@ -488,7 +484,7 @@ export class SharedIndex extends DurableObject<Env> {
         if (!body.token || !body.email) {
           return Response.json({ error: "token and email required" }, { status: 400 });
         }
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           "INSERT OR REPLACE INTO mcp_token_index (token, email, created_at) VALUES (?, ?, ?)",
           body.token,
           body.email.trim().toLowerCase(),
@@ -500,13 +496,13 @@ export class SharedIndex extends DurableObject<Env> {
       if (request.method === "GET" && url.pathname.startsWith("/mcp-token-index/")) {
         const token = decodeURIComponent(url.pathname.slice("/mcp-token-index/".length));
         if (!token) return Response.json({ email: null });
-        const row = this.db.one("SELECT email FROM mcp_token_index WHERE token = ?", token);
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT email FROM mcp_token_index WHERE token = ?", token))[0] as SqlRow | null);
         return Response.json({ email: row ? String(row.email) : null });
       }
 
       if (request.method === "DELETE" && url.pathname.startsWith("/mcp-token-index/")) {
         const token = decodeURIComponent(url.pathname.slice("/mcp-token-index/".length));
-        this.db.exec("DELETE FROM mcp_token_index WHERE token = ?", token);
+        this.ctx.storage.sql.exec("DELETE FROM mcp_token_index WHERE token = ?", token);
         return Response.json({ ok: true });
       }
 
@@ -514,7 +510,7 @@ export class SharedIndex extends DurableObject<Env> {
       // and when a user is removed from the allowlist).
       if (request.method === "DELETE" && url.pathname.startsWith("/mcp-token-index-by-email/")) {
         const email = decodeURIComponent(url.pathname.slice("/mcp-token-index-by-email/".length)).trim().toLowerCase();
-        this.db.exec("DELETE FROM mcp_token_index WHERE email = ?", email);
+        this.ctx.storage.sql.exec("DELETE FROM mcp_token_index WHERE email = ?", email);
         return Response.json({ ok: true });
       }
 
@@ -545,7 +541,7 @@ export class SharedIndex extends DurableObject<Env> {
         if (existing) return Response.json({ seed: existing, created: false });
 
         const now = nowEpoch();
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           `INSERT INTO seed_sessions (repo_id, base_branch, session_id, owner_email, repo_url, repo_dir, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           body.repoId,
@@ -574,7 +570,7 @@ export class SharedIndex extends DurableObject<Env> {
         const repoId = decodeURIComponent(parts[2]);
         const baseBranch = decodeURIComponent(parts[3]);
         const before = this.getSeed(repoId, baseBranch);
-        this.db.exec("DELETE FROM seed_sessions WHERE repo_id = ? AND base_branch = ?", repoId, baseBranch);
+        this.ctx.storage.sql.exec("DELETE FROM seed_sessions WHERE repo_id = ? AND base_branch = ?", repoId, baseBranch);
         return Response.json({ deleted: true, repoId, baseBranch, seed: before });
       }
 
@@ -584,7 +580,7 @@ export class SharedIndex extends DurableObject<Env> {
         const parts = url.pathname.split("/");
         const repoId = decodeURIComponent(parts[2]);
         const baseBranch = decodeURIComponent(parts[3]);
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           "UPDATE seed_sessions SET updated_at = ? WHERE repo_id = ? AND base_branch = ?",
           nowEpoch(),
           repoId,
@@ -601,7 +597,7 @@ export class SharedIndex extends DurableObject<Env> {
   }
 
   private initializeSchema(): void {
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS users (
         email TEXT PRIMARY KEY,
         display_name TEXT,
@@ -612,14 +608,14 @@ export class SharedIndex extends DurableObject<Env> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS host_allowlist (
         hostname TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS models_cache (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -631,7 +627,7 @@ export class SharedIndex extends DurableObject<Env> {
     `);
 
     // Phase 2 tables — created now so schema is stable
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS session_shares (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -644,9 +640,9 @@ export class SharedIndex extends DurableObject<Env> {
         label TEXT
       )
     `);
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_shares_session ON session_shares(session_id)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_shares_session ON session_shares(session_id)");
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS session_permissions (
         session_id TEXT NOT NULL,
         owner_email TEXT NOT NULL,
@@ -657,9 +653,9 @@ export class SharedIndex extends DurableObject<Env> {
         PRIMARY KEY (session_id, grantee_email)
       )
     `);
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_perms_grantee ON session_permissions(grantee_email)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_perms_grantee ON session_permissions(grantee_email)");
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS account_permissions (
         account_owner TEXT NOT NULL,
         grantee_email TEXT NOT NULL,
@@ -671,17 +667,17 @@ export class SharedIndex extends DurableObject<Env> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS aggregate_stats (
         key TEXT PRIMARY KEY,
         value INTEGER NOT NULL DEFAULT 0
       )
     `);
     // Seed default stat keys
-    this.db.exec("INSERT OR IGNORE INTO aggregate_stats (key, value) VALUES ('sessionCount', 0)");
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO aggregate_stats (key, value) VALUES ('sessionCount', 0)");
 
     // Client error reporting table
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS client_errors (
         id TEXT PRIMARY KEY,
         message TEXT NOT NULL,
@@ -695,27 +691,27 @@ export class SharedIndex extends DurableObject<Env> {
         created_at INTEGER NOT NULL
       )
     `);
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_errors_created ON client_errors(created_at)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_errors_created ON client_errors(created_at)");
 
     // Global token → email pointer for user-scoped MCP tokens. The full
     // token record (with label, timestamps) lives in the user's UserControl
     // DO; this table only exists so /mcp can resolve a bearer token to an
     // email without knowing which user to ask. Wiped per-user when tokens
     // are revoked or the user is deleted.
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS mcp_token_index (
         token TEXT PRIMARY KEY,
         email TEXT NOT NULL,
         created_at INTEGER NOT NULL
       )
     `);
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_mcp_token_index_email ON mcp_token_index(email)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_mcp_token_index_email ON mcp_token_index(email)");
 
     // Global seed-session registry. Maps a known repo + base branch to an
     // admin-owned session that already has the repo cloned. Other users
     // fork that session instead of cloning from scratch, saving tokens and
     // wall time. Manual-cleanup-only — never auto-evicted.
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS seed_sessions (
         repo_id TEXT NOT NULL,
         base_branch TEXT NOT NULL,
@@ -736,18 +732,16 @@ export class SharedIndex extends DurableObject<Env> {
   // ─── Seed session registry ───
 
   private getSeed(repoId: string, baseBranch: string): SeedRecord | null {
-    const row = this.db.one(
+    const row = (Array.from(this.ctx.storage.sql.exec(
       "SELECT repo_id, base_branch, session_id, owner_email, repo_url, repo_dir, created_at, updated_at FROM seed_sessions WHERE repo_id = ? AND base_branch = ?",
       repoId,
       baseBranch,
-    );
+    ))[0] as SqlRow | null);
     return row ? this.mapSeedRow(row) : null;
   }
 
   private listSeeds(): SeedRecord[] {
-    return this.db
-      .all("SELECT repo_id, base_branch, session_id, owner_email, repo_url, repo_dir, created_at, updated_at FROM seed_sessions ORDER BY repo_id ASC, base_branch ASC")
-      .map((row) => this.mapSeedRow(row));
+    return Array.from(this.ctx.storage.sql.exec("SELECT repo_id, base_branch, session_id, owner_email, repo_url, repo_dir, created_at, updated_at FROM seed_sessions ORDER BY repo_id ASC, base_branch ASC")).map((row) => this.mapSeedRow(row));
   }
 
   private mapSeedRow(row: SqlRow): SeedRecord {
@@ -765,10 +759,10 @@ export class SharedIndex extends DurableObject<Env> {
 
   private migrateAddBrowserEnabled(): void {
     // Check if column already exists by querying table_info
-    const cols = this.db.all("PRAGMA table_info(users)");
+    const cols = Array.from(this.ctx.storage.sql.exec("PRAGMA table_info(users)"));
     const hasBrowserEnabled = cols.some((col) => String(col.name) === "browser_enabled");
     if (!hasBrowserEnabled) {
-      this.db.exec("ALTER TABLE users ADD COLUMN browser_enabled INTEGER NOT NULL DEFAULT 0");
+      this.ctx.storage.sql.exec("ALTER TABLE users ADD COLUMN browser_enabled INTEGER NOT NULL DEFAULT 0");
     }
   }
 
@@ -776,7 +770,7 @@ export class SharedIndex extends DurableObject<Env> {
     const adminEmail = resolveAdminEmail(this.env);
     if (!adminEmail) return; // No admin configured — skip seeding
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO users (email, display_name, role, created_at, last_seen_at) VALUES (?, ?, 'admin', ?, ?)",
       adminEmail,
       "Admin",
@@ -788,19 +782,18 @@ export class SharedIndex extends DurableObject<Env> {
   // ─── User management ───
 
   private getUser(email: string): { email: string; displayName: string | null; role: string; blockedAt: number | null; browserEnabled: boolean; createdAt: string; lastSeenAt: string } | null {
-    const row = this.db.one("SELECT email, display_name, role, blocked_at, browser_enabled, created_at, last_seen_at FROM users WHERE email = ?", email);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT email, display_name, role, blocked_at, browser_enabled, created_at, last_seen_at FROM users WHERE email = ?", email))[0] as SqlRow | null);
     if (!row) return null;
     return this.mapUserRow(row);
   }
 
   private listUsers(): Array<{ email: string; displayName: string | null; role: string; blockedAt: number | null; browserEnabled: boolean; createdAt: string; lastSeenAt: string }> {
-    return this.db.all("SELECT email, display_name, role, blocked_at, browser_enabled, created_at, last_seen_at FROM users ORDER BY created_at ASC")
-      .map((row) => this.mapUserRow(row));
+    return Array.from(this.ctx.storage.sql.exec("SELECT email, display_name, role, blocked_at, browser_enabled, created_at, last_seen_at FROM users ORDER BY created_at ASC")).map((row) => this.mapUserRow(row));
   }
 
   private addUser(email: string, displayName: string | null, role: string): { email: string; displayName: string | null; role: string; blockedAt: number | null; browserEnabled: boolean; createdAt: string; lastSeenAt: string } {
     const now = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO users (email, display_name, role, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET display_name = COALESCE(excluded.display_name, users.display_name), role = excluded.role",
       email,
       displayName,
@@ -828,19 +821,19 @@ export class SharedIndex extends DurableObject<Env> {
   private addAllowlistHost(hostname: string): AllowlistEntry {
     const normalized = normalizeHostname(hostname);
     if (!normalized) throw new Error("Hostname is required");
-    this.db.exec("INSERT OR IGNORE INTO host_allowlist (hostname, created_at) VALUES (?, ?)", normalized, nowEpoch());
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO host_allowlist (hostname, created_at) VALUES (?, ?)", normalized, nowEpoch());
     return this.listAllowlist().find((entry) => entry.hostname === normalized)!;
   }
 
   private listAllowlist(): AllowlistEntry[] {
-    return this.db.all("SELECT hostname, created_at FROM host_allowlist ORDER BY hostname ASC").map((row) => ({
+    return Array.from(this.ctx.storage.sql.exec("SELECT hostname, created_at FROM host_allowlist ORDER BY hostname ASC")).map((row) => ({
       createdAt: epochToIso(row.created_at),
       hostname: String(row.hostname),
     }));
   }
 
   private isAllowedHost(hostname: string): boolean {
-    return !!this.db.one("SELECT hostname FROM host_allowlist WHERE hostname = ?", hostname);
+    return !!(Array.from(this.ctx.storage.sql.exec("SELECT hostname FROM host_allowlist WHERE hostname = ?", hostname))[0] as SqlRow | null);
   }
 
   // ─── Models cache (migrated from AppControl) ───
@@ -848,13 +841,13 @@ export class SharedIndex extends DurableObject<Env> {
   private async getModels(): Promise<Array<{ id: string; name: string; costInput: number | null; costOutput: number | null; contextWindow: number | null }>> {
     const CACHE_TTL = 86400;
     const now = nowEpoch();
-    const cached = this.db.all("SELECT id, name, cost_input, cost_output, context_window FROM models_cache WHERE fetched_at > ?", now - CACHE_TTL);
+    const cached = Array.from(this.ctx.storage.sql.exec("SELECT id, name, cost_input, cost_output, context_window FROM models_cache WHERE fetched_at > ?", now - CACHE_TTL));
 
     if (cached.length > 0) {
       const needsEnrichment = cached.filter((row) => row.cost_input === null);
       if (needsEnrichment.length > 0) {
         await this.enrichModelCosts(needsEnrichment.map((row) => String(row.id)));
-        const enriched = this.db.all("SELECT id, name, cost_input, cost_output, context_window FROM models_cache WHERE fetched_at > ?", now - CACHE_TTL);
+        const enriched = Array.from(this.ctx.storage.sql.exec("SELECT id, name, cost_input, cost_output, context_window FROM models_cache WHERE fetched_at > ?", now - CACHE_TTL));
         return enriched.map((row) => this.mapModelRow(row));
       }
       return cached.map((row) => this.mapModelRow(row));
@@ -900,9 +893,9 @@ export class SharedIndex extends DurableObject<Env> {
         }),
       );
 
-      this.db.exec("DELETE FROM models_cache");
+      this.ctx.storage.sql.exec("DELETE FROM models_cache");
       for (const m of details) {
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           "INSERT INTO models_cache (id, name, cost_input, cost_output, context_window, fetched_at) VALUES (?, ?, ?, ?, ?, ?)",
           m.id, m.name, m.costInput, m.costOutput, m.contextWindow, now,
         );
@@ -929,7 +922,7 @@ export class SharedIndex extends DurableObject<Env> {
           const costInputMatch = toml.match(/\[cost\][\s\S]*?input\s*=\s*([\d.]+)/);
           const costOutputMatch = toml.match(/\[cost\][\s\S]*?output\s*=\s*([\d.]+)/);
           const contextMatch = toml.match(/context\s*=\s*([\d_]+)/);
-          this.db.exec(
+          this.ctx.storage.sql.exec(
             "UPDATE models_cache SET name = ?, cost_input = ?, cost_output = ?, context_window = ? WHERE id = ?",
             nameMatch?.[1] ?? slug,
             costInputMatch ? parseFloat(costInputMatch[1]) : null,
@@ -968,7 +961,7 @@ export class SharedIndex extends DurableObject<Env> {
     const now = nowEpoch();
     const expiresAt = input.expiresAt ? Math.floor(new Date(input.expiresAt).getTime() / 1000) : null;
 
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `INSERT INTO session_shares (id, session_id, owner_email, permission, created_by, created_at, expires_at, label)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       tokenHash,
@@ -994,9 +987,7 @@ export class SharedIndex extends DurableObject<Env> {
     expiresAt: string | null;
     revokedAt: string | null;
   }> {
-    return this.db
-      .all("SELECT id, session_id, owner_email, permission, label, created_at, expires_at, revoked_at FROM session_shares WHERE session_id = ? ORDER BY created_at DESC", sessionId)
-      .map((row) => ({
+    return Array.from(this.ctx.storage.sql.exec("SELECT id, session_id, owner_email, permission, label, created_at, expires_at, revoked_at FROM session_shares WHERE session_id = ? ORDER BY created_at DESC", sessionId)).map((row) => ({
         id: String(row.id),
         sessionId: String(row.session_id),
         ownerEmail: String(row.owner_email),
@@ -1015,10 +1006,10 @@ export class SharedIndex extends DurableObject<Env> {
     ownerEmail?: string;
   }> {
     const tokenHash = await hashShareToken(token, this.env.COOKIE_SECRET);
-    const row = this.db.one(
+    const row = (Array.from(this.ctx.storage.sql.exec(
       "SELECT session_id, owner_email, permission, expires_at, revoked_at FROM session_shares WHERE id = ?",
       tokenHash,
-    );
+    ))[0] as SqlRow | null);
 
     if (!row) return { valid: false };
     if (row.revoked_at !== null) return { valid: false };
@@ -1047,10 +1038,10 @@ export class SharedIndex extends DurableObject<Env> {
     grantedBy: string;
     createdAt: string;
   } | null {
-    const row = this.db.one(
+    const row = (Array.from(this.ctx.storage.sql.exec(
       "SELECT session_id, owner_email, grantee_email, permission, granted_by, created_at FROM session_permissions WHERE session_id = ? AND grantee_email = ?",
       sessionId, email,
-    );
+    ))[0] as SqlRow | null);
     if (!row) return null;
     return {
       sessionId: String(row.session_id),
@@ -1069,7 +1060,7 @@ export class SharedIndex extends DurableObject<Env> {
     permission: string;
     grantedBy: string;
   }): void {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `INSERT INTO session_permissions (session_id, owner_email, grantee_email, permission, granted_by, created_at)
        VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id, grantee_email) DO UPDATE SET permission = excluded.permission, granted_by = excluded.granted_by`,
@@ -1090,9 +1081,7 @@ export class SharedIndex extends DurableObject<Env> {
     grantedBy: string;
     createdAt: string;
   }> {
-    return this.db
-      .all("SELECT session_id, owner_email, grantee_email, permission, granted_by, created_at FROM session_permissions WHERE session_id = ? ORDER BY created_at ASC", sessionId)
-      .map((row) => this.mapPermissionRow(row));
+    return Array.from(this.ctx.storage.sql.exec("SELECT session_id, owner_email, grantee_email, permission, granted_by, created_at FROM session_permissions WHERE session_id = ? ORDER BY created_at ASC", sessionId)).map((row) => this.mapPermissionRow(row));
   }
 
   private listPermissionsByGrantee(granteeEmail: string): Array<{
@@ -1103,9 +1092,7 @@ export class SharedIndex extends DurableObject<Env> {
     grantedBy: string;
     createdAt: string;
   }> {
-    return this.db
-      .all("SELECT session_id, owner_email, grantee_email, permission, granted_by, created_at FROM session_permissions WHERE grantee_email = ? ORDER BY created_at ASC", granteeEmail)
-      .map((row) => this.mapPermissionRow(row));
+    return Array.from(this.ctx.storage.sql.exec("SELECT session_id, owner_email, grantee_email, permission, granted_by, created_at FROM session_permissions WHERE grantee_email = ? ORDER BY created_at ASC", granteeEmail)).map((row) => this.mapPermissionRow(row));
   }
 
   private mapPermissionRow(row: SqlRow): {
@@ -1134,7 +1121,7 @@ export class SharedIndex extends DurableObject<Env> {
     permission: string;
     grantedBy: string;
   }): void {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `INSERT INTO account_permissions (account_owner, grantee_email, permission, granted_by, created_at)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(account_owner, grantee_email, permission) DO UPDATE SET granted_by = excluded.granted_by, revoked_at = NULL`,
@@ -1154,9 +1141,7 @@ export class SharedIndex extends DurableObject<Env> {
     createdAt: string;
     revokedAt: string | null;
   }> {
-    return this.db
-      .all("SELECT account_owner, grantee_email, permission, granted_by, created_at, revoked_at FROM account_permissions WHERE account_owner = ? ORDER BY created_at ASC", owner)
-      .map((row) => ({
+    return Array.from(this.ctx.storage.sql.exec("SELECT account_owner, grantee_email, permission, granted_by, created_at, revoked_at FROM account_permissions WHERE account_owner = ? ORDER BY created_at ASC", owner)).map((row) => ({
         accountOwner: String(row.account_owner),
         granteeEmail: String(row.grantee_email),
         permission: String(row.permission),
@@ -1167,10 +1152,10 @@ export class SharedIndex extends DurableObject<Env> {
   }
 
   private checkAccountCreatePermission(granteeEmail: string): { hasCreate: boolean; accountOwner: string | null } {
-    const row = this.db.one(
+    const row = (Array.from(this.ctx.storage.sql.exec(
       "SELECT account_owner FROM account_permissions WHERE grantee_email = ? AND permission = 'create' AND revoked_at IS NULL",
       granteeEmail,
-    );
+    ))[0] as SqlRow | null);
     if (!row) return { hasCreate: false, accountOwner: null };
     return { hasCreate: true, accountOwner: String(row.account_owner) };
   }
@@ -1183,10 +1168,10 @@ export class SharedIndex extends DurableObject<Env> {
     totalShares: number;
     totalPermissions: number;
   } {
-    const userCount = Number(this.db.one("SELECT COUNT(*) AS c FROM users")?.c ?? 0);
-    const sessionCount = Number(this.db.one("SELECT value FROM aggregate_stats WHERE key = 'sessionCount'")?.value ?? 0);
-    const totalShares = Number(this.db.one("SELECT COUNT(*) AS c FROM session_shares WHERE revoked_at IS NULL")?.c ?? 0);
-    const totalPermissions = Number(this.db.one("SELECT COUNT(*) AS c FROM session_permissions")?.c ?? 0);
+    const userCount = Number((Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS c FROM users"))[0] as SqlRow | null)?.c ?? 0);
+    const sessionCount = Number((Array.from(this.ctx.storage.sql.exec("SELECT value FROM aggregate_stats WHERE key = 'sessionCount'"))[0] as SqlRow | null)?.value ?? 0);
+    const totalShares = Number((Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS c FROM session_shares WHERE revoked_at IS NULL"))[0] as SqlRow | null)?.c ?? 0);
+    const totalPermissions = Number((Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS c FROM session_permissions"))[0] as SqlRow | null)?.c ?? 0);
     return { userCount, sessionCount, totalShares, totalPermissions };
   }
 
@@ -1199,13 +1184,11 @@ export class SharedIndex extends DurableObject<Env> {
     createdAt: string;
     lastSeenAt: string;
   }> {
-    return this.db
-      .all("SELECT email, display_name, role, blocked_at, browser_enabled, created_at, last_seen_at FROM users ORDER BY last_seen_at DESC")
-      .map((row) => this.mapUserRow(row));
+    return Array.from(this.ctx.storage.sql.exec("SELECT email, display_name, role, blocked_at, browser_enabled, created_at, last_seen_at FROM users ORDER BY last_seen_at DESC")).map((row) => this.mapUserRow(row));
   }
 
   private incrementStat(key: string, delta: number): void {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO aggregate_stats (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = aggregate_stats.value + ?",
       key,
       delta,
