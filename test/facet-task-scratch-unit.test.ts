@@ -32,7 +32,7 @@ vi.mock("@cloudflare/codemode", async (importOriginal) => {
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/subagent-runner", async () => await import("./helpers/subagent-runner-mock"));
 vi.mock("../src/notify", () => ({
-  sendNotification: vi.fn(),
+  dispatchNotification: vi.fn(),
 }));
 
 function makeParentConfig(overrides: Partial<AppConfig> = {}): AppConfig {

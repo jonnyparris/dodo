@@ -12,7 +12,7 @@ const { sendNotificationMock } = vi.hoisted(() => ({
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 
 vi.mock("../src/notify", () => ({
-  sendNotification: sendNotificationMock,
+  dispatchNotification: sendNotificationMock,
 }));
 
 import worker from "../src/index";

@@ -17,6 +17,20 @@ export type NotificationPayload = {
   ownerEmail?: string;
 };
 
+/** Semantic kind of notification — drives priority mapping and filtering. */
+export type NotificationKind =
+  | "prompt-complete"
+  | "prompt-error"
+  | "prompt-aborted"
+  | "watchdog-stalled"
+  | "run-done"
+  | "run-failed";
+
+/** Input to the pure planning phase. */
+export interface NotificationInput extends NotificationPayload {
+  kind: NotificationKind;
+}
+
 /**
  * A configured delivery target. Implementations are stateless — each
  * `send()` is a one-shot fetch. Failures must not throw out of
@@ -26,6 +40,55 @@ export type NotificationPayload = {
 export interface NotificationChannel {
   readonly id: string;
   send(payload: NotificationPayload): Promise<void>;
+}
+
+/**
+ * Resolved, plain-data channel configuration. Produced by the impure
+ * `resolveNotificationConfig` and consumed by the pure `planNotification`.
+ */
+export interface ResolvedNtfyConfig {
+  type: "ntfy";
+  topic: string;
+}
+
+export interface ResolvedWebhookConfig {
+  type: "webhook";
+  id: string;
+  url: string;
+  method?: "POST" | "PUT";
+  headers: Record<string, string>;
+  bodyTemplate: string;
+  contentType?: string;
+  minPriority?: Priority;
+}
+
+export type ResolvedChannelConfig = ResolvedNtfyConfig | ResolvedWebhookConfig;
+
+/**
+ * Per-user notification configuration resolved from secrets/env.
+ * This is the bridge between the impure secret-resolution world and
+ * the pure planning world.
+ */
+export interface UserNotificationConfig {
+  channels: ResolvedChannelConfig[];
+  /** Optional per-kind priority overrides. When absent, the input's own priority is used. */
+  priorities?: Partial<Record<NotificationKind, Priority>>;
+}
+
+/** One rendered message ready for a specific channel. */
+export interface PlannedChannelMessage {
+  channel: ResolvedChannelConfig;
+  body: string;
+  title: string;
+  priority: Priority;
+  tags?: string;
+  url?: string;
+}
+
+/** The result of pure planning — a manifest of what to send and what was skipped. */
+export interface NotificationPlan {
+  perChannelMessages: PlannedChannelMessage[];
+  skipped: Array<{ channelType: string; channelId?: string; reason: string }>;
 }
 
 /**
@@ -46,39 +109,6 @@ async function readUserSecret(env: Env, ownerEmail: string, key: string): Promis
     // Fall through
   }
   return undefined;
-}
-
-/**
- * Build the ntfy channel for this owner, if a topic is configured.
- * Tries per-user encrypted secret `ntfy_topic` first, then falls back
- * to the shared `NTFY_TOPIC` env var. Returns undefined when neither
- * is set — caller skips the channel.
- */
-async function buildNtfyChannel(env: Env, ownerEmail?: string): Promise<NotificationChannel | undefined> {
-  let topic: string | undefined;
-  if (ownerEmail) topic = await readUserSecret(env, ownerEmail, "ntfy_topic");
-  if (!topic) topic = env.NTFY_TOPIC;
-  if (!topic) return undefined;
-
-  return {
-    id: "ntfy",
-    async send(payload) {
-      const headers: Record<string, string> = {
-        Title: payload.title,
-        Priority: payload.priority ?? "default",
-      };
-      if (payload.tags) headers.Tags = payload.tags;
-      if (payload.url) headers.Click = payload.url;
-
-      await fetch(`https://ntfy.sh/${topic}`, {
-        body: payload.body,
-        headers,
-        method: "POST",
-      }).catch(() => {
-        // Silently ignore — notification failures are non-fatal.
-      });
-    },
-  };
 }
 
 /**
@@ -163,35 +193,6 @@ async function resolveWebhookHeaders(
   return headers;
 }
 
-/** Build a single webhook channel from its config. The returned
- *  channel renders the body template per-call and respects
- *  `minPriority` if set. */
-function buildWebhookChannel(
-  env: Env,
-  ownerEmail: string | undefined,
-  config: WebhookConfig,
-): NotificationChannel {
-  return {
-    id: `webhook:${config.id}`,
-    async send(payload) {
-      if (config.minPriority && priorityRank(payload.priority) < priorityRank(config.minPriority)) {
-        return;
-      }
-      const contentType = config.contentType ?? "application/json";
-      const jsonEscape = contentType.includes("json");
-      const body = renderTemplate(config.bodyTemplate, payload, jsonEscape);
-      const headers = await resolveWebhookHeaders(env, ownerEmail, config);
-      await fetch(config.url, {
-        method: config.method ?? "POST",
-        headers,
-        body,
-      }).catch(() => {
-        // Silently ignore — notification failures are non-fatal.
-      });
-    },
-  };
-}
-
 /** Load configured webhooks from the encrypted secret
  *  `notification_webhooks`. Malformed JSON or missing required fields
  *  on individual entries are ignored — a broken entry must not stop
@@ -214,42 +215,144 @@ async function loadWebhookConfigs(env: Env, ownerEmail?: string): Promise<Webhoo
 }
 
 /**
- * Resolve all enabled notification channels for an owner. Channels
- * are independent — one returning undefined doesn't stop the others.
- *
- * Channel order today:
- *   1. ntfy (per-user secret or env fallback)
- *   2. generic webhooks (zero or more, from `notification_webhooks` secret)
- *
- * Future channels (email, etc.) plug in here.
+ * Resolve all enabled notification channels for an owner into plain
+ * data configs. This is the impure boundary — it reads secrets and
+ * env vars. The result is fed into the pure `planNotification`.
  */
-async function resolveChannels(env: Env, ownerEmail?: string): Promise<NotificationChannel[]> {
-  const channels: NotificationChannel[] = [];
-  const ntfy = await buildNtfyChannel(env, ownerEmail);
-  if (ntfy) channels.push(ntfy);
+export async function resolveNotificationConfig(env: Env, ownerEmail?: string): Promise<UserNotificationConfig> {
+  const channels: ResolvedChannelConfig[] = [];
+
+  // ntfy
+  let topic: string | undefined;
+  if (ownerEmail) topic = await readUserSecret(env, ownerEmail, "ntfy_topic");
+  if (!topic) topic = env.NTFY_TOPIC;
+  if (topic) channels.push({ type: "ntfy", topic });
+
+  // webhooks
   const webhookConfigs = await loadWebhookConfigs(env, ownerEmail);
   for (const config of webhookConfigs) {
-    channels.push(buildWebhookChannel(env, ownerEmail, config));
+    const headers = await resolveWebhookHeaders(env, ownerEmail, config);
+    channels.push({
+      type: "webhook",
+      id: config.id,
+      url: config.url,
+      method: config.method,
+      headers,
+      bodyTemplate: config.bodyTemplate,
+      contentType: config.contentType,
+      minPriority: config.minPriority,
+    });
   }
-  return channels;
+
+  return { channels };
 }
 
 /**
- * Dispatch a notification to every configured channel for this owner.
- * Fire-and-forget via `ctx.waitUntil` — the call returns immediately
- * and delivery happens out-of-band. Per-channel failures are swallowed
- * inside each channel's `send()`.
+ * Pure function: given a notification input and resolved user config,
+ * produce a plan of exactly which messages go to which channels and
+ * which channels are skipped (with reasons).
+ *
+ * No fetch, no waitUntil, no storage access. Testable as plain data.
  */
-export function sendNotification(
+export function planNotification(input: NotificationInput, config: UserNotificationConfig): NotificationPlan {
+  const perChannelMessages: PlannedChannelMessage[] = [];
+  const skipped: NotificationPlan["skipped"] = [];
+
+  const effectivePriority: Priority = config.priorities?.[input.kind] ?? input.priority ?? "default";
+
+  for (const channel of config.channels) {
+    if (channel.type === "ntfy") {
+      perChannelMessages.push({
+        channel,
+        title: input.title,
+        body: input.body,
+        priority: effectivePriority,
+        tags: input.tags,
+        url: input.url,
+      });
+      continue;
+    }
+
+    if (channel.type === "webhook") {
+      if (channel.minPriority && priorityRank(effectivePriority) < priorityRank(channel.minPriority)) {
+        skipped.push({
+          channelType: "webhook",
+          channelId: channel.id,
+          reason: `priority ${effectivePriority} below minPriority ${channel.minPriority}`,
+        });
+        continue;
+      }
+      const contentType = channel.contentType ?? "application/json";
+      const jsonEscape = contentType.includes("json");
+      const body = renderTemplate(channel.bodyTemplate, { ...input, priority: effectivePriority }, jsonEscape);
+      perChannelMessages.push({
+        channel,
+        title: input.title,
+        body,
+        priority: effectivePriority,
+        tags: input.tags,
+        url: input.url,
+      });
+    }
+  }
+
+  return { perChannelMessages, skipped };
+}
+
+/**
+ * Impure function: execute a notification plan by iterating
+ * `perChannelMessages` and firing each over its channel. Failures
+ * are swallowed per-channel so one failing target doesn't block
+ * the others.
+ */
+export async function sendNotification(plan: NotificationPlan, _env: Env): Promise<void> {
+  await Promise.all(
+    plan.perChannelMessages.map(async (message) => {
+      const channel = message.channel;
+      try {
+        if (channel.type === "ntfy") {
+          const headers: Record<string, string> = {
+            Title: message.title,
+            Priority: message.priority,
+          };
+          if (message.tags) headers.Tags = message.tags;
+          if (message.url) headers.Click = message.url;
+
+          await fetch(`https://ntfy.sh/${channel.topic}`, {
+            body: message.body,
+            headers,
+            method: "POST",
+          });
+        } else if (channel.type === "webhook") {
+          await fetch(channel.url, {
+            method: channel.method ?? "POST",
+            headers: channel.headers,
+            body: message.body,
+          });
+        }
+      } catch {
+        // Silently ignore — notification failures are non-fatal.
+      }
+    }),
+  );
+}
+
+/**
+ * Convenience: resolve config, plan, and dispatch inside `waitUntil`.
+ * Returns the plan synchronously so callers can observe what was
+ * composed. This is the stable public surface for existing call sites.
+ */
+export function dispatchNotification(
   env: Env,
   ctx: { waitUntil: (promise: Promise<unknown>) => void },
-  options: NotificationPayload,
+  input: NotificationInput,
 ): void {
   ctx.waitUntil(
     (async () => {
-      const channels = await resolveChannels(env, options.ownerEmail);
-      if (channels.length === 0) return;
-      await Promise.all(channels.map((channel) => channel.send(options).catch(() => {})));
+      const config = await resolveNotificationConfig(env, input.ownerEmail);
+      const plan = planNotification(input, config);
+      if (plan.perChannelMessages.length === 0) return;
+      await sendNotification(plan, env);
     })(),
   );
 }
@@ -272,8 +375,8 @@ export function sendRunNotification(
   ownerEmail?: string,
 ): void {
   if (run.status === oldStatus) return;
-  const config = RUN_STATUS_NOTIFY_CONFIG[run.status];
-  if (!config) return;
+  const statusConfig = RUN_STATUS_NOTIFY_CONFIG[run.status];
+  if (!statusConfig) return;
 
   const lines: string[] = [
     `Branch: ${run.branch}`,
@@ -286,11 +389,12 @@ export function sendRunNotification(
     lines.push(`Snapshot: ${run.failureSnapshotId}`);
   }
 
-  sendNotification(env, ctx, {
-    title: `Dodo: ${run.title} ${config.titleSuffix}`,
+  dispatchNotification(env, ctx, {
+    kind: run.status === "done" ? "run-done" : "run-failed",
+    title: `Dodo: ${run.title} ${statusConfig.titleSuffix}`,
     body: lines.join("\n"),
-    priority: config.priority,
-    tags: config.tags,
+    priority: statusConfig.priority,
+    tags: statusConfig.tags,
     ownerEmail,
   });
 }
