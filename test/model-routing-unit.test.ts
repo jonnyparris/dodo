@@ -13,7 +13,7 @@
  * Keep this file in sync with the canonical versions in src/.
  */
 import { describe, expect, it } from "vitest";
-import { resolveWireModelId } from "../src/agentic";
+import { resolveWireModelId } from "../src/subagent-runner";
 
 // ─── Mirror of isRoutableByOpencodeGateway from src/shared-index.ts ───
 

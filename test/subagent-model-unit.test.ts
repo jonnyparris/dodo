@@ -6,7 +6,7 @@
  * spinning up a provider / real LLM.
  */
 import { describe, expect, it } from "vitest";
-import { resolveSubagentModel } from "../src/agentic";
+import { resolveSubagentModel } from "../src/subagent-runner";
 
 const MAIN_ANTHROPIC = "anthropic/claude-opus-4-7";
 const MAIN_OPENAI = "openai/gpt-5.4";

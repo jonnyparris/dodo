@@ -17,6 +17,14 @@ export type {
 } from "@cloudflare/think";
 
 export { createWorkspaceTools } from "@cloudflare/think/tools/workspace";
+export {
+  createReadTool,
+  createListTool,
+  createFindTool,
+  createGrepTool,
+  createWriteTool,
+  createEditTool,
+} from "@cloudflare/think/tools/workspace";
 export { createExecuteTool } from "@cloudflare/think/tools/execute";
 export { truncateToolOutput } from "@cloudflare/think/session";
 

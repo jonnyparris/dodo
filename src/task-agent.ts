@@ -1,6 +1,6 @@
 import { Workspace } from "@cloudflare/shell";
 import { Agent, getAgentByName } from "agents";
-import { generateText, stepCountIs, type ToolSet } from "ai";
+import { type ToolSet } from "ai";
 import {
   createReadTool,
   createListTool,
@@ -8,16 +8,14 @@ import {
   createGrepTool,
   createWriteTool,
   createEditTool,
-} from "@cloudflare/think/tools/workspace";
+} from "./think-adapter";
 import {
-  buildProviderForModel,
-  capToolOutputs,
+  runSubagent,
   resolveSubagentModel,
-  subagentPrepareStep,
   TASK_SYSTEM_PROMPT,
   TASK_MAX_STEPS,
   TASK_FACET_TIMEOUT_MS,
-} from "./agentic";
+} from "./subagent-runner";
 import type { AppConfig, Env } from "./types";
 import type { CodingAgent } from "./coding-agent";
 
@@ -221,8 +219,6 @@ export class TaskAgent extends Agent<Env> {
     const workspaceMode: "shared" | "scratch" = opts.workspaceMode ?? "shared";
 
     const modelId = resolveSubagentModel({ model: opts.model }, config.taskModel, config.model);
-    const provider = buildProviderForModel(modelId, config, this.env);
-    const model = provider.chatModel(modelId);
 
     const parent = (await getAgentByName(
       this.env.CODING_AGENT as never,
@@ -264,45 +260,35 @@ export class TaskAgent extends Agent<Env> {
     const timeoutMs = TASK_FACET_TIMEOUT_MS;
 
     try {
-      const result = await generateText({
-        model,
-        system: TASK_SYSTEM_PROMPT,
-        messages: [{ role: "user" as const, content: userMessage }],
-        tools: taskTools,
-        stopWhen: stepCountIs(TASK_MAX_STEPS),
-        maxOutputTokens: 4000,
-        // See `subagentPrepareStep` in agentic.ts — prunes tool-result
-        // accumulation across steps. Task has more tool call variety than
-        // explore (write + edit in addition to read/grep/find) so the
-        // accumulation curve is steeper without this.
-        prepareStep: subagentPrepareStep(),
-        abortSignal: AbortSignal.timeout(timeoutMs),
+      const result = await runSubagent({
+        kind: "task",
+        prompt: userMessage,
+        model: modelId,
+        config,
+        toolset: taskTools,
+        systemPrompt: TASK_SYSTEM_PROMPT,
+        maxSteps: TASK_MAX_STEPS,
+        timeoutMs,
+        env: this.env,
       });
 
-      const summaryText = result.text;
-      const steps = result.steps.length;
-      const toolCalls = result.steps.flatMap((s) =>
-        (s.toolCalls ?? []).map((tc) => tc.toolName),
-      );
-      const totalInput = result.steps.reduce((sum, s) => sum + (s.usage?.inputTokens ?? 0), 0);
-      const totalOutput = result.steps.reduce((sum, s) => sum + (s.usage?.outputTokens ?? 0), 0);
-      const usageLine = totalInput > 0 || totalOutput > 0
-        ? `**Tokens:** ${totalInput} in / ${totalOutput} out | `
+      const usageLine = result.tokenInput > 0 || result.tokenOutput > 0
+        ? `**Tokens:** ${result.tokenInput} in / ${result.tokenOutput} out | `
         : "";
 
       const modeLabel = workspaceMode === "scratch" ? " [scratch workspace]" : "";
       const formatted = [
         `## Task results (model: ${modelId}) [facet: ${this.name}]${modeLabel}`,
-        `${usageLine}**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
+        `${usageLine}**Steps:** ${result.steps} | **Tools used:** ${result.toolCalls.join(", ") || "none"}`,
         "",
-        summaryText || "(No output — task ran its step budget without emitting a summary.)",
+        result.finalText || "(No output — task ran its step budget without emitting a summary.)",
       ].filter(Boolean).join("\n");
 
       this.recordTranscript("assistant", formatted, {
         model: modelId,
         workspaceMode,
-        tokenInput: totalInput,
-        tokenOutput: totalOutput,
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
       });
 
       return {
@@ -310,8 +296,8 @@ export class TaskAgent extends Agent<Env> {
         facetName: this.name,
         summary: formatted,
         workspaceMode,
-        tokenInput: totalInput,
-        tokenOutput: totalOutput,
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
         scratchWrites: workspaceMode === "scratch" ? this.listScratchWrites() : undefined,
       };
     } catch (error) {
@@ -417,7 +403,7 @@ export class TaskAgent extends Agent<Env> {
    * canonical session state.
    */
   private buildSharedTools(parent: ParentStub): ToolSet {
-    return capToolOutputs({
+    return {
       read: createReadTool({
         ops: {
           readFile: (path: string) => parent.facetReadFile(path),
@@ -455,7 +441,7 @@ export class TaskAgent extends Agent<Env> {
           },
         },
       }),
-    });
+    };
   }
 
   /**
@@ -484,7 +470,7 @@ export class TaskAgent extends Agent<Env> {
       this.recordScratchWrite(path);
     };
 
-    return capToolOutputs({
+    return {
       read: createReadTool({
         ops: {
           readFile: readFromScratchThenParent,
@@ -571,7 +557,7 @@ export class TaskAgent extends Agent<Env> {
           writeFile: writeToScratch,
         },
       }),
-    });
+    };
   }
 
   /**

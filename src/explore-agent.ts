@@ -1,20 +1,17 @@
 import { Agent, getAgentByName } from "agents";
-import { generateText, stepCountIs } from "ai";
 import {
   createReadTool,
   createListTool,
   createFindTool,
   createGrepTool,
-} from "@cloudflare/think/tools/workspace";
+} from "./think-adapter";
 import {
-  buildProviderForModel,
-  capToolOutputs,
+  runSubagent,
   EXPLORE_SYSTEM_PROMPT,
   EXPLORE_MAX_STEPS,
   EXPLORE_TIMEOUT_MS,
   resolveSubagentModel,
-  subagentPrepareStep,
-} from "./agentic";
+} from "./subagent-runner";
 import type { AppConfig, Env } from "./types";
 import type { CodingAgent } from "./coding-agent";
 
@@ -154,8 +151,6 @@ export class ExploreAgent extends Agent<Env> {
     const parentSessionId = opts.parentSessionId;
 
     const modelId = resolveSubagentModel({ model: opts.model }, config.exploreModel, config.model);
-    const provider = buildProviderForModel(modelId, config, this.env);
-    const model = provider.chatModel(modelId);
 
     // Get the parent stub and build read-only workspace tools that proxy
     // through the parent's workspace — see `CodingAgent.facetReadFile`.
@@ -164,7 +159,7 @@ export class ExploreAgent extends Agent<Env> {
       parentSessionId,
     )) as unknown as ParentStub;
 
-    const readOnlyTools = capToolOutputs({
+    const readOnlyTools = {
       read: createReadTool({
         ops: {
           readFile: (path: string) => parent.facetReadFile(path),
@@ -188,7 +183,7 @@ export class ExploreAgent extends Agent<Env> {
           readFile: (path: string) => parent.facetReadFile(path),
         },
       }),
-    });
+    };
 
     const scope = opts.scope ? `\n\nSearch scope: ${opts.scope}` : "";
     const userMessage = `${opts.q}${scope}`;
@@ -196,43 +191,28 @@ export class ExploreAgent extends Agent<Env> {
     this.recordTranscript("user", userMessage, { model: modelId });
 
     try {
-      const result = await generateText({
-        model,
-        system: EXPLORE_SYSTEM_PROMPT,
-        messages: [{ role: "user" as const, content: userMessage }],
-        tools: readOnlyTools,
-        stopWhen: stepCountIs(EXPLORE_MAX_STEPS),
-        maxOutputTokens: 4000,
-        // See `subagentPrepareStep` in agentic.ts — prunes tool-result
-        // accumulation across steps so a 16-step run doesn't ship ~300k
-        // tokens of stale context back to the model on every call.
-        prepareStep: subagentPrepareStep(),
-        abortSignal: AbortSignal.timeout(EXPLORE_TIMEOUT_MS),
+      const result = await runSubagent({
+        kind: "explore",
+        prompt: userMessage,
+        model: modelId,
+        config,
+        toolset: readOnlyTools,
+        systemPrompt: EXPLORE_SYSTEM_PROMPT,
+        maxSteps: EXPLORE_MAX_STEPS,
+        timeoutMs: EXPLORE_TIMEOUT_MS,
+        env: this.env,
       });
 
-      const summary = result.text;
-      const steps = result.steps.length;
-      const toolCalls = result.steps.flatMap((s) =>
-        (s.toolCalls ?? []).map((tc) => tc.toolName),
-      );
-      const totalInput = result.steps.reduce(
-        (sum, s) => sum + (s.usage?.inputTokens ?? 0),
-        0,
-      );
-      const totalOutput = result.steps.reduce(
-        (sum, s) => sum + (s.usage?.outputTokens ?? 0),
-        0,
-      );
       const usageLine =
-        totalInput > 0 || totalOutput > 0
-          ? `**Tokens:** ${totalInput} in / ${totalOutput} out | `
+        result.tokenInput > 0 || result.tokenOutput > 0
+          ? `**Tokens:** ${result.tokenInput} in / ${result.tokenOutput} out | `
           : "";
 
       const formatted = [
         `## Explore results (model: ${modelId}) [facet: ${this.name}]`,
-        `${usageLine}**Steps:** ${steps} | **Tools used:** ${toolCalls.join(", ") || "none"}`,
+        `${usageLine}**Steps:** ${result.steps} | **Tools used:** ${result.toolCalls.join(", ") || "none"}`,
         "",
-        summary ||
+        result.finalText ||
           "(No output — subagent ran its tool budget without emitting a summary. Try a narrower query or a higher-capability model via the `model` arg.)",
       ]
         .filter(Boolean)
@@ -240,16 +220,16 @@ export class ExploreAgent extends Agent<Env> {
 
       this.recordTranscript("assistant", formatted, {
         model: modelId,
-        tokenInput: totalInput,
-        tokenOutput: totalOutput,
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
       });
 
       return {
         ok: true,
         facetName: this.name,
         summary: formatted,
-        tokenInput: totalInput,
-        tokenOutput: totalOutput,
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);

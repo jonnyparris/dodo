@@ -10,7 +10,7 @@
  * compaction, regardless of the session's default model).
  */
 import { describe, expect, it } from "vitest";
-import { addAnthropicCacheMarkers } from "../src/agentic";
+import { addAnthropicCacheMarkers } from "../src/subagent-runner";
 
 const ANTHROPIC_MODEL = "anthropic/claude-opus-4-7";
 
