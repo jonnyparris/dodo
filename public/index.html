@@ -757,6 +757,23 @@
           </details>
         </div>
         <div class="section">
+          <h2>Watchdog</h2>
+          <p style="margin:0 0 6px;color:var(--muted);font-size:12px">Auto-detect stalled prompts. Fires a notification (and optionally aborts or nudges) when the active prompt is idle past the threshold.</p>
+          <div id="watchdog-status">
+            <div class="empty">Loading…</div>
+          </div>
+          <details style="margin-top:6px">
+            <summary>Arm watchdog</summary>
+            <label for="watchdog-stall" class="visually-hidden">Stall threshold (seconds)</label>
+            <input id="watchdog-stall" type="number" min="60" max="86400" value="600" placeholder="Stall threshold (seconds)" style="margin-top:6px;margin-bottom:4px"/>
+            <div style="display:flex;gap:4px;flex-wrap:wrap">
+              <button onclick="armWatchdog('notify')" title="Send a notification on stall; prompt keeps running">Notify only</button>
+              <button onclick="armWatchdog('abort')" title="Abort the prompt + notify">Auto-abort</button>
+              <button onclick="armWatchdog('nudge')" title="Abort, ask the agent to summarise, then notify">Auto-nudge</button>
+            </div>
+          </details>
+        </div>
+        <div class="section">
           <h2>Memory</h2>
           <div style="display:flex;gap:4px;margin-bottom:8px">
             <label for="mem-search" class="visually-hidden">Search memory entries</label>

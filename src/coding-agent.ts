@@ -3651,6 +3651,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       priority: "high",
       ownerEmail,
     });
+
+    // Live UI update — emit on the per-session SSE channel so the
+    // watchdog panel can refresh without polling.
+    this.emitEvent({
+      data: {
+        action: config.action,
+        stallSeconds: decision.stallSeconds,
+        activePromptId: decision.activePromptId,
+        firedAt: now,
+      },
+      type: "watchdog_fired",
+    });
   }
 
   async runCronPrompt(payload: { description: string; prompt: string }): Promise<void> {

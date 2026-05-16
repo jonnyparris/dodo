@@ -267,6 +267,13 @@ function connectSSE(id){
       if(el){const pos=el.querySelector('.queue-position');if(pos)pos.textContent=`#${q.position} in queue`}
     });
   });
+
+  eventSource.addEventListener("watchdog_fired",(e)=>{
+    let data={};try{data=JSON.parse(e.data)}catch{}
+    const mins=Math.floor((data.stallSeconds||0)/60);
+    toast(`Watchdog fired (${data.action||"notify"}) — stalled ${mins}m`,"warning");
+    if(typeof loadWatchdog==='function')loadWatchdog();
+  });
 }
 
 function showQueuedMessage(content,queueId,position){

@@ -94,6 +94,7 @@ async function selectSession(id){
     apiSafe(`/session/${id}`),
     apiSafe(`/session/${id}/messages`),
     loadFiles("/"),loadCron(),refreshGit(),
+    typeof loadWatchdog==='function'?loadWatchdog():Promise.resolve(),
     typeof loadSessionTodos==='function'?loadSessionTodos():Promise.resolve()
   ]);
   $("chat").innerHTML="";
