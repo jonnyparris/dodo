@@ -14,7 +14,7 @@ import { runSandboxedCode } from "./executor";
 import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { log } from "./logger";
-import { HttpMcpGatekeeper, type McpGatekeeper, type McpGatekeeperConfig } from "./mcp-gatekeeper";
+import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
 import { sendNotification } from "./notify";
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
@@ -432,7 +432,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /** Set by assembleContext() when messages are dropped due to token budget. */
   private _contextTruncated = false;
   /** Connected MCP gatekeepers, populated by connectMcpServers(). */
-  private mcpGatekeepers: McpGatekeeper[] = [];
+  private mcpGatekeepers: McpClient[] = [];
   /**
    * OAuth MCP tools federated from the per-user hub DO.
    *
@@ -5817,7 +5817,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       if (!configsRes.ok) return;
 
       const { configs } = (await configsRes.json()) as {
-        configs: Array<McpGatekeeperConfig & { overridden: boolean }>;
+        configs: Array<McpClientConfig & { overridden: boolean }>;
       };
 
       // Gate browser-rendering MCP on the per-session browser_enabled flag.
@@ -5835,7 +5835,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       if (enabled.length === 0) return;
 
       // Resolve encrypted headers and connect each gatekeeper
-      const connected: McpGatekeeper[] = [];
+      const connected: McpClient[] = [];
       for (const config of enabled) {
         try {
           // Resolve headers via internal secret endpoint
@@ -5854,7 +5854,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             }
           }
 
-          const gk = new HttpMcpGatekeeper({
+          const gk = new HttpMcpClient({
             ...config,
             headers,
           }, this.mcpDepth);

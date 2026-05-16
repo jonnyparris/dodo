@@ -3,7 +3,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 
 // ─── Types ───
 
-export interface McpGatekeeperConfig {
+export interface McpClientConfig {
   id: string;
   name: string;
   type: "http" | "service-binding";
@@ -26,7 +26,7 @@ export interface McpToolInfo {
   inputSchema?: unknown;
 }
 
-export interface McpGatekeeper {
+export interface McpClient {
   connect(): Promise<void>;
   disconnect(): void;
   listTools(): Promise<McpToolInfo[]>;
@@ -37,25 +37,25 @@ export interface McpGatekeeper {
   isConnected(): boolean;
 }
 
-// ─── HTTP MCP Gatekeeper ───
+// ─── HTTP MCP Client ───
 
 /**
- * HTTP MCP Gatekeeper — wraps a remote MCP server via Streamable HTTP transport.
+ * HTTP MCP Client — wraps a remote MCP server via Streamable HTTP transport.
  * Uses @modelcontextprotocol/sdk Client to connect and communicate.
  */
-export class HttpMcpGatekeeper implements McpGatekeeper {
+export class HttpMcpClient implements McpClient {
   private client: Client | null = null;
   private transport: StreamableHTTPClientTransport | null = null;
   private connected = false;
   private cachedTools: McpToolInfo[] | null = null;
   private mcpDepth = 0;
 
-  constructor(private config: McpGatekeeperConfig, mcpDepth = 0) {
+  constructor(private config: McpClientConfig, mcpDepth = 0) {
     if (config.type !== "http") {
-      throw new Error(`HttpMcpGatekeeper only supports type "http", got "${config.type}"`);
+      throw new Error(`HttpMcpClient only supports type "http", got "${config.type}"`);
     }
     if (!config.url) {
-      throw new Error("HttpMcpGatekeeper requires a url");
+      throw new Error("HttpMcpClient requires a url");
     }
     this.mcpDepth = mcpDepth;
   }
@@ -79,7 +79,7 @@ export class HttpMcpGatekeeper implements McpGatekeeper {
 
     this.transport = new StreamableHTTPClientTransport(url, { requestInit });
     this.client = new Client(
-      { name: `dodo-gatekeeper-${this.config.id}`, version: "1.0.0" },
+      { name: `dodo-client-${this.config.id}`, version: "1.0.0" },
       { capabilities: {} },
     );
 
