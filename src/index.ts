@@ -13,7 +13,7 @@ import { createDodoMcpServer } from "./mcp";
 import { MCP_CATALOG } from "./mcp-catalog";
 import { createDodoCodeModeMcpServer } from "./mcp-codemode";
 import { AllowlistOutbound } from "./outbound";
-import { errorLimiter, maybeCleanupRateLimiters, messageLimiter, promptLimiter, shareLimiter } from "./rate-limiters";
+import { errorLimiter, maybeCleanupRateLimiters, messageLimiter, promptLimiter, shareLimiter } from "./rate-limit";
 import { buildAuthenticatedApi } from "./rpc-api";
 import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
 import { signCookie, verifyCookie } from "./share";
@@ -22,7 +22,7 @@ import { TaskAgent } from "./task-agent";
 import type { AccessIdentity, AppConfig, Env } from "./types";
 import { UserControl } from "./user-control";
 
-// Rate limiters live in src/rate-limiters.ts so MCP tools can charge the
+// Rate limiters live in src/rate-limit.ts so MCP tools can charge the
 // same per-user budgets as the HTTP routes (audit follow-up F3).
 
 type PermissionLevel = "readonly" | "readwrite" | "write" | "admin";
