@@ -75,7 +75,7 @@ async function eventually(assertion: () => Promise<void>, attempts = 20): Promis
 
 describe("Artifacts flush", () => {
   it("swallows errors silently", async () => {
-    const { flushTurnToArtifacts } = await import("../src/artifacts-flush");
+    const { flushTurnToArtifacts } = await import("../src/artifacts");
     const workspace = {} as any;
     const result = await flushTurnToArtifacts({
       workspace,
