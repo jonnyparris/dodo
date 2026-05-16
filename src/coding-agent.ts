@@ -36,7 +36,7 @@ import {
   type Skill,
   scanWorkspaceSkills,
 } from "./skill-registry";
-import { epochToIso, nowEpoch, SqlHelper } from "./sql-helpers";
+import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
 import type { SnapshotV2 } from "./think-adapter";
 import {
@@ -433,7 +433,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   override fibers = true;
 
   private readonly clients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
-  private readonly db: SqlHelper;
   /** Captured token usage from the most recent onChatMessage() call. */
   private _lastUsage: { inputTokens: number; outputTokens: number } | null = null;
   /** Overflow recovery flag — prevents infinite retry loops on persistent overflow. */
@@ -495,7 +494,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.db = new SqlHelper(ctx.storage.sql);
     this.initializeSchema();
     this.workspace = new Workspace({
       name: () => this.sessionId() || "session-pending",
@@ -738,16 +736,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     try {
       // Synchronous readDir not available — use the Think workspace's
       // internal SQL to get a fast root listing without async.
-      const rows = this.db.all(
+      const rows = Array.from(this.ctx.storage.sql.exec(
         "SELECT path, type FROM workspace_entries WHERE parent = '/' ORDER BY type DESC, path ASC LIMIT 40",
-      );
+      ));
       if (!rows.length) return null;
 
       const lines = rows.map((r) => {
         const name = String(r.path).split("/").filter(Boolean).pop() ?? String(r.path);
         return r.type === "directory" ? `${name}/` : name;
       });
-      const total = this.db.one("SELECT COUNT(*) as cnt FROM workspace_entries WHERE parent = '/'");
+      const total = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) as cnt FROM workspace_entries WHERE parent = '/'"))[0] as SqlRow | null);
       const count = Number(total?.cnt ?? lines.length);
       let result = "```\n" + lines.join("\n") + "\n```";
       if (count > 40) {
@@ -2231,9 +2229,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const cw = CONTEXT_WINDOW_TOKENS[mid] ?? DEFAULT_CONTEXT_WINDOW;
         const cb = Math.floor(cw * CONTEXT_BUDGET_FACTOR);
 
-        const latestAssistant = this.db.one(
+        const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
           "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-        );
+        ))[0] as SqlRow | null);
         const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
         const usagePct = cb > 0 ? Math.round((lastInputTokens / cb) * 100) : 0;
 
@@ -2295,7 +2293,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       if (request.method === "GET" && url.pathname === "/prompts/count") {
         // Lightweight count endpoint used by the UserControl idle-session
         // sweep. Full /prompts would serialise the whole list.
-        const row = this.db.one("SELECT COUNT(*) AS n FROM prompts");
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM prompts"))[0] as SqlRow | null);
         return Response.json({ count: Number(row?.n ?? 0) });
       }
 
@@ -2305,7 +2303,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
       if (request.method === "DELETE" && url.pathname.startsWith("/prompt-queue/")) {
         const queueId = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
-        this.db.exec("DELETE FROM prompt_queue WHERE id = ?", queueId);
+        this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", queueId);
         this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
         return Response.json({ deleted: true, id: queueId });
       }
@@ -2793,7 +2791,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private initializeSchema(): void {
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
@@ -2802,7 +2800,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     `);
 
     // Sidecar metadata for Think messages — Dodo-specific fields
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS message_metadata (
         message_id TEXT PRIMARY KEY,
         author_email TEXT,
@@ -2828,7 +2826,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // R2 lifecycle (30 days) is the canonical retention; this table is just
     // a pointer index. If a pointer outlives its R2 object the client gets
     // a 404 on load — acceptable degradation for long-gone history.
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS message_attachments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         message_id TEXT NOT NULL,
@@ -2840,11 +2838,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         created_at INTEGER NOT NULL
       )
     `);
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_message_attachments_msg ON message_attachments(message_id)",
     );
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS prompts (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -2859,7 +2857,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS cron_jobs (
         schedule_id TEXT PRIMARY KEY,
         description TEXT NOT NULL,
@@ -2868,7 +2866,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS prompt_queue (
         id TEXT PRIMARY KEY,
         content TEXT NOT NULL,
@@ -2882,7 +2880,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // session so no cross-session leakage. Persisted through compaction
     // (which summarizes messages, not this table) so the model always
     // has a stable checklist to refer to after context summaries.
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS session_todos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         content TEXT NOT NULL,
@@ -2899,7 +2897,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     //
     // One row per run; facet transcripts themselves live in the facet
     // DO's own SQLite (see ExploreAgent.getTranscript / TaskAgent.getTranscript).
-    this.db.exec(`
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS facet_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         facet_type TEXT NOT NULL CHECK(facet_type IN ('explore','task')),
@@ -2915,11 +2913,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       )
     `);
 
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_session_todos_status ON session_todos(status)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_started ON facet_runs(started_at DESC)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_name ON facet_runs(facet_name)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_session_todos_status ON session_todos(status)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_started ON facet_runs(started_at DESC)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_name ON facet_runs(facet_name)");
   }
 
   /**
@@ -2928,9 +2926,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * synchronous SQL operation — no async bookkeeping needed.
    */
   private listTodos(): TodoItem[] {
-    const rows = this.db.all(
+    const rows = Array.from(this.ctx.storage.sql.exec(
       "SELECT id, content, status, priority, created_at, updated_at FROM session_todos ORDER BY id ASC",
-    );
+    ));
     return rows.map((r) => ({
       id: Number(r.id),
       content: String(r.content),
@@ -2949,7 +2947,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       list: () => this.listTodos(),
       add: (content, priority) => {
         const now = nowEpoch();
-        this.db.exec(
+        this.ctx.storage.sql.exec(
           "INSERT INTO session_todos (content, status, priority, created_at, updated_at) VALUES (?, 'pending', ?, ?, ?)",
           content,
           priority ?? "medium",
@@ -2960,10 +2958,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       },
       update: (id, patch) => {
         const now = nowEpoch();
-        const existing = this.db.one("SELECT id FROM session_todos WHERE id = ?", id);
+        const existing = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM session_todos WHERE id = ?", id))[0] as SqlRow | null);
         if (!existing) return false;
         if (patch.status) {
-          this.db.exec(
+          this.ctx.storage.sql.exec(
             "UPDATE session_todos SET status = ?, updated_at = ? WHERE id = ?",
             patch.status,
             now,
@@ -2971,7 +2969,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           );
         }
         if (patch.content) {
-          this.db.exec(
+          this.ctx.storage.sql.exec(
             "UPDATE session_todos SET content = ?, updated_at = ? WHERE id = ?",
             patch.content,
             now,
@@ -2979,7 +2977,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           );
         }
         if (patch.priority) {
-          this.db.exec(
+          this.ctx.storage.sql.exec(
             "UPDATE session_todos SET priority = ?, updated_at = ? WHERE id = ?",
             patch.priority,
             now,
@@ -2990,7 +2988,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return true;
       },
       clear: () => {
-        this.db.exec("DELETE FROM session_todos");
+        this.ctx.storage.sql.exec("DELETE FROM session_todos");
         this.emitTodos();
       },
     };
@@ -3479,7 +3477,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       scheduled = await this.scheduleEvery(body.intervalSeconds, "runCronPrompt", { description: body.description, prompt: body.prompt });
     }
 
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO cron_jobs (schedule_id, description, prompt, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(schedule_id) DO UPDATE SET description = excluded.description, prompt = excluded.prompt",
       scheduled.id,
       body.description,
@@ -3493,7 +3491,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private async handleDeleteCron(scheduleId: string): Promise<Response> {
     const id = decodeURIComponent(scheduleId);
     await this.cancelSchedule(id);
-    this.db.exec("DELETE FROM cron_jobs WHERE schedule_id = ?", id);
+    this.ctx.storage.sql.exec("DELETE FROM cron_jobs WHERE schedule_id = ?", id);
     return Response.json({ deleted: true, id });
   }
 
@@ -3688,7 +3686,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private listCronJobs(): CronJobRecord[] {
-    return this.db.all("SELECT schedule_id, description, prompt, created_at FROM cron_jobs ORDER BY created_at DESC").map((row) => {
+    return Array.from(this.ctx.storage.sql.exec("SELECT schedule_id, description, prompt, created_at FROM cron_jobs ORDER BY created_at DESC")).map((row) => {
       const schedule = this.getSchedule<{ description: string; prompt: string }>(String(row.schedule_id));
       return this.toCronJobRecord(schedule, String(row.description), String(row.prompt), Number(row.created_at));
     });
@@ -4251,9 +4249,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const id = crypto.randomUUID();
     const now = nowEpoch();
     // Position = max existing position + 1
-    const maxRow = this.db.one("SELECT MAX(position) as max_pos FROM prompt_queue");
+    const maxRow = (Array.from(this.ctx.storage.sql.exec("SELECT MAX(position) as max_pos FROM prompt_queue"))[0] as SqlRow | null);
     const position = maxRow?.max_pos != null ? Number(maxRow.max_pos) + 1 : 1;
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO prompt_queue (id, content, author_email, created_at, position) VALUES (?, ?, ?, ?, ?)",
       id, content, authorEmail ?? null, now, position,
     );
@@ -4262,7 +4260,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private dequeueAndRunNext(): void {
-    const next = this.db.one("SELECT id, content, author_email FROM prompt_queue ORDER BY position ASC LIMIT 1");
+    const next = (Array.from(this.ctx.storage.sql.exec("SELECT id, content, author_email FROM prompt_queue ORDER BY position ASC LIMIT 1"))[0] as SqlRow | null);
     if (!next) return;
 
     const queuedId = String(next.id);
@@ -4270,7 +4268,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const authorEmail = next.author_email ? String(next.author_email) : undefined;
 
     // Remove from queue
-    this.db.exec("DELETE FROM prompt_queue WHERE id = ?", queuedId);
+    this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", queuedId);
     this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
 
     // Run as a new prompt via fiber
@@ -4295,7 +4293,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private readQueueState(): { queue: Array<{ id: string; content: string; position: number; createdAt: string }> } {
-    const rows = this.db.all("SELECT id, content, position, created_at FROM prompt_queue ORDER BY position ASC");
+    const rows = Array.from(this.ctx.storage.sql.exec("SELECT id, content, position, created_at FROM prompt_queue ORDER BY position ASC"));
     return {
       queue: rows.map((r) => ({
         id: String(r.id),
@@ -4407,13 +4405,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   /** Read the fiber_id from a prompt row. */
   private readPromptFiberId(promptId: string): string | null {
-    const row = this.db.one("SELECT fiber_id FROM prompts WHERE id = ?", promptId);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT fiber_id FROM prompts WHERE id = ?", promptId))[0] as SqlRow | null);
     return row?.fiber_id ? String(row.fiber_id) : null;
   }
 
   /** Store a fiber_id on a prompt row. */
   private setPromptFiberId(promptId: string, fiberId: string): void {
-    this.db.exec("UPDATE prompts SET fiber_id = ? WHERE id = ?", fiberId, promptId);
+    this.ctx.storage.sql.exec("UPDATE prompts SET fiber_id = ? WHERE id = ?", fiberId, promptId);
   }
 
   /**
@@ -4422,7 +4420,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   async onFiberRecovered(ctx: FiberRecoveryContext): Promise<void> {
     // Find the prompt associated with this fiber
-    const row = this.db.one("SELECT id FROM prompts WHERE fiber_id = ?", ctx.id);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM prompts WHERE fiber_id = ?", ctx.id))[0] as SqlRow | null);
     if (row) {
       const promptId = String(row.id);
       this.updatePrompt(promptId, { status: "running" });
@@ -4441,7 +4439,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   async onFiberComplete(ctx: FiberCompleteContext): Promise<void> {
     // Find the associated prompt
-    const row = this.db.one("SELECT id, status FROM prompts WHERE fiber_id = ?", ctx.id);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, status FROM prompts WHERE fiber_id = ?", ctx.id))[0] as SqlRow | null);
     if (!row) return;
 
     const promptId = String(row.id);
@@ -4515,7 +4513,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     tokenInput?: number;
     tokenOutput?: number;
   }): void {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT OR REPLACE INTO message_metadata (message_id, author_email, model, provider, token_input, token_output, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       input.messageId,
       input.authorEmail ?? null,
@@ -4544,7 +4542,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     size: number;
     source: "user" | "assistant" | "tool";
   }): void {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO message_attachments (message_id, tool_call_id, media_type, url, size, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       input.messageId,
       input.toolCallId ?? null,
@@ -4564,7 +4562,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private rebindToolAttachments(toolCallIds: string[], assistantMessageId: string): void {
     if (toolCallIds.length === 0) return;
     const placeholders = toolCallIds.map(() => "?").join(",");
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       `UPDATE message_attachments SET message_id = ? WHERE tool_call_id IN (${placeholders}) AND message_id != ?`,
       assistantMessageId,
       ...toolCallIds,
@@ -4582,10 +4580,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // back to "tool" for legacy rows written before the column became
     // NOT NULL (defensive — should not happen in practice). (audit
     // follow-up: previously dead column.)
-    const rows = this.db.all(
+    const rows = Array.from(this.ctx.storage.sql.exec(
       `SELECT message_id, media_type, url, size, source FROM message_attachments WHERE message_id IN (${placeholders}) ORDER BY id ASC`,
       ...messageIds,
-    );
+    ));
     for (const row of rows) {
       const id = String(row.message_id);
       const list = result.get(id) ?? [];
@@ -4605,10 +4603,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   /** Read metadata for a Think message. */
   private readMessageMetadata(messageId: string): MessageMetadata | null {
-    const row = this.db.one(
+    const row = (Array.from(this.ctx.storage.sql.exec(
       "SELECT message_id, author_email, model, provider, token_input, token_output, created_at FROM message_metadata WHERE message_id = ?",
       messageId,
-    );
+    ))[0] as SqlRow | null);
     if (!row) return null;
     return {
       messageId: String(row.message_id),
@@ -4972,9 +4970,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this._contextTruncated = false; // Reset for next turn
     let usagePercent = 100; // Default to high for forced/truncated compaction
     if (!options?.force && !contextWasTruncated) {
-      const latestAssistant = this.db.one(
+      const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
         "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-      );
+      ))[0] as SqlRow | null);
       const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
       if (lastInputTokens === 0) return;
 
@@ -5296,7 +5294,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       void this.syncSessionIndex({ status: "idle" }).catch(() => {});
     }
     // Get token totals from the appropriate source
-    const metaTotals = this.db.one("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM message_metadata");
+    const metaTotals = (Array.from(this.ctx.storage.sql.exec("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM message_metadata"))[0] as SqlRow | null);
     const totalTokenInput = Number(metaTotals?.total_in ?? 0);
     const totalTokenOutput = Number(metaTotals?.total_out ?? 0);
 
@@ -5306,9 +5304,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
     // Use latest assistant turn's input tokens as the best proxy for current context size
-    const latestAssistant = this.db.one(
+    const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
       "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-    );
+    ))[0] as SqlRow | null);
     const estimatedContext = Number(latestAssistant?.token_input ?? 0);
     const contextUsagePercent = contextBudget > 0
       ? Math.round((estimatedContext / contextBudget) * 100)
@@ -5354,7 +5352,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private insertPrompt(promptId: string, content: string, status: PromptRecord["status"], authorEmail?: string | null): void {
     const sessionId = this.sessionId();
     const createdAt = nowEpoch();
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO prompts (id, session_id, content, status, author_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       promptId,
       sessionId,
@@ -5370,8 +5368,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     promptId: string,
     patch: { error?: string; resultMessageId?: string; status: PromptRecord["status"] },
   ): void {
-    const existing = this.db.one("SELECT error, result_message_id FROM prompts WHERE id = ?", promptId);
-    this.db.exec(
+    const existing = (Array.from(this.ctx.storage.sql.exec("SELECT error, result_message_id FROM prompts WHERE id = ?", promptId))[0] as SqlRow | null);
+    this.ctx.storage.sql.exec(
       "UPDATE prompts SET status = ?, error = ?, result_message_id = ?, updated_at = ? WHERE id = ?",
       patch.status,
       patch.error ?? (existing?.error === null || existing?.error === undefined ? null : String(existing.error)),
@@ -5385,9 +5383,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private listPrompts(): PromptRecord[] {
-    return this.db.all(
+    return Array.from(this.ctx.storage.sql.exec(
       "SELECT id, content, status, error, result_message_id, author_email, created_at, updated_at FROM prompts ORDER BY created_at DESC, rowid DESC",
-    ).map((row) => ({
+    )).map((row) => ({
       authorEmail: row.author_email === null || row.author_email === undefined ? null : String(row.author_email),
       content: String(row.content),
       createdAt: epochToIso(row.created_at),
@@ -5627,12 +5625,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private readMetadata(key: string): string | null {
-    const row = this.db.one("SELECT value FROM metadata WHERE key = ?", key);
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT value FROM metadata WHERE key = ?", key))[0] as SqlRow | null);
     return row ? String(row.value) : null;
   }
 
   private writeMetadata(key: string, value: string): void {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "INSERT INTO metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
       key,
       value,
@@ -5641,7 +5639,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private deleteMetadata(key: string): void {
-    this.db.exec("DELETE FROM metadata WHERE key = ?", key);
+    this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", key);
   }
 
   /**
@@ -6005,25 +6003,25 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private insertFacetRun(opts: { facetType: "explore" | "task"; facetName: string; input: string; workspaceMode: string | null }): number {
     const now = nowEpoch();
-    const rows = this.db.all(
+    const rows = Array.from(this.ctx.storage.sql.exec(
       `INSERT INTO facet_runs (facet_type, facet_name, input, workspace_mode, started_at, status)
        VALUES (?, ?, ?, ?, ?, 'running')
        RETURNING id`,
       opts.facetType, opts.facetName, opts.input, opts.workspaceMode, now,
-    ) as Array<{ id: number }>;
+    )) as Array<{ id: number }>;
     return Number(rows[0]?.id ?? 0);
   }
 
   private completeFacetRun(runId: number, summary: string, tokens: { input: number; output: number }): void {
     const preview = summary.length > 500 ? `${summary.slice(0, 500)}…` : summary;
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "UPDATE facet_runs SET status = 'completed', summary_preview = ?, token_input = ?, token_output = ?, finished_at = ? WHERE id = ?",
       preview, tokens.input, tokens.output, nowEpoch(), runId,
     );
   }
 
   private failFacetRun(runId: number, error: string): void {
-    this.db.exec(
+    this.ctx.storage.sql.exec(
       "UPDATE facet_runs SET status = 'failed', summary_preview = ?, finished_at = ? WHERE id = ?",
       `(failed) ${error.slice(0, 400)}`, nowEpoch(), runId,
     );
@@ -6139,7 +6137,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     finishedAt: string | null;
     status: "running" | "completed" | "failed";
   }>> {
-    const rows = this.db.all(
+    const rows = Array.from(this.ctx.storage.sql.exec(
       `SELECT id, facet_type as facetType, facet_name as facetName, input,
               summary_preview as summaryPreview, workspace_mode as workspaceMode,
               token_input as tokenInput, token_output as tokenOutput,
@@ -6148,7 +6146,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
        ORDER BY started_at DESC
        LIMIT ?`,
       Math.min(Math.max(limit, 1), 200),
-    ) as Array<{
+    )) as Array<{
       id: number;
       facetType: "explore" | "task";
       facetName: string;
@@ -6178,10 +6176,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Look the name up in the facet_runs table to figure out which
     // facet class to ask. Falls back to trying explore first if we
     // can't resolve the type locally — idempotent.
-    const row = this.db.all(
+    const row = Array.from(this.ctx.storage.sql.exec(
       "SELECT facet_type as facetType FROM facet_runs WHERE facet_name = ? ORDER BY started_at DESC LIMIT 1",
       facetName,
-    ) as Array<{ facetType: "explore" | "task" }>;
+    )) as Array<{ facetType: "explore" | "task" }>;
 
     if (row.length === 0) return null;
 
@@ -6238,14 +6236,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   private facetExists(facetName: string, facetType?: "explore" | "task"): boolean {
     const rows = facetType
-      ? this.db.all(
+      ? Array.from(this.ctx.storage.sql.exec(
           "SELECT 1 as hit FROM facet_runs WHERE facet_name = ? AND facet_type = ? LIMIT 1",
           facetName, facetType,
-        )
-      : this.db.all(
+        ))
+      : Array.from(this.ctx.storage.sql.exec(
           "SELECT 1 as hit FROM facet_runs WHERE facet_name = ? LIMIT 1",
           facetName,
-        );
+        ));
     return rows.length > 0;
   }
 
@@ -6306,7 +6304,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // row, so the cancelSchedule calls were silent no-ops and the H6 fix
       // shipped in d1a138f didn't actually cancel alarms. Caught by the
       // /audit-stubs sweep on 2026-04-25.
-      const cronRows = this.db.all("SELECT schedule_id FROM cron_jobs");
+      const cronRows = Array.from(this.ctx.storage.sql.exec("SELECT schedule_id FROM cron_jobs"));
       for (const row of cronRows) {
         const id = String(row.schedule_id);
         try {
@@ -6322,14 +6320,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Drop every table this DO writes to. Missing tables here mean stale
     // rows hang around after a "delete" and can leak between session
     // recreations on the same DO key.
-    this.db.exec("DELETE FROM message_metadata");
-    this.db.exec("DELETE FROM message_attachments");
-    this.db.exec("DELETE FROM prompts");
-    this.db.exec("DELETE FROM prompt_queue");
-    this.db.exec("DELETE FROM cron_jobs");
-    this.db.exec("DELETE FROM session_todos");
-    this.db.exec("DELETE FROM facet_runs");
-    this.db.exec("DELETE FROM metadata");
+    this.ctx.storage.sql.exec("DELETE FROM message_metadata");
+    this.ctx.storage.sql.exec("DELETE FROM message_attachments");
+    this.ctx.storage.sql.exec("DELETE FROM prompts");
+    this.ctx.storage.sql.exec("DELETE FROM prompt_queue");
+    this.ctx.storage.sql.exec("DELETE FROM cron_jobs");
+    this.ctx.storage.sql.exec("DELETE FROM session_todos");
+    this.ctx.storage.sql.exec("DELETE FROM facet_runs");
+    this.ctx.storage.sql.exec("DELETE FROM metadata");
 
     // Clear the daily MCP-hygiene alarm armed in onStart. ctx.storage is
     // shared with cancelSchedule so we drop any remaining alarm wholesale.
