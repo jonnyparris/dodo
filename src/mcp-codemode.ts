@@ -54,6 +54,9 @@ const API_CATALOG = [
   { method: "POST", path: "/agent/{sessionId}/message", description: "Send sync message (waits for response)", params: [{ name: "sessionId", in: "path" }, { name: "content", in: "body" }] },
   { method: "POST", path: "/agent/{sessionId}/prompt", description: "Send async prompt (returns immediately)", params: [{ name: "sessionId", in: "path" }, { name: "content", in: "body" }] },
   { method: "POST", path: "/agent/{sessionId}/abort", description: "Abort running prompt", params: [{ name: "sessionId", in: "path" }] },
+  { method: "GET", path: "/agent/{sessionId}/watchdog", description: "Read session watchdog config + counters (armed, lastCheckedAt, lastFiredAt, fireCount). Watchdog autonomously detects stalled prompts and notifies / aborts / nudges.", params: [{ name: "sessionId", in: "path" }] },
+  { method: "PUT", path: "/agent/{sessionId}/watchdog", description: "Install or replace the session watchdog. action='notify' alerts only; 'abort' cancels the stuck prompt; 'nudge' aborts then dispatches a follow-up summary prompt. stallSeconds 60..86400. checkCron defaults to '*/5 * * * *'. Use this to walk away from a long-running prompt with confidence it won't hang silently.", params: [{ name: "sessionId", in: "path" }, { name: "stallSeconds", in: "body", optional: true }, { name: "action", in: "body", optional: true }, { name: "checkCron", in: "body", optional: true }, { name: "nudgePrompt", in: "body", optional: true }] },
+  { method: "DELETE", path: "/agent/{sessionId}/watchdog", description: "Remove the session watchdog (cancels its recurring schedule).", params: [{ name: "sessionId", in: "path" }] },
   { method: "GET", path: "/agent/{sessionId}/snapshot", description: "Get workspace snapshot", params: [{ name: "sessionId", in: "path" }] },
   { method: "POST", path: "/agent/{sessionId}/snapshot/import", description: "Import a snapshot", params: [{ name: "sessionId", in: "path" }, { name: "snapshotId", in: "query" }] },
 
@@ -222,6 +225,18 @@ async () => {
   const latest = sessions[0];
   const messages = await dodo.request({ method: "GET", path: \`/agent/\${latest.id}/messages\` });
   return { session: latest, messages };
+}
+
+// Arm a watchdog so a long-running prompt can't hang silently. Fires
+// once if the prompt is idle for stallSeconds. 'nudge' aborts the
+// stuck prompt then asks the agent to summarise where it got stuck.
+async () => {
+  const sessionId = "abc-123";
+  return dodo.request({
+    method: "PUT",
+    path: \`/agent/\${sessionId}/watchdog\`,
+    body: { stallSeconds: 600, action: "nudge" }
+  });
 }`, {
     code: z.string().describe("JavaScript async arrow function to execute"),
   }, async ({ code }) => {
