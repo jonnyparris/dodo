@@ -1712,6 +1712,16 @@ app.get("/session/:id/debug/compaction", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/debug/compaction");
 });
 
+// Per-config MCP connect status from the most recent connectMcpServers() run.
+// Lets the UI explain why an MCP config has no tools (e.g. "Invalid Bearer
+// token format") instead of silently dropping them.
+app.get("/session/:id/mcp-status", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const ownerEmail = c.get("sessionOwnerEmail") || c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/mcp-status", { "x-owner-email": ownerEmail });
+});
+
 
 
 // ─── Facet transcripts (Phase 5) ───

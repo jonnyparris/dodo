@@ -1,6 +1,54 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
+// ─── Auth header normalisation ───
+
+/**
+ * Normalise an `Authorization` header value so users who paste a bare API key
+ * (the common footgun for static-headers MCP integrations) still get a valid
+ * `Bearer <token>` header sent on the wire.
+ *
+ * Rules:
+ * - If the value already starts with a recognised auth scheme (Bearer, Basic,
+ *   Token, OAuth, Digest, etc. — anything matching `<scheme> <rest>` where
+ *   scheme is letters/digits/`-`/`_`), leave it untouched.
+ * - If the value is empty or whitespace-only, leave it as-is (let upstream 401).
+ * - Otherwise prepend `Bearer `.
+ *
+ * Exported for unit testing.
+ */
+export function normaliseAuthorizationHeader(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === "") return value;
+  // Match `<scheme> <something>` where scheme is letters/digits/-/_ and there's
+  // at least one space-separated token after. Case-insensitive on scheme name.
+  if (/^[A-Za-z][A-Za-z0-9_-]*\s+\S/.test(trimmed)) return value;
+  return `Bearer ${trimmed}`;
+}
+
+/**
+ * Apply `normaliseAuthorizationHeader` to whichever header key matches
+ * `Authorization` case-insensitively. Returns a new headers object; does not
+ * mutate the input. Returns `{ headers, normalised }` so callers can decide
+ * whether to log.
+ */
+export function normaliseAuthHeaders(
+  headers: Record<string, string>,
+): { headers: Record<string, string>; normalised: boolean } {
+  const out: Record<string, string> = {};
+  let normalised = false;
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === "authorization") {
+      const next = normaliseAuthorizationHeader(value);
+      if (next !== value) normalised = true;
+      out[key] = next;
+    } else {
+      out[key] = value;
+    }
+  }
+  return { headers: out, normalised };
+}
+
 // ─── Types ───
 
 export interface McpClientConfig {
@@ -65,9 +113,19 @@ export class HttpMcpClient implements McpClient {
 
     const url = new URL(this.config.url!);
     const requestInit: RequestInit = {};
-    const headers: Record<string, string> = {};
+    let headers: Record<string, string> = {};
     if (this.config.headers && Object.keys(this.config.headers).length > 0) {
       Object.assign(headers, this.config.headers);
+    }
+    // Normalise Authorization header so bare-token values (a common
+    // static-headers footgun) still produce a valid `Bearer <token>` header
+    // on the wire.
+    const norm = normaliseAuthHeaders(headers);
+    headers = norm.headers;
+    if (norm.normalised) {
+      console.info(
+        `[mcp] prepended "Bearer " to Authorization header for "${this.config.name}" (${this.config.id}) — stored value was missing an auth scheme`,
+      );
     }
     // Propagate MCP recursion depth to outbound MCP servers
     if (this.mcpDepth > 0) {

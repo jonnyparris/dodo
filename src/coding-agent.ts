@@ -438,6 +438,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /** Connected MCP gatekeepers, populated by connectMcpServers(). */
   private mcpGatekeepers: McpClient[] = [];
   /**
+   * Per-config connect status from the most recent `connectMcpServers()` call.
+   * Surfaced via `GET /mcp-status` so the UI can show "✗ tools/list failed:
+   * Invalid Bearer token format" instead of silently dropping tools.
+   *
+   * Keyed by MCP config id. Includes both successful and failed attempts.
+   * OAuth-federated tools are not included here — those live in the hub DO.
+   */
+  private mcpStatus: Map<string, {
+    name: string;
+    url?: string;
+    ok: boolean;
+    toolCount?: number;
+    error?: string;
+    lastCheckedAt: number;
+  }> = new Map();
+  /**
    * OAuth MCP tools federated from the per-user hub DO.
    *
    * Session DOs (keyed by sessionId) don't hold OAuth state — it lives in
@@ -2152,6 +2168,23 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         await this.syncSessionIndex({ status: "deleted" });
         await this.destroyStorage();
         return Response.json({ deleted: true, sessionId: sid });
+      }
+
+      // MCP connection status — surfaces per-config connect/listTools results
+      // from the last connectMcpServers() run. Failures here are why tools
+      // sometimes silently fail to appear; the UI can read this endpoint to
+      // show "✗ <name>: <error>" alongside each MCP config row.
+      if (request.method === "GET" && url.pathname === "/mcp-status") {
+        const statuses = Array.from(this.mcpStatus.entries()).map(([id, s]) => ({
+          id,
+          name: s.name,
+          url: s.url,
+          ok: s.ok,
+          toolCount: s.toolCount,
+          error: s.error,
+          lastCheckedAt: s.lastCheckedAt,
+        }));
+        return Response.json({ statuses });
       }
 
       // Debug endpoint: run compaction diagnostics without side effects
@@ -5615,6 +5648,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
     }
     this.mcpGatekeepers = [];
+    this.mcpStatus.clear();
   }
 
   /**
@@ -5762,6 +5796,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       gk.disconnect();
     }
     this.mcpGatekeepers = [];
+    // Clear status from the previous attempt — we're about to repopulate.
+    this.mcpStatus.clear();
 
     try {
       const stub = getUserControlStub(this.env, ownerEmail);
@@ -5817,14 +5853,31 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           }, this.mcpDepth);
 
           await gk.connect();
-          await gk.listTools(); // Pre-populate cache for synchronous getTools()
+          const tools = await gk.listTools(); // Pre-populate cache for synchronous getTools()
           connected.push(gk);
+          this.mcpStatus.set(config.id, {
+            name: config.name,
+            url: config.url,
+            ok: true,
+            toolCount: tools.length,
+            lastCheckedAt: Date.now(),
+          });
         } catch (error) {
-          // Log but don't fail — one broken MCP server shouldn't block the session
+          // Log but don't fail — one broken MCP server shouldn't block the session.
+          // We also record the failure on `mcpStatus` so the UI can surface it
+          // instead of leaving the user to guess why tools never appeared.
+          const message = error instanceof Error ? error.message : String(error);
           console.warn(
             `MCP connect failed for "${config.name}" (${config.id}):`,
-            error instanceof Error ? error.message : error,
+            message,
           );
+          this.mcpStatus.set(config.id, {
+            name: config.name,
+            url: config.url,
+            ok: false,
+            error: message,
+            lastCheckedAt: Date.now(),
+          });
         }
       }
 
