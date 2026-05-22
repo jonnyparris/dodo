@@ -360,16 +360,52 @@ async function toggleBrowser(){
 }
 
 // --- Session MCP Config Overrides ---
+//
+// Renders the per-session MCP toggle list. We also fetch the live
+// `/mcp-status` data — populated by connectMcpServers() inside the
+// CodingAgent DO — so the row can show whether the last connect
+// attempt actually succeeded. Status is empty until the session
+// processes its first message (DOs are lazy).
 async function loadSessionMcpConfigs(){
   if(!currentSession)return;
   try{
-    const{configs}=await api(`/session/${currentSession}/mcp-configs`);
-    $("session-mcp-list").innerHTML=(configs||[]).length?(configs||[]).map(c=>{
+    // Fetch both in parallel. mcp-status can legitimately 404 / be empty
+    // on a freshly-created session, so swallow the error there.
+    const[configsRes,statusRes]=await Promise.all([
+      api(`/session/${currentSession}/mcp-configs`),
+      api(`/session/${currentSession}/mcp-status`).catch(()=>({statuses:[]})),
+    ]);
+    const configs=configsRes.configs||[];
+    const statusMap=new Map((statusRes.statuses||[]).map(s=>[s.id,s]));
+    $("session-mcp-list").innerHTML=configs.length?configs.map(c=>{
       const checked=c.enabled?"checked":"";
       const overrideTag=c.overridden?'<span class="tag">overridden</span>':"";
-      return `<div class="kv"><span style="font-size:12px">${esc(c.name)} ${overrideTag}</span><div style="display:flex;gap:6px;align-items:center"><label class="toggle-switch"><input type="checkbox" ${checked} onchange="setSessionMcpOverride('${esc(c.id)}',this.checked)"/><span class="slider"></span></label>${c.overridden?`<button class="sm" onclick="removeSessionMcpOverride('${esc(c.id)}')">Reset</button>`:""}</div></div>`;
+      const status=statusMap.get(c.id);
+      const statusPill=renderMcpStatusPill(c,status);
+      return `<div class="kv"><span style="font-size:12px;display:flex;align-items:center;gap:6px">${esc(c.name)} ${statusPill} ${overrideTag}</span><div style="display:flex;gap:6px;align-items:center"><label class="toggle-switch"><input type="checkbox" ${checked} onchange="setSessionMcpOverride('${esc(c.id)}',this.checked)"/><span class="slider"></span></label>${c.overridden?`<button class="sm" onclick="removeSessionMcpOverride('${esc(c.id)}')">Reset</button>`:""}</div></div>`;
     }).join(""):'<div class="empty">No integrations configured</div>';
   }catch{$("session-mcp-list").innerHTML='<div class="empty">Failed to load</div>'}
+}
+
+// Pure renderer for the per-MCP status pill. Three states:
+//   - never tried (no entry in statusMap) → grey "—"
+//   - ok          → green "✓ N tools"
+//   - failed      → red "✗" with error in title attr (hover tooltip)
+// Disabled configs render a muted "off" pill regardless of last-seen
+// status, because the session won't have tried to connect.
+function renderMcpStatusPill(config,status){
+  if(!config.enabled){
+    return `<span class="mcp-status mcp-status-off" title="Disabled — won't connect this session">off</span>`;
+  }
+  if(!status){
+    return `<span class="mcp-status mcp-status-pending" title="No connect attempt yet — send a message to trigger">—</span>`;
+  }
+  if(status.ok){
+    const n=Number(status.toolCount||0);
+    return `<span class="mcp-status mcp-status-ok" title="Last connect ok — ${n} tool${n===1?"":"s"}">✓ ${n}</span>`;
+  }
+  const err=String(status.error||"unknown error");
+  return `<span class="mcp-status mcp-status-fail" title="${esc(err)}">✗</span>`;
 }
 
 async function setSessionMcpOverride(mcpId,enabled){

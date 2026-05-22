@@ -265,6 +265,14 @@
     .section{margin-bottom:24px}
     .kv{display:flex;justify-content:space-between;padding:6px 0;font-size:12px;align-items:center;gap:8px}
     .tag{display:inline-block;background:var(--brand-tint);color:var(--text-info);padding:2px 8px;border-radius:100px;font-size:11px;font-weight:500;margin-right:4px}
+    /* MCP connect-status pill — surfaced next to each session MCP toggle.
+       States: ok (green), fail (red, error in title), pending (grey dash,
+       no connect attempted yet), off (muted, MCP disabled this session). */
+    .mcp-status{display:inline-block;padding:1px 6px;border-radius:100px;font-size:10px;font-weight:500;line-height:14px;cursor:help}
+    .mcp-status-ok{background:var(--success-tint);color:var(--text-success)}
+    .mcp-status-fail{background:var(--danger-tint);color:var(--text-danger)}
+    .mcp-status-pending{background:var(--base-2,#1a1a1a);color:var(--text-subtle);border:1px solid var(--line)}
+    .mcp-status-off{background:transparent;color:var(--text-inactive);border:1px solid var(--line)}
     .empty{color:var(--text-inactive);font-style:italic;font-size:12px;padding:8px 0}
 
     /* === Example prompts — Kumo layer card style.
