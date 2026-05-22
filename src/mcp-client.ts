@@ -1,5 +1,14 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+// Use the Workers-compatible JSON Schema validator. The SDK default
+// (AjvJsonSchemaValidator) calls `new Function()` to compile schemas,
+// which Cloudflare Workers blocks with "Code generation from strings
+// disallowed for this context". This bites whenever a remote MCP server
+// returns tools with an `outputSchema` — see Client.cacheToolMetadata in
+// @modelcontextprotocol/sdk/client/index.js. (You.com's tools all carry
+// outputSchema, which is why their MCP server's tools never appeared
+// despite a working connect/initialize.)
+import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker-provider.js";
 
 // ─── Auth header normalisation ───
 
@@ -138,7 +147,11 @@ export class HttpMcpClient implements McpClient {
     this.transport = new StreamableHTTPClientTransport(url, { requestInit });
     this.client = new Client(
       { name: `dodo-client-${this.config.id}`, version: "1.0.0" },
-      { capabilities: {} },
+      {
+        capabilities: {},
+        // Workers-safe validator — see the import comment above.
+        jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
+      },
     );
 
     await this.client.connect(this.transport);
