@@ -546,6 +546,17 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     return jsonFetch(env, "agent", "/", { sessionId, depth });
   });
 
+  server.tool(
+    "get_mcp_status",
+    "Get per-config MCP connect status for a session (ok / error / toolCount from the last connectMcpServers() run). Use this to diagnose why an MCP server's tools never appeared in the session.",
+    { sessionId: z.string().describe("Session ID") },
+    async ({ sessionId }) => {
+      const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+      if (!access.ok) return access.result;
+      return jsonFetch(env, "agent", "/mcp-status", { sessionId, depth });
+    },
+  );
+
   server.tool("delete_session", "Delete a Dodo session and its storage. The session can be restored within 5 minutes using restore_session.", { sessionId: z.string().describe("Session ID") }, async ({ sessionId }) => {
     // Delete is admin-level — only the session owner / platform admin may
     // soft-delete. (audit finding H3)
