@@ -378,6 +378,26 @@ export function buildProviderForModel(modelId: string, config: AppConfig, env: E
 export const EXPLORE_MAX_STEPS = 16;
 export const EXPLORE_TIMEOUT_MS = 60_000;
 
+/**
+ * Standard hint appended to every explore failure summary. Tells the
+ * orchestrator that the failure is transient and points it at the
+ * direct read-only tools so it can complete the task without explore.
+ *
+ * Why this exists: we saw three real sessions where explore returned
+ * "internal API error" and the orchestrator (small model, no recovery
+ * heuristic) declared the task impossible and stopped — instead of
+ * just running `list` + `grep` directly. The hint short-circuits that
+ * dead-end.
+ */
+export const EXPLORE_FALLBACK_HINT = [
+  "",
+  "Recovery: explore is unavailable on this call. Continue the task using `list`,",
+  "`find`, `grep`, and `read` directly — they are always available. If the",
+  "workspace appears empty, the repo has not been cloned yet; use `git_clone`",
+  "or `git_clone_known` first. Do NOT report the task as impossible just",
+  "because explore failed.",
+].join("\n");
+
 export const EXPLORE_SYSTEM_PROMPT = [
   "You are a search assistant. Your job is to find files and code relevant to the user's query.",
   "",

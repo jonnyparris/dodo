@@ -10,6 +10,18 @@ export const TASK_FACET_TIMEOUT_MS = 600_000;
 export const EXPLORE_SYSTEM_PROMPT = "You are a search assistant (mock).";
 export const TASK_SYSTEM_PROMPT = "You are a focused subagent (mock).";
 
+// Re-export the hint verbatim so failure-path assertions work in tests
+// that mock the runner. Keeping it identical to the real export ensures
+// `expect(summary).toContain(EXPLORE_FALLBACK_HINT)` is a meaningful check.
+export const EXPLORE_FALLBACK_HINT = [
+  "",
+  "Recovery: explore is unavailable on this call. Continue the task using `list`,",
+  "`find`, `grep`, and `read` directly — they are always available. If the",
+  "workspace appears empty, the repo has not been cloned yet; use `git_clone`",
+  "or `git_clone_known` first. Do NOT report the task as impossible just",
+  "because explore failed.",
+].join("\n");
+
 // Pass-through helpers — real behaviour is fine for tests since they
 // touch no I/O.
 export function capToolOutputs<T extends Record<string, unknown>>(tools: T): T {
