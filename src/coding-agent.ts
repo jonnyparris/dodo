@@ -1056,7 +1056,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
             compactionTriggered = true;
             try {
-              await self.maybeCompactContext();
+              // force=true so maybeCompactContext() bypasses the
+              // `lastInputTokens === 0` early-return guard. The mid-loop
+              // trigger fires on the FIRST user turn (before any assistant
+              // message is persisted), so lastInputTokens is always 0 here
+              // and the guard would silently no-op without `force`. The
+              // own-loop has already proved compaction is warranted by
+              // measuring cumulativeInputTokens directly — don't make
+              // maybeCompactContext re-decide.
+              await self.maybeCompactContext({ force: true });
               // Refresh messages from storage and re-assemble with compaction summary.
               const thinkSessionId = self.getCurrentSessionId();
               if (thinkSessionId) {
@@ -4992,8 +5000,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
 
     const messagesToCompact = realMessages.slice(0, compactCount);
+    // Guard against the pathological case where realMessages has fewer
+    // entries than targetCompactCount (e.g. force=true on the very first
+    // turn, when Think hasn't persisted the assistant message yet and
+    // realMessages.length === 1). Without this we'd hit
+    // `messagesToCompact[1].id` → TypeError on undefined.
+    if (messagesToCompact.length < 2) {
+      log("info", "compaction: skipped — fewer than 2 real messages to compact", {
+        sessionId: this.sessionId(),
+        realMessageCount: realMessages.length,
+      });
+      return;
+    }
     const fromMessageId = messagesToCompact[0].id;
-    const toMessageId = messagesToCompact[compactCount - 1].id;
+    const toMessageId = messagesToCompact[messagesToCompact.length - 1].id;
 
     // Check if this range is already compacted
     const existingCompactions = this.sessions.getCompactions(thinkSessionId);
