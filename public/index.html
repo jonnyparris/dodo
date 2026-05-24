@@ -823,6 +823,16 @@
           </details>
         </div>
         <div class="section">
+          <h2>Skills</h2>
+          <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Skills are SKILL.md files the agent loads on demand. Built-in skills ship with Dodo; personal skills you author here. Workspace skills (per-session, from <code>.dodo/skills/</code> etc.) are not shown here.</p>
+          <div id="skills-list"></div>
+        </div>
+        <div class="section">
+          <h2>Tools</h2>
+          <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Always-on tools available to the agent. Configure MCP integrations below to add more.</p>
+          <div id="tool-catalog-list"></div>
+        </div>
+        <div class="section">
           <h2>Integrations</h2>
           <div id="integrations-list"></div>
           <details style="margin-top:6px">
@@ -996,7 +1006,7 @@
     // --- Boot ---
     async function boot(){
       const isSharedSession=location.hash.match(/^#session=(.+)$/);
-      const bootTasks=[loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets(),loadIntegrations(),loadBrowserConfig()];
+      const bootTasks=[loadIdentity(),loadSessions(),loadConfig(),loadAllowlist(),loadMemory(),loadModels(),loadStatus(),loadTasks(),loadPasskeyStatus(),loadSecrets(),loadIntegrations(),loadBrowserConfig(),loadSkillsAndTools()];
       if(!isSharedSession)bootTasks.push(checkOnboarding());
       await Promise.all(bootTasks);
       startTaskSync();

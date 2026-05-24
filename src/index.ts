@@ -795,6 +795,37 @@ app.get("/api/skills", async (c) => {
   return proxyToUserControl(c.env, email, `/skills${new URL(c.req.raw.url).search}`);
 });
 
+// Merged personal + built-in skill list. Registered BEFORE /api/skills/:name
+// so Hono doesn't route "/api/skills/all" as the GET-by-name handler.
+// Workspace skills are session-scoped (live inside the cloned repo) and are
+// intentionally excluded — they only resolve when the user has a session
+// selected. Surfaced for the Skills sidebar so users can see what their
+// agent knows without diving into the system prompt.
+app.get("/api/skills/all", async (c) => {
+  const email = c.get("userEmail");
+  const personalRes = await proxyToUserControl(c.env, email, "/skills");
+  const personalPayload = await personalRes.json() as { skills?: Array<Record<string, unknown>> };
+  const personal = (personalPayload.skills ?? []).map((s) => ({
+    name: String(s.name),
+    description: String(s.description ?? ""),
+    enabled: s.enabled !== false,
+    source: "personal" as const,
+  }));
+  const { listBuiltinSkills } = await import("./builtin-skills");
+  const builtin = listBuiltinSkills().map((s) => ({
+    name: s.name,
+    description: s.description,
+    enabled: true,
+    source: "builtin" as const,
+  }));
+  const personalNames = new Set(personal.map((s) => s.name));
+  const merged = [
+    ...personal,
+    ...builtin.filter((s) => !personalNames.has(s.name)),
+  ].sort((a, b) => a.name.localeCompare(b.name));
+  return c.json({ skills: merged });
+});
+
 app.post("/api/skills", async (c) => {
   const email = c.get("userEmail");
   return proxyToUserControl(c.env, email, "/skills", {
@@ -831,6 +862,16 @@ app.delete("/api/skills/:name", async (c) => {
   const email = c.get("userEmail");
   return proxyToUserControl(c.env, email, `/skills/${encodeURIComponent(c.req.param("name"))}`, {
     method: "DELETE",
+  });
+});
+
+// ─── Tool catalog (static, for UI surfacing) ───
+
+app.get("/api/tool-catalog", async (c) => {
+  const { getOrchestratorToolCatalog, getSubagentToolCatalog } = await import("./tool-catalog");
+  return c.json({
+    orchestrator: getOrchestratorToolCatalog(),
+    subagent: getSubagentToolCatalog(),
   });
 });
 
