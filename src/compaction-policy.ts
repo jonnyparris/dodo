@@ -28,13 +28,23 @@ export interface CompactionInputs {
 
 /** Should the session trigger a compaction pass? */
 export function shouldCompact(inputs: CompactionInputs): boolean {
-  const minMessages = inputs.minMessages ?? 6;
+  // Emergency / forced compaction bypasses BOTH the usage check and the
+  // minMessages guard. Without this short-circuit, a first-turn balloon
+  // (e.g. a single assistant turn with many tool calls that compound to
+  // 200k+ input tokens) silently skips compaction because the persisted
+  // messageCount is still 2 (user + assistant) — well below the default
+  // minMessages of 6. The same applies after assembleContext() truncates
+  // history; we need a way to opt back in regardless of message count.
+  //
+  // We still require at least 2 real messages to have something to
+  // summarise — compacting 1 message is a no-op and 0 is a crash.
+  if (inputs.force || inputs.contextWasTruncated) {
+    return inputs.realMessageCount >= 2;
+  }
 
+  const minMessages = inputs.minMessages ?? 6;
   if (inputs.messageCount < minMessages) return false;
   if (inputs.realMessageCount < minMessages) return false;
-
-  // Emergency / forced compaction bypasses the usage check.
-  if (inputs.force || inputs.contextWasTruncated) return true;
 
   const tokenBudget = Math.floor(inputs.modelContextWindow * 0.8);
   if (tokenBudget <= 0) return false;

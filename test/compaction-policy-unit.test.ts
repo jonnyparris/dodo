@@ -58,6 +58,50 @@ describe("shouldCompact", () => {
     });
     expect(result).toBe(true);
   });
+
+  // Regression: force used to be gated by the minMessages guard, which
+  // meant first-turn balloons (one assistant turn with many tool calls
+  // pushing input tokens past 200k while messageCount stayed at 2) silently
+  // skipped compaction. The force / contextWasTruncated short-circuit must
+  // bypass minMessages entirely. See memory/learnings/dodo-orchestrator-model-matters.md.
+  it("force=true bypasses the minMessages guard (2 messages is enough)", () => {
+    const result = shouldCompact({
+      messageCount: 2,
+      realMessageCount: 2,
+      estimatedTokens: 1,
+      modelContextWindow: 10_000,
+      thresholdRatio: 0.5,
+      force: true,
+    });
+    expect(result).toBe(true);
+  });
+
+  it("contextWasTruncated=true bypasses the minMessages guard", () => {
+    const result = shouldCompact({
+      messageCount: 3,
+      realMessageCount: 3,
+      estimatedTokens: 100,
+      modelContextWindow: 10_000,
+      thresholdRatio: 0.5,
+      contextWasTruncated: true,
+    });
+    expect(result).toBe(true);
+  });
+
+  // Edge case: force still needs SOMETHING to compact. Single-message
+  // sessions (just the user prompt, no assistant turn yet) have no real
+  // content to summarise.
+  it("force=true with only 1 real message still returns false (nothing to compact)", () => {
+    const result = shouldCompact({
+      messageCount: 1,
+      realMessageCount: 1,
+      estimatedTokens: 50_000,
+      modelContextWindow: 100_000,
+      thresholdRatio: 0.5,
+      force: true,
+    });
+    expect(result).toBe(false);
+  });
 });
 
 describe("pickCutoff", () => {
