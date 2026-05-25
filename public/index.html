@@ -145,6 +145,37 @@
     button.ghost:hover{color:var(--text-default);background:var(--fill-hover)}
     button.icon-btn{padding:6px 8px;min-width:36px;display:inline-flex;align-items:center;justify-content:center}
 
+    /* === Utility classes — used to replace repeated inline styles === */
+    .field-label{font-size:11px;color:var(--muted);display:block}
+    .field-label-sm{font-size:10px;opacity:.7;font-weight:normal}
+    .field-row{display:flex;gap:4px;margin-bottom:8px}
+    .field-row-between{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+    .field-help{font-size:11px;color:var(--muted);margin-top:8px}
+    .field-help-tight{font-size:11px;color:var(--muted);margin-top:4px}
+    .form-input-mono{font-family:var(--mono,monospace);font-size:12px;width:100%}
+
+    /* Sidebar — identity strip + sessions section spacing */
+    .sidebar-identity{display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:8px 10px;background:var(--accent-bg);border-radius:var(--radius)}
+    .sidebar-identity .identity-text{font-size:11px;color:var(--muted)}
+    .sidebar h2{margin:0}
+    .sidebar .section{margin-top:24px}
+    .sidebar-version{font-size:11px;color:var(--text-inactive);text-align:center;margin-top:16px;padding:8px 0}
+
+    /* Onboarding panel — centered column */
+    .onboarding-col{margin-top:16px;text-align:left;max-width:400px;margin-left:auto;margin-right:auto}
+    .onboarding-logo{margin-bottom:12px}
+    .reset-list{list-style:none;padding:0;margin:0}
+
+    /* Footer logo + link styles */
+    .footer-brand{display:inline-flex;align-items:center;gap:4px}
+    .footer-logo{opacity:.7}
+    .footer-link{color:inherit;margin-left:8px}
+
+    /* Misc layout */
+    .flex-1{flex:1}
+    .collapsible-body-inner{padding-top:8px;display:flex;flex-direction:column;gap:6px}
+    .collapsible-body-inner > .field-label{margin-top:2px}
+
     /* === Inputs — Kumo input styling === */
     input,textarea,select{border:1px solid var(--line);border-radius:var(--radius);padding:7px 12px;font-size:13px;font-family:inherit;width:100%;background:var(--control);color:var(--text-default);min-height:36px;transition:border-color .12s,box-shadow .12s}
     input::placeholder,textarea::placeholder{color:var(--text-placeholder)}
@@ -623,13 +654,13 @@
         <h3>Sessions</h3>
         <button class="ghost" onclick="switchTab('chat')" aria-label="Close panel"><i class="ph ph-x" aria-hidden="true"></i></button>
       </div>
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:8px 10px;background:var(--accent-bg);border-radius:var(--radius)">
+      <div class="sidebar-identity">
         <img src="/favicon.svg" alt="Dodo" class="dodo-logo sm dodo-logo-img"/>
-        <div id="identity-display" style="font-size:11px;color:var(--muted)"></div>
+        <div id="identity-display" class="identity-text"></div>
       </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <h2 style="margin:0">Sessions</h2>
-        <div style="display:flex;gap:6px">
+      <div class="field-row-between">
+        <h2>Sessions</h2>
+        <div class="field-row" style="margin-bottom:0">
           <button onclick="clearOtherSessions()" title="Delete all sessions except the current one">Clear</button>
           <button onclick="openSessionPicker()" aria-label="Pick skills and MCPs for new session" title="Pick skills and MCPs for new session">Pick…</button>
           <button class="primary" onclick="createSession()" aria-label="Create new session">+ New</button>
@@ -637,43 +668,45 @@
       </div>
       <input id="session-search" class="session-search" placeholder="Search sessions..." oninput="filterSessions(this.value)" aria-label="Search sessions"/>
       <div id="session-list"></div>
-      <div class="section" style="margin-top:24px">
-        <h2>Config</h2>
+
+      <!-- Settings section — config + allowlist tucked behind details to keep the sidebar quiet -->
+      <div class="section">
+        <h2>Settings</h2>
         <div id="config-display"></div>
-        <details style="margin-top:8px">
+        <details>
           <summary>Edit config</summary>
-          <div style="margin-top:8px">
-            <label for="cfg-model" style="font-size:11px;color:var(--muted)">Model</label>
-            <input id="cfg-model" list="model-list" style="margin-bottom:6px"/>
+          <div class="collapsible-body-inner">
+            <label for="cfg-model" class="field-label">Model</label>
+            <input id="cfg-model" list="model-list"/>
             <datalist id="model-list"></datalist>
-            <label for="cfg-gateway" style="font-size:11px;color:var(--muted)">Gateway</label>
-            <select id="cfg-gateway" style="margin-bottom:6px" onchange="loadModels()">
+            <label for="cfg-gateway" class="field-label">Gateway</label>
+            <select id="cfg-gateway" onchange="loadModels()">
               <option value="ai-gateway">AI Gateway</option>
               <option value="opencode">OpenCode</option>
             </select>
-            <label for="cfg-gateway-url" style="font-size:11px;color:var(--muted)">Gateway URL</label>
-            <input id="cfg-gateway-url" placeholder="https://..." style="margin-bottom:6px"/>
-            <label for="cfg-git-author-name" style="font-size:11px;color:var(--muted)">Git Author Name</label>
-            <input id="cfg-git-author-name" placeholder="Dodo" style="margin-bottom:6px"/>
-            <label for="cfg-git-author-email" style="font-size:11px;color:var(--muted)">Git Author Email</label>
-            <input id="cfg-git-author-email" type="email" placeholder="dodo@example.com" style="margin-bottom:6px"/>
-            <label for="cfg-system-prompt-prefix" style="font-size:11px;color:var(--muted)">System prompt prefix <span style="font-size:10px;opacity:.7">(prepended to every session, 4 KB max)</span></label>
-            <textarea id="cfg-system-prompt-prefix" placeholder="Personal preamble \u2014 writing style, conventions, tone\u2026" rows="4" style="width:100%;margin-bottom:6px;font-family:var(--mono,monospace);font-size:12px"></textarea>
-            <button onclick="saveConfig()" style="margin-top:4px">Save</button>
+            <label for="cfg-gateway-url" class="field-label">Gateway URL</label>
+            <input id="cfg-gateway-url" placeholder="https://..."/>
+            <label for="cfg-git-author-name" class="field-label">Git Author Name</label>
+            <input id="cfg-git-author-name" placeholder="Dodo"/>
+            <label for="cfg-git-author-email" class="field-label">Git Author Email</label>
+            <input id="cfg-git-author-email" type="email" placeholder="dodo@example.com"/>
+            <label for="cfg-system-prompt-prefix" class="field-label">System prompt prefix <span class="field-label-sm">(prepended to every session, 4 KB max)</span></label>
+            <textarea id="cfg-system-prompt-prefix" placeholder="Personal preamble — writing style, conventions, tone…" rows="4" class="form-input-mono"></textarea>
+            <button onclick="saveConfig()">Save</button>
           </div>
         </details>
-      </div>
-      <div class="section">
         <details>
           <summary>Manage hosts</summary>
-          <div id="allowlist-display"></div>
-          <div style="display:flex;gap:4px;margin-top:6px">
-            <input id="allowlist-input" placeholder="hostname" aria-label="Hostname to allowlist" style="flex:1"/>
-            <button onclick="addHost()" aria-label="Add host">+</button>
+          <div class="collapsible-body-inner">
+            <div id="allowlist-display"></div>
+            <div class="field-row" style="margin-top:6px;margin-bottom:0">
+              <input id="allowlist-input" placeholder="hostname" aria-label="Hostname to allowlist" class="flex-1"/>
+              <button onclick="addHost()" aria-label="Add host">+</button>
+            </div>
           </div>
         </details>
       </div>
-      <div id="sidebar-version" style="font-size:11px;color:var(--text-inactive);text-align:center;margin-top:16px;padding:8px 0"></div>
+      <div id="sidebar-version" class="sidebar-version"></div>
     </nav>
 
     <div class="resize-handle" id="resize-left" role="separator" aria-orientation="vertical" aria-label="Resize left sidebar"></div>
@@ -713,16 +746,16 @@
       </div>
       <div class="chat" id="chat">
         <div class="onboarding" id="onboarding">
-          <img src="/favicon.svg" alt="Dodo" class="dodo-logo lg dodo-logo-img" style="margin-bottom:12px"/>
+          <img src="/favicon.svg" alt="Dodo" class="dodo-logo lg dodo-logo-img onboarding-logo"/>
           <h3>Welcome to Dodo</h3>
           <p>Your AI coding assistant. Start typing or pick up where you left off.</p>
-          <div id="onboarding-sessions" class="onboarding-sessions" style="margin-top:16px;text-align:left;max-width:400px;margin-left:auto;margin-right:auto">
+          <div id="onboarding-sessions" class="onboarding-sessions onboarding-col">
             <h2>Recent sessions</h2>
             <div id="onboarding-session-list"></div>
           </div>
-          <div style="margin-top:16px;text-align:left;max-width:400px;margin-left:auto;margin-right:auto">
+          <div class="onboarding-col">
             <h2 id="example-prompts-heading">Try these prompts</h2>
-            <ul role="list" aria-labelledby="example-prompts-heading" style="list-style:none;padding:0;margin:0">
+            <ul role="list" aria-labelledby="example-prompts-heading" class="reset-list">
               <li><button type="button" class="example-prompt" onclick="useExample(this)">Create a Cloudflare Worker that returns the current time as JSON. Write it to /src/index.ts</button></li>
               <li><button type="button" class="example-prompt" onclick="useExample(this)">Write a fibonacci function in /src/fib.ts, then write tests for it in /test/fib.test.ts</button></li>
               <li><button type="button" class="example-prompt" onclick="useExample(this)">Read all files in the workspace and give me a summary of what's there</button></li>
@@ -748,8 +781,8 @@
       </div>
       <div class="footer" id="footer">
         <button class="ghost sm" onclick="togglePanel('sidebar')" title="Toggle left sidebar" aria-label="Toggle left sidebar" id="toggle-sidebar-btn">&laquo;</button>
-        <span id="footer-text" style="display:inline-flex;align-items:center;gap:4px"><img src="/favicon.svg" alt="" width="14" height="14" style="opacity:.7" class="dodo-logo-img"/>Dodo</span>
-        <a href="https://github.com/jonnyparris/dodo" target="_blank" rel="noopener noreferrer" title="View on GitHub" aria-label="View Dodo source on GitHub" style="color:inherit;margin-left:8px;"><i class="ph ph-github-logo" aria-hidden="true"></i><span class="visually-hidden">View on GitHub</span></a>
+        <span id="footer-text" class="footer-brand"><img src="/favicon.svg" alt="" width="14" height="14" class="dodo-logo-img footer-logo"/>Dodo</span>
+        <a href="https://github.com/jonnyparris/dodo" target="_blank" rel="noopener noreferrer" title="View on GitHub" aria-label="View Dodo source on GitHub" class="footer-link"><i class="ph ph-github-logo" aria-hidden="true"></i><span class="visually-hidden">View on GitHub</span></a>
         <button class="ghost sm" onclick="togglePanel('right')" title="Toggle right panel" aria-label="Toggle right panel" id="toggle-right-btn">&raquo;</button>
       </div>
     </main>
@@ -766,19 +799,19 @@
         <div class="section">
           <h2>Agent Todos</h2>
           <div id="session-todos-list" class="session-todos"></div>
-          <p id="session-todos-empty" style="font-size:11px;color:var(--muted);margin-top:8px">No todos yet. The agent will populate this list when it plans multi-step work.</p>
+          <p id="session-todos-empty" class="field-help">No todos yet. The agent will populate this list when it plans multi-step work.</p>
         </div>
         <div class="section">
           <h2>Workspace Files</h2>
           <div id="file-tree" class="file-tree"></div>
-          <p style="font-size:11px;color:var(--muted);margin-top:8px">Files are managed by the agent. Ask Dodo to create, edit, or delete files.</p>
+          <p class="field-help">Files are managed by the agent. Ask Dodo to create, edit, or delete files.</p>
         </div>
         <div class="section">
           <h2>Git</h2>
           <div id="git-status-display"></div>
           <div id="git-log-display" style="margin-top:8px"></div>
           <div id="artifacts-clone" style="margin-top:8px"></div>
-          <p style="font-size:11px;color:var(--muted);margin-top:4px">Git operations are handled by the agent. Ask Dodo to init, commit, or push.</p>
+          <p class="field-help-tight">Git operations are handled by the agent. Ask Dodo to init, commit, or push.</p>
         </div>
       </div>
       <div id="tools-group">
@@ -1027,7 +1060,7 @@
           </label>
           <span style="font-size:12px" id="browser-status">Loading...</span>
         </div>
-        <p style="font-size:11px;color:var(--muted);margin-top:4px">An admin must enable browser access for your account first. Configure credentials under Browser Rendering in the sidebar, or use the built-in browser (admin only).</p>
+        <p class="field-help-tight">An admin must enable browser access for your account first. Configure credentials under Browser Rendering in the sidebar, or use the built-in browser (admin only).</p>
       </div>
 
       <!-- Session MCP Overrides -->
