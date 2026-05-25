@@ -546,6 +546,21 @@ app.get("/admin/seeds", async (c) => {
   return new Response("Seed cache admin page not available", { status: 404 });
 });
 
+// Global system-prompt admin page — same shape as /admin/seeds.
+app.get("/admin/system-prompt", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-system-prompt.html", c.req.url), c.req.raw));
+  }
+  return new Response("Admin page not available", { status: 404 });
+});
+
+app.get("/admin/autopilot", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-autopilot.html", c.req.url), c.req.raw));
+  }
+  return new Response("Admin page not available", { status: 404 });
+});
+
 // ─── Admin routes (admin only) ───
 
 const adminGuard = async (c: { get: (key: string) => unknown; env: Env; json: (data: unknown, status?: number) => Response }, next: () => Promise<void>): Promise<Response | void> => {
@@ -603,6 +618,220 @@ app.post("/api/admin/health-check", adminGuard as never, async (c) => {
   const report = await runHealthCheck(c.env, c.executionCtx);
   return c.json(report);
 });
+
+// ─── Admin: autopilot self-diagnose kickoff ───
+//
+// Creates a fresh session owned by the admin, marks it as an autopilot
+// worker, seeds the diagnose prompt, and returns the session id. The LLM
+// runs in the background (fiber-backed async prompt) — the admin can pop
+// open the session in the UI and watch it work.
+
+app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const body = await c.req.raw.json().catch(() => ({})) as {
+    targetArea?: string;
+    contextNotes?: string;
+    sinceHours?: number;
+  };
+
+  // Lazy imports so a non-admin user's bundle doesn't pay the cost.
+  const { buildDiagnosePrompt, resolveAutopilotOwner } = await import("./autopilot");
+  let owner: string;
+  try {
+    owner = resolveAutopilotOwner(c.env);
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : "Autopilot unavailable" }, 500);
+  }
+  // The kickoff route always acts on behalf of the admin who clicked the
+  // button. resolveAutopilotOwner just confirms ADMIN_EMAIL is set.
+  if (adminEmail.toLowerCase() !== owner) {
+    return c.json({ error: "Only the configured ADMIN_EMAIL can kick off autopilot" }, 403);
+  }
+
+  const sessionId = crypto.randomUUID();
+
+  // Create the session. No skill/MCP overrides — autopilot needs all tools
+  // available since it may need diagnose, audit-stubs, and git skills.
+  const createRes = await proxyToUserControl(c.env, owner, "/sessions", {
+    body: JSON.stringify({ id: sessionId, ownerEmail: owner, createdBy: owner }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  if (!createRes.ok) {
+    const text = await createRes.text().catch(() => "");
+    return c.json({ error: `Failed to create autopilot session: ${text}` }, 500);
+  }
+
+  // Tag the session as autopilot so the UI can badge it and so a future
+  // sweep can list autopilot runs distinctly from human sessions.
+  const agentStub = await getAgentByName(c.env.CODING_AGENT as never, sessionId);
+  await agentStub.fetch(`https://coding-agent/autopilot-flag`, {
+    body: JSON.stringify({ isAutopilot: true, role: "worker-manual" }),
+    headers: { "content-type": "application/json", "x-dodo-session-id": sessionId, "x-owner-email": owner },
+    method: "PUT",
+  });
+  // Use a recognisable title prefix so the session list shows what this is.
+  const title = `[autopilot] ${body.targetArea ?? "diagnose " + new Date().toISOString().slice(0, 16)}`;
+  await proxyToUserControl(c.env, owner, `/sessions/${encodeURIComponent(sessionId)}`, {
+    body: JSON.stringify({ title }),
+    headers: { "content-type": "application/json" },
+    method: "PATCH",
+  });
+
+  const prompt = buildDiagnosePrompt({
+    targetArea: body.targetArea,
+    contextNotes: body.contextNotes,
+    sinceHours: body.sinceHours ?? 24,
+  });
+  const ownerConfigRes = await readConfig(c.env, owner);
+  const promptRes = await agentStub.fetch(`https://coding-agent/prompt`, {
+    body: JSON.stringify({ content: prompt }),
+    headers: {
+      "content-type": "application/json",
+      "x-dodo-session-id": sessionId,
+      "x-owner-email": owner,
+      "x-author-email": owner,
+      "x-dodo-ai-base-url": ownerConfigRes.aiGatewayBaseURL,
+      "x-dodo-gateway": ownerConfigRes.activeGateway,
+      "x-dodo-model": ownerConfigRes.model,
+      "x-dodo-opencode-base-url": ownerConfigRes.opencodeBaseURL,
+    },
+    method: "POST",
+  });
+  if (!promptRes.ok) {
+    const text = await promptRes.text().catch(() => "");
+    log("warn", "autopilot kickoff: prompt rejected", { sessionId, body: text.slice(0, 200) });
+    // Session still exists — admin can open it and prompt manually
+    return c.json({ id: sessionId, warning: `Session created but initial prompt failed: ${text.slice(0, 200)}` }, 201);
+  }
+
+  log("info", "Autopilot worker kicked off", { sessionId, targetArea: body.targetArea ?? null });
+  return c.json({ id: sessionId, ownerEmail: owner, title }, 201);
+});
+
+// ─── Admin: autopilot supervisor schedule ───
+//
+// Installs (or replaces) a scheduled supervisor session that fires on a
+// cron and decides whether to dispatch worker sessions. The supervisor is
+// a regular scheduled session under the hood — we just hand it the
+// supervisor prompt template and tag it as autopilot when it spawns.
+
+const AUTOPILOT_SUPERVISOR_DESC = "Dodo autopilot supervisor";
+
+app.get("/api/admin/autopilot/supervisor", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const res = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions");
+  if (!res.ok) return c.json({ error: `Failed to list schedules: ${res.status}` }, 500);
+  const body = (await res.json()) as { scheduledSessions?: Array<{ id: string; description: string; cron_expression?: string; next_run_epoch?: number; last_run_epoch?: number }> };
+  const supervisor = (body.scheduledSessions ?? []).find((s) => s.description === AUTOPILOT_SUPERVISOR_DESC);
+  return c.json({ supervisor: supervisor ?? null });
+});
+
+app.post("/api/admin/autopilot/supervisor", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const body = (await c.req.raw.json().catch(() => ({}))) as { cron?: string; sinceHours?: number };
+  const cron = (body.cron ?? "0 */12 * * *").trim();
+  const sinceHours = body.sinceHours ?? 12;
+
+  const { buildSupervisorPrompt, resolveAutopilotOwner } = await import("./autopilot");
+  try {
+    const owner = resolveAutopilotOwner(c.env);
+    if (adminEmail.toLowerCase() !== owner) {
+      return c.json({ error: "Only the configured ADMIN_EMAIL can install the supervisor" }, 403);
+    }
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : "Autopilot unavailable" }, 500);
+  }
+
+  // Remove any existing supervisor — keeps a single schedule per admin.
+  const existingRes = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions");
+  if (existingRes.ok) {
+    const existing = (await existingRes.json()) as { scheduledSessions?: Array<{ id: string; description: string }> };
+    for (const s of existing.scheduledSessions ?? []) {
+      if (s.description === AUTOPILOT_SUPERVISOR_DESC) {
+        await proxyToUserControl(c.env, adminEmail, `/scheduled-sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
+      }
+    }
+  }
+
+  const payload = {
+    description: AUTOPILOT_SUPERVISOR_DESC,
+    prompt: buildSupervisorPrompt({ sinceHours }),
+    type: "cron" as const,
+    cron,
+    source: "fresh" as const,
+    title: "[autopilot supervisor]",
+    createdBy: adminEmail,
+  };
+
+  const createRes = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions", {
+    body: JSON.stringify(payload),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  if (!createRes.ok) {
+    const text = await createRes.text().catch(() => "");
+    return c.json({ error: `Failed to install supervisor: ${text}` }, 500);
+  }
+  const created = await createRes.json();
+  return c.json({ installed: true, schedule: created }, 201);
+});
+
+app.delete("/api/admin/autopilot/supervisor", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const existingRes = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions");
+  if (!existingRes.ok) return c.json({ error: `Failed to list schedules: ${existingRes.status}` }, 500);
+  const existing = (await existingRes.json()) as { scheduledSessions?: Array<{ id: string; description: string }> };
+  let removed = 0;
+  for (const s of existing.scheduledSessions ?? []) {
+    if (s.description === AUTOPILOT_SUPERVISOR_DESC) {
+      await proxyToUserControl(c.env, adminEmail, `/scheduled-sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
+      removed++;
+    }
+  }
+  return c.json({ removed });
+});
+
+app.get("/api/admin/autopilot/workers", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const limit = Math.min(Number(c.req.query("limit") ?? 25), 100);
+  const res = await proxyToUserControl(c.env, adminEmail, "/sessions");
+  if (!res.ok) return c.json({ error: `Failed to list sessions: ${res.status}` }, 500);
+  const body = (await res.json()) as { sessions?: Array<{ id: string; title?: string; status?: string; created_at?: number }> };
+  const all = body.sessions ?? [];
+  const autopilot = all
+    .filter((s) => (s.title ?? "").startsWith("[autopilot]"))
+    .sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))
+    .slice(0, limit);
+  return c.json({ count: autopilot.length, sessions: autopilot });
+});
+
+// ─── Admin: global system-prompt prefix ───
+//
+// A preamble prepended to the system prompt for every session across every
+// user. Capped at 4 KB on the SharedIndex side. Sessions pick up changes on
+// the next prompt turn (60-second TTL cache in CodingAgent).
+
+app.get("/api/admin/global-system-prompt", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/global-config/system_prompt_prefix"),
+);
+
+app.put("/api/admin/global-system-prompt", adminGuard as never, async (c) => {
+  const body = (await c.req.json()) as { value?: string };
+  const updatedBy = c.get("userEmail") as string;
+  if (typeof body.value !== "string") {
+    return c.json({ error: "value (string) required" }, 400);
+  }
+  return proxyToSharedIndex(c.env, "/global-config/system_prompt_prefix", {
+    body: JSON.stringify({ value: body.value, updatedBy }),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/admin/global-system-prompt", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/global-config/system_prompt_prefix", { method: "DELETE" }),
+);
 
 // Approved-MCPs admin routes use the shared `adminGuard` middleware so the
 // admin gate is applied consistently with every other /api/admin/* route.
@@ -1628,7 +1857,14 @@ app.post("/api/scheduled-sessions/:id/retry", async (c) => {
 
 app.post("/session", async (c) => {
   const email = c.get("userEmail");
-  const body = await c.req.raw.json().catch(() => ({})) as { ownerOverride?: string };
+  const body = await c.req.raw.json().catch(() => ({})) as {
+    ownerOverride?: string;
+    // Optional pre-session picker selections. Each entry sets the effective
+    // enabled flag for one skill / MCP in the new session. Absence means
+    // the picker wasn't used — caller wants the default behaviour.
+    skillOverrides?: Array<{ skillName: string; enabled: boolean }>;
+    mcpOverrides?: Array<{ mcpConfigId: string; enabled: boolean }>;
+  };
   const sessionId = crypto.randomUUID();
 
   // Check for account-level create permission (delegation)
@@ -1678,7 +1914,69 @@ app.post("/session", async (c) => {
     });
   }
 
-  log("info", "Session created", { email, sessionId, ownerEmail, createdBy });
+  // Resolve which overrides to apply. The picker passes them explicitly;
+  // bare "+ New" sends an empty body, in which case we replay the user's
+  // last-session selection (the "Remember last session's selection"
+  // default behaviour). Explicit empty arrays in the body are honoured —
+  // that lets the picker say "all on" by sending an empty array, distinct
+  // from "use my last selection".
+  let appliedSkillOverrides = body.skillOverrides;
+  let appliedMcpOverrides = body.mcpOverrides;
+  if (appliedSkillOverrides === undefined && appliedMcpOverrides === undefined) {
+    try {
+      const prefsRes = await proxyToUserControl(c.env, ownerEmail, "/session-preferences");
+      if (prefsRes.ok) {
+        const prefs = (await prefsRes.json()) as {
+          skillOverrides: Array<{ skillName: string; enabled: boolean }>;
+          mcpOverrides: Array<{ mcpConfigId: string; enabled: boolean }>;
+        };
+        appliedSkillOverrides = prefs.skillOverrides;
+        appliedMcpOverrides = prefs.mcpOverrides;
+      }
+    } catch (e) {
+      log("warn", "Failed to load session preferences for default-apply", { email, sessionId, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  // Apply pre-session picker selections (if any) before the agent first
+  // wakes up. Use bulk PUT endpoints so the whole selection lands in one
+  // round-trip each.
+  if (appliedSkillOverrides && appliedSkillOverrides.length > 0) {
+    await proxyToUserControl(c.env, ownerEmail, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides`, {
+      body: JSON.stringify({ overrides: appliedSkillOverrides }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  }
+  if (appliedMcpOverrides && appliedMcpOverrides.length > 0) {
+    await proxyToUserControl(c.env, ownerEmail, `/sessions/${encodeURIComponent(sessionId)}/mcp-overrides`, {
+      body: JSON.stringify({ overrides: appliedMcpOverrides }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  }
+  // Remember the explicit picker selection (only when the caller provided
+  // one — replays from last-session don't need re-saving).
+  if (body.skillOverrides !== undefined || body.mcpOverrides !== undefined) {
+    await proxyToUserControl(c.env, ownerEmail, "/session-preferences", {
+      body: JSON.stringify({
+        skillOverrides: body.skillOverrides ?? [],
+        mcpOverrides: body.mcpOverrides ?? [],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  }
+
+  log("info", "Session created", {
+    email,
+    sessionId,
+    ownerEmail,
+    createdBy,
+    skillOverrides: appliedSkillOverrides?.length ?? 0,
+    mcpOverrides: appliedMcpOverrides?.length ?? 0,
+    pickerProvided: body.skillOverrides !== undefined || body.mcpOverrides !== undefined,
+  });
   // Increment global session counter
   await proxyToSharedIndex(c.env, "/stats/increment", {
     body: JSON.stringify({ stat: "sessionCount", delta: 1 }),
@@ -2256,6 +2554,59 @@ app.delete("/session/:id/mcp-configs/:mcpId", async (c) => {
   const mcpId = c.req.param("mcpId");
   return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/mcp-overrides/${encodeURIComponent(mcpId)}`, {
     method: "DELETE",
+  });
+});
+
+// ─── Session Skill Overrides ───
+//
+// Mirror of MCP override routes for skills. The picker writes these at
+// session-creation time; the in-session settings UI can also toggle
+// individual skills after creation.
+
+app.get("/session/:id/skill-overrides", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides`);
+});
+
+app.post("/session/:id/skill-overrides", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.delete("/session/:id/skill-overrides/:skillName", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const skillName = c.req.param("skillName");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides/${encodeURIComponent(skillName)}`, {
+    method: "DELETE",
+  });
+});
+
+// ─── Last-session preference memory (powers the pre-session picker) ───
+
+app.get("/api/session-preferences", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/session-preferences");
+});
+
+app.put("/api/session-preferences", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/session-preferences", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
   });
 });
 

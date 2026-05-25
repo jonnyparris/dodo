@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Dodo — Global System Prompt (Admin)</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    :root{--bg:#f5f5f0;--panel:#fff;--text:#1a1a1a;--muted:#666;--accent:#0a7c66;--accent-bg:rgba(10,124,102,.06);--border:#e0e0e0;--radius:8px;--mono:"SFMono-Regular",Consolas,monospace;--brand:#6c47ff;--danger:#c62828;--success:#0a7c66;--warning:#e65100}
+    @media(prefers-color-scheme:dark){:root{--bg:#111;--panel:#1a1a1a;--text:#e5e5e5;--muted:#999;--accent:#4ecdc4;--accent-bg:rgba(78,205,196,.08);--border:#333;--brand:#9b7dff;--danger:#ef5350;--success:#4ecdc4;--warning:#ffb74d}}
+    *{box-sizing:border-box;margin:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
+    main{max-width:1024px;margin:0 auto;padding:32px 20px 80px}
+    h1{font-size:24px;margin-bottom:8px}
+    h2{font-size:16px;margin:32px 0 12px;color:var(--accent)}
+    p{color:var(--muted);margin-bottom:12px}
+    a{color:var(--accent)}
+    .back{display:inline-block;margin-bottom:24px;font-size:13px}
+    code{font-family:var(--mono);font-size:12px;background:var(--accent-bg);padding:2px 6px;border-radius:4px}
+    label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+    textarea{width:100%;min-height:280px;font-family:var(--mono);font-size:13px;padding:12px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);line-height:1.45;resize:vertical}
+    textarea:focus{outline:none;border-color:var(--accent)}
+    button{font-family:inherit;font-size:13px;padding:8px 14px;border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:6px;cursor:pointer;margin-right:6px}
+    button:hover{border-color:var(--accent);color:var(--accent)}
+    button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+    button.primary:hover{background:var(--accent);color:#fff;opacity:.9}
+    button.danger{border-color:var(--danger);color:var(--danger)}
+    button.danger:hover{background:var(--danger);color:#fff}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .toolbar{display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap}
+    .toolbar .grow{flex:1}
+    .meta{font-size:12px;color:var(--muted)}
+    .status{font-size:12px;color:var(--muted);margin-top:12px;min-height:18px}
+    .status.error{color:var(--danger)}
+    .status.success{color:var(--success)}
+    .counter{font-size:12px;color:var(--muted);font-family:var(--mono)}
+    .counter.over{color:var(--danger);font-weight:600}
+  </style>
+</head>
+<body>
+  <main>
+    <a href="/" class="back">&larr; Back to Dodo</a>
+    <h1>Global System Prompt</h1>
+    <p>A preamble prepended to the system prompt for <strong>every session across every user</strong>. Use this for organisation-wide rules, conventions, or context that should never be skipped.</p>
+    <p>This prefix layers <em>above</em> each user's personal <code>systemPromptPrefix</code>, which in turn layers above Dodo's hardcoded base prompt. Capped at 4 KB. Active sessions pick up changes within ~60 seconds (TTL cache).</p>
+
+    <label for="prompt">Prefix text</label>
+    <textarea id="prompt" placeholder="e.g. Always answer in metric units. Prefer Cloudflare Workers idioms over Node.js patterns."></textarea>
+
+    <div class="toolbar">
+      <button id="save" type="button" class="primary">Save</button>
+      <button id="clear" type="button" class="danger">Clear</button>
+      <span class="grow"></span>
+      <span id="counter" class="counter">0 / 4000</span>
+    </div>
+
+    <div class="status" id="status"></div>
+
+    <div class="meta" id="last-updated"></div>
+
+    <h2>How it works</h2>
+    <p>Saved values are stored on the <code>SharedIndex</code> DO under <code>global_config</code>. The <code>CodingAgent</code> DO fetches the value at the start of every prompt turn (with a 60-second TTL cache) and assembles the final system prompt as <code>admin-prefix → user-prefix → base prompt → skills → workspace</code>. To clear the prefix, save an empty value or hit Clear.</p>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const MAX = 4000;
+    const setStatus = (msg, kind) => {
+      const s = $("status");
+      s.textContent = msg;
+      s.className = "status" + (kind ? " " + kind : "");
+    };
+
+    async function api(path, init) {
+      const res = await fetch(path, init);
+      if (!res.ok) {
+        let detail = "";
+        try { detail = (await res.json()).error || ""; } catch { /* not json */ }
+        throw new Error(`${res.status} ${detail || res.statusText}`);
+      }
+      return await res.json();
+    }
+
+    function fmtDate(iso) {
+      if (!iso) return "—";
+      try { return new Date(iso).toLocaleString(); } catch { return iso; }
+    }
+
+    function updateCounter() {
+      const len = $("prompt").value.length;
+      const c = $("counter");
+      c.textContent = `${len} / ${MAX}`;
+      c.className = "counter" + (len > MAX ? " over" : "");
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    }
+
+    async function load() {
+      setStatus("Loading…");
+      try {
+        const data = await api("/api/admin/global-system-prompt");
+        const value = data?.value ?? "";
+        $("prompt").value = value || "";
+        if (data?.updatedAt) {
+          $("last-updated").innerHTML = `Last updated ${escapeHtml(fmtDate(data.updatedAt))} by <code>${escapeHtml(data.updatedBy || "—")}</code>.`;
+        } else {
+          $("last-updated").textContent = "No prefix set yet.";
+        }
+        updateCounter();
+        setStatus("");
+      } catch (err) {
+        setStatus(`Failed to load: ${err.message}`, "error");
+      }
+    }
+
+    async function save() {
+      const value = $("prompt").value;
+      if (value.length > MAX) {
+        setStatus(`Too long: ${value.length} > ${MAX} bytes. Trim before saving.`, "error");
+        return;
+      }
+      const btn = $("save");
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Saving…";
+      setStatus("Saving…");
+      try {
+        await api("/api/admin/global-system-prompt", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ value }),
+        });
+        setStatus(value.trim() === "" ? "Cleared." : "Saved. Active sessions will pick this up within ~60 seconds.", "success");
+        await load();
+      } catch (err) {
+        setStatus(`Save failed: ${err.message}`, "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function clearPrefix() {
+      if (!confirm("Clear the global system-prompt prefix? Active sessions will pick this up within ~60 seconds.")) return;
+      $("prompt").value = "";
+      updateCounter();
+      await save();
+    }
+
+    $("prompt").addEventListener("input", updateCounter);
+    $("save").addEventListener("click", save);
+    $("clear").addEventListener("click", clearPrefix);
+
+    load();
+  </script>
+</body>
+</html>

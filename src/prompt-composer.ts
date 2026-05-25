@@ -18,6 +18,12 @@ export interface PromptComposeInputs {
   projectInstructions?: string;
   /** User-supplied prefix (systemPromptPrefix in DodoConfig). */
   userPrefix?: string;
+  /**
+   * Admin-managed global prefix applied to every session across every user.
+   * Sits above `userPrefix` so layering is `admin > user > base`. Same 4 KB
+   * cap as `userPrefix`. Loaded from SharedIndex `global_config`.
+   */
+  adminPrefix?: string;
   /** Hard cap on prompt length in bytes. */
   maxLengthBytes?: number;
 }
@@ -26,12 +32,13 @@ export interface PromptComposeInputs {
  * Assemble the final system prompt from its constituent parts.
  *
  * Ordering (outermost → innermost):
- * 1. User prefix (if any) — placed at the very top.
- * 2. Static base prompt.
- * 3. Skill manifest (if any).
- * 4. Browser section (if any).
- * 5. Workspace summary (if any).
- * 6. Project instructions (if any).
+ * 1. Admin prefix (if any) — placed at the very top, applies to every session.
+ * 2. User prefix (if any) — per-user preamble, below admin prefix.
+ * 3. Static base prompt.
+ * 4. Skill manifest (if any).
+ * 5. Browser section (if any).
+ * 6. Workspace summary (if any).
+ * 7. Project instructions (if any).
  *
  * If `maxLengthBytes` is set and the assembled prompt exceeds it, the
  * optional sections are dropped in reverse priority order until it fits.
@@ -57,8 +64,14 @@ export function assembleSystemPrompt(inputs: PromptComposeInputs): string {
 
   let prompt = parts.join("\n\n");
 
+  // User prefix layers above the base; admin prefix layers above that. Both
+  // are joined with `---` so the model can recognise the boundary.
   if (inputs.userPrefix) {
     prompt = `${inputs.userPrefix}\n\n---\n\n${prompt}`;
+  }
+
+  if (inputs.adminPrefix) {
+    prompt = `${inputs.adminPrefix}\n\n---\n\n${prompt}`;
   }
 
   if (inputs.maxLengthBytes && prompt.length > inputs.maxLengthBytes) {

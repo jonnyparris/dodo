@@ -593,6 +593,7 @@
         <h2 style="margin:0">Sessions</h2>
         <div style="display:flex;gap:6px">
           <button onclick="clearOtherSessions()" title="Delete all sessions except the current one">Clear</button>
+          <button onclick="openSessionPicker()" aria-label="Pick skills and MCPs for new session" title="Pick skills and MCPs for new session">Pick…</button>
           <button class="primary" onclick="createSession()" aria-label="Create new session">+ New</button>
         </div>
       </div>
@@ -618,6 +619,8 @@
             <input id="cfg-git-author-name" placeholder="Dodo" style="margin-bottom:6px"/>
             <label for="cfg-git-author-email" style="font-size:11px;color:var(--muted)">Git Author Email</label>
             <input id="cfg-git-author-email" type="email" placeholder="dodo@example.com" style="margin-bottom:6px"/>
+            <label for="cfg-system-prompt-prefix" style="font-size:11px;color:var(--muted)">System prompt prefix <span style="font-size:10px;opacity:.7">(prepended to every session, 4 KB max)</span></label>
+            <textarea id="cfg-system-prompt-prefix" placeholder="Personal preamble \u2014 writing style, conventions, tone\u2026" rows="4" style="width:100%;margin-bottom:6px;font-family:var(--mono,monospace);font-size:12px"></textarea>
             <button onclick="saveConfig()" style="margin-top:4px">Save</button>
           </div>
         </details>
@@ -990,6 +993,36 @@
         <h4>MCP Integrations (Session Override)</h4>
         <p style="font-size:11px;color:var(--muted);margin-bottom:8px">Toggle integrations on/off for this session only.</p>
         <div id="session-mcp-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pre-session picker overlay -->
+  <div class="wizard-overlay" id="picker-overlay" style="display:none" role="dialog" aria-modal="true" aria-label="Pick skills and MCPs">
+    <div class="wizard-card" style="max-width:680px;text-align:left;max-height:84vh;overflow:hidden;display:flex;flex-direction:column">
+      <button class="wizard-skip" onclick="closeSessionPicker()" aria-label="Close picker">&times;</button>
+      <h3 style="text-align:left">New session</h3>
+      <p style="text-align:left">Pick which skills and MCP integrations to enable. Your selection is remembered for next time.</p>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+        <button onclick="pickerSelectAll()" type="button">Select all</button>
+        <button onclick="pickerSelectNone()" type="button">Select none</button>
+        <button onclick="pickerLoadLast()" type="button" title="Reload your last-session selection">Last selection</button>
+        <span style="flex:1"></span>
+        <input id="picker-filter" placeholder="Filter\u2026" oninput="renderPickerLists()" style="flex:0 0 180px;font-size:12px;padding:6px 8px"/>
+      </div>
+      <div style="flex:1;overflow:auto;display:grid;grid-template-columns:1fr 1fr;gap:16px;min-height:0">
+        <div>
+          <h4 style="margin:0 0 8px;font-size:13px;color:var(--accent,var(--brand))">Skills <span id="picker-skill-count" style="font-size:11px;color:var(--muted);font-weight:400"></span></h4>
+          <div id="picker-skills"></div>
+        </div>
+        <div>
+          <h4 style="margin:0 0 8px;font-size:13px;color:var(--accent,var(--brand))">MCP integrations <span id="picker-mcp-count" style="font-size:11px;color:var(--muted);font-weight:400"></span></h4>
+          <div id="picker-mcps"></div>
+        </div>
+      </div>
+      <div class="wizard-actions" style="justify-content:flex-end;margin-top:16px">
+        <button onclick="closeSessionPicker()" type="button">Cancel</button>
+        <button onclick="createSessionFromPicker()" type="button" class="primary">Create session</button>
       </div>
     </div>
   </div>

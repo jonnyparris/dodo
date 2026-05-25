@@ -8,6 +8,7 @@ import { createDraftPrForRun, createGithubRepo, pollVerifyWorkflow, triggerVerif
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
 import { errorResult, mcpUserEmail, propagateMcpDepth } from "./mcp-shared";
+import { queryRecentExceptions, querySessionLogs, queryWorkerLogs } from "./cloudflare-logs";
 import type { CodingAgent } from "./coding-agent";
 import type { Env, WorkerRunRecord } from "./types";
 
@@ -1525,6 +1526,302 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     }
     return jsonFetch(env, "user", `/tasks/${encodeURIComponent(id)}`, { init: { method: "DELETE" } });
   });
+
+  // ─── Admin: self-introspection (Cloudflare Logs + cross-session sweep) ───
+  //
+  // All gated on isAdmin(). These power the autopilot self-diagnose loop
+  // (Ask 4c) and let an admin investigate Dodo's own behaviour without
+  // bouncing out to the Cloudflare dashboard.
+
+  server.tool(
+    "fetch_worker_logs",
+    "ADMIN-ONLY. Query Dodo's own Cloudflare Workers Observability logs (last N hours, with optional full-text needle). Returns recent log events with outcomes, errors, and raw fields. Use this to investigate Dodo behaviour, find error patterns, or audit recent sessions.",
+    {
+      sinceHours: z.number().min(1).max(168).optional().describe("How far back to look (default 1, max 168 = 7 days)."),
+      needle: z.string().max(500).optional().describe("Full-text substring to match against log fields."),
+      errorOnly: z.boolean().optional().describe("Only return events where $metadata.error is set."),
+      limit: z.number().min(1).max(200).optional().describe("Max events returned (default 50, max 200)."),
+    },
+    async ({ sinceHours, needle, errorOnly, limit }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const toMs = Date.now();
+      const fromMs = toMs - (sinceHours ?? 1) * 60 * 60 * 1000;
+      const result = errorOnly
+        ? await queryRecentExceptions(env, { sinceHours: sinceHours ?? 1, limit })
+        : await queryWorkerLogs(env, { fromMs, toMs, needle, limit, view: "events" });
+      if (!result.ok) return errorResult({ error: result.message, reason: result.reason });
+      return textResult({
+        fromMs: result.fromMs,
+        toMs: result.toMs,
+        total: result.total,
+        events: result.events.map((e) => ({
+          timestamp: e.timestamp,
+          outcome: e.outcome,
+          message: e.message,
+          error: e.error,
+        })),
+      });
+    },
+  );
+
+  server.tool(
+    "fetch_session_logs",
+    "ADMIN-ONLY. Query Workers Observability logs scoped to a specific Dodo session id. Uses the session id as a full-text needle.",
+    {
+      sessionId: z.string().min(1).describe("Session id to filter logs by."),
+      sinceHours: z.number().min(1).max(168).optional().describe("How far back to look (default 24, max 168)."),
+      limit: z.number().min(1).max(200).optional().describe("Max events returned (default 100)."),
+    },
+    async ({ sessionId, sinceHours, limit }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const result = await querySessionLogs(env, sessionId, { sinceHours, limit });
+      if (!result.ok) return errorResult({ error: result.message, reason: result.reason });
+      return textResult({ sessionId, total: result.total, events: result.events });
+    },
+  );
+
+  server.tool(
+    "list_failed_sessions",
+    "ADMIN-ONLY. Cross-section view of recent failures: aggregates Worker exceptions + client-side errors + scheduled-session stalls. Useful for picking what to investigate first.",
+    {
+      sinceHours: z.number().min(1).max(168).optional().describe("Window in hours (default 24)."),
+    },
+    async ({ sinceHours }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const hours = sinceHours ?? 24;
+      const sharedStub = getSharedIndexStub(env);
+
+      const [workerExceptions, clientErrorsRes] = await Promise.all([
+        queryRecentExceptions(env, { sinceHours: hours, limit: 100 }),
+        sharedStub.fetch("https://shared-index/errors/summary"),
+      ]);
+      const clientErrors = clientErrorsRes.ok
+        ? (await clientErrorsRes.json()) as { groups?: Array<{ message: string; count: number }> }
+        : { groups: [] };
+
+      // Walk every user's UserControl for stalled scheduled sessions
+      // (consecutive_failures >= 3). Admin scope only.
+      let stalledSchedules: Array<{ ownerEmail: string; id: string; description: string; failures: number; lastError: string | null }> = [];
+      try {
+        const usersRes = await sharedStub.fetch("https://shared-index/users");
+        const users = usersRes.ok
+          ? (await usersRes.json() as { users?: Array<{ email: string }> }).users ?? []
+          : [];
+        for (const user of users) {
+          const stub = getUserControlStub(env, user.email);
+          const res = await stub.fetch("https://user-control/scheduled-sessions");
+          if (!res.ok) continue;
+          const body = (await res.json()) as { scheduledSessions?: Array<{ id: string; description: string; consecutive_failures?: number; last_error?: string | null }> };
+          for (const s of body.scheduledSessions ?? []) {
+            if ((s.consecutive_failures ?? 0) >= 3) {
+              stalledSchedules.push({
+                ownerEmail: user.email,
+                id: s.id,
+                description: s.description,
+                failures: s.consecutive_failures ?? 0,
+                lastError: s.last_error ?? null,
+              });
+            }
+          }
+        }
+      } catch (e) {
+        log("warn", "list_failed_sessions: schedule sweep failed", { error: e instanceof Error ? e.message : String(e) });
+      }
+
+      return textResult({
+        windowHours: hours,
+        workerExceptions: workerExceptions.ok
+          ? workerExceptions.events.slice(0, 20).map((e) => ({
+              timestamp: e.timestamp,
+              error: e.error,
+              message: e.message,
+            }))
+          : { error: workerExceptions.message },
+        clientErrorTopGroups: clientErrors.groups ?? [],
+        stalledSchedules,
+      });
+    },
+  );
+
+  server.tool(
+    "dispatch_autopilot_worker",
+    "ADMIN-ONLY. Dispatch a self-diagnose worker session from inside the autopilot supervisor. Forks the autopilot seed, tags the session as a worker, attaches the diagnose prompt template with your target area + notes, and returns the session id. Use this to fan out investigations across the issues you've identified.",
+    {
+      targetArea: z.string().min(1).max(500).describe("What this worker should focus on (one concrete area)."),
+      contextNotes: z.string().max(4000).optional().describe("Notes from your log sweep that the worker should see."),
+      sinceHours: z.number().min(1).max(168).optional().describe("Log window for the worker. Default 24."),
+    },
+    async ({ targetArea, contextNotes, sinceHours }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const { buildDiagnosePrompt, resolveAutopilotOwner } = await import("./autopilot");
+      let owner: string;
+      try {
+        owner = resolveAutopilotOwner(env);
+      } catch (e) {
+        return errorResult({ error: e instanceof Error ? e.message : "Autopilot owner unavailable" });
+      }
+
+      const sessionId = crypto.randomUUID();
+      const createRes = await userControlFetch(env, "/sessions", {
+        body: JSON.stringify({ id: sessionId, ownerEmail: owner, createdBy: owner }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, owner);
+      if (!createRes.ok) {
+        return errorResult({ error: `Failed to create worker session: ${createRes.status}` });
+      }
+
+      // Tag the new session as an autopilot worker
+      const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
+      await agent.fetch("https://coding-agent/autopilot-flag", {
+        body: JSON.stringify({ isAutopilot: true, role: "worker-auto" }),
+        headers: { "content-type": "application/json", "x-dodo-session-id": sessionId, "x-owner-email": owner },
+        method: "PUT",
+      });
+
+      const title = `[autopilot] ${targetArea.slice(0, 64)}`;
+      await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}`, {
+        body: JSON.stringify({ title }),
+        headers: { "content-type": "application/json" },
+        method: "PATCH",
+      }, owner);
+
+      const prompt = buildDiagnosePrompt({
+        targetArea,
+        contextNotes,
+        sinceHours: sinceHours ?? 24,
+      });
+
+      // Read owner config for gateway/model headers — autopilot uses the
+      // admin's chosen model so they can tune cost-vs-quality.
+      const cfgRes = await userControlFetch(env, "/config", undefined, owner);
+      const cfg = (await cfgRes.json()) as { activeGateway?: string; model?: string; aiGatewayBaseURL?: string; opencodeBaseURL?: string };
+      await agent.fetch("https://coding-agent/prompt", {
+        body: JSON.stringify({ content: prompt }),
+        headers: {
+          "content-type": "application/json",
+          "x-dodo-session-id": sessionId,
+          "x-owner-email": owner,
+          "x-author-email": owner,
+          "x-dodo-ai-base-url": cfg.aiGatewayBaseURL ?? "",
+          "x-dodo-gateway": cfg.activeGateway ?? "opencode",
+          "x-dodo-model": cfg.model ?? "",
+          "x-dodo-opencode-base-url": cfg.opencodeBaseURL ?? "",
+        },
+        method: "POST",
+      });
+
+      log("info", "Autopilot worker dispatched", { sessionId, targetArea });
+      return textResult({ sessionId, title, ownerEmail: owner });
+    },
+  );
+
+  server.tool(
+    "list_autopilot_workers",
+    "ADMIN-ONLY. List recent autopilot worker sessions (both manual and supervisor-dispatched). Returns id, title, status, role, created_at — useful for the supervisor to review past runs.",
+    {
+      limit: z.number().min(1).max(100).optional().describe("Max sessions to return (default 25)."),
+    },
+    async ({ limit }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const { resolveAutopilotOwner } = await import("./autopilot");
+      let owner: string;
+      try {
+        owner = resolveAutopilotOwner(env);
+      } catch (e) {
+        return errorResult({ error: e instanceof Error ? e.message : "Autopilot owner unavailable" });
+      }
+      const res = await userControlFetch(env, "/sessions", undefined, owner);
+      if (!res.ok) return errorResult({ error: `Failed to list sessions: ${res.status}` });
+      const body = (await res.json()) as { sessions?: Array<{ id: string; title?: string; status?: string; created_at?: number }> };
+      const all = body.sessions ?? [];
+      // Title-prefix filter — robust even if the per-session metadata flag
+      // is missing (the kickoff always uses the [autopilot] prefix).
+      const autopilot = all
+        .filter((s) => (s.title ?? "").startsWith("[autopilot]"))
+        .sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))
+        .slice(0, limit ?? 25);
+      return textResult({ count: autopilot.length, sessions: autopilot });
+    },
+  );
+
+  server.tool(
+    "autopilot_notify",
+    "ADMIN-ONLY. Send an ntfy notification on behalf of the autopilot supervisor. Use this when the supervisor decides to pause itself or when a worker hits a recurring failure pattern that needs human attention.",
+    {
+      title: z.string().min(1).max(200),
+      body: z.string().min(1).max(2000),
+      priority: z.enum(["min", "low", "default", "high", "urgent"]).optional().describe("ntfy priority. Default 'default'; use 'high' or 'urgent' for stuck patterns."),
+    },
+    async ({ title, body, priority }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const { resolveAutopilotOwner } = await import("./autopilot");
+      let owner: string;
+      try {
+        owner = resolveAutopilotOwner(env);
+      } catch (e) {
+        return errorResult({ error: e instanceof Error ? e.message : "Autopilot owner unavailable" });
+      }
+      const { planNotification, resolveNotificationConfig, sendNotification } = await import("./notify");
+      const config = await resolveNotificationConfig(env, owner);
+      const plan = planNotification(
+        {
+          kind: "autopilot",
+          title: `[autopilot] ${title}`,
+          body,
+          tags: "robot",
+          priority: priority ?? "default",
+          ownerEmail: owner,
+        },
+        config,
+      );
+      if (plan.perChannelMessages.length === 0) {
+        return textResult({ delivered: 0, reason: "No notification channels configured for the autopilot owner" });
+      }
+      await sendNotification(plan, env);
+      return textResult({ delivered: plan.perChannelMessages.length, channels: plan.perChannelMessages.map((m) => m.channel.type) });
+    },
+  );
+
+  server.tool(
+    "summarize_session_run",
+    "ADMIN-ONLY. Read a session's prompt + message history and return a structured summary (turn count, tools used, last error if any). Faster than reading the full transcript when triaging.",
+    {
+      sessionId: z.string().min(1).describe("Session id to summarize."),
+    },
+    async ({ sessionId }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+      if (!access.ok) return access.result;
+      const [stateRes, promptsRes, messagesRes] = await Promise.all([
+        jsonFetch(env, "agent", "/", { sessionId, depth }),
+        jsonFetch(env, "agent", "/prompts", { sessionId, depth }),
+        jsonFetch(env, "agent", "/messages", { sessionId, depth }),
+      ]);
+      // jsonFetch returns the MCP content block; pull the inner JSON back
+      // out for aggregation.
+      const parse = (r: { content?: Array<{ text?: string }> }) => {
+        try { return JSON.parse(r.content?.[0]?.text ?? "{}"); } catch { return {}; }
+      };
+      const state = parse(stateRes as { content?: Array<{ text?: string }> });
+      const prompts = parse(promptsRes as { content?: Array<{ text?: string }> });
+      const messages = parse(messagesRes as { content?: Array<{ text?: string }> });
+      const promptList = (prompts.prompts ?? []) as Array<{ id: string; status: string; error?: string | null; created_at?: number }>;
+      const lastError = [...promptList].reverse().find((p) => p.error)?.error ?? null;
+      return textResult({
+        sessionId,
+        title: state.title ?? null,
+        status: state.status ?? null,
+        promptCount: promptList.length,
+        promptStatuses: promptList.reduce<Record<string, number>>((acc, p) => {
+          acc[p.status] = (acc[p.status] ?? 0) + 1;
+          return acc;
+        }, {}),
+        messageCount: (messages.messages ?? messages.records ?? []).length,
+        lastError,
+      });
+    },
+  );
 
   return server;
 }

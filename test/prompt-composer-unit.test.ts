@@ -90,4 +90,28 @@ describe("assembleSystemPrompt", () => {
       ).toBeGreaterThan(indices[i - 1].idx);
     }
   });
+
+  it("admin prefix sits above user prefix", () => {
+    const result = assembleSystemPrompt({
+      staticBase: "BASE",
+      userPrefix: "USER-PREFIX",
+      adminPrefix: "ADMIN-PREFIX",
+    });
+    expect(result.startsWith("ADMIN-PREFIX")).toBe(true);
+    const adminIdx = result.indexOf("ADMIN-PREFIX");
+    const userIdx = result.indexOf("USER-PREFIX");
+    const baseIdx = result.indexOf("BASE");
+    expect(adminIdx).toBeLessThan(userIdx);
+    expect(userIdx).toBeLessThan(baseIdx);
+  });
+
+  it("admin prefix alone works without user prefix", () => {
+    const result = assembleSystemPrompt({
+      staticBase: "BASE",
+      adminPrefix: "ADMIN-ONLY",
+    });
+    expect(result.startsWith("ADMIN-ONLY")).toBe(true);
+    expect(result).toContain("BASE");
+    expect(result.indexOf("ADMIN-ONLY")).toBeLessThan(result.indexOf("BASE"));
+  });
 });

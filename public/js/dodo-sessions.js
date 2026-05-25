@@ -82,6 +82,131 @@ function filterSessions(query){
   renderSessionList(filtered);
 }
 async function createSession(){const d=await jsonSafe("/session",{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
+
+// ===== Pre-session picker =====
+//
+// In-memory state. Each entry is `{ name|id, label, source?, enabled }`. The
+// `enabled` flag tracks what the user has toggled in the picker; on submit
+// we send only the disabled entries (and any explicitly-on overrides) as
+// `skillOverrides` / `mcpOverrides` to POST /session.
+const _picker = { skills: [], mcps: [] };
+
+async function openSessionPicker(){
+  const overlay = document.getElementById("picker-overlay");
+  if (!overlay) return;
+  // Always pre-fill from last-session prefs so "Remember last session's
+  // selection" is the visible default.
+  await pickerLoadAvailable();
+  await pickerLoadLast({ silent: true });
+  overlay.style.display = "flex";
+}
+
+function closeSessionPicker(){
+  const overlay = document.getElementById("picker-overlay");
+  if (!overlay) return;
+  overlay.style.display = "none";
+}
+
+async function pickerLoadAvailable(){
+  // /api/skills/all returns personal + builtin (workspace is per-session
+  // and not visible before clone). /api/mcp-configs returns user MCPs.
+  const [skillsRes, mcpRes] = await Promise.all([
+    apiSafe("/api/skills/all"),
+    apiSafe("/api/mcp-configs"),
+  ]);
+  const skills = (skillsRes?.skills ?? []).map((s) => ({
+    name: s.name,
+    description: s.description || "",
+    source: s.source,
+    enabled: s.enabled !== false,
+  }));
+  const mcps = (mcpRes?.configs ?? mcpRes?.mcpConfigs ?? mcpRes ?? []).map((m) => ({
+    id: m.id,
+    name: m.name || m.id,
+    description: m.description || m.url || "",
+    enabled: m.enabled !== false,
+  }));
+  _picker.skills = skills;
+  _picker.mcps = mcps;
+  renderPickerLists();
+}
+
+async function pickerLoadLast(opts){
+  const prefs = await apiSafe("/api/session-preferences");
+  if (!prefs) {
+    if (!opts?.silent) toast("No prior selection found", "info");
+    return;
+  }
+  const skillMap = new Map((prefs.skillOverrides || []).map((o) => [o.skillName, o.enabled]));
+  const mcpMap = new Map((prefs.mcpOverrides || []).map((o) => [o.mcpConfigId, o.enabled]));
+  for (const s of _picker.skills) {
+    if (skillMap.has(s.name)) s.enabled = skillMap.get(s.name);
+  }
+  for (const m of _picker.mcps) {
+    if (mcpMap.has(m.id)) m.enabled = mcpMap.get(m.id);
+  }
+  renderPickerLists();
+}
+
+function pickerSelectAll(){
+  for (const s of _picker.skills) s.enabled = true;
+  for (const m of _picker.mcps) m.enabled = true;
+  renderPickerLists();
+}
+function pickerSelectNone(){
+  for (const s of _picker.skills) s.enabled = false;
+  for (const m of _picker.mcps) m.enabled = false;
+  renderPickerLists();
+}
+
+function renderPickerLists(){
+  const filter = (document.getElementById("picker-filter")?.value || "").toLowerCase();
+  const matches = (label, desc) => !filter || (label || "").toLowerCase().includes(filter) || (desc || "").toLowerCase().includes(filter);
+
+  const skillsHost = document.getElementById("picker-skills");
+  const mcpsHost = document.getElementById("picker-mcps");
+  if (!skillsHost || !mcpsHost) return;
+
+  const skillRows = _picker.skills.filter((s) => matches(s.name, s.description)).map((s, i) => {
+    const idx = _picker.skills.indexOf(s);
+    const sourceLabel = s.source ? `<span style="font-size:10px;color:var(--muted);margin-left:6px">[${esc(s.source)}]</span>` : "";
+    return `<label class="picker-row" style="display:flex;align-items:flex-start;gap:8px;padding:4px 2px;font-size:12px;cursor:pointer">
+      <input type="checkbox" ${s.enabled ? "checked" : ""} onchange="_picker.skills[${idx}].enabled=this.checked"/>
+      <span style="flex:1;min-width:0">
+        <span style="font-weight:500">${esc(s.name)}</span>${sourceLabel}
+        <span style="display:block;color:var(--muted);font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${esc((s.description || "").slice(0, 200))}</span>
+      </span>
+    </label>`;
+  });
+  const mcpRows = _picker.mcps.filter((m) => matches(m.name, m.description)).map((m) => {
+    const idx = _picker.mcps.indexOf(m);
+    return `<label class="picker-row" style="display:flex;align-items:flex-start;gap:8px;padding:4px 2px;font-size:12px;cursor:pointer">
+      <input type="checkbox" ${m.enabled ? "checked" : ""} onchange="_picker.mcps[${idx}].enabled=this.checked"/>
+      <span style="flex:1;min-width:0">
+        <span style="font-weight:500">${esc(m.name)}</span>
+        <span style="display:block;color:var(--muted);font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${esc((m.description || "").slice(0, 200))}</span>
+      </span>
+    </label>`;
+  });
+
+  const skillSelected = _picker.skills.filter((s) => s.enabled).length;
+  const mcpSelected = _picker.mcps.filter((m) => m.enabled).length;
+  document.getElementById("picker-skill-count").textContent = `${skillSelected}/${_picker.skills.length} on`;
+  document.getElementById("picker-mcp-count").textContent = `${mcpSelected}/${_picker.mcps.length} on`;
+  skillsHost.innerHTML = skillRows.length ? skillRows.join("") : '<div style="color:var(--muted);font-size:12px">No matches</div>';
+  mcpsHost.innerHTML = mcpRows.length ? mcpRows.join("") : '<div style="color:var(--muted);font-size:12px">No MCPs configured</div>';
+}
+
+async function createSessionFromPicker(){
+  const skillOverrides = _picker.skills.map((s) => ({ skillName: s.name, enabled: s.enabled }));
+  const mcpOverrides = _picker.mcps.map((m) => ({ mcpConfigId: m.id, enabled: m.enabled }));
+  const d = await jsonSafe("/session", { skillOverrides, mcpOverrides });
+  if (!d) { toast("Failed to create session", "error"); return; }
+  closeSessionPicker();
+  const { id } = d;
+  currentSession = id;
+  await selectSession(id);
+}
 async function selectSession(id){
   currentSession=id;setProcessing(false);_gitRemoteUrlCache='';history.replaceState(null,"",`#session=${id}`);
   // Drop any staged image attachments from the previous session — they belong
