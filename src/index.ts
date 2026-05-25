@@ -1663,7 +1663,14 @@ app.post("/api/scheduled-sessions/:id/retry", async (c) => {
 
 app.post("/session", async (c) => {
   const email = c.get("userEmail");
-  const body = await c.req.raw.json().catch(() => ({})) as { ownerOverride?: string };
+  const body = await c.req.raw.json().catch(() => ({})) as {
+    ownerOverride?: string;
+    // Optional pre-session picker selections. Each entry sets the effective
+    // enabled flag for one skill / MCP in the new session. Absence means
+    // the picker wasn't used — caller wants the default behaviour.
+    skillOverrides?: Array<{ skillName: string; enabled: boolean }>;
+    mcpOverrides?: Array<{ mcpConfigId: string; enabled: boolean }>;
+  };
   const sessionId = crypto.randomUUID();
 
   // Check for account-level create permission (delegation)
@@ -1713,7 +1720,69 @@ app.post("/session", async (c) => {
     });
   }
 
-  log("info", "Session created", { email, sessionId, ownerEmail, createdBy });
+  // Resolve which overrides to apply. The picker passes them explicitly;
+  // bare "+ New" sends an empty body, in which case we replay the user's
+  // last-session selection (the "Remember last session's selection"
+  // default behaviour). Explicit empty arrays in the body are honoured —
+  // that lets the picker say "all on" by sending an empty array, distinct
+  // from "use my last selection".
+  let appliedSkillOverrides = body.skillOverrides;
+  let appliedMcpOverrides = body.mcpOverrides;
+  if (appliedSkillOverrides === undefined && appliedMcpOverrides === undefined) {
+    try {
+      const prefsRes = await proxyToUserControl(c.env, ownerEmail, "/session-preferences");
+      if (prefsRes.ok) {
+        const prefs = (await prefsRes.json()) as {
+          skillOverrides: Array<{ skillName: string; enabled: boolean }>;
+          mcpOverrides: Array<{ mcpConfigId: string; enabled: boolean }>;
+        };
+        appliedSkillOverrides = prefs.skillOverrides;
+        appliedMcpOverrides = prefs.mcpOverrides;
+      }
+    } catch (e) {
+      log("warn", "Failed to load session preferences for default-apply", { email, sessionId, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  // Apply pre-session picker selections (if any) before the agent first
+  // wakes up. Use bulk PUT endpoints so the whole selection lands in one
+  // round-trip each.
+  if (appliedSkillOverrides && appliedSkillOverrides.length > 0) {
+    await proxyToUserControl(c.env, ownerEmail, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides`, {
+      body: JSON.stringify({ overrides: appliedSkillOverrides }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  }
+  if (appliedMcpOverrides && appliedMcpOverrides.length > 0) {
+    await proxyToUserControl(c.env, ownerEmail, `/sessions/${encodeURIComponent(sessionId)}/mcp-overrides`, {
+      body: JSON.stringify({ overrides: appliedMcpOverrides }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  }
+  // Remember the explicit picker selection (only when the caller provided
+  // one — replays from last-session don't need re-saving).
+  if (body.skillOverrides !== undefined || body.mcpOverrides !== undefined) {
+    await proxyToUserControl(c.env, ownerEmail, "/session-preferences", {
+      body: JSON.stringify({
+        skillOverrides: body.skillOverrides ?? [],
+        mcpOverrides: body.mcpOverrides ?? [],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  }
+
+  log("info", "Session created", {
+    email,
+    sessionId,
+    ownerEmail,
+    createdBy,
+    skillOverrides: appliedSkillOverrides?.length ?? 0,
+    mcpOverrides: appliedMcpOverrides?.length ?? 0,
+    pickerProvided: body.skillOverrides !== undefined || body.mcpOverrides !== undefined,
+  });
   // Increment global session counter
   await proxyToSharedIndex(c.env, "/stats/increment", {
     body: JSON.stringify({ stat: "sessionCount", delta: 1 }),
@@ -2291,6 +2360,59 @@ app.delete("/session/:id/mcp-configs/:mcpId", async (c) => {
   const mcpId = c.req.param("mcpId");
   return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/mcp-overrides/${encodeURIComponent(mcpId)}`, {
     method: "DELETE",
+  });
+});
+
+// ─── Session Skill Overrides ───
+//
+// Mirror of MCP override routes for skills. The picker writes these at
+// session-creation time; the in-session settings UI can also toggle
+// individual skills after creation.
+
+app.get("/session/:id/skill-overrides", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides`);
+});
+
+app.post("/session/:id/skill-overrides", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.delete("/session/:id/skill-overrides/:skillName", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const skillName = c.req.param("skillName");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides/${encodeURIComponent(skillName)}`, {
+    method: "DELETE",
+  });
+});
+
+// ─── Last-session preference memory (powers the pre-session picker) ───
+
+app.get("/api/session-preferences", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/session-preferences");
+});
+
+app.put("/api/session-preferences", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/session-preferences", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
   });
 });
 

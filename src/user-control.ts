@@ -795,6 +795,86 @@ export class UserControl extends DurableObject<Env> {
         return Response.json({ configs: this.getEffectiveMcpConfigs(sessionId) });
       }
 
+      // ─── Session Skill Overrides ───
+      //
+      // Same shape as MCP overrides — a per-session enabled/disabled map
+      // for skills by name. CodingAgent.warmSkills() reads these and
+      // applies them to the merged skill list before rendering the manifest.
+
+      if (request.method === "GET" && url.pathname.match(/^\/sessions\/[^/]+\/skill-overrides$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        return Response.json({ overrides: this.listSkillOverrides(sessionId) });
+      }
+
+      if (request.method === "POST" && url.pathname.match(/^\/sessions\/[^/]+\/skill-overrides$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const body = z.object({
+          skillName: z.string().min(1).max(200),
+          enabled: z.boolean(),
+        }).parse(await request.json());
+        this.setSkillOverride(sessionId, body.skillName, body.enabled);
+        return Response.json({ sessionId, skillName: body.skillName, enabled: body.enabled }, { status: 201 });
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/[^/]+\/skill-overrides\/[^/]+$/)) {
+        const parts = url.pathname.split("/");
+        const skillName = decodeURIComponent(parts.at(-1) ?? "");
+        const sessionId = decodeURIComponent(parts.at(-3) ?? "");
+        this.ctx.storage.sql.exec("DELETE FROM session_skill_overrides WHERE session_id = ? AND skill_name = ?", sessionId, skillName);
+        return Response.json({ deleted: true, sessionId, skillName });
+      }
+
+      // Bulk set — used at session-creation time so we can persist a whole
+      // picker selection in one round-trip.
+      if (request.method === "PUT" && url.pathname.match(/^\/sessions\/[^/]+\/skill-overrides$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const body = z.object({
+          overrides: z.array(z.object({
+            skillName: z.string().min(1).max(200),
+            enabled: z.boolean(),
+          })),
+        }).parse(await request.json());
+        this.replaceSkillOverrides(sessionId, body.overrides);
+        return Response.json({ sessionId, count: body.overrides.length });
+      }
+
+      if (request.method === "PUT" && url.pathname.match(/^\/sessions\/[^/]+\/mcp-overrides$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const body = z.object({
+          overrides: z.array(z.object({
+            mcpConfigId: z.string().min(1),
+            enabled: z.boolean(),
+          })),
+        }).parse(await request.json());
+        this.replaceMcpOverrides(sessionId, body.overrides);
+        return Response.json({ sessionId, count: body.overrides.length });
+      }
+
+      // ─── User session preferences ───
+      //
+      // "Remember last session's selection" — pre-fill the picker with
+      // whatever the user toggled last time. Stored as JSON blobs in
+      // user_config so we don't need a new table.
+
+      if (request.method === "GET" && url.pathname === "/session-preferences") {
+        return Response.json(this.getSessionPreferences());
+      }
+
+      if (request.method === "PUT" && url.pathname === "/session-preferences") {
+        const body = z.object({
+          skillOverrides: z.array(z.object({
+            skillName: z.string().min(1).max(200),
+            enabled: z.boolean(),
+          })).optional(),
+          mcpOverrides: z.array(z.object({
+            mcpConfigId: z.string().min(1),
+            enabled: z.boolean(),
+          })).optional(),
+        }).parse(await request.json());
+        this.setSessionPreferences(body);
+        return Response.json(this.getSessionPreferences());
+      }
+
       // ─── Scheduled sessions ───
 
       if (request.method === "GET" && url.pathname === "/scheduled-sessions") {
@@ -1261,6 +1341,19 @@ export class UserControl extends DurableObject<Env> {
         mcp_config_id TEXT NOT NULL,
         enabled INTEGER NOT NULL,
         PRIMARY KEY (session_id, mcp_config_id)
+      )
+    `);
+
+    // Mirrors session_mcp_overrides for skills. Each row sets the effective
+    // enabled flag for one skill in one session. Absence of a row means
+    // the skill falls back to its source-level default (personal toggle,
+    // builtin always-on, workspace always-on).
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS session_skill_overrides (
+        session_id TEXT NOT NULL,
+        skill_name TEXT NOT NULL,
+        enabled INTEGER NOT NULL,
+        PRIMARY KEY (session_id, skill_name)
       )
     `);
 
@@ -2323,6 +2416,94 @@ export class UserControl extends DurableObject<Env> {
       const effectiveEnabled = hasOverride ? overrideMap.get(config.id)! : config.enabled;
       return { ...config, enabled: effectiveEnabled, overridden: hasOverride };
     });
+  }
+
+  private replaceMcpOverrides(sessionId: string, overrides: Array<{ mcpConfigId: string; enabled: boolean }>): void {
+    this.ctx.storage.sql.exec("DELETE FROM session_mcp_overrides WHERE session_id = ?", sessionId);
+    for (const o of overrides) {
+      this.setMcpOverride(sessionId, o.mcpConfigId, o.enabled);
+    }
+  }
+
+  // ─── Session Skill Overrides ───
+  //
+  // Mirror of MCP overrides for skills. Stored by name (not id) since
+  // skills have stable names across personal / workspace / builtin sources.
+
+  private listSkillOverrides(sessionId: string): Array<{ sessionId: string; skillName: string; enabled: boolean }> {
+    return Array.from(this.ctx.storage.sql.exec(
+      "SELECT session_id, skill_name, enabled FROM session_skill_overrides WHERE session_id = ? ORDER BY skill_name ASC",
+      sessionId,
+    )).map((row) => ({
+      sessionId: String(row.session_id),
+      skillName: String(row.skill_name),
+      enabled: Number(row.enabled) === 1,
+    }));
+  }
+
+  private setSkillOverride(sessionId: string, skillName: string, enabled: boolean): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO session_skill_overrides (session_id, skill_name, enabled)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_id, skill_name) DO UPDATE SET enabled = excluded.enabled`,
+      sessionId,
+      skillName,
+      enabled ? 1 : 0,
+    );
+  }
+
+  private replaceSkillOverrides(sessionId: string, overrides: Array<{ skillName: string; enabled: boolean }>): void {
+    this.ctx.storage.sql.exec("DELETE FROM session_skill_overrides WHERE session_id = ?", sessionId);
+    for (const o of overrides) {
+      this.setSkillOverride(sessionId, o.skillName, o.enabled);
+    }
+  }
+
+  // ─── User session preferences (last-session memory) ───
+
+  private getSessionPreferences(): {
+    skillOverrides: Array<{ skillName: string; enabled: boolean }>;
+    mcpOverrides: Array<{ mcpConfigId: string; enabled: boolean }>;
+  } {
+    const get = (key: string): string | null => {
+      const row = Array.from(this.ctx.storage.sql.exec(
+        "SELECT value FROM user_config WHERE key = ?",
+        key,
+      ))[0] as SqlRow | undefined;
+      return row ? String(row.value) : null;
+    };
+    const parseArray = <T,>(raw: string | null): T[] => {
+      if (!raw) return [];
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed as T[] : [];
+      } catch {
+        return [];
+      }
+    };
+    return {
+      skillOverrides: parseArray(get("last_session_skill_overrides")),
+      mcpOverrides: parseArray(get("last_session_mcp_overrides")),
+    };
+  }
+
+  private setSessionPreferences(prefs: {
+    skillOverrides?: Array<{ skillName: string; enabled: boolean }>;
+    mcpOverrides?: Array<{ mcpConfigId: string; enabled: boolean }>;
+  }): void {
+    const now = nowEpoch();
+    const put = (key: string, value: string) => {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO user_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        key, value, now,
+      );
+    };
+    if (prefs.skillOverrides !== undefined) {
+      put("last_session_skill_overrides", JSON.stringify(prefs.skillOverrides));
+    }
+    if (prefs.mcpOverrides !== undefined) {
+      put("last_session_mcp_overrides", JSON.stringify(prefs.mcpOverrides));
+    }
   }
 
   // ─── Onboarding ───

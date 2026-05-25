@@ -672,6 +672,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private async warmSkills(): Promise<void> {
     const ownerEmail = this.readMetadata("owner_email");
     const personal: Skill[] = [];
+    let sessionOverrides: Array<{ skillName: string; enabled: boolean }> = [];
     if (ownerEmail) {
       try {
         const stub = getUserControlStub(this.env, ownerEmail);
@@ -680,6 +681,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         personal.push(...list);
       } catch (error) {
         log("warn", "skills-personal-load-failed", {
+          sessionId: this.sessionId(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
+      // Fetch per-session skill overrides (mirror of MCP overrides). Stored
+      // as `(session_id, skill_name, enabled)` rows on UserControl.
+      try {
+        const stub = getUserControlStub(this.env, ownerEmail);
+        const res = await stub.fetch(`https://user-control/sessions/${encodeURIComponent(this.sessionId())}/skill-overrides`);
+        if (res.ok) {
+          const body = (await res.json()) as { overrides: Array<{ skillName: string; enabled: boolean }> };
+          sessionOverrides = body.overrides ?? [];
+        }
+      } catch (error) {
+        log("warn", "skills-session-overrides-load-failed", {
           sessionId: this.sessionId(),
           error: error instanceof Error ? error.message : String(error),
         });
@@ -699,6 +716,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const builtin = listBuiltinSkills();
 
     const merged = mergeSkills(personal, workspace, builtin);
+
+    // Apply per-session overrides to the merged list. Absence of an
+    // override means the skill keeps its source-level default (personal
+    // can be off, workspace and builtin default on). The renderManifest
+    // filter on `enabled` does the actual gating.
+    if (sessionOverrides.length > 0) {
+      const overrideMap = new Map(sessionOverrides.map((o) => [o.skillName, o.enabled]));
+      for (const skill of merged) {
+        if (overrideMap.has(skill.name)) {
+          skill.enabled = overrideMap.get(skill.name)!;
+        }
+      }
+    }
+
     this._skills = merged;
     this._skillManifest = renderSkillManifest(merged) || null;
     log("info", "skills-warmed", {
@@ -707,6 +738,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       workspace: workspace.length,
       builtin: builtin.length,
       merged: merged.length,
+      sessionOverrides: sessionOverrides.length,
     });
   }
 
@@ -4658,6 +4690,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   async runFiberPrompt(payload: { promptId: string; content: string; images?: Array<{ data: string; mediaType: string }>; authorEmail?: string; title: string }): Promise<void> {
     const { promptId, content, images, authorEmail, title } = payload;
 
+    // If the prompt was aborted (or otherwise finished) before the fiber
+    // started, don't run it. Without this guard, an abort that fires
+    // before the fiber wakes up gets overwritten by the fiber's later
+    // "completed" finalization — a stale "aborted" status flips back to
+    // "completed" once the slow LLM call returns. This is the same class
+    // of race that the `if (signal.aborted) return` guard in the catch
+    // block protects against, but at the start of the fiber instead of
+    // the end.
+    const promptStatusRow = (Array.from(this.ctx.storage.sql.exec("SELECT status FROM prompts WHERE id = ?", promptId))[0] as SqlRow | null);
+    const promptStatus = promptStatusRow ? String(promptStatusRow.status) : null;
+    if (promptStatus && promptStatus !== "queued" && promptStatus !== "running") {
+      return;
+    }
+
     // Refresh Think config from the latest account config before each prompt run.
     await this.readAppConfig();
 
@@ -4693,6 +4739,19 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         this.emitEvent({ data: { message }, type: "error_message" });
         await this.finishPrompt(promptId, { error: message, status: "failed" });
         dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+        return;
+      }
+
+      // Final-check: if the prompt was aborted while we were in flight
+      // (signal.aborted) or while the catch block was skipped (Think
+      // swallows AbortError without rethrowing in some paths), don't
+      // overwrite the "aborted" status with "completed". Also reread the
+      // DB status so we cover the case where abort fired BEFORE we
+      // registered the AbortController (signal would not have flipped).
+      if (signal.aborted) return;
+      const currentStatusRow = (Array.from(this.ctx.storage.sql.exec("SELECT status FROM prompts WHERE id = ?", promptId))[0] as SqlRow | null);
+      const currentStatus = currentStatusRow ? String(currentStatusRow.status) : null;
+      if (currentStatus && currentStatus !== "queued" && currentStatus !== "running") {
         return;
       }
 
@@ -5020,10 +5079,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string }> {
     // Connect MCP servers before Think calls getTools()
     await this.connectMcpServers();
-
-    // Warm admin-managed global prompt prefix. TTL-cached so cheap. Covers
-    // the fiber-recovery and cron paths that bypass `onChatMessage`.
-    await this.warmGlobalPrompt();
 
     // Insert user message metadata
     const userMsgId = crypto.randomUUID();
