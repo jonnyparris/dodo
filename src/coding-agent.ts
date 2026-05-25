@@ -55,6 +55,7 @@ import {
   type WatchdogConfig,
 } from "./watchdog";
 import { shouldCompact, pickCutoff } from "./compaction-policy";
+import { pruneOversizedToolResults } from "./own-loop-prune";
 import { nextRetry } from "./overflow-retry";
 import { assembleSystemPrompt } from "./prompt-composer";
 import { evaluateSession } from "./watchdog-policy";
@@ -1130,16 +1131,48 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             }
           }
 
-          // Hard stop if even after compaction we're projected above the budget.
+          // ─── In-memory tool-result prune (harness safety net) ───
+          // Think-level compaction operates on persisted session history.
+          // On the very first user turn that's just `[user]`, so compaction
+          // had nothing to summarise and left `finalMessages` untouched.
+          // For weak orchestrators that fan out many tool calls inside a
+          // single turn, this is the failure mode that ends sessions
+          // prematurely with "context budget exhausted".
+          //
+          // This is a no-LLM, no-storage fallback: walk `finalMessages`
+          // and shorten the largest tool-result payloads (oldest first,
+          // preserving the most recent two) until projected tokens are
+          // back under the mid-loop threshold. Preserves the tool-call
+          // envelope (toolName, toolCallId) so the model's chain of
+          // pending tool calls still resolves.
+          const projectedAfterCompactionTokens = estimateMessagesTokens(finalMessages);
+          if (projectedAfterCompactionTokens / tokenBudget >= MID_LOOP_COMPACTION_THRESHOLD) {
+            const pruneResult = pruneOversizedToolResults(finalMessages, {
+              targetTokens: Math.floor(tokenBudget * MID_LOOP_COMPACTION_THRESHOLD),
+              estimate: estimateMessagesTokens,
+            });
+            if (pruneResult.pruned) {
+              log("info", "own-loop: in-memory tool-result prune", {
+                sessionId,
+                step,
+                partsPruned: pruneResult.partsPruned,
+                bytesRemoved: pruneResult.bytesRemoved,
+                tokensBefore: pruneResult.tokensBefore,
+                tokensAfter: pruneResult.tokensAfter,
+              });
+            }
+          }
+
+          // Hard stop if even after compaction + prune we're projected above the budget.
           // Without this, streamText() is guaranteed to throw a context-overflow
           // error — better to exit cleanly with a wrap-up message.
-          const projectedAfterCompactionTokens = estimateMessagesTokens(finalMessages);
-          const projectedAfterUsage = projectedAfterCompactionTokens / tokenBudget;
+          const projectedAfterPruneTokens = estimateMessagesTokens(finalMessages);
+          const projectedAfterUsage = projectedAfterPruneTokens / tokenBudget;
           if (projectedAfterUsage >= HARD_STOP_THRESHOLD) {
             log("warn", "own-loop: pre-step hard stop — projected tokens exceed budget", {
               sessionId,
               step,
-              projectedInputTokens: projectedAfterCompactionTokens,
+              projectedInputTokens: projectedAfterPruneTokens,
               tokenBudget,
               projectedUsage: `${Math.round(projectedAfterUsage * 100)}%`,
             });
