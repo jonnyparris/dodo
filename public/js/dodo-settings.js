@@ -1,6 +1,40 @@
 // dodo-settings.js — Identity, passkeys, secrets, integrations, session settings, permissions, sharing, browser, MCP overrides
 
-function humanizeSecretName(name,configs){const m=name.match(/^mcp:([^:]+):(.+)$/);if(m&&configs){const c=configs.find(x=>x.id===m[1]);if(c)return c.name+" \u2014 "+m[2]}return name}
+// Map of well-known per-user secret keys → human label. Kept in lockstep
+// with the <select id="secret-key"> options in index.html plus the keys
+// the onboarding wizard and notify.ts read directly (notification_webhooks,
+// ntfy_token).
+const SECRET_LABELS={
+  github_token:"GitHub Token",
+  gitlab_token:"GitLab Token",
+  gateway_token:"Gateway Token",
+  ntfy_topic:"Ntfy Topic",
+  ntfy_token:"Ntfy Token",
+  notification_webhooks:"Notification Webhooks",
+};
+
+// Render a per-user secret key as a human-readable label.
+//
+// Three shapes to cover:
+//   1. mcp:<configId>:<header>  — owned by an MCP integration. Look up the
+//      config by id and render "<integration name> — <header>". If the
+//      config can't be resolved yet (boot race) OR no longer exists
+//      (orphaned secret), fall back to "Unknown MCP (<id-prefix>…) —
+//      <header>" so the user can still tell what kind of secret it is.
+//   2. well-known plain key (github_token etc.) — render the friendly
+//      label from SECRET_LABELS.
+//   3. anything else — render verbatim. Future custom keys land here.
+function humanizeSecretName(name,configs){
+  const m=name.match(/^mcp:([^:]+):(.+)$/);
+  if(m){
+    const id=m[1],header=m[2];
+    const c=configs&&configs.find(x=>x.id===id);
+    if(c)return c.name+" \u2014 "+header;
+    return"Unknown MCP ("+id.slice(0,8)+"\u2026) \u2014 "+header;
+  }
+  if(SECRET_LABELS[name])return SECRET_LABELS[name];
+  return name;
+}
 
 // --- Identity ---
 async function loadIdentity(){
@@ -32,23 +66,35 @@ async function changePasskey(){
   if(!current||!newPk||newPk.length<4)return toast("Both fields required, new passkey min 4 chars","warning");
   try{await json("/api/passkey/change",{currentPasskey:current,newPasskey:newPk});$("passkey-current").value="";$("passkey-new").value="";toast("Passkey changed","success")}catch(e){toast("Failed: "+(e.message||e),"error")}
 }
+// Pure renderer: takes the cached secretKeys + mcpConfigs and updates the
+// DOM. Split out of loadSecrets() so loadIntegrations() can re-render once
+// mcpConfigs arrives, without re-fetching the secrets list. Closes the
+// boot-time race that made MCP secrets render as raw "mcp:<uuid>:Authorization"
+// for the first paint.
+function renderSecretsList(){
+  const keys=secretKeys||[];
+  $("secrets-list").innerHTML=keys.length
+    ?keys.map(k=>`<div class="kv"><code>${esc(humanizeSecretName(k,mcpConfigs))}</code><button onclick="deleteSecret('${esc(k)}')" class="sm">x</button></div>`).join("")
+    :'<div class="empty">No secrets</div>';
+  // Hide dropdown options for secrets that already exist; hide form entirely if all are set
+  const sel=$("secret-key");
+  const form=$("secret-add-form");
+  if(sel&&form){
+    const set=new Set(keys.filter(k=>!k.startsWith("mcp:")));
+    let available=0;
+    for(const opt of sel.options){opt.disabled=set.has(opt.value);if(!opt.disabled)available++}
+    if(!available)form.style.display="none";
+    else form.style.display="block";
+    for(const opt of sel.options){if(!opt.disabled){sel.value=opt.value;break}}
+  }
+}
+
 async function loadSecrets(){
   try{
     const{keys}=await api("/api/secrets");
     secretKeys=keys||[];
-    $("secrets-list").innerHTML=keys.length?keys.map(k=>`<div class="kv"><code>${esc(humanizeSecretName(k,mcpConfigs))}</code><button onclick="deleteSecret('${esc(k)}')" class="sm">x</button></div>`).join(""):'<div class="empty">No secrets</div>';
+    renderSecretsList();
     if(mcpCatalog.length)renderIntegrations();
-    // Hide dropdown options for secrets that already exist; hide form entirely if all are set
-    const sel=$("secret-key");
-    const form=$("secret-add-form");
-    if(sel&&form){
-      const set=new Set(keys.filter(k=>!k.startsWith("mcp:")));
-      let available=0;
-      for(const opt of sel.options){opt.disabled=set.has(opt.value);if(!opt.disabled)available++}
-      if(!available)form.style.display="none";
-      // Select the first available option
-      for(const opt of sel.options){if(!opt.disabled){sel.value=opt.value;break}}
-    }
   }catch{secretKeys=[];$("secrets-list").innerHTML='<div class="empty">No secrets</div>'}
 }
 async function setSecret(){
@@ -187,6 +233,10 @@ async function loadIntegrations(){
     mcpCatalog=Array.isArray(catalog)?catalog:[];
     mcpConfigs=configsRes.configs||[];
     renderIntegrations();
+    // Re-render the secrets list now that we know which MCP configs exist —
+    // boot-time render may have shown raw "mcp:<uuid>:Authorization" entries
+    // because mcpConfigs was still empty when loadSecrets() ran.
+    if(secretKeys.length)renderSecretsList();
   }catch{$("integrations-list").innerHTML='<div class="empty">Failed to load</div>'}
 }
 
@@ -265,7 +315,10 @@ async function testIntegration(id){
 async function deleteIntegration(id){
   const ok=await appConfirm("Delete this integration?");if(!ok)return;
   await apiSafe(`/api/mcp-configs/${encodeURIComponent(id)}`,{method:"DELETE"});
-  await loadIntegrations();
+  // Server-side delete also wipes the integration's mcp:<id>:* secrets, so
+  // refresh the secrets list too. Otherwise the UI keeps showing them as
+  // orphans until the next page load.
+  await Promise.all([loadIntegrations(),loadSecrets()]);
 }
 
 // --- Session Settings ---
