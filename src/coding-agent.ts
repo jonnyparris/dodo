@@ -55,6 +55,7 @@ import {
   type WatchdogConfig,
 } from "./watchdog";
 import { shouldCompact, pickCutoff } from "./compaction-policy";
+import { detectSameToolRepetition } from "./loop-detection";
 import { pruneOversizedToolResults } from "./own-loop-prune";
 import { nextRetry } from "./overflow-retry";
 import { assembleSystemPrompt } from "./prompt-composer";
@@ -283,9 +284,14 @@ const SYSTEM_PROMPT = [
   "4. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
   "5. **Plan, then edit.** State your plan in one short paragraph (or a todo list, preferred), then execute. Don't narrate each step.",
   "6. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
-  "7. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
-  "8. **Delete unused code.** No commented-out code, no `_unused` renames.",
-  "9. **Be security-conscious.** Never commit secrets or credentials.",
+  "7. **Know when to stop.** When you have enough information to answer the user (or have completed the requested change), write your conclusion as a plain-text response and stop calling tools. Do NOT keep making speculative tool calls 'to be thorough' — every extra call costs context and the user is waiting. Specifically:",
+  "   - If three consecutive tool calls have produced no new useful information, write what you have and stop.",
+  "   - If you have answered the user's question, do not run more tools to 'verify'.",
+  "   - If a tool keeps returning errors, write what failed and stop — don't retry with minor variations.",
+  "   - Your final reply should always be plain text, never a tool call.",
+  "8. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
+  "9. **Delete unused code.** No commented-out code, no `_unused` renames.",
+  "10. **Be security-conscious.** Never commit secrets or credentials.",
   "",
   "## Workspace tools",
   "",
@@ -862,6 +868,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // OpenAI/Google/DeepSeek models work silently (tool calls without text narration).
     // The no-text detector is only useful for Anthropic models where silence means stuck.
     const noTextDetectionEnabled = modelId.startsWith("anthropic/");
+    // ─── Same-tool repetition (softer than doom-loop) ───
+    // The doom-loop detector requires *identical* tool+args calls. This
+    // catches the looser pattern of "same tool name, different args, N
+    // times in a row" which is how a model gets stuck speculatively
+    // calling codemode / explore / grep without ever wrapping up.
+    // Provider-agnostic — applies to every orchestrator. Nudge first,
+    // then hard-break if the model ignores the nudge.
+    const SAME_TOOL_NUDGE_THRESHOLD = 6;
+    const SAME_TOOL_HARD_BREAK_THRESHOLD = 10;
+    let sameToolNudgeInjected = false;
 
     // ─── Mid-loop compaction threshold ───
     const MID_LOOP_COMPACTION_THRESHOLD = 0.50; // Compact when >50% of budget used
@@ -1001,6 +1017,57 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 repeats: DOOM_LOOP_THRESHOLD,
               });
             }
+          }
+
+          // ─── Same-tool repetition detection (looser than doom-loop) ───
+          // Catches the pattern where a model speculatively calls the same
+          // tool over and over with *different* args, never producing a
+          // text answer. Doom-loop misses this because each call's args
+          // differ. The harness intervenes in two stages:
+          //   1. Nudge at SAME_TOOL_NUDGE_THRESHOLD (default 6) — inject
+          //      a system message asking the model whether it's done.
+          //   2. Hard-break at SAME_TOOL_HARD_BREAK_THRESHOLD (default 10) —
+          //      if the model ignored the nudge and kept calling the same
+          //      tool, we exit cleanly with a wrap-up message.
+          // Provider-agnostic — applies to every orchestrator regardless
+          // of whether silent tool-calling is normal for the provider.
+          // First observed on Gemma 4 26B running 18 consecutive codemode
+          // calls without ever writing a conclusion.
+          const hardBreakTool = detectSameToolRepetition(
+            recentToolCalls,
+            SAME_TOOL_HARD_BREAK_THRESHOLD,
+          );
+          if (hardBreakTool) {
+            log("warn", "same-tool repetition hard break", {
+              sessionId,
+              toolName: hardBreakTool,
+              step,
+              repeats: SAME_TOOL_HARD_BREAK_THRESHOLD,
+            });
+            yield {
+              type: "text-delta",
+              id: crypto.randomUUID(),
+              delta: `\n\n[Stopped: ${hardBreakTool} called ${SAME_TOOL_HARD_BREAK_THRESHOLD} times in a row without producing a text answer — write your conclusion from what you have so far.]\n\n`,
+            };
+            exitReason = "doom-loop";
+            break;
+          }
+          const nudgeTool = detectSameToolRepetition(
+            recentToolCalls,
+            SAME_TOOL_NUDGE_THRESHOLD,
+          );
+          if (nudgeTool && !sameToolNudgeInjected) {
+            sameToolNudgeInjected = true;
+            injections.push({
+              role: "system" as const,
+              content: `[STOP-CHECK] You've called \`${nudgeTool}\` ${SAME_TOOL_NUDGE_THRESHOLD} times in a row. Do you have enough information to answer the user? If yes: write your conclusion as plain text and do NOT call any more tools. If no: switch to a different tool or explain what's missing. Do not call \`${nudgeTool}\` again unless you have a concrete new question that requires it.`,
+            });
+            log("info", "same-tool repetition nudge injected", {
+              sessionId,
+              toolName: nudgeTool,
+              step,
+              repeats: SAME_TOOL_NUDGE_THRESHOLD,
+            });
           }
 
           // ─── Cost runaway backstop ───
@@ -1386,9 +1453,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             for (const tc of lastStep.toolCalls) {
               recentToolCalls.push(`${tc.toolName}:${JSON.stringify(tc.input)}`);
             }
-            // Keep only the last DOOM_LOOP_THRESHOLD * 2 entries to bound memory
-            if (recentToolCalls.length > DOOM_LOOP_THRESHOLD * 2) {
-              recentToolCalls.splice(0, recentToolCalls.length - DOOM_LOOP_THRESHOLD * 2);
+            // Keep enough history to feed all the loop detectors that
+            // read from this buffer: the doom-loop check needs the last
+            // DOOM_LOOP_THRESHOLD * 2 entries; the same-tool hard-break
+            // check needs the last SAME_TOOL_HARD_BREAK_THRESHOLD. Pick
+            // the larger so neither detector starves.
+            const recentToolCallsRetention = Math.max(
+              DOOM_LOOP_THRESHOLD * 2,
+              SAME_TOOL_HARD_BREAK_THRESHOLD,
+            );
+            if (recentToolCalls.length > recentToolCallsRetention) {
+              recentToolCalls.splice(0, recentToolCalls.length - recentToolCallsRetention);
             }
           }
 
