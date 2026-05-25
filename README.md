@@ -330,7 +330,9 @@ Set via `wrangler secret put <NAME>` or through the Deploy to Cloudflare flow.
 | `AI_GATEWAY_KEY` | If using AI Gateway | Auth key for the Cloudflare AI Gateway |
 | `CF_ACCESS_AUD` | If using Access | Cloudflare Access application audience tag |
 | `CF_ACCESS_TEAM_DOMAIN` | If using Access | Cloudflare Access team domain URL |
-| `NTFY_TOPIC` | Optional | ntfy.sh topic for worker run push notifications |
+| `NTFY_TOPIC` | Optional | ntfy topic for worker run push notifications |
+| `NTFY_BASE_URL` | Optional | Override the publish endpoint. Defaults to `https://ntfy.sh`; set to a self-hosted ntfy-compatible worker URL otherwise |
+| `NTFY_TOKEN` | Optional | Bearer token sent on every ntfy publish. Required by self-hosted workers with auth; leave unset for public ntfy.sh |
 | `GITHUB_TOKEN` | Optional | Admin-only env fallback when no per-user GitHub token is set |
 | `GITLAB_TOKEN` | Optional | Admin-only env fallback when no per-user GitLab token is set |
 

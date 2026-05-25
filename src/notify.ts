@@ -49,6 +49,19 @@ export interface NotificationChannel {
 export interface ResolvedNtfyConfig {
   type: "ntfy";
   topic: string;
+  /**
+   * Base URL the publish is POSTed to, with no trailing slash. When
+   * unset, defaults to `https://ntfy.sh`. Self-hosted deployments
+   * point this at an ntfy-compatible worker URL.
+   */
+  baseUrl?: string;
+  /**
+   * Optional bearer token sent as `Authorization: Bearer <token>` on
+   * publish. Per-user `ntfy_token` secret overrides the `NTFY_TOKEN`
+   * env var so the workspace token can be replaced per owner without
+   * a redeploy.
+   */
+  token?: string;
 }
 
 export interface ResolvedWebhookConfig {
@@ -226,7 +239,14 @@ export async function resolveNotificationConfig(env: Env, ownerEmail?: string): 
   let topic: string | undefined;
   if (ownerEmail) topic = await readUserSecret(env, ownerEmail, "ntfy_topic");
   if (!topic) topic = env.NTFY_TOPIC;
-  if (topic) channels.push({ type: "ntfy", topic });
+  if (topic) {
+    // Trim trailing slashes so we can append `/${topic}` unconditionally.
+    const baseUrl = (env.NTFY_BASE_URL ?? "https://ntfy.sh").replace(/\/+$/, "");
+    let token: string | undefined;
+    if (ownerEmail) token = await readUserSecret(env, ownerEmail, "ntfy_token");
+    if (!token) token = env.NTFY_TOKEN;
+    channels.push({ type: "ntfy", topic, baseUrl, token });
+  }
 
   // webhooks
   const webhookConfigs = await loadWebhookConfigs(env, ownerEmail);
@@ -317,8 +337,10 @@ export async function sendNotification(plan: NotificationPlan, _env: Env): Promi
           };
           if (message.tags) headers.Tags = message.tags;
           if (message.url) headers.Click = message.url;
+          if (channel.token) headers.Authorization = `Bearer ${channel.token}`;
 
-          await fetch(`https://ntfy.sh/${channel.topic}`, {
+          const baseUrl = (channel.baseUrl ?? "https://ntfy.sh").replace(/\/+$/, "");
+          await fetch(`${baseUrl}/${channel.topic}`, {
             body: message.body,
             headers,
             method: "POST",

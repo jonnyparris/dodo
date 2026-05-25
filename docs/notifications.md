@@ -18,12 +18,33 @@ state change to avoid notification spam.
 
 ## ntfy channel
 
-Already documented elsewhere. Set a topic and you're done:
+Set a topic and you're done:
 
 - **Per-user secret:** `PUT /api/secrets/ntfy_topic` with `{"value":"your-topic"}`
 - **Or env var:** `NTFY_TOPIC` (shared, applies to anyone without a per-user secret)
 
 If neither is set, the ntfy channel is skipped.
+
+### Target server
+
+By default the channel posts to `https://ntfy.sh`. Override with the env
+var `NTFY_BASE_URL` to publish to a self-hosted ntfy-compatible worker
+instead — for example
+[ntfy-worker](https://github.com/jonnyparris/ntfy-worker) deployed at
+`https://ntfy-worker.<your-subdomain>.workers.dev`. Trailing slashes are
+stripped, so either form works.
+
+### Auth
+
+Public ntfy.sh accepts unauthenticated posts. Self-hosted deployments
+typically require a shared bearer token. Set one of:
+
+- **Per-user secret:** `PUT /api/secrets/ntfy_token` with `{"value":"<token>"}`
+- **Or env var:** `NTFY_TOKEN`
+
+When set, Dodo sends `Authorization: Bearer <token>` on every publish.
+When absent, no auth header is sent — fine for public ntfy.sh; a
+self-hosted worker with auth will reject the request.
 
 ## Webhook channels
 

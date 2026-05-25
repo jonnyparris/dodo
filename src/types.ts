@@ -59,6 +59,18 @@ export interface Env {
   GITHUB_TOKEN?: string;
   GITLAB_TOKEN?: string;
   NTFY_TOPIC?: string;
+  /**
+   * Optional base URL for ntfy publishes. Defaults to `https://ntfy.sh`.
+   * Set this to point at a self-hosted ntfy-compatible worker, e.g.
+   * `https://ntfy-worker.<your-subdomain>.workers.dev`.
+   */
+  NTFY_BASE_URL?: string;
+  /**
+   * Optional bearer token sent as `Authorization: Bearer <token>` on
+   * every ntfy publish. Required when targeting a self-hosted ntfy
+   * worker with auth; leave unset for public ntfy.sh.
+   */
+  NTFY_TOKEN?: string;
   OPENCODE_GATEWAY_TOKEN?: string;
 }
 
