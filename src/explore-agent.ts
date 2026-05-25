@@ -10,6 +10,7 @@ import {
   EXPLORE_SYSTEM_PROMPT,
   EXPLORE_MAX_STEPS,
   EXPLORE_TIMEOUT_MS,
+  EXPLORE_FALLBACK_HINT,
   resolveSubagentModel,
 } from "./subagent-runner";
 import type { AppConfig, Env } from "./types";
@@ -233,7 +234,7 @@ export class ExploreAgent extends Agent<Env> {
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      const failureSummary = `Explore failed (model: ${modelId}) [facet: ${this.name}]: ${msg}`;
+      const failureSummary = `Explore failed (model: ${modelId}) [facet: ${this.name}]: ${msg}\n${EXPLORE_FALLBACK_HINT}`;
       this.recordTranscript("assistant", failureSummary, { model: modelId });
       return {
         ok: true,

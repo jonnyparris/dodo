@@ -12,6 +12,7 @@ import { getKnownRepo, listKnownRepos, parseRemoteSpec } from "./repos";
 import {
   buildProviderForModel,
   capToolOutputs,
+  EXPLORE_FALLBACK_HINT,
   EXPLORE_MAX_STEPS,
   EXPLORE_SYSTEM_PROMPT,
   EXPLORE_TIMEOUT_MS,
@@ -773,7 +774,11 @@ function buildSubagentTool(spec: {
         ].filter(Boolean).join("\n");
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        return `${spec.name} failed (model: ${modelId}): ${msg}`;
+        const base = `${spec.name} failed (model: ${modelId}): ${msg}`;
+        // Only Explore gets the read-only fallback hint — Task subagent
+        // failures don't have a clean fallback path (they can write, and
+        // the orchestrator can't reliably substitute).
+        return spec.name === "Explore" ? `${base}\n${EXPLORE_FALLBACK_HINT}` : base;
       }
     },
   });
@@ -864,7 +869,7 @@ function buildExploreTool(
             return result.summary;
           } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
-            return `Explore failed (facet mode): ${msg}`;
+            return `Explore failed (facet mode): ${msg}\n${EXPLORE_FALLBACK_HINT}`;
           }
         }
 
@@ -881,12 +886,14 @@ function buildExploreTool(
           `# Parallel explore — ${queries.length} queries in parallel`,
           "",
         ];
+        let allFailed = true;
         for (let i = 0; i < settled.length; i++) {
           const q = queries[i];
           const outcome = settled[i];
           blocks.push(`## Query ${i + 1}: ${q}`, "");
           if (outcome.status === "fulfilled") {
             blocks.push(outcome.value.summary, "");
+            allFailed = false;
           } else {
             const reason = outcome.reason instanceof Error
               ? outcome.reason.message
@@ -894,6 +901,10 @@ function buildExploreTool(
             blocks.push(`(query ${i + 1} failed: ${reason})`, "");
           }
         }
+        // Only attach the global recovery hint if every query failed —
+        // partial success is still useful and the per-query failure
+        // lines stand on their own.
+        if (allFailed) blocks.push(EXPLORE_FALLBACK_HINT);
         return blocks.join("\n").trimEnd();
       },
     });
