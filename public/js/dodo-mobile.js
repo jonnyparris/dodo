@@ -2,30 +2,44 @@
 
 // --- Mobile tab switching ---
 function switchTab(tab){
+  // Legacy alias: old code paths may still pass 'settings'; route them to 'sessions'.
+  if(tab==='settings')tab='sessions';
   activeTab=tab;
   document.querySelectorAll('.mobile-nav button').forEach(b=>b.classList.remove('active'));
   document.querySelector(`.mobile-nav button[onclick="switchTab('${tab}')"]`)?.classList.add('active');
-  $('sidebar-panel').classList.remove('mobile-visible');
-  $('right-panel').classList.remove('mobile-visible');
-  document.querySelector('.center').style.display=tab==='chat'?'flex':'none';
+  const sidebar=$('sidebar-panel');
+  const right=$('right-panel');
+  const backdrop=$('mobile-backdrop');
+  sidebar.classList.remove('mobile-visible');
+  right.classList.remove('mobile-visible');
+  if(backdrop)backdrop.classList.remove('visible');
+  // Sessions drawer is partial-width so chat stays visible behind it.
+  // Files/Tools are full-screen overlays so chat hides under them.
+  const showChat=tab==='chat'||tab==='sessions';
+  document.querySelector('.center').style.display=showChat?'flex':'none';
   const fab=document.querySelector('.fab');
   if(fab&&window.innerWidth<=900)fab.style.display=tab==='chat'?'none':'flex';
   const filesGroup=$('files-group');
   const toolsGroup=$('tools-group');
   if(filesGroup)filesGroup.style.display='';
   if(toolsGroup)toolsGroup.style.display='';
-  if(tab==='settings')$('sidebar-panel').classList.add('mobile-visible');
+  if(tab==='sessions'){
+    sidebar.classList.add('mobile-visible');
+    if(backdrop)backdrop.classList.add('visible');
+    // Focus the sessions search for keyboard users
+    requestAnimationFrame(()=>$('session-search')?.focus());
+  }
   if(tab==='files'){
-    $('right-panel').classList.add('mobile-visible');
+    right.classList.add('mobile-visible');
     const title=$('right-panel-title');if(title)title.textContent='Files';
     if(toolsGroup)toolsGroup.style.display='none';
-    $('right-panel').scrollTop=0;
+    right.scrollTop=0;
   }
   if(tab==='tools'){
-    $('right-panel').classList.add('mobile-visible');
+    right.classList.add('mobile-visible');
     const title=$('right-panel-title');if(title)title.textContent='Tools';
     if(filesGroup)filesGroup.style.display='none';
-    $('right-panel').scrollTop=0;
+    right.scrollTop=0;
   }
 }
 
@@ -62,7 +76,8 @@ if(window.visualViewport){
 // --- Swipe between tabs (mobile) ---
 (function(){
   if(window.innerWidth>900)return;
-  const tabs=['chat','files','tools','settings'];
+  // Tab order matches mobile-nav button order: swiping left advances right.
+  const tabs=['sessions','chat','files','tools'];
   let touchStartX=0,touchStartY=0,swiping=false;
   const app=document.querySelector('.app');
   document.addEventListener('touchstart',(e)=>{
