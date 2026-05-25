@@ -319,6 +319,19 @@
     .footer{padding:8px 16px;font-size:11px;color:var(--text-subtle);text-align:center;border-top:1px solid var(--line);background:var(--base);display:flex;align-items:center;justify-content:center;gap:12px}
     .token-summary{font-size:11px;color:var(--text-subtle)}
 
+    /* === Session header — title row + meta row === */
+    .session-header{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel)}
+    .session-meta{display:flex;flex-direction:column;min-width:0;flex:1;gap:2px}
+    .session-meta-title{display:flex;align-items:center;gap:8px;min-width:0}
+    .session-title-btn{cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;font-weight:700;font-size:inherit;font-family:inherit;background:none;border:none;padding:0;text-align:left;color:inherit;min-height:0;box-shadow:none;border-radius:0;flex:1}
+    .session-title-btn:focus-visible{outline:2px solid var(--brand);outline-offset:2px;border-radius:3px}
+    .session-meta-secondary{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text-subtle);min-width:0;flex-wrap:wrap}
+    .session-meta-secondary > *{flex-shrink:0}
+    .session-meta-secondary .dot-sep{opacity:.5}
+    .session-meta-secondary #token-summary,
+    .session-meta-secondary #build-version,
+    .session-meta-secondary #session-id-display{margin:0}
+
     /* === Overlays — Kumo dialog style === */
     .help-overlay{position:fixed;inset:0;background:light-dark(oklch(0% 0 0 / 0.4), oklch(0% 0 0 / 0.6));z-index:1000;display:flex;align-items:center;justify-content:center}
     .help-content{background:var(--base);border-radius:12px;padding:24px;max-width:560px;max-height:80vh;overflow-y:auto;width:90%;box-shadow:var(--shadow-md);border:1px solid var(--line)}
@@ -432,17 +445,17 @@
     .msg-attachment{margin-top:6px}
     .msg-attachment img{max-width:300px;max-height:200px;border-radius:var(--radius);cursor:pointer;border:1px solid var(--line)}
 
-    /* === Session header actions — wrap on small screens === */
-    .header-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
-    .btn-icon{display:none}
-    .btn-label{display:inline}
+    /* === Session header actions — 3 icon buttons + overflow kebab at all widths === */
+    .header-actions{display:flex;gap:6px;justify-content:flex-end;flex-shrink:0}
+    .icon-btn{padding:6px 8px;min-width:32px;display:inline-flex;align-items:center;justify-content:center;font-size:14px}
 
-    /* === Mobile overflow menu (Fork/Abort/Delete behind ⋯) === */
-    .top-bar-overflow{position:relative;display:none}
+    /* === Overflow menu — Fork / Abort / Help / Delete behind ⋯ === */
+    .top-bar-overflow{position:relative;display:block}
     .top-bar-overflow-btn{background:var(--control);border:1px solid var(--line);border-radius:var(--radius);cursor:pointer;font-size:16px;padding:4px 8px;color:var(--text-default);box-shadow:0 1px 2px var(--shadow-drop)}
     .top-bar-overflow-menu{display:none;position:absolute;right:0;top:100%;margin-top:4px;background:var(--base);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow-md);z-index:100;min-width:160px;padding:4px}
     .top-bar-overflow-menu.open{display:block}
     .top-bar-overflow-menu button{display:flex;align-items:center;gap:8px;width:100%;padding:8px 12px;border:none;background:none;cursor:pointer;font-size:13px;color:var(--text-default);text-align:left;white-space:nowrap;min-height:36px;border-radius:6px}
+    .top-bar-overflow-menu button:disabled{opacity:.45;cursor:not-allowed}
     .top-bar-overflow-menu button:hover{background:var(--fill-hover)}
     .top-bar-overflow-menu button.danger{color:var(--text-danger)}
     .top-bar-overflow-menu button.danger:hover{background:var(--danger-tint)}
@@ -568,21 +581,13 @@
       .msg{max-width:90%;padding:12px 14px}
       .msg.assistant,.msg.tool_call{max-width:100%}
 
-      /* Header actions — collapse overflow on mobile */
-      .header-actions{flex-wrap:wrap;gap:3px;justify-content:flex-end;max-width:45%}
-      .header-actions button{white-space:nowrap;font-size:12px;padding:4px 6px;min-width:28px}
-      .header-actions .mobile-hide{display:none}
-      .top-bar-overflow{display:block}
-      .btn-icon{display:inline;font-size:14px}
-      .btn-label{display:none}
-      .theme-toggle{font-size:14px !important;padding:4px 6px !important}
+      /* Header actions — already minimal; overflow kebab shown by default at all sizes */
+      .header-actions{gap:4px;flex-shrink:0}
 
-      /* Hide non-essential metadata on mobile to prevent overlap */
-      #session-id-display,#build-version{display:none}
-
-      /* Token summary stays visible but smaller and shrinkable */
-      #token-summary{font-size:10px;flex-shrink:1 !important;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50%}
-      #session-title-display{min-width:80px !important}
+      /* Secondary metadata line — keep token count visible, hide the noisier bits */
+      .session-meta-secondary{font-size:10px;gap:6px}
+      .session-meta-secondary #build-version,
+      .session-meta-secondary #session-id-display{display:none}
       .footer{display:none}
 
       /* File entries bigger touch targets */
@@ -672,28 +677,29 @@
 
     <div class="resize-handle" id="resize-left" role="separator" aria-orientation="vertical" aria-label="Resize left sidebar"></div>
 
-    <main class="center" id="main-content">
-      <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--panel);gap:8px">
-        <div style="display:flex;align-items:center;min-width:0;flex:1">
-          <span id="session-status-dot" class="status-dot idle" role="img" aria-label="Session status: idle"></span>
-          <button id="session-title-display" style="cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;font-weight:700;font-size:inherit;font-family:inherit;background:none;border:none;padding:0;text-align:left;color:inherit;min-height:0;box-shadow:none;border-radius:0" onclick="renameSession()" title="Click to rename">No session</button>
-          <span id="session-id-display" style="font-size:11px;color:var(--muted);margin-left:8px;flex-shrink:0"></span>
-          <span id="token-summary" class="token-summary" style="margin-left:8px;flex-shrink:0"></span>
-          <span id="build-version" class="token-summary" style="margin-left:8px;flex-shrink:0"></span>
-          <div id="presence-bar" class="presence-bar"></div>
+     <main class="center" id="main-content">
+      <div class="session-header">
+        <div class="session-meta">
+          <div class="session-meta-title">
+            <span id="session-status-dot" class="status-dot idle" role="img" aria-label="Session status: idle"></span>
+            <button id="session-title-display" class="session-title-btn" onclick="renameSession()" title="Click to rename">No session</button>
+            <div id="presence-bar" class="presence-bar"></div>
+          </div>
+          <div class="session-meta-secondary">
+            <span id="token-summary" class="token-summary"></span>
+            <span id="build-version" class="token-summary"></span>
+            <span id="session-id-display"></span>
+          </div>
         </div>
         <div class="header-actions">
-          <button onclick="showSessionSettings()" title="Session settings" aria-label="Session settings"><span class="btn-label">Settings</span><span class="btn-icon"><i class="ph ph-gear" aria-hidden="true"></i></span></button>
-          <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle dark/light mode" aria-label="Toggle dark/light mode"><i class="ph ph-moon" id="theme-icon" aria-hidden="true"></i></button>
-          <button onclick="showHelp()" title="Help" aria-label="Help"><i class="ph ph-question" aria-hidden="true"></i></button>
-          <button class="mobile-hide" onclick="forkSession()" title="Fork copies this session's files, git history, and conversation so you can try a different approach." aria-label="Fork session"><span class="btn-label">Fork</span><span class="btn-icon"><i class="ph ph-git-fork" aria-hidden="true"></i></span></button>
-          <button class="mobile-hide" id="abort-btn" onclick="abortPrompt()" disabled title="Abort prompt" aria-label="Abort prompt"><span class="btn-label">Abort</span><span class="btn-icon"><i class="ph ph-stop-circle" aria-hidden="true"></i></span></button>
-          <button class="danger mobile-hide" onclick="deleteSession()" title="Delete session" aria-label="Delete session"><span class="btn-label">Delete</span><span class="btn-icon"><i class="ph ph-trash" aria-hidden="true"></i></span></button>
+          <button onclick="showSessionSettings()" title="Session settings" aria-label="Session settings" class="icon-btn"><i class="ph ph-gear" aria-hidden="true"></i></button>
+          <button class="theme-toggle icon-btn" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle dark/light mode" aria-label="Toggle dark/light mode"><i class="ph ph-moon" id="theme-icon" aria-hidden="true"></i></button>
           <div class="top-bar-overflow">
             <button class="top-bar-overflow-btn" onclick="toggleOverflowMenu(event)" title="More actions" aria-label="More actions" aria-haspopup="menu"><i class="ph ph-dots-three-vertical" aria-hidden="true"></i></button>
             <div class="top-bar-overflow-menu" id="overflow-menu" role="menu">
-              <button role="menuitem" onclick="forkSession();closeOverflowMenu()"><i class="ph ph-git-fork" aria-hidden="true"></i> Fork session</button>
-              <button role="menuitem" onclick="abortPrompt();closeOverflowMenu()" id="abort-btn-mobile"><i class="ph ph-stop-circle" aria-hidden="true"></i> Abort prompt</button>
+              <button role="menuitem" onclick="forkSession();closeOverflowMenu()" id="fork-btn-menu"><i class="ph ph-git-fork" aria-hidden="true"></i> Fork session</button>
+              <button role="menuitem" onclick="abortPrompt();closeOverflowMenu()" id="abort-btn" disabled><i class="ph ph-stop-circle" aria-hidden="true"></i> Abort prompt</button>
+              <button role="menuitem" onclick="showHelp();closeOverflowMenu()"><i class="ph ph-question" aria-hidden="true"></i> Help</button>
               <button role="menuitem" class="danger" onclick="deleteSession();closeOverflowMenu()"><i class="ph ph-trash" aria-hidden="true"></i> Delete session</button>
             </div>
           </div>

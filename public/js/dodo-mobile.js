@@ -111,11 +111,6 @@ function scrollChatToBottom(){const c=$("chat");c.scrollTo({top:c.scrollHeight,b
 function toggleOverflowMenu(e){e.stopPropagation();$('overflow-menu').classList.toggle('open')}
 function closeOverflowMenu(){$('overflow-menu').classList.remove('open')}
 document.addEventListener('click',()=>closeOverflowMenu());
-const _abortObserver=new MutationObserver(()=>{
-  const main=$('abort-btn'),mobile=$('abort-btn-mobile');
-  if(main&&mobile){mobile.disabled=main.disabled;mobile.style.opacity=main.disabled?'0.4':'1'}
-});
-window.addEventListener('load',()=>{const main=$('abort-btn');if(main)_abortObserver.observe(main,{attributes:true,attributeFilter:['disabled']})});
 
 // --- Collapsible animation ---
 document.querySelectorAll('details').forEach(d=>{
