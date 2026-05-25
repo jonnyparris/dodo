@@ -1644,6 +1644,146 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   );
 
   server.tool(
+    "dispatch_autopilot_worker",
+    "ADMIN-ONLY. Dispatch a self-diagnose worker session from inside the autopilot supervisor. Forks the autopilot seed, tags the session as a worker, attaches the diagnose prompt template with your target area + notes, and returns the session id. Use this to fan out investigations across the issues you've identified.",
+    {
+      targetArea: z.string().min(1).max(500).describe("What this worker should focus on (one concrete area)."),
+      contextNotes: z.string().max(4000).optional().describe("Notes from your log sweep that the worker should see."),
+      sinceHours: z.number().min(1).max(168).optional().describe("Log window for the worker. Default 24."),
+    },
+    async ({ targetArea, contextNotes, sinceHours }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const { buildDiagnosePrompt, resolveAutopilotOwner } = await import("./autopilot");
+      let owner: string;
+      try {
+        owner = resolveAutopilotOwner(env);
+      } catch (e) {
+        return errorResult({ error: e instanceof Error ? e.message : "Autopilot owner unavailable" });
+      }
+
+      const sessionId = crypto.randomUUID();
+      const createRes = await userControlFetch(env, "/sessions", {
+        body: JSON.stringify({ id: sessionId, ownerEmail: owner, createdBy: owner }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, owner);
+      if (!createRes.ok) {
+        return errorResult({ error: `Failed to create worker session: ${createRes.status}` });
+      }
+
+      // Tag the new session as an autopilot worker
+      const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
+      await agent.fetch("https://coding-agent/autopilot-flag", {
+        body: JSON.stringify({ isAutopilot: true, role: "worker-auto" }),
+        headers: { "content-type": "application/json", "x-dodo-session-id": sessionId, "x-owner-email": owner },
+        method: "PUT",
+      });
+
+      const title = `[autopilot] ${targetArea.slice(0, 64)}`;
+      await userControlFetch(env, `/sessions/${encodeURIComponent(sessionId)}`, {
+        body: JSON.stringify({ title }),
+        headers: { "content-type": "application/json" },
+        method: "PATCH",
+      }, owner);
+
+      const prompt = buildDiagnosePrompt({
+        targetArea,
+        contextNotes,
+        sinceHours: sinceHours ?? 24,
+      });
+
+      // Read owner config for gateway/model headers — autopilot uses the
+      // admin's chosen model so they can tune cost-vs-quality.
+      const cfgRes = await userControlFetch(env, "/config", undefined, owner);
+      const cfg = (await cfgRes.json()) as { activeGateway?: string; model?: string; aiGatewayBaseURL?: string; opencodeBaseURL?: string };
+      await agent.fetch("https://coding-agent/prompt", {
+        body: JSON.stringify({ content: prompt }),
+        headers: {
+          "content-type": "application/json",
+          "x-dodo-session-id": sessionId,
+          "x-owner-email": owner,
+          "x-author-email": owner,
+          "x-dodo-ai-base-url": cfg.aiGatewayBaseURL ?? "",
+          "x-dodo-gateway": cfg.activeGateway ?? "opencode",
+          "x-dodo-model": cfg.model ?? "",
+          "x-dodo-opencode-base-url": cfg.opencodeBaseURL ?? "",
+        },
+        method: "POST",
+      });
+
+      log("info", "Autopilot worker dispatched", { sessionId, targetArea });
+      return textResult({ sessionId, title, ownerEmail: owner });
+    },
+  );
+
+  server.tool(
+    "list_autopilot_workers",
+    "ADMIN-ONLY. List recent autopilot worker sessions (both manual and supervisor-dispatched). Returns id, title, status, role, created_at — useful for the supervisor to review past runs.",
+    {
+      limit: z.number().min(1).max(100).optional().describe("Max sessions to return (default 25)."),
+    },
+    async ({ limit }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const { resolveAutopilotOwner } = await import("./autopilot");
+      let owner: string;
+      try {
+        owner = resolveAutopilotOwner(env);
+      } catch (e) {
+        return errorResult({ error: e instanceof Error ? e.message : "Autopilot owner unavailable" });
+      }
+      const res = await userControlFetch(env, "/sessions", undefined, owner);
+      if (!res.ok) return errorResult({ error: `Failed to list sessions: ${res.status}` });
+      const body = (await res.json()) as { sessions?: Array<{ id: string; title?: string; status?: string; created_at?: number }> };
+      const all = body.sessions ?? [];
+      // Title-prefix filter — robust even if the per-session metadata flag
+      // is missing (the kickoff always uses the [autopilot] prefix).
+      const autopilot = all
+        .filter((s) => (s.title ?? "").startsWith("[autopilot]"))
+        .sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))
+        .slice(0, limit ?? 25);
+      return textResult({ count: autopilot.length, sessions: autopilot });
+    },
+  );
+
+  server.tool(
+    "autopilot_notify",
+    "ADMIN-ONLY. Send an ntfy notification on behalf of the autopilot supervisor. Use this when the supervisor decides to pause itself or when a worker hits a recurring failure pattern that needs human attention.",
+    {
+      title: z.string().min(1).max(200),
+      body: z.string().min(1).max(2000),
+      priority: z.enum(["min", "low", "default", "high", "urgent"]).optional().describe("ntfy priority. Default 'default'; use 'high' or 'urgent' for stuck patterns."),
+    },
+    async ({ title, body, priority }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const { resolveAutopilotOwner } = await import("./autopilot");
+      let owner: string;
+      try {
+        owner = resolveAutopilotOwner(env);
+      } catch (e) {
+        return errorResult({ error: e instanceof Error ? e.message : "Autopilot owner unavailable" });
+      }
+      const { planNotification, resolveNotificationConfig, sendNotification } = await import("./notify");
+      const config = await resolveNotificationConfig(env, owner);
+      const plan = planNotification(
+        {
+          kind: "autopilot",
+          title: `[autopilot] ${title}`,
+          body,
+          tags: "robot",
+          priority: priority ?? "default",
+          ownerEmail: owner,
+        },
+        config,
+      );
+      if (plan.perChannelMessages.length === 0) {
+        return textResult({ delivered: 0, reason: "No notification channels configured for the autopilot owner" });
+      }
+      await sendNotification(plan, env);
+      return textResult({ delivered: plan.perChannelMessages.length, channels: plan.perChannelMessages.map((m) => m.channel.type) });
+    },
+  );
+
+  server.tool(
     "summarize_session_run",
     "ADMIN-ONLY. Read a session's prompt + message history and return a structured summary (turn count, tools used, last error if any). Faster than reading the full transcript when triaging.",
     {

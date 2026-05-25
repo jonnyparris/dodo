@@ -24,7 +24,8 @@ export type NotificationKind =
   | "prompt-aborted"
   | "watchdog-stalled"
   | "run-done"
-  | "run-failed";
+  | "run-failed"
+  | "autopilot";
 
 /** Input to the pure planning phase. */
 export interface NotificationInput extends NotificationPayload {

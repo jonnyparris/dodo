@@ -65,6 +65,36 @@
     </div>
 
     <div class="panel">
+      <h2>Supervisor schedule</h2>
+      <p>Install a scheduled supervisor session that fires on a cron, reviews recent failures, and dispatches worker sessions automatically. The supervisor uses <code>dispatch_autopilot_worker</code> and stops itself if the same error pattern recurs for three runs in a row.</p>
+
+      <div class="row" id="supervisor-status">
+        <span>Status</span><span id="sup-status">Loading…</span>
+      </div>
+      <div class="row" id="supervisor-cron-row" style="display:none">
+        <span>Cron</span><code id="sup-cron"></code>
+      </div>
+      <div class="row" id="supervisor-next-row" style="display:none">
+        <span>Next run</span><span id="sup-next"></span>
+      </div>
+
+      <label for="cron">Cron expression</label>
+      <input id="cron" value="0 */12 * * *" placeholder="0 */12 * * *" style="font-family:var(--mono);width:240px"/>
+      <label for="sup-hours">Log window for supervisor (hours)</label>
+      <input id="sup-hours" type="number" min="1" max="168" value="12" style="width:120px"/>
+
+      <button id="install-sup" class="primary" type="button">Install / Replace supervisor</button>
+      <button id="uninstall-sup" type="button">Uninstall</button>
+      <div class="status" id="sup-feedback"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Recent autopilot sessions</h2>
+      <div id="workers-list" style="font-size:12px"></div>
+      <button id="refresh-workers" type="button" style="margin-top:8px">Reload</button>
+    </div>
+
+    <div class="panel">
       <h2>Safety rails</h2>
       <ul style="font-size:12px;color:var(--muted);line-height:1.7;padding-left:18px">
         <li>Hard cap: 50 tool turns. Worker writes a status note and stops if stuck.</li>
@@ -140,6 +170,96 @@
       $("result").style.display = "none";
       setStatus("");
     });
+
+    // === Supervisor schedule ===
+    const setSupFeedback = (msg, kind) => {
+      const s = $("sup-feedback");
+      s.textContent = msg;
+      s.className = "status" + (kind ? " " + kind : "");
+    };
+    function fmtEpoch(epoch) {
+      if (!epoch) return "—";
+      try { return new Date(epoch * 1000).toLocaleString(); } catch { return String(epoch); }
+    }
+    async function loadSupervisor() {
+      try {
+        const data = await api("/api/admin/autopilot/supervisor");
+        if (data.supervisor) {
+          $("sup-status").textContent = "Installed";
+          $("sup-cron").textContent = data.supervisor.cron_expression || "—";
+          $("sup-next").textContent = fmtEpoch(data.supervisor.next_run_epoch);
+          $("supervisor-cron-row").style.display = "grid";
+          $("supervisor-next-row").style.display = "grid";
+          if (data.supervisor.cron_expression) $("cron").value = data.supervisor.cron_expression;
+        } else {
+          $("sup-status").textContent = "Not installed";
+          $("supervisor-cron-row").style.display = "none";
+          $("supervisor-next-row").style.display = "none";
+        }
+      } catch (err) {
+        $("sup-status").textContent = "Error loading";
+        setSupFeedback(err.message, "error");
+      }
+    }
+    async function installSupervisor() {
+      const cron = $("cron").value.trim();
+      const sinceHours = Number($("sup-hours").value) || 12;
+      setSupFeedback("Installing…");
+      try {
+        await api("/api/admin/autopilot/supervisor", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cron, sinceHours }),
+        });
+        setSupFeedback("Installed. Next run shown above.", "success");
+        await loadSupervisor();
+      } catch (err) {
+        setSupFeedback(`Install failed: ${err.message}`, "error");
+      }
+    }
+    async function uninstallSupervisor() {
+      if (!confirm("Uninstall the autopilot supervisor? You can re-install at any time.")) return;
+      setSupFeedback("Uninstalling…");
+      try {
+        const r = await api("/api/admin/autopilot/supervisor", { method: "DELETE" });
+        setSupFeedback(`Removed ${r.removed} schedule(s).`, "success");
+        await loadSupervisor();
+      } catch (err) {
+        setSupFeedback(`Uninstall failed: ${err.message}`, "error");
+      }
+    }
+    $("install-sup").addEventListener("click", installSupervisor);
+    $("uninstall-sup").addEventListener("click", uninstallSupervisor);
+
+    // === Recent workers ===
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    }
+    async function loadWorkers() {
+      try {
+        const data = await api("/api/admin/autopilot/workers?limit=20");
+        const sessions = data.sessions || [];
+        if (sessions.length === 0) {
+          $("workers-list").innerHTML = "<em style=\"color:var(--muted)\">No autopilot sessions yet.</em>";
+          return;
+        }
+        $("workers-list").innerHTML = sessions.map((s) => {
+          const statusColor = s.status === "failed" ? "var(--danger)" : s.status === "running" ? "var(--brand)" : "var(--muted)";
+          return `<div style="padding:6px 0;border-bottom:1px solid var(--border)">
+            <a href="/#session=${encodeURIComponent(s.id)}" target="_blank" style="font-family:var(--mono);font-size:11px">${escapeHtml(s.id.slice(0,8))}\u2026</a>
+            <span style="margin-left:8px">${escapeHtml(s.title || "(no title)")}</span>
+            <span style="margin-left:8px;color:${statusColor};font-size:11px">${escapeHtml(s.status || "—")}</span>
+            <span style="margin-left:8px;color:var(--muted);font-size:11px">${fmtEpoch(s.created_at)}</span>
+          </div>`;
+        }).join("");
+      } catch (err) {
+        $("workers-list").innerHTML = `<em style="color:var(--danger)">Failed to load: ${escapeHtml(err.message)}</em>`;
+      }
+    }
+    $("refresh-workers").addEventListener("click", loadWorkers);
+
+    loadSupervisor();
+    loadWorkers();
   </script>
 </body>
 </html>

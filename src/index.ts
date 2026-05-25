@@ -709,6 +709,103 @@ app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
   return c.json({ id: sessionId, ownerEmail: owner, title }, 201);
 });
 
+// ─── Admin: autopilot supervisor schedule ───
+//
+// Installs (or replaces) a scheduled supervisor session that fires on a
+// cron and decides whether to dispatch worker sessions. The supervisor is
+// a regular scheduled session under the hood — we just hand it the
+// supervisor prompt template and tag it as autopilot when it spawns.
+
+const AUTOPILOT_SUPERVISOR_DESC = "Dodo autopilot supervisor";
+
+app.get("/api/admin/autopilot/supervisor", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const res = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions");
+  if (!res.ok) return c.json({ error: `Failed to list schedules: ${res.status}` }, 500);
+  const body = (await res.json()) as { scheduledSessions?: Array<{ id: string; description: string; cron_expression?: string; next_run_epoch?: number; last_run_epoch?: number }> };
+  const supervisor = (body.scheduledSessions ?? []).find((s) => s.description === AUTOPILOT_SUPERVISOR_DESC);
+  return c.json({ supervisor: supervisor ?? null });
+});
+
+app.post("/api/admin/autopilot/supervisor", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const body = (await c.req.raw.json().catch(() => ({}))) as { cron?: string; sinceHours?: number };
+  const cron = (body.cron ?? "0 */12 * * *").trim();
+  const sinceHours = body.sinceHours ?? 12;
+
+  const { buildSupervisorPrompt, resolveAutopilotOwner } = await import("./autopilot");
+  try {
+    const owner = resolveAutopilotOwner(c.env);
+    if (adminEmail.toLowerCase() !== owner) {
+      return c.json({ error: "Only the configured ADMIN_EMAIL can install the supervisor" }, 403);
+    }
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : "Autopilot unavailable" }, 500);
+  }
+
+  // Remove any existing supervisor — keeps a single schedule per admin.
+  const existingRes = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions");
+  if (existingRes.ok) {
+    const existing = (await existingRes.json()) as { scheduledSessions?: Array<{ id: string; description: string }> };
+    for (const s of existing.scheduledSessions ?? []) {
+      if (s.description === AUTOPILOT_SUPERVISOR_DESC) {
+        await proxyToUserControl(c.env, adminEmail, `/scheduled-sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
+      }
+    }
+  }
+
+  const payload = {
+    description: AUTOPILOT_SUPERVISOR_DESC,
+    prompt: buildSupervisorPrompt({ sinceHours }),
+    type: "cron" as const,
+    cron,
+    source: "fresh" as const,
+    title: "[autopilot supervisor]",
+    createdBy: adminEmail,
+  };
+
+  const createRes = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions", {
+    body: JSON.stringify(payload),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  if (!createRes.ok) {
+    const text = await createRes.text().catch(() => "");
+    return c.json({ error: `Failed to install supervisor: ${text}` }, 500);
+  }
+  const created = await createRes.json();
+  return c.json({ installed: true, schedule: created }, 201);
+});
+
+app.delete("/api/admin/autopilot/supervisor", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const existingRes = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions");
+  if (!existingRes.ok) return c.json({ error: `Failed to list schedules: ${existingRes.status}` }, 500);
+  const existing = (await existingRes.json()) as { scheduledSessions?: Array<{ id: string; description: string }> };
+  let removed = 0;
+  for (const s of existing.scheduledSessions ?? []) {
+    if (s.description === AUTOPILOT_SUPERVISOR_DESC) {
+      await proxyToUserControl(c.env, adminEmail, `/scheduled-sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
+      removed++;
+    }
+  }
+  return c.json({ removed });
+});
+
+app.get("/api/admin/autopilot/workers", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const limit = Math.min(Number(c.req.query("limit") ?? 25), 100);
+  const res = await proxyToUserControl(c.env, adminEmail, "/sessions");
+  if (!res.ok) return c.json({ error: `Failed to list sessions: ${res.status}` }, 500);
+  const body = (await res.json()) as { sessions?: Array<{ id: string; title?: string; status?: string; created_at?: number }> };
+  const all = body.sessions ?? [];
+  const autopilot = all
+    .filter((s) => (s.title ?? "").startsWith("[autopilot]"))
+    .sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))
+    .slice(0, limit);
+  return c.json({ count: autopilot.length, sessions: autopilot });
+});
+
 // ─── Admin: global system-prompt prefix ───
 //
 // A preamble prepended to the system prompt for every session across every
