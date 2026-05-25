@@ -29,7 +29,11 @@ function connectUserEvents(){
 function _sessionItemHtml(s){
   // Both Enter and Space must activate `role=button` elements (ARIA spec).
   // preventDefault() on Space stops the page from scrolling.
-  return `<div class="session-item ${currentSession===s.id?'active':''}" data-sid="${esc(s.id)}" onclick="selectSession('${esc(s.id)}')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();selectSession('${esc(s.id)}')}" aria-label="Open session ${esc(s.title||s.id.slice(0,8))}"><div class="session-title">${esc(s.title||s.id.slice(0,8))}</div><div class="session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`
+  // No `aria-label` — when set, AT announces only the label and skips inner
+  // text, which would hide the `.session-meta` status + timestamp. Letting
+  // accessible-name computation fall through to the title + meta children
+  // matches what sighted users see.
+  return `<div class="session-item ${currentSession===s.id?'active':''}" data-sid="${esc(s.id)}" onclick="selectSession('${esc(s.id)}')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();selectSession('${esc(s.id)}')}"><div class="session-title">${esc(s.title||s.id.slice(0,8))}</div><div class="session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`
 }
 function renderSessionList(sessions){
   const el=$("session-list");
