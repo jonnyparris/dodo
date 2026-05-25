@@ -457,24 +457,37 @@ function updateTokenSummary(state){
       el.textContent='';
       el.title='';
     }
-    const banner=$("context-warning");
-    if(banner)banner.style.display="none";
+    hideContextWarning();
     return;
   }
-  // Color code by context usage
+  // Color code by context usage — use design tokens, not hardcoded hex
   let color='var(--text-subtle)';
-  if(pct>80)color='#e74c3c';
-  else if(pct>50)color='#e67e22';
+  if(pct>80)color='var(--text-danger)';
+  else if(pct>50)color='var(--text-warning)';
   el.style.color=color;
   const budgetStr=budget?`${Math.round(budget/1000)}k`:'?';
   el.textContent=pct>0?`Context: ${pct}% of ${budgetStr} · ${(ti/1000).toFixed(1)}k in / ${(to/1000).toFixed(1)}k out`:`${(ti/1000).toFixed(1)}k in / ${(to/1000).toFixed(1)}k out`;
   el.title=`Context window: ${state.contextWindow??0} tokens\nBudget (80%): ${budget} tokens\nUsage: ~${pct}%\nModel: ${state.model??'unknown'}`;
   // Show/hide context warning banner
-  const banner=$("context-warning");
-  if(banner){
-    if(pct>80){banner.style.display="block";banner.textContent=`Context is ${pct}% full. Consider starting a new session for a fresh topic.`}
-    else{banner.style.display="none"}
+  if(pct>80){
+    showContextWarning(`Context is ${pct}% full. Consider starting a new session for a fresh topic.`);
+  } else {
+    hideContextWarning();
   }
+}
+
+// Show/hide the sticky context-usage banner. Writes only the message span so
+// the dismiss button (and its aria-label) are preserved across updates.
+function showContextWarning(message){
+  const banner=$("context-warning");
+  if(!banner)return;
+  const msg=$("context-warning-msg");
+  if(msg)msg.textContent=message;
+  banner.classList.add("visible");
+}
+function hideContextWarning(){
+  const banner=$("context-warning");
+  if(banner)banner.classList.remove("visible");
 }
 
 // --- Chat actions ---
@@ -519,7 +532,7 @@ async function sendMessage(){
 }
 async function abortPrompt(){if(!currentSession)return;await jsonSafe(`/session/${currentSession}/abort`,{});setProcessing(false);hideThinking()}
 async function forkSession(){if(!currentSession)return;const d=await jsonSafe(`/session/${currentSession}/fork`,{});if(!d)return;const{id}=d;currentSession=id;await selectSession(id)}
-async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;clearPendingImages();$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("token-summary").style.color="";const cw=$("context-warning");if(cw)cw.style.display="none";$("presence-bar").innerHTML="";if(typeof renderSessionTodos==='function')renderSessionTodos([]);history.replaceState(null,"",location.pathname);await loadSessions();if(window.innerWidth<=900)switchTab('chat')}
+async function deleteSession(){if(!currentSession)return;const ok=await appConfirm("Delete this session? This can\u2019t be undone.");if(!ok)return;await apiSafe(`/session/${currentSession}`,{method:"DELETE"});currentSession=null;clearPendingImages();$("chat").innerHTML="";$("session-title-display").textContent="No session";$("session-id-display").textContent="";$("token-summary").textContent="";$("token-summary").style.color="";hideContextWarning();$("presence-bar").innerHTML="";if(typeof renderSessionTodos==='function')renderSessionTodos([]);history.replaceState(null,"",location.pathname);await loadSessions();if(window.innerWidth<=900)switchTab('chat')}
 
 // --- Session rename ---
 async function renameSession(){
@@ -666,3 +679,12 @@ function clearPendingImages(){
   _pendingImages.length=0;
   renderImagePreviews();
 }
+
+// Wire up the context-warning dismiss button. The banner returns next time
+// updateTokenSummary() decides usage is still > 80%, so this is an "until I
+// stop typing" dismissal, not a permanent suppression — which matches the
+// pre-refactor click-anywhere behaviour.
+window.addEventListener('load',()=>{
+  const btn=$("context-warning-dismiss");
+  if(btn)btn.addEventListener('click',hideContextWarning);
+});

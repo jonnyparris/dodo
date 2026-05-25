@@ -307,6 +307,15 @@
     @keyframes banner-in{from{opacity:0;transform:translateY(-100%)}to{opacity:1;transform:translateY(0)}}
     .sse-banner{position:sticky;top:0;z-index:10;padding:6px 12px;font-size:12px;text-align:center;background:var(--danger-tint);color:var(--text-danger);border-bottom:1px solid var(--danger);display:none}
     .sse-banner.visible{display:block}
+    /* Context-usage warning — same shape as .sse-banner but warning-coloured
+       and dismissible. A real <button> handles the close (keyboard + AT), not
+       click-anywhere-on-the-banner. Uses the same `--warning` / `--text-warning`
+       pair as the dead `.banner.warn` rule that was already in this file. */
+    .context-banner{position:sticky;top:0;z-index:9;padding:6px 12px;font-size:12px;background:var(--warning);color:var(--text-warning);border-bottom:1px solid var(--warning);display:none;align-items:center;justify-content:center;gap:8px}
+    .context-banner.visible{display:flex}
+    .context-banner .context-banner-msg{flex:1;text-align:center}
+    .context-banner button{padding:2px 6px;min-height:22px;background:transparent;border:1px solid currentColor;color:inherit;font-size:11px;box-shadow:none;flex-shrink:0}
+    .context-banner button:hover{background:var(--fill-hover);border-color:currentColor}
     .footer{padding:8px 16px;font-size:11px;color:var(--text-subtle);text-align:center;border-top:1px solid var(--line);background:var(--base);display:flex;align-items:center;justify-content:center;gap:12px}
     .token-summary{font-size:11px;color:var(--text-subtle)}
 
@@ -656,7 +665,10 @@
         </div>
       </div>
       <div id="sse-banner" class="sse-banner">Connection lost — reconnecting…</div>
-      <div id="context-warning" style="display:none;background:#e67e22;color:#fff;text-align:center;padding:6px 12px;font-size:12px;cursor:pointer" onclick="this.style.display='none'"></div>
+      <div id="context-warning" class="context-banner" role="status" aria-live="polite">
+        <span class="context-banner-msg" id="context-warning-msg"></span>
+        <button type="button" id="context-warning-dismiss" aria-label="Dismiss context warning">Dismiss</button>
+      </div>
       <div class="chat" id="chat">
         <div class="onboarding" id="onboarding">
           <img src="/favicon.svg" alt="Dodo" class="dodo-logo lg dodo-logo-img" style="margin-bottom:12px"/>

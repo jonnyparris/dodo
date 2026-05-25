@@ -27,7 +27,9 @@ function connectUserEvents(){
   };
 }
 function _sessionItemHtml(s){
-  return `<div class="session-item ${currentSession===s.id?'active':''}" data-sid="${esc(s.id)}" onclick="selectSession('${esc(s.id)}')" role="button" tabindex="0" onkeydown="if(event.key==='Enter')selectSession('${esc(s.id)}')"><div class="session-title">${esc(s.title||s.id.slice(0,8))}</div><div class="session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`
+  // Both Enter and Space must activate `role=button` elements (ARIA spec).
+  // preventDefault() on Space stops the page from scrolling.
+  return `<div class="session-item ${currentSession===s.id?'active':''}" data-sid="${esc(s.id)}" onclick="selectSession('${esc(s.id)}')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();selectSession('${esc(s.id)}')}" aria-label="Open session ${esc(s.title||s.id.slice(0,8))}"><div class="session-title">${esc(s.title||s.id.slice(0,8))}</div><div class="session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></div>`
 }
 function renderSessionList(sessions){
   const el=$("session-list");
@@ -82,7 +84,7 @@ async function selectSession(id){
   // to whatever the user was about to send there, not here.
   if(typeof clearPendingImages==='function')clearPendingImages();
   $("chat").innerHTML="";$("onboarding")?.remove();
-  const cw=$("context-warning");if(cw)cw.style.display="none";
+  if(typeof hideContextWarning==='function')hideContextWarning();
   showSkeleton($("chat"),5);
   $("session-id-display").textContent=id.slice(0,8);
   $("session-title-display").textContent=id.slice(0,8);
