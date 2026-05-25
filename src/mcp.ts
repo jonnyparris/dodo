@@ -8,6 +8,7 @@ import { createDraftPrForRun, createGithubRepo, pollVerifyWorkflow, triggerVerif
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
 import { errorResult, mcpUserEmail, propagateMcpDepth } from "./mcp-shared";
+import { queryRecentExceptions, querySessionLogs, queryWorkerLogs } from "./cloudflare-logs";
 import type { CodingAgent } from "./coding-agent";
 import type { Env, WorkerRunRecord } from "./types";
 
@@ -1525,6 +1526,162 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     }
     return jsonFetch(env, "user", `/tasks/${encodeURIComponent(id)}`, { init: { method: "DELETE" } });
   });
+
+  // ─── Admin: self-introspection (Cloudflare Logs + cross-session sweep) ───
+  //
+  // All gated on isAdmin(). These power the autopilot self-diagnose loop
+  // (Ask 4c) and let an admin investigate Dodo's own behaviour without
+  // bouncing out to the Cloudflare dashboard.
+
+  server.tool(
+    "fetch_worker_logs",
+    "ADMIN-ONLY. Query Dodo's own Cloudflare Workers Observability logs (last N hours, with optional full-text needle). Returns recent log events with outcomes, errors, and raw fields. Use this to investigate Dodo behaviour, find error patterns, or audit recent sessions.",
+    {
+      sinceHours: z.number().min(1).max(168).optional().describe("How far back to look (default 1, max 168 = 7 days)."),
+      needle: z.string().max(500).optional().describe("Full-text substring to match against log fields."),
+      errorOnly: z.boolean().optional().describe("Only return events where $metadata.error is set."),
+      limit: z.number().min(1).max(200).optional().describe("Max events returned (default 50, max 200)."),
+    },
+    async ({ sinceHours, needle, errorOnly, limit }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const toMs = Date.now();
+      const fromMs = toMs - (sinceHours ?? 1) * 60 * 60 * 1000;
+      const result = errorOnly
+        ? await queryRecentExceptions(env, { sinceHours: sinceHours ?? 1, limit })
+        : await queryWorkerLogs(env, { fromMs, toMs, needle, limit, view: "events" });
+      if (!result.ok) return errorResult({ error: result.message, reason: result.reason });
+      return textResult({
+        fromMs: result.fromMs,
+        toMs: result.toMs,
+        total: result.total,
+        events: result.events.map((e) => ({
+          timestamp: e.timestamp,
+          outcome: e.outcome,
+          message: e.message,
+          error: e.error,
+        })),
+      });
+    },
+  );
+
+  server.tool(
+    "fetch_session_logs",
+    "ADMIN-ONLY. Query Workers Observability logs scoped to a specific Dodo session id. Uses the session id as a full-text needle.",
+    {
+      sessionId: z.string().min(1).describe("Session id to filter logs by."),
+      sinceHours: z.number().min(1).max(168).optional().describe("How far back to look (default 24, max 168)."),
+      limit: z.number().min(1).max(200).optional().describe("Max events returned (default 100)."),
+    },
+    async ({ sessionId, sinceHours, limit }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const result = await querySessionLogs(env, sessionId, { sinceHours, limit });
+      if (!result.ok) return errorResult({ error: result.message, reason: result.reason });
+      return textResult({ sessionId, total: result.total, events: result.events });
+    },
+  );
+
+  server.tool(
+    "list_failed_sessions",
+    "ADMIN-ONLY. Cross-section view of recent failures: aggregates Worker exceptions + client-side errors + scheduled-session stalls. Useful for picking what to investigate first.",
+    {
+      sinceHours: z.number().min(1).max(168).optional().describe("Window in hours (default 24)."),
+    },
+    async ({ sinceHours }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const hours = sinceHours ?? 24;
+      const sharedStub = getSharedIndexStub(env);
+
+      const [workerExceptions, clientErrorsRes] = await Promise.all([
+        queryRecentExceptions(env, { sinceHours: hours, limit: 100 }),
+        sharedStub.fetch("https://shared-index/errors/summary"),
+      ]);
+      const clientErrors = clientErrorsRes.ok
+        ? (await clientErrorsRes.json()) as { groups?: Array<{ message: string; count: number }> }
+        : { groups: [] };
+
+      // Walk every user's UserControl for stalled scheduled sessions
+      // (consecutive_failures >= 3). Admin scope only.
+      let stalledSchedules: Array<{ ownerEmail: string; id: string; description: string; failures: number; lastError: string | null }> = [];
+      try {
+        const usersRes = await sharedStub.fetch("https://shared-index/users");
+        const users = usersRes.ok
+          ? (await usersRes.json() as { users?: Array<{ email: string }> }).users ?? []
+          : [];
+        for (const user of users) {
+          const stub = getUserControlStub(env, user.email);
+          const res = await stub.fetch("https://user-control/scheduled-sessions");
+          if (!res.ok) continue;
+          const body = (await res.json()) as { scheduledSessions?: Array<{ id: string; description: string; consecutive_failures?: number; last_error?: string | null }> };
+          for (const s of body.scheduledSessions ?? []) {
+            if ((s.consecutive_failures ?? 0) >= 3) {
+              stalledSchedules.push({
+                ownerEmail: user.email,
+                id: s.id,
+                description: s.description,
+                failures: s.consecutive_failures ?? 0,
+                lastError: s.last_error ?? null,
+              });
+            }
+          }
+        }
+      } catch (e) {
+        log("warn", "list_failed_sessions: schedule sweep failed", { error: e instanceof Error ? e.message : String(e) });
+      }
+
+      return textResult({
+        windowHours: hours,
+        workerExceptions: workerExceptions.ok
+          ? workerExceptions.events.slice(0, 20).map((e) => ({
+              timestamp: e.timestamp,
+              error: e.error,
+              message: e.message,
+            }))
+          : { error: workerExceptions.message },
+        clientErrorTopGroups: clientErrors.groups ?? [],
+        stalledSchedules,
+      });
+    },
+  );
+
+  server.tool(
+    "summarize_session_run",
+    "ADMIN-ONLY. Read a session's prompt + message history and return a structured summary (turn count, tools used, last error if any). Faster than reading the full transcript when triaging.",
+    {
+      sessionId: z.string().min(1).describe("Session id to summarize."),
+    },
+    async ({ sessionId }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");
+      if (!access.ok) return access.result;
+      const [stateRes, promptsRes, messagesRes] = await Promise.all([
+        jsonFetch(env, "agent", "/", { sessionId, depth }),
+        jsonFetch(env, "agent", "/prompts", { sessionId, depth }),
+        jsonFetch(env, "agent", "/messages", { sessionId, depth }),
+      ]);
+      // jsonFetch returns the MCP content block; pull the inner JSON back
+      // out for aggregation.
+      const parse = (r: { content?: Array<{ text?: string }> }) => {
+        try { return JSON.parse(r.content?.[0]?.text ?? "{}"); } catch { return {}; }
+      };
+      const state = parse(stateRes as { content?: Array<{ text?: string }> });
+      const prompts = parse(promptsRes as { content?: Array<{ text?: string }> });
+      const messages = parse(messagesRes as { content?: Array<{ text?: string }> });
+      const promptList = (prompts.prompts ?? []) as Array<{ id: string; status: string; error?: string | null; created_at?: number }>;
+      const lastError = [...promptList].reverse().find((p) => p.error)?.error ?? null;
+      return textResult({
+        sessionId,
+        title: state.title ?? null,
+        status: state.status ?? null,
+        promptCount: promptList.length,
+        promptStatuses: promptList.reduce<Record<string, number>>((acc, p) => {
+          acc[p.status] = (acc[p.status] ?? 0) + 1;
+          return acc;
+        }, {}),
+        messageCount: (messages.messages ?? messages.records ?? []).length,
+        lastError,
+      });
+    },
+  );
 
   return server;
 }

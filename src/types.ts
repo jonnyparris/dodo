@@ -54,6 +54,15 @@ export interface Env {
   // Admin
   ADMIN_EMAIL?: string;
 
+  // Cloudflare API access (admin observability + autopilot self-diagnose).
+  // Token needs `Workers Scripts:Read` + `Workers Observability:Read` for the
+  // Workers Logs / Logs Engine query API. Wrangler secret.
+  CLOUDFLARE_API_TOKEN?: string;
+  /** Cloudflare account id used to scope Workers API calls. Wrangler var. */
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  /** Worker script name used when querying observability for this worker. Wrangler var. */
+  DODO_WORKER_NAME?: string;
+
   // Per-user secrets (deprecated as env vars — now in UserControl encrypted_secrets)
   // Kept temporarily for migration and fallback
   GITHUB_TOKEN?: string;
