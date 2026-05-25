@@ -263,5 +263,9 @@ function renderOnboardingSessions(){
   // Use <button> for the same reason as example prompts: keyboard
   // accessibility. The .example-prompt CSS class already handles the
   // visual reset (width, text-align, colors).
-  list.innerHTML=recent.map(s=>{const id=esc(s.id);const title=esc(s.title||s.id.slice(0,8));return `<button type="button" class="example-prompt" onclick="selectSession('${id}')" aria-label="Open session: ${title}"><strong>${title}</strong><div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></button>`}).join('');
+  // Drop the aria-label — WCAG 2.5.3 "label in name" requires the accessible name
+  // to contain the visible text. The button's inner text (title + status + timestamp)
+  // already serves as a clear accessible name, so the explicit aria-label was both
+  // redundant and a label-mismatch violation.
+  list.innerHTML=recent.map(s=>{const id=esc(s.id);const title=esc(s.title||s.id.slice(0,8));return `<button type="button" class="example-prompt" onclick="selectSession('${id}')"><strong>${title}</strong><div class="recent-session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></button>`}).join('');
 }
