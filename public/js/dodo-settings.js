@@ -423,3 +423,62 @@ async function removeSessionMcpOverride(mcpId){
     await loadSessionMcpConfigs();
   }catch(e){toast("Failed: "+(e.message||e),"error")}
 }
+
+// --- Skills & Tools catalog ---
+async function loadSkillsAndTools(){
+  const skillsEl=$("skills-list");
+  const toolsEl=$("tool-catalog-list");
+  if(!skillsEl&&!toolsEl)return;
+  try{
+    const[skillsRes,toolsRes]=await Promise.all([
+      api("/api/skills/all").catch(()=>({skills:[]})),
+      api("/api/tool-catalog").catch(()=>({orchestrator:[],subagent:[]})),
+    ]);
+    renderSkillCatalog(skillsRes.skills||[]);
+    renderToolCatalog(toolsRes.orchestrator||[]);
+  }catch(e){
+    if(skillsEl)skillsEl.innerHTML='<div class="empty">Failed to load skills</div>';
+    if(toolsEl)toolsEl.innerHTML='<div class="empty">Failed to load tools</div>';
+  }
+}
+
+function renderSkillCatalog(skills){
+  const el=$("skills-list");if(!el)return;
+  if(!skills.length){el.innerHTML='<div class="empty">No skills available</div>';return}
+  // Group: built-in vs personal
+  const groups={builtin:[],personal:[]};
+  for(const s of skills){(groups[s.source]||groups.personal).push(s)}
+  const renderRow=s=>{
+    const badge=s.source==="builtin"
+      ?'<span class="integ-status" style="color:var(--text-subtle);font-size:10px">built-in</span>'
+      :`<span class="integ-status" style="color:${s.enabled?'var(--text-success)':'var(--text-subtle)'};font-size:10px">${s.enabled?'enabled':'disabled'}</span>`;
+    return `<div class="integ-card"><div class="integ-name">${esc(s.name)}</div><div class="integ-desc">${esc(s.description||"")}</div>${badge}</div>`;
+  };
+  const sections=[];
+  if(groups.personal.length){
+    sections.push(`<div style="font-size:11px;color:var(--text-subtle);margin:6px 0 4px">Personal (${groups.personal.length})</div>${groups.personal.map(renderRow).join("")}`);
+  }
+  if(groups.builtin.length){
+    sections.push(`<div style="font-size:11px;color:var(--text-subtle);margin:6px 0 4px">Built-in (${groups.builtin.length})</div>${groups.builtin.map(renderRow).join("")}`);
+  }
+  el.innerHTML=sections.join("");
+}
+
+function renderToolCatalog(tools){
+  const el=$("tool-catalog-list");if(!el)return;
+  if(!tools.length){el.innerHTML='<div class="empty">No tools available</div>';return}
+  // Group by category for readability
+  const order=["subagent","discovery","files","edit","planning","skill","execution","git"];
+  const labels={subagent:"Subagents",discovery:"Discovery",files:"Files",edit:"Edit",planning:"Planning",skill:"Skills",execution:"Execution",git:"Git"};
+  const byCat={};
+  for(const t of tools){(byCat[t.category]=byCat[t.category]||[]).push(t)}
+  const sections=order.filter(c=>byCat[c]&&byCat[c].length).map(cat=>{
+    const items=byCat[cat].map(t=>{
+      const dim=t.alwaysOn?"":";opacity:0.6";
+      const caveat=t.caveat?` <span style="color:var(--text-subtle);font-style:italic">(${esc(t.caveat)})</span>`:"";
+      return `<div class="integ-card" style="padding:6px 8px${dim}"><div style="display:flex;align-items:baseline;gap:6px"><code style="font-family:var(--mono);font-size:12px">${esc(t.name)}</code>${t.alwaysOn?"":'<span class="integ-status" style="font-size:10px;color:var(--text-subtle)">off</span>'}</div><div class="integ-desc" style="margin-top:2px">${esc(t.description)}${caveat}</div></div>`;
+    }).join("");
+    return `<div style="font-size:11px;color:var(--text-subtle);margin:6px 0 4px">${labels[cat]||cat}</div>${items}`;
+  });
+  el.innerHTML=sections.join("");
+}
