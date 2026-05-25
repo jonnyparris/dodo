@@ -2811,6 +2811,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return Response.json({ browserEnabled: enabled, sessionId: sid });
       }
 
+      if (request.method === "PUT" && url.pathname === "/autopilot-flag") {
+        const body = (await request.json()) as { isAutopilot?: boolean; role?: string };
+        const isAutopilot = Boolean(body.isAutopilot);
+        this.writeMetadata("is_autopilot", String(isAutopilot));
+        if (body.role) {
+          this.writeMetadata("autopilot_role", body.role);
+        }
+        return Response.json({ isAutopilot, role: body.role ?? null });
+      }
+
+      if (request.method === "GET" && url.pathname === "/autopilot-flag") {
+        const isAutopilot = this.readMetadata("is_autopilot") === "true";
+        const role = this.readMetadata("autopilot_role");
+        return Response.json({ isAutopilot, role });
+      }
+
       if (request.method === "GET" && url.pathname === "/files") {
         return await this.handleListFiles(url);
       }

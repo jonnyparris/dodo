@@ -554,6 +554,13 @@ app.get("/admin/system-prompt", async (c) => {
   return new Response("Admin page not available", { status: 404 });
 });
 
+app.get("/admin/autopilot", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-autopilot.html", c.req.url), c.req.raw));
+  }
+  return new Response("Admin page not available", { status: 404 });
+});
+
 // ─── Admin routes (admin only) ───
 
 const adminGuard = async (c: { get: (key: string) => unknown; env: Env; json: (data: unknown, status?: number) => Response }, next: () => Promise<void>): Promise<Response | void> => {
@@ -610,6 +617,96 @@ app.delete("/api/admin/errors", adminGuard as never, async (c) => proxyToSharedI
 app.post("/api/admin/health-check", adminGuard as never, async (c) => {
   const report = await runHealthCheck(c.env, c.executionCtx);
   return c.json(report);
+});
+
+// ─── Admin: autopilot self-diagnose kickoff ───
+//
+// Creates a fresh session owned by the admin, marks it as an autopilot
+// worker, seeds the diagnose prompt, and returns the session id. The LLM
+// runs in the background (fiber-backed async prompt) — the admin can pop
+// open the session in the UI and watch it work.
+
+app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const body = await c.req.raw.json().catch(() => ({})) as {
+    targetArea?: string;
+    contextNotes?: string;
+    sinceHours?: number;
+  };
+
+  // Lazy imports so a non-admin user's bundle doesn't pay the cost.
+  const { buildDiagnosePrompt, resolveAutopilotOwner } = await import("./autopilot");
+  let owner: string;
+  try {
+    owner = resolveAutopilotOwner(c.env);
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : "Autopilot unavailable" }, 500);
+  }
+  // The kickoff route always acts on behalf of the admin who clicked the
+  // button. resolveAutopilotOwner just confirms ADMIN_EMAIL is set.
+  if (adminEmail.toLowerCase() !== owner) {
+    return c.json({ error: "Only the configured ADMIN_EMAIL can kick off autopilot" }, 403);
+  }
+
+  const sessionId = crypto.randomUUID();
+
+  // Create the session. No skill/MCP overrides — autopilot needs all tools
+  // available since it may need diagnose, audit-stubs, and git skills.
+  const createRes = await proxyToUserControl(c.env, owner, "/sessions", {
+    body: JSON.stringify({ id: sessionId, ownerEmail: owner, createdBy: owner }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  if (!createRes.ok) {
+    const text = await createRes.text().catch(() => "");
+    return c.json({ error: `Failed to create autopilot session: ${text}` }, 500);
+  }
+
+  // Tag the session as autopilot so the UI can badge it and so a future
+  // sweep can list autopilot runs distinctly from human sessions.
+  const agentStub = await getAgentByName(c.env.CODING_AGENT as never, sessionId);
+  await agentStub.fetch(`https://coding-agent/autopilot-flag`, {
+    body: JSON.stringify({ isAutopilot: true, role: "worker-manual" }),
+    headers: { "content-type": "application/json", "x-dodo-session-id": sessionId, "x-owner-email": owner },
+    method: "PUT",
+  });
+  // Use a recognisable title prefix so the session list shows what this is.
+  const title = `[autopilot] ${body.targetArea ?? "diagnose " + new Date().toISOString().slice(0, 16)}`;
+  await proxyToUserControl(c.env, owner, `/sessions/${encodeURIComponent(sessionId)}`, {
+    body: JSON.stringify({ title }),
+    headers: { "content-type": "application/json" },
+    method: "PATCH",
+  });
+
+  const prompt = buildDiagnosePrompt({
+    targetArea: body.targetArea,
+    contextNotes: body.contextNotes,
+    sinceHours: body.sinceHours ?? 24,
+  });
+  const ownerConfigRes = await readConfig(c.env, owner);
+  const promptRes = await agentStub.fetch(`https://coding-agent/prompt`, {
+    body: JSON.stringify({ content: prompt }),
+    headers: {
+      "content-type": "application/json",
+      "x-dodo-session-id": sessionId,
+      "x-owner-email": owner,
+      "x-author-email": owner,
+      "x-dodo-ai-base-url": ownerConfigRes.aiGatewayBaseURL,
+      "x-dodo-gateway": ownerConfigRes.activeGateway,
+      "x-dodo-model": ownerConfigRes.model,
+      "x-dodo-opencode-base-url": ownerConfigRes.opencodeBaseURL,
+    },
+    method: "POST",
+  });
+  if (!promptRes.ok) {
+    const text = await promptRes.text().catch(() => "");
+    log("warn", "autopilot kickoff: prompt rejected", { sessionId, body: text.slice(0, 200) });
+    // Session still exists — admin can open it and prompt manually
+    return c.json({ id: sessionId, warning: `Session created but initial prompt failed: ${text.slice(0, 200)}` }, 201);
+  }
+
+  log("info", "Autopilot worker kicked off", { sessionId, targetArea: body.targetArea ?? null });
+  return c.json({ id: sessionId, ownerEmail: owner, title }, 201);
 });
 
 // ─── Admin: global system-prompt prefix ───
