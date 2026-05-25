@@ -601,6 +601,18 @@ app.get("/api/admin/stats", adminGuard as never, async (c) => proxyToSharedIndex
 
 app.get("/api/admin/users/detailed", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users/detailed"));
 
+// Admin diagnostic: list a target user's per-user secret KEYS (not values).
+// Per-user secrets are envelope-encrypted with a key derived per user, so
+// even the admin can't decrypt the values — but key names + timestamps
+// are stored as plaintext and are useful for diagnosing setup state
+// ("did user X set their ntfy_topic?", etc.). Privacy-safe: this returns
+// the same shape as `GET /api/secrets` does for the target user, minus
+// any value data.
+app.get("/api/admin/users/:email/secret-keys", adminGuard as never, async (c) => {
+  const targetEmail = decodeURIComponent(c.req.param("email"));
+  return proxyToUserControl(c.env, targetEmail, "/secrets");
+});
+
 // ─── Admin: error monitoring ───
 
 app.get("/api/admin/errors", adminGuard as never, async (c) => {
