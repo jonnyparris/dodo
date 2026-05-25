@@ -926,19 +926,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const entryUsage = entryInputTokens / tokenBudget;
         if (entryUsage >= MID_LOOP_COMPACTION_THRESHOLD) {
           compactionTriggered = true;
-          log("info", "own-loop: loop-entry compaction triggered", {
-            sessionId,
-            entryInputTokens,
-            tokenBudget,
-            entryUsage: `${Math.round(entryUsage * 100)}%`,
-          });
           try {
+            const compactionsBefore = self.getCompactionCount();
             await self.maybeCompactContext({ force: true });
+            const compactionsAfter = self.getCompactionCount();
             const thinkSessionId = self.getCurrentSessionId();
             if (thinkSessionId) {
               self.messages = self.sessions.getHistory(thinkSessionId);
             }
             messages = await self.assembleContext();
+            log("info", "own-loop: loop-entry compaction attempted", {
+              sessionId,
+              entryInputTokens,
+              tokenBudget,
+              entryUsage: `${Math.round(entryUsage * 100)}%`,
+              outcome: compactionsAfter > compactionsBefore ? "summarised" : "noop",
+            });
           } catch (err) {
             log("warn", "own-loop: loop-entry compaction failed", {
               sessionId,
@@ -1065,18 +1068,26 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               // own-loop has already proved compaction is warranted by
               // measuring cumulativeInputTokens directly — don't make
               // maybeCompactContext re-decide.
+              const compactionsBefore = self.getCompactionCount();
               await self.maybeCompactContext({ force: true });
+              const compactionsAfter = self.getCompactionCount();
               // Refresh messages from storage and re-assemble with compaction summary.
               const thinkSessionId = self.getCurrentSessionId();
               if (thinkSessionId) {
                 self.messages = self.sessions.getHistory(thinkSessionId);
               }
               messages = await self.assembleContext();
-              log("info", "own-loop: mid-loop compaction triggered", {
+              // Log the outcome truthfully — distinguishes "we attempted and
+              // it summarised something" from "we attempted but it no-op'd
+              // because there's nothing in Think's persisted history yet."
+              // Without the distinction, debugging compaction issues is a
+              // wild goose chase (we hit that twice already — see PR #74).
+              log("info", "own-loop: mid-loop compaction attempted", {
                 sessionId,
                 step,
                 cumulativeInputTokens,
                 tokenBudget,
+                outcome: compactionsAfter > compactionsBefore ? "summarised" : "noop",
               });
             } catch (err) {
               log("warn", "own-loop: mid-loop compaction failed", {
@@ -1105,15 +1116,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
           if (projectedUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
             compactionTriggered = true;
-            log("info", "own-loop: pre-step compaction triggered", {
-              sessionId,
-              step,
-              projectedInputTokens,
-              tokenBudget,
-              projectedUsage: `${Math.round(projectedUsage * 100)}%`,
-            });
             try {
+              const compactionsBefore = self.getCompactionCount();
               await self.maybeCompactContext({ force: true });
+              const compactionsAfter = self.getCompactionCount();
               const thinkSessionId = self.getCurrentSessionId();
               if (thinkSessionId) {
                 self.messages = self.sessions.getHistory(thinkSessionId);
@@ -1122,6 +1128,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               finalMessages = injections.length > 0
                 ? [...messages, ...injections]
                 : messages;
+              log("info", "own-loop: pre-step compaction attempted", {
+                sessionId,
+                step,
+                projectedInputTokens,
+                tokenBudget,
+                projectedUsage: `${Math.round(projectedUsage * 100)}%`,
+                outcome: compactionsAfter > compactionsBefore ? "summarised" : "noop",
+              });
             } catch (err) {
               log("warn", "own-loop: pre-step compaction failed", {
                 sessionId,
@@ -1145,8 +1159,29 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // back under the mid-loop threshold. Preserves the tool-call
           // envelope (toolName, toolCallId) so the model's chain of
           // pending tool calls still resolves.
+          //
+          // **Trigger condition.** Two signals can independently warrant
+          // a prune:
+          //  1. `projectedInputTokens` — what we're about to send to
+          //     streamText on this iteration. Useful when the current
+          //     iteration's payload is already huge.
+          //  2. `cumulativeInputTokens` — what we've sent across ALL
+          //     iterations of this turn so far. Useful when the cumulative
+          //     climb is the problem even though any single iteration
+          //     looks small.
+          //
+          // Without #2 the prune never fires for the typical Gemma
+          // failure: each per-step call sends ~19k tokens (system prompt
+          // + tool defs dominate) so the per-iteration projection stays
+          // small, but the running total burns through the budget. We
+          // saw this empirically: 8 successful steps, cumulative 158k
+          // (77%), zero prune log lines.
           const projectedAfterCompactionTokens = estimateMessagesTokens(finalMessages);
-          if (projectedAfterCompactionTokens / tokenBudget >= MID_LOOP_COMPACTION_THRESHOLD) {
+          const projectedTrigger =
+            projectedAfterCompactionTokens / tokenBudget >= MID_LOOP_COMPACTION_THRESHOLD;
+          const cumulativeTrigger =
+            cumulativeInputTokens / tokenBudget >= MID_LOOP_COMPACTION_THRESHOLD;
+          if (projectedTrigger || cumulativeTrigger) {
             const pruneResult = pruneOversizedToolResults(finalMessages, {
               targetTokens: Math.floor(tokenBudget * MID_LOOP_COMPACTION_THRESHOLD),
               estimate: estimateMessagesTokens,
@@ -1159,6 +1194,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
                 bytesRemoved: pruneResult.bytesRemoved,
                 tokensBefore: pruneResult.tokensBefore,
                 tokensAfter: pruneResult.tokensAfter,
+                trigger: cumulativeTrigger ? "cumulative" : "projected",
               });
             }
           }
@@ -4973,6 +5009,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * Triggers when the last turn's input tokens exceed COMPACTION_TRIGGER_PERCENT
    * of the context budget.
    */
+  /**
+   * Number of compaction summaries persisted for the current Think session.
+   * Used by the own-loop to decide whether a `maybeCompactContext()` call
+   * actually summarised something or no-op'd (see `outcome: "summarised"`
+   * vs `"noop"` log lines). Returns 0 when there is no active session.
+   */
+  private getCompactionCount(): number {
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) return 0;
+    return this.sessions.getCompactions(thinkSessionId).length;
+  }
+
   private async maybeCompactContext(options?: { force?: boolean }): Promise<void> {
     const thinkSessionId = this.getCurrentSessionId();
     if (!thinkSessionId) return;
