@@ -55,6 +55,7 @@ import {
   type WatchdogConfig,
 } from "./watchdog";
 import { shouldCompact, pickCutoff } from "./compaction-policy";
+import { shouldRunFinalSummary, stripHarnessNotices } from "./final-summary-policy";
 import { detectSameToolRepetition } from "./loop-detection";
 import { pruneOversizedToolResults } from "./own-loop-prune";
 import { nextRetry } from "./overflow-retry";
@@ -855,6 +856,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     let compactionTriggered = false;
     let consecutiveNoTextSteps = 0; // Track iterations where the model produces tool calls but no text
     let exitReason: "natural" | "step-limit" | "budget-limit" | "doom-loop" | "no-text-loop" | "text-loop" | "abort" = "natural";
+    // Running total of plain text emitted across iterations. Used after the
+    // loop to decide whether a forced final-summary turn is needed (only
+    // when the loop ended on a stuck signal and the model never wrote
+    // a real conclusion).
+    let turnText = "";
 
     // ─── Budget thresholds (% of tokenBudget) ───
     const WARN_THRESHOLD = 0.70;
@@ -1359,6 +1365,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               const c = chunk as { type?: string; delta?: string; errorText?: string; error?: string };
               if (c.type === "text-delta" && c.delta) {
                 iterationText += c.delta;
+                turnText += c.delta;
               } else if (c.type === "error") {
                 hasErrorChunk = true;
                 errorText = c.errorText ?? c.error ?? "unknown";
@@ -1538,6 +1545,124 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         // Tag step-limit exit (while condition failed)
         if (step >= maxSteps && exitReason === "natural") {
           exitReason = "step-limit";
+        }
+
+        // ─── Final-summary turn (after a stuck-loop exit) ───
+        //
+        // When the loop exits on a stuck signal (doom-loop, no-text-loop,
+        // text-loop, or budget hard-stop without auto-continuation),
+        // the model often left only the harness's own
+        // "[Stopped: ...]" delta in the user-visible response — no real
+        // conclusion. The auto-continuation block below SKIPS those exits
+        // by design (they mean the model is stuck and shouldn't be
+        // restarted). But it leaves users with a stop notice and no
+        // answer.
+        //
+        // Run one more single-turn streamText with NO tools and a
+        // strict 'write your conclusion now' system message. The model
+        // has no choice but to emit text. Bounded by a short timeout
+        // so this can't itself loop.
+        //
+        // Guards:
+        //   - skipped on abort (the user asked to stop)
+        //   - skipped on `natural` exit (the model already wrapped up)
+        //   - skipped when the turn already produced substantive text
+        //     (>=200 chars of non-stop-notice content)
+        //   - skipped on cost-runaway exits where there's no point
+        //     spending more tokens
+        const FINAL_SUMMARY_MIN_EXISTING_TEXT = 200;
+        const FINAL_SUMMARY_TIMEOUT_MS = 30_000;
+        const FINAL_SUMMARY_MAX_OUTPUT_TOKENS = 800;
+
+        const turnTextWithoutHarnessNotices = stripHarnessNotices(turnText);
+        const runFinalSummary = shouldRunFinalSummary({
+          exitReason,
+          signalAborted: !!signal?.aborted,
+          turnText,
+          minExistingTextChars: FINAL_SUMMARY_MIN_EXISTING_TEXT,
+        });
+
+        if (runFinalSummary) {
+          log("info", "own-loop: final-summary turn starting", {
+            sessionId,
+            exitReason,
+            existingTextChars: turnTextWithoutHarnessNotices.length,
+            step,
+          });
+
+          // Pure-text system injection appended to the existing messages.
+          // No tools handed to the model — it cannot make another tool
+          // call, only write text. This is the whole point.
+          const summaryInjection: ModelMessage = {
+            role: "system" as const,
+            content: [
+              "[FINAL TURN — NO TOOLS AVAILABLE]",
+              "The session has been stopped by the harness because " +
+                (exitReason === "doom-loop"
+                  ? "you called the same tool too many times in a row"
+                  : exitReason === "no-text-loop"
+                  ? "you made many tool calls without writing any text"
+                  : "your responses started repeating") +
+                ".",
+              "Write your final answer to the user now. Summarise:",
+              "  1. What you were trying to do.",
+              "  2. What you actually found out (the useful information from your tool calls).",
+              "  3. What you would have done next if you'd had more turns.",
+              "Do NOT apologise, do NOT explain that you stopped — the user already knows. Just give the conclusion.",
+            ].join("\n"),
+          };
+
+          const summaryMessages = [...messages, summaryInjection];
+
+          // Bound this turn with a fresh AbortController chained to the
+          // outer signal, so a timeout here doesn't leak the outer
+          // controller. We can't directly time-bound streamText, but
+          // we can race its iterator against a timer.
+          const summaryController = new AbortController();
+          const onOuterAbort = () => summaryController.abort();
+          signal?.addEventListener("abort", onOuterAbort, { once: true });
+          const timeoutHandle = setTimeout(() => {
+            summaryController.abort();
+            log("warn", "own-loop: final-summary turn timed out", {
+              sessionId,
+              timeoutMs: FINAL_SUMMARY_TIMEOUT_MS,
+            });
+          }, FINAL_SUMMARY_TIMEOUT_MS);
+
+          try {
+            const summaryResult = streamText({
+              model,
+              system,
+              messages: summaryMessages,
+              tools: {}, // No tools — the model must write text.
+              maxOutputTokens: FINAL_SUMMARY_MAX_OUTPUT_TOKENS,
+              abortSignal: summaryController.signal,
+            });
+            // Separator so the conclusion is visibly distinct from
+            // any harness stop notice that came before it.
+            yield {
+              type: "text-delta",
+              id: crypto.randomUUID(),
+              delta: "\n\n---\n\n",
+            };
+            for await (const chunk of summaryResult.toUIMessageStream()) {
+              yield chunk;
+            }
+            log("info", "own-loop: final-summary turn complete", {
+              sessionId,
+              exitReason,
+            });
+          } catch (err) {
+            log("warn", "own-loop: final-summary turn failed", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            // Non-fatal — the stop notice already in `turnText` is the
+            // user-visible result; we tried for more and failed.
+          } finally {
+            clearTimeout(timeoutHandle);
+            signal?.removeEventListener("abort", onOuterAbort);
+          }
         }
 
         // ─── Multi-phase auto-continuation ───
