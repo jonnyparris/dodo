@@ -1003,14 +1003,59 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             }
           }
 
-          // Budget-aware injections
-          const budgetUsage = cumulativeInputTokens / tokenBudget;
-
-          if (budgetUsage >= HARD_STOP_THRESHOLD) {
-            // Hard stop — yield a wrap-up message and break
-            log("warn", "own-loop: hard stop — budget exhausted", {
+          // ─── Cost runaway backstop ───
+          // Per-call context pressure (below) is the primary stop signal,
+          // but a model stuck in a non-doom-loop loop (tools succeeding,
+          // results changing, but no real progress) could still burn
+          // unbounded tokens. Cap absolute cumulative input at 5× the
+          // context budget. For a 200k-context model that's 1M tokens —
+          // generous for real work, low enough to catch obvious runaway.
+          const COST_RUNAWAY_FACTOR = 5;
+          if (cumulativeInputTokens >= tokenBudget * COST_RUNAWAY_FACTOR) {
+            log("warn", "own-loop: cost runaway backstop", {
               sessionId,
               step,
+              cumulativeInputTokens,
+              tokenBudget,
+              factor: COST_RUNAWAY_FACTOR,
+            });
+            yield {
+              type: "text-delta",
+              id: crypto.randomUUID(),
+              delta: `\n\n[Stopped: cumulative input tokens exceeded ${COST_RUNAWAY_FACTOR}× the context budget — likely loop]\n\n`,
+            };
+            exitReason = "budget-limit";
+            break;
+          }
+
+          // ─── Budget-aware injections (context pressure, not cumulative cost) ───
+          //
+          // The thresholds below tell the model when it's running out of
+          // **context window space**, not when it's spent a lot of tokens.
+          // These are different: cumulative input grows by ~system-prompt
+          // size every step regardless of how much real history the model
+          // is carrying, so gating on cumulative tells the model to bail
+          // when its actual context window has plenty of room.
+          //
+          // We estimate the size of the message array we'd send NEXT to
+          // streamText (system prompt + tools are added by the SDK on top;
+          // this only measures the messages-array portion). That's the
+          // signal that matches what the wrap-up text actually says
+          // ("nearly exhausted... do not read new files").
+          //
+          // `cumulativeInputTokens` is kept for telemetry — logged on every
+          // step-complete line — but no longer gates injections. We
+          // discovered the previous coupling by deploying #75 + #76 and
+          // watching Gemma get told to stop at step 8 of a session where
+          // projected context was at 10%. See PR #77.
+          const projectedNextCallTokens = estimateMessagesTokens(messages);
+          const budgetUsage = projectedNextCallTokens / tokenBudget;
+
+          if (budgetUsage >= HARD_STOP_THRESHOLD) {
+            log("warn", "own-loop: hard stop — projected context budget exhausted", {
+              sessionId,
+              step,
+              projectedNextCallTokens,
               cumulativeInputTokens,
               tokenBudget,
               usage: `${Math.round(budgetUsage * 100)}%`,
@@ -1028,6 +1073,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             log("info", "own-loop: wrap-up injection", {
               sessionId,
               step,
+              projectedNextCallTokens,
               cumulativeInputTokens,
               tokenBudget,
               usage: `${Math.round(budgetUsage * 100)}%`,
@@ -1041,6 +1087,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             log("info", "own-loop: budget warning injection", {
               sessionId,
               step,
+              projectedNextCallTokens,
               cumulativeInputTokens,
               tokenBudget,
               usage: `${Math.round(budgetUsage * 100)}%`,
