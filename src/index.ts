@@ -819,10 +819,17 @@ app.get("/api/skills/all", async (c) => {
     source: "builtin" as const,
   }));
   const personalNames = new Set(personal.map((s) => s.name));
+  // Sort mirrors mergeSkills() in src/skill-registry.ts: personal (rank 0)
+  // before builtin (rank 2), alphabetical inside each block. The UI groups
+  // by source after the fact, but other consumers (docs, mcp) get the same
+  // shape the system prompt manifest uses.
+  const sourceRank = (s: "personal" | "builtin") => (s === "personal" ? 0 : 2);
   const merged = [
     ...personal,
     ...builtin.filter((s) => !personalNames.has(s.name)),
-  ].sort((a, b) => a.name.localeCompare(b.name));
+  ].sort(
+    (a, b) => sourceRank(a.source) - sourceRank(b.source) || a.name.localeCompare(b.name),
+  );
   return c.json({ skills: merged });
 });
 
@@ -868,10 +875,9 @@ app.delete("/api/skills/:name", async (c) => {
 // ─── Tool catalog (static, for UI surfacing) ───
 
 app.get("/api/tool-catalog", async (c) => {
-  const { getOrchestratorToolCatalog, getSubagentToolCatalog } = await import("./tool-catalog");
+  const { getOrchestratorToolCatalog } = await import("./tool-catalog");
   return c.json({
     orchestrator: getOrchestratorToolCatalog(),
-    subagent: getSubagentToolCatalog(),
   });
 });
 
