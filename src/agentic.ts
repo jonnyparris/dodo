@@ -115,6 +115,22 @@ interface BuildToolsOptions {
      * can suggest what's actually available right now.
      */
     listSkillNames?: () => Array<{ name: string; source: "personal" | "workspace" | "builtin" }>;
+    /**
+     * Read the current goal state. Returned to the `set_goal_status` tool
+     * so the tool can refuse early when no goal is set (avoids confusion
+     * if a model in a no-goal session calls the tool by mistake).
+     */
+    readGoalState?: () => {
+      text: string | null;
+      status: "none" | "active" | "done" | "blocked" | "needs_input" | "exhausted";
+      turnsUsed: number;
+      maxTurns: number;
+    };
+    /** Declare a terminal goal status from inside the `set_goal_status` tool. */
+    declareGoalTerminal?: (
+      status: "done" | "blocked" | "needs_input",
+      summary: string,
+    ) => { status: string; turnsUsed: number; maxTurns: number };
   };
 }
 
@@ -1150,6 +1166,53 @@ function buildTaskTool(
  * list drifts. A durable list the model can query each turn collapses that
  * failure mode.
  */
+/**
+ * `set_goal_status` — the model's only way to stop the auto-continue
+ * loop when a goal is active. Kept deliberately small: three statuses,
+ * one mandatory summary. Refuses to fire when there's no active goal so
+ * a stray call in a regular chat session is a no-op error rather than
+ * silently writing nonsense to metadata.
+ */
+function buildGoalStatusTool(parent: NonNullable<BuildToolsOptions["parentAgent"]>): AnyTool {
+  return tool({
+    description: [
+      "Declare your session's goal is at a terminal state. The session has been auto-continuing this prompt until you call this tool.",
+      "",
+      "- `done` — goal achieved. Include a one-line summary of what was done.",
+      "- `blocked` — you genuinely cannot proceed. Explain the blocker.",
+      "- `needs_input` — a human decision is required. Explain what's needed; the owner will be notified.",
+      "",
+      "Only call this when you've actually reached a terminal state. Don't call it just to narrate progress.",
+    ].join("\n"),
+    inputSchema: zodSchema(z.object({
+      status: z.enum(["done", "blocked", "needs_input"]).describe("Terminal state."),
+      summary: z.string().min(1).max(2000).describe("One- or two-line summary of the outcome."),
+    }).strict()),
+    execute: async ({ status, summary }) => {
+      const state = parent.readGoalState?.();
+      if (!state || state.status === "none" || !state.text) {
+        return {
+          ok: false,
+          error: "No active goal on this session. set_goal_status only applies when a goal is set via PUT /session/:id/goal or the autopilot kickoff flow.",
+        };
+      }
+      if (state.status !== "active") {
+        return {
+          ok: false,
+          error: `Goal is already in terminal state '${state.status}'. Cannot set status again.`,
+        };
+      }
+      const result = parent.declareGoalTerminal?.(status, summary);
+      return {
+        ok: true,
+        status: result?.status ?? status,
+        turnsUsed: result?.turnsUsed ?? state.turnsUsed,
+        maxTurns: result?.maxTurns ?? state.maxTurns,
+      };
+    },
+  });
+}
+
 function buildTodoTools(store: TodoStore): Record<string, AnyTool> {
   const priorityEnum = z.enum(["low", "medium", "high"]);
   const statusEnum = z.enum(["pending", "in_progress", "completed", "cancelled"]);
@@ -1450,6 +1513,13 @@ function buildTools(
   // model stay oriented across long multi-step tasks and compactions.
   if (options?.todoStore) {
     Object.assign(tools, buildTodoTools(options.todoStore));
+  }
+
+  // Goal status tool — only present when the parent agent exposes the
+  // goal hooks. Lets a session that has a goal declare it complete /
+  // blocked / needs_input so the auto-continue loop can stop.
+  if (options?.parentAgent?.declareGoalTerminal && options?.parentAgent?.readGoalState) {
+    tools.set_goal_status = buildGoalStatusTool(options.parentAgent);
   }
 
   // Browser tools — full CDP access via code-mode pattern.

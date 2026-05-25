@@ -19,14 +19,15 @@
 import type { Env } from "./types";
 
 /**
- * Build the diagnose prompt template injected into a self-diagnose worker
- * session. The prompt is intentionally direct, hard-capped on turns, and
- * stops short of merging anything.
+ * Build the diagnose goal text — the description of what an autopilot
+ * worker is trying to accomplish. Used as the `goal_text` on the worker
+ * session; the session self-continues until the model calls
+ * `set_goal_status` with `done`, `blocked`, or `needs_input`.
  *
- * `targetArea` is optional — when set, the worker is told to focus on that
- * area; otherwise it picks the highest-impact issue from the log sweep.
+ * `targetArea` is optional — when set, the worker focuses on that area;
+ * otherwise it picks the highest-impact issue from the log sweep.
  */
-export function buildDiagnosePrompt(opts: {
+export function buildDiagnoseGoal(opts: {
   targetArea?: string;
   contextNotes?: string;
   sinceHours?: number;
@@ -35,16 +36,16 @@ export function buildDiagnosePrompt(opts: {
   const sinceHours = opts.sinceHours ?? 24;
   const branchPrefix = opts.branchPrefix ?? "autopilot/diagnose";
   const focus = opts.targetArea
-    ? `**Target area:** ${opts.targetArea}\n`
-    : "**Target area:** pick the single highest-impact issue from the log sweep.\n";
+    ? `**Target area:** ${opts.targetArea}`
+    : "**Target area:** pick the single highest-impact issue from the log sweep.";
   const notes = opts.contextNotes
     ? `\n**Supervisor notes:**\n${opts.contextNotes}\n`
     : "";
 
   return [
-    "You are a Dodo autopilot worker session. Your job is to investigate one issue in the Dodo codebase and submit a draft PR with a fix.",
+    "Investigate one issue in the Dodo codebase and submit a draft PR with a fix.",
     "",
-    focus.trim(),
+    focus,
     notes.trim(),
     "",
     "**Workspace:** the Dodo repo is already cloned (forked from the autopilot seed).",
@@ -55,23 +56,31 @@ export function buildDiagnosePrompt(opts: {
     "2. Call `list_failed_sessions` for additional triage signal (stalled schedules, client errors).",
     "3. Pick ONE concrete, fixable issue. Skip anything that needs human judgement or product input.",
     "4. Investigate the relevant source files. Use `read`, `grep`, `glob` aggressively before changing anything.",
-    "5. Make the minimum viable fix. Run `npm test` (the focused tests for the area you changed — not the full suite). Add or extend a test that covers the bug.",
+    "5. Make the minimum viable fix. Run focused tests for the area you changed. Add or extend a test that covers the bug.",
     `6. Create a branch named \`${branchPrefix}-{short-sha}-{slug}\` and commit with a clear message.`,
     "7. Push to GitHub and open a **draft** pull request. Title prefix: `[autopilot] `. Body: link to the log evidence, describe the fix, list the test you added.",
-    "8. If you can't find an actionable issue, write a short note to the session log explaining what you saw and stop. Don't open a PR.",
+    "",
+    "**Terminal states:**",
+    "",
+    "- After opening a draft PR, call `set_goal_status` with `status: \"done\"` and a one-line summary of what you fixed.",
+    "- If you couldn't find an actionable issue, call `set_goal_status` with `status: \"blocked\"` and a short note on what you looked at.",
+    "- If a human needs to make a decision (e.g. ambiguous root cause), call `set_goal_status` with `status: \"needs_input\"` and the question.",
     "",
     "**Hard rules:**",
     "",
-    "- Hard cap: 50 tool turns. If you're not close to a PR by turn 40, write a status note and stop.",
     "- NEVER auto-merge. Draft PR only. Human review required.",
     "- NEVER force-push or rewrite history.",
     "- NEVER touch `wrangler.jsonc` migrations without an explicit instruction in the supervisor notes.",
     "- NEVER edit secrets or `.dev.vars`.",
-    "- If the fix would change more than 5 files, stop and write a note instead — the supervisor will break it down.",
-    "",
-    "Begin by reading recent worker logs.",
+    "- If the fix would change more than 5 files, call `set_goal_status: blocked` with a note instead — the supervisor will break it down.",
   ].join("\n");
 }
+
+/**
+ * @deprecated kept temporarily for the autopilot kickoff endpoint while it
+ * transitions to goal-based flow. Use `buildDiagnoseGoal` instead.
+ */
+export const buildDiagnosePrompt = buildDiagnoseGoal;
 
 /** Marker stored on a session's metadata to flag it as an autopilot run. */
 export const AUTOPILOT_METADATA_KEY = "is_autopilot";
@@ -89,15 +98,19 @@ export function resolveAutopilotOwner(env: Env): string {
 }
 
 /**
- * Build the supervisor prompt. The supervisor runs on a cron, reads
- * aggregated logs and the last few worker runs, then dispatches one or
- * more workers via `dispatch_autopilot_worker`. Stops itself if the last
- * N runs produced no actionable issue (cooldown signal).
+ * Build the supervisor prompt. The supervisor runs on a cron and is
+ * **not** goal-driven across turns — each cron fire is a fresh
+ * single-prompt session that lists failed sessions, decides whether to
+ * dispatch workers, and finishes. The cron is the continuation
+ * mechanism, not auto-continue.
+ *
+ * Workers dispatched via `dispatch_autopilot_worker` ARE goal-driven —
+ * they self-continue until `set_goal_status` fires.
  */
-export function buildSupervisorPrompt(opts: { sinceHours?: number } = {}): string {
+export function buildSupervisorGoal(opts: { sinceHours?: number } = {}): string {
   const sinceHours = opts.sinceHours ?? 12;
   return [
-    "You are the Dodo autopilot supervisor. You run on a schedule. Your job is to decide whether anything in the Dodo codebase needs investigating right now, and if so, dispatch worker sessions to do the investigation.",
+    "Decide whether anything in the Dodo codebase needs investigating right now, and if so, dispatch worker sessions to investigate.",
     "",
     "**Steps:**",
     "",
@@ -112,12 +125,11 @@ export function buildSupervisorPrompt(opts: { sinceHours?: number } = {}): strin
     "",
     "**If no:**",
     "",
-    "- Write a short note to the session log explaining what you saw (or didn't see).",
-    "- Do NOT dispatch workers if you can't articulate a concrete target area.",
+    "- Write a short note explaining what you saw (or didn't see) and stop. Do NOT dispatch workers if you can't articulate a concrete target area.",
     "",
     "**Stuck-pattern detection:**",
     "",
-    "- If the same error pattern appears in `list_failed_sessions` for the third supervisor run in a row WITHOUT a worker successfully fixing it, send a `high`-priority `autopilot_notify` titled 'autopilot paused — repeated failure pattern' with the pattern details. Then write a note and stop. Do not dispatch more workers for that pattern.",
+    "- If the same error pattern appears in `list_failed_sessions` for the third supervisor run in a row WITHOUT a worker successfully fixing it, send a `high`-priority `autopilot_notify` titled 'autopilot paused — repeated failure pattern' with the pattern details. Don't dispatch more workers for that pattern.",
     "",
     "**Hard rules:**",
     "",
@@ -125,7 +137,8 @@ export function buildSupervisorPrompt(opts: { sinceHours?: number } = {}): strin
     "- Never dispatch a worker for a problem that's already in flight (status=running on an existing autopilot session).",
     "- Never auto-merge anything. Workers always open draft PRs.",
     "- Keep your own analysis short — you're a router, not an investigator. The workers do the deep work.",
-    "",
-    "Begin by listing failed sessions.",
   ].join("\n");
 }
+
+/** @deprecated use {@link buildSupervisorGoal}. */
+export const buildSupervisorPrompt = buildSupervisorGoal;

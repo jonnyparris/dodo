@@ -36,6 +36,7 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
 | Linting (two-layer, why) | `docs/linting.md` |
 | Deploy details + post-deploy probe | `docs/deploying.md` |
 | Facets / scheduled sessions / notifications | `docs/facets.md`, `docs/scheduled-sessions.md`, `docs/notifications.md` |
+| Goal-driven sessions (self-continuation) | `docs/session-goals.md` |
 | Testing patterns | `docs/testing.md` |
 | Watchdog | `docs/session-watchdog.md` |
 
@@ -94,6 +95,7 @@ Worker (Hono router + CF Access auth)
 +-- CodingAgent DO (one per session, extends Think<Env, DodoConfig>)
 |   +-- Think tables: assistant_sessions, assistant_messages, _think_config, cf_agents_fibers
 |   +-- Dodo tables: metadata, message_metadata, prompts, cron_jobs
+|   +-- Goal state: goal_text / goal_status / goal_turns_used in metadata (see docs/session-goals.md)
 |   +-- Workspace (@cloudflare/shell, SQLite + optional R2 spill)
 |   +-- createExecuteTool (codemode with workspace + git providers, gated outbound)
 |   +-- One Think session per DO — single-session invariant

@@ -31,9 +31,11 @@
 **Some real examples:**
 
 - **"Fix the bug in auth.ts and push a branch"** -- Dodo clones the repo, reads the code, makes the fix, runs the tests, and pushes. You review the PR.
+- **"Rename X to Y everywhere"** -- Set a goal, walk away. The session auto-continues across grep, edits, typecheck, and the final commit, then declares itself done. No mid-task nudges.
 - **10 tasks on the kanban, one click** -- Dispatch all of them in parallel. Each gets its own isolated session with its own workspace.
 - **"Every morning at 9am, run the test suite"** -- Schedule prompts with cron expressions. Your agent works while you sleep.
 - **"Read the Cloudflare docs and write a migration script"** -- Headless Chrome is built in. The agent can browse the web, read documentation, and use what it finds.
+- **Dodo fixes Dodo** -- Install the autopilot supervisor and let scheduled worker sessions investigate recent log errors and open draft PRs against this repo.
 - **Share a session with your team** -- Read-only or read-write access, with per-user encrypted secrets.
 
 ---
@@ -225,6 +227,45 @@ Kanban-style task management with backlog/todo/in_progress/done/cancelled states
 ### Scheduling
 
 Four job types: delayed (N seconds), datetime (specific time), cron expression, and interval (repeating). Jobs dispatch prompts to the session automatically.
+
+### Goal-driven sessions
+
+Set a goal on a session and it keeps running until the model declares it's finished. After every turn, Dodo auto-prompts the session to continue. The model calls `set_goal_status` with `done`, `blocked`, or `needs_input` to stop — or the configurable turn budget (default 50, max 200) runs out and the session is `exhausted`.
+
+Why: without goals, a session is reactive — model finishes one turn, session goes idle, waits for a human. Goals invert that: the session is responsible for finishing what it started.
+
+Three API calls turn any session into a goal-driven one:
+
+```sh
+# 1. Create a session
+SID=$(curl -X POST $URL/session | jq -r .id)
+# 2. Set a goal (text + optional max-turn budget)
+curl -X PUT $URL/session/$SID/goal -d '{"text":"Rename getCwd to getCurrentWorkingDirectory everywhere. Run typecheck. Commit.","maxTurns":40}'
+# 3. Kick it off
+curl -X POST $URL/session/$SID/prompt -d '{"content":"Begin."}'
+```
+
+Example goals that work today:
+
+- **Long refactor** — "Rename `X` to `Y` everywhere. Run typecheck. Commit."
+- **PRD → implementation** — "Implement the feature in this PRD: <paste>. Open a draft PR when done."
+- **Incident triage** — "Investigate why session-prompt latency spiked between 14:00 and 15:00 UTC. Write a 5-line finding."
+- **Doc generation** — "Write a CONTEXT.md for every package that lacks one."
+- **PR review** — "Review PR #123. Leave inline comments. Summarise verdict."
+- **Migration runner** — "Apply this migration to every `*.db` file. Verify each one."
+- **Autopilot self-diagnose** — Dodo's own use case: read worker logs, fix a bug, open a draft PR.
+
+Full details, lifecycle, and safety rails in [`docs/session-goals.md`](docs/session-goals.md).
+
+### Autopilot
+
+Goal-driven sessions plus the existing scheduling + log access give Dodo a self-diagnose loop. Install a scheduled **supervisor** (cron) that reads worker logs and dispatches **workers** — fresh goal-driven sessions that investigate one issue each and open draft PRs. The supervisor uses `ntfy` to alert when it pauses on a repeated failure pattern.
+
+- Manual kickoff: `/admin/autopilot` (one-click "spawn worker" form)
+- Scheduled supervisor: `POST /api/admin/autopilot/supervisor` with a cron
+- MCP tools: `fetch_worker_logs`, `list_failed_sessions`, `dispatch_autopilot_worker`, `autopilot_notify`
+
+Requires `CLOUDFLARE_API_TOKEN` (secret), `CLOUDFLARE_ACCOUNT_ID` (var), and `DODO_WORKER_NAME` (var) for log access. Without them the worker sessions fall back to running on whatever the session can see directly.
 
 ### Memory
 

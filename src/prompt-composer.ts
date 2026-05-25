@@ -24,6 +24,12 @@ export interface PromptComposeInputs {
    * cap as `userPrefix`. Loaded from SharedIndex `global_config`.
    */
   adminPrefix?: string;
+  /**
+   * Optional `## Your goal` section. Sits between the skill manifest and
+   * the project instructions so the model sees its goal in roughly the
+   * same spot every turn (prompt-cache friendly).
+   */
+  goalSection?: string;
   /** Hard cap on prompt length in bytes. */
   maxLengthBytes?: number;
 }
@@ -52,6 +58,10 @@ export function assembleSystemPrompt(inputs: PromptComposeInputs): string {
 
   if (inputs.browserSection) {
     parts.push(inputs.browserSection);
+  }
+
+  if (inputs.goalSection) {
+    parts.push(inputs.goalSection);
   }
 
   if (inputs.workspaceSummary) {

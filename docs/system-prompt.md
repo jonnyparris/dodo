@@ -26,6 +26,21 @@ The system prompt lives in `src/coding-agent.ts` as `const SYSTEM_PROMPT`. It's 
 | Working with errors | State what failed, fix it, move on |
 | Limits | 10-step cap, ephemeral workspace, no shell |
 
+## Dynamic sections
+
+`getSystemPrompt()` layers the static base with runtime context. In priority order (outermost wraps innermost):
+
+| Source | When present |
+|---|---|
+| Admin global prefix | When SharedIndex `global_config.system_prompt_prefix` is set (admin-managed, applies to every session) |
+| User prefix | When the session owner has `systemPromptPrefix` configured |
+| Static base | Always (the `SYSTEM_PROMPT` const) |
+| `<available_skills>` block | Always (warmed each turn from personal + workspace + builtin sources, capped at 4 KB) |
+| Browser tools section | When `browser_enabled` metadata is true |
+| **`## Your goal` section** | **When `goal_status === "active"`** — shows the goal text, current turn / max, and the `set_goal_status` contract. See [`session-goals.md`](session-goals.md). |
+| `## Current workspace` | First turn only — bounded root listing |
+| `## Project instructions` | When `AGENTS.md` / `CLAUDE.md` exists in the workspace |
+
 ## Changing the prompt
 
 When modifying the system prompt:

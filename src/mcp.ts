@@ -1645,15 +1645,16 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
 
   server.tool(
     "dispatch_autopilot_worker",
-    "ADMIN-ONLY. Dispatch a self-diagnose worker session from inside the autopilot supervisor. Forks the autopilot seed, tags the session as a worker, attaches the diagnose prompt template with your target area + notes, and returns the session id. Use this to fan out investigations across the issues you've identified.",
+    "ADMIN-ONLY. Dispatch a self-diagnose worker session. Creates a session, sets the diagnose goal so the session self-continues until set_goal_status is called, and kicks it off with 'Begin.' Returns the worker session id.",
     {
       targetArea: z.string().min(1).max(500).describe("What this worker should focus on (one concrete area)."),
       contextNotes: z.string().max(4000).optional().describe("Notes from your log sweep that the worker should see."),
       sinceHours: z.number().min(1).max(168).optional().describe("Log window for the worker. Default 24."),
+      maxTurns: z.number().min(1).max(200).optional().describe("Max auto-continue turns. Default 50."),
     },
-    async ({ targetArea, contextNotes, sinceHours }) => {
+    async ({ targetArea, contextNotes, sinceHours, maxTurns }) => {
       if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
-      const { buildDiagnosePrompt, resolveAutopilotOwner } = await import("./autopilot");
+      const { buildDiagnoseGoal, resolveAutopilotOwner } = await import("./autopilot");
       let owner: string;
       try {
         owner = resolveAutopilotOwner(env);
@@ -1671,7 +1672,6 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
         return errorResult({ error: `Failed to create worker session: ${createRes.status}` });
       }
 
-      // Tag the new session as an autopilot worker
       const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
       await agent.fetch("https://coding-agent/autopilot-flag", {
         body: JSON.stringify({ isAutopilot: true, role: "worker-auto" }),
@@ -1686,18 +1686,23 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
         method: "PATCH",
       }, owner);
 
-      const prompt = buildDiagnosePrompt({
+      // Set the goal — the diagnose template carries all the instructions,
+      // and the session self-continues until set_goal_status is called.
+      const goalText = buildDiagnoseGoal({
         targetArea,
         contextNotes,
         sinceHours: sinceHours ?? 24,
       });
+      await agent.fetch("https://coding-agent/goal", {
+        body: JSON.stringify({ text: goalText, maxTurns: maxTurns ?? 50, role: "autopilot-worker" }),
+        headers: { "content-type": "application/json", "x-dodo-session-id": sessionId, "x-owner-email": owner },
+        method: "PUT",
+      });
 
-      // Read owner config for gateway/model headers — autopilot uses the
-      // admin's chosen model so they can tune cost-vs-quality.
       const cfgRes = await userControlFetch(env, "/config", undefined, owner);
       const cfg = (await cfgRes.json()) as { activeGateway?: string; model?: string; aiGatewayBaseURL?: string; opencodeBaseURL?: string };
       await agent.fetch("https://coding-agent/prompt", {
-        body: JSON.stringify({ content: prompt }),
+        body: JSON.stringify({ content: "Begin." }),
         headers: {
           "content-type": "application/json",
           "x-dodo-session-id": sessionId,

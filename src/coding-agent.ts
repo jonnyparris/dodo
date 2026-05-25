@@ -22,6 +22,16 @@ import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc";
 import { extractGeneratePrompt, FALLBACK_MODELS, FLUX_IMAGE_MEDIA_TYPE, FLUX_IMAGE_MODEL, FLUX_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import {
+  buildContinuePrompt,
+  DEFAULT_GOAL_MAX_TURNS,
+  type GoalState,
+  type GoalStatus,
+  HARD_GOAL_MAX_TURNS,
+  isTerminalStatus,
+  renderGoalSystemPromptSection,
+  shouldAutoContinue,
+} from "./session-goal";
+import {
   createPersonalSkillClient,
   mergeSkills,
   renderSkillContent,
@@ -580,10 +590,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     const config = this.getConfig();
 
+    // Goal section — only present when a goal is active. The model sees
+    // its current goal, turn count, and the obligation to call
+    // `set_goal_status` at terminal states.
+    const goalState = this.readGoalState();
+    const goalSection = renderGoalSystemPromptSection(goalState) ?? undefined;
+
     return assembleSystemPrompt({
       staticBase: SYSTEM_PROMPT,
       skillManifest: this._skillManifest ?? undefined,
       browserSection,
+      goalSection,
       workspaceSummary,
       projectInstructions: this._projectInstructions ?? undefined,
       userPrefix: config?.systemPromptPrefix?.trim(),
@@ -2811,6 +2828,28 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return Response.json({ browserEnabled: enabled, sessionId: sid });
       }
 
+      if (request.method === "GET" && url.pathname === "/goal") {
+        return Response.json(this.readGoalState());
+      }
+
+      if (request.method === "PUT" && url.pathname === "/goal") {
+        const body = (await request.json()) as { text?: string; maxTurns?: number; role?: string };
+        if (typeof body.text !== "string" || body.text.trim().length === 0) {
+          return Response.json({ error: "text required (non-empty string)" }, { status: 400 });
+        }
+        const state = this.setGoal({
+          text: body.text,
+          maxTurns: body.maxTurns,
+          role: body.role,
+        });
+        return Response.json(state);
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/goal") {
+        this.clearGoal();
+        return Response.json({ cleared: true });
+      }
+
       if (request.method === "PUT" && url.pathname === "/autopilot-flag") {
         const body = (await request.json()) as { isAutopilot?: boolean; role?: string };
         const isAutopilot = Boolean(body.isAutopilot);
@@ -4820,6 +4859,79 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     await this.finishPrompt(promptId, { resultMessageId: snapshot.assistantMessageId, status: "completed" });
     this.emitEvent({ data: assistantRecord, type: "message" });
     dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+
+    // Self-continuation: if a goal is still active after this turn, fire
+    // the next continue prompt. The model declared it had work to do (by
+    // not calling set_goal_status) or hasn't been given the chance yet.
+    // Bumps the turn counter; flips to "exhausted" when the budget runs out.
+    this.maybeAutoContinue(title);
+  }
+
+  /**
+   * If a goal is active and the turn budget isn't spent, enqueue a
+   * "continue" prompt. Idempotent — checks `active_prompt_id` to avoid
+   * racing a concurrent prompt (queued user message, cron fire, etc.).
+   */
+  private maybeAutoContinue(title: string): void {
+    const before = this.readGoalState();
+    if (!shouldAutoContinue(before.status)) return;
+    if (this.readMetadata("active_prompt_id")) return; // queue/cron wins
+    if (this.ctx.storage.sql.exec("SELECT 1 FROM prompt_queue LIMIT 1").toArray().length > 0) {
+      // A queued user prompt will dequeue next via finishPrompt's
+      // dequeueAndRunNext — don't race it with a goal continue.
+      return;
+    }
+
+    const after = this.incrementGoalTurns();
+    if (isTerminalStatus(after.status)) {
+      // Just hit the budget. Notify the owner that the agent stopped.
+      dispatchNotification(this.env, this.ctx, {
+        kind: "prompt-error",
+        title: `Dodo: ${title} — goal exhausted`,
+        body: `Used all ${after.maxTurns} auto-continue turns without reaching a terminal state.`,
+        tags: "warning,robot",
+        priority: "high",
+        ownerEmail: this.readMetadata("owner_email") ?? undefined,
+      });
+      return;
+    }
+
+    const promptId = crypto.randomUUID();
+    const content = buildContinuePrompt(after);
+    this.writeMetadata("active_prompt_id", promptId);
+    this.writeMetadata("status", "running");
+    this.insertPrompt(promptId, content, "queued", "goal-autocontinue");
+
+    const fiberId = this.spawnFiber("runFiberPrompt", {
+      promptId,
+      content,
+      authorEmail: "goal-autocontinue",
+      title,
+    }, { maxRetries: 3 });
+    this.setPromptFiberId(promptId, fiberId);
+    log("info", "goal-autocontinue", {
+      sessionId: this.sessionId(),
+      promptId,
+      turnsUsed: after.turnsUsed,
+      maxTurns: after.maxTurns,
+    });
+  }
+
+  /** Called by the set_goal_status tool from inside agentic.ts. */
+  declareGoalTerminal(status: "done" | "blocked" | "needs_input", summary: string): GoalState {
+    const state = this.updateGoalStatus(status, summary);
+    if (status === "needs_input") {
+      // Wake the owner — they need to come back and answer.
+      dispatchNotification(this.env, this.ctx, {
+        kind: "prompt-complete",
+        title: `Dodo: needs your input`,
+        body: summary.slice(0, 200),
+        tags: "question,robot",
+        priority: "high",
+        ownerEmail: this.readMetadata("owner_email") ?? undefined,
+      });
+    }
+    return state;
   }
 
   /** Read the fiber_id from a prompt row. */
@@ -6086,6 +6198,82 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private deleteMetadata(key: string): void {
     this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", key);
+  }
+
+  // ─── Session goals ───
+  //
+  // A goal makes a session self-continuing. When `goal_status === "active"`,
+  // `finalizePromptFromFiber` auto-enqueues a continue prompt at the end of
+  // each turn until the model calls `set_goal_status` with a terminal state
+  // or the turn budget runs out. Stored as plain keys in the `metadata`
+  // table so no schema migration is needed.
+
+  /** Read the full goal state from metadata. Returns a record with sane
+   *  defaults when no goal is set. Safe to call anywhere. */
+  readGoalState(): GoalState {
+    const status = (this.readMetadata("goal_status") as GoalStatus | null) ?? "none";
+    const maxRaw = this.readMetadata("goal_max_turns");
+    const turnsRaw = this.readMetadata("goal_turns_used");
+    const setAtRaw = this.readMetadata("goal_set_at");
+    return {
+      text: this.readMetadata("goal_text"),
+      status,
+      setAt: setAtRaw ? Number(setAtRaw) : null,
+      turnsUsed: turnsRaw ? Number(turnsRaw) : 0,
+      maxTurns: maxRaw ? Number(maxRaw) : DEFAULT_GOAL_MAX_TURNS,
+      summary: this.readMetadata("goal_summary"),
+      role: this.readMetadata("goal_role"),
+    };
+  }
+
+  /** Set or replace the active goal. Resets turn counter. */
+  setGoal(opts: { text: string; maxTurns?: number; role?: string }): GoalState {
+    const max = Math.min(
+      Math.max(1, Math.floor(opts.maxTurns ?? DEFAULT_GOAL_MAX_TURNS)),
+      HARD_GOAL_MAX_TURNS,
+    );
+    this.writeMetadata("goal_text", opts.text);
+    this.writeMetadata("goal_status", "active");
+    this.writeMetadata("goal_set_at", String(nowEpoch()));
+    this.writeMetadata("goal_turns_used", "0");
+    this.writeMetadata("goal_max_turns", String(max));
+    if (opts.role) {
+      this.writeMetadata("goal_role", opts.role);
+    } else {
+      this.deleteMetadata("goal_role");
+    }
+    this.deleteMetadata("goal_summary");
+    const state = this.readGoalState();
+    this.emitEvent({ data: state, type: "goal_state" });
+    return state;
+  }
+
+  /** Update the goal status (called from the `set_goal_status` tool). */
+  updateGoalStatus(status: GoalStatus, summary?: string): GoalState {
+    this.writeMetadata("goal_status", status);
+    if (summary) this.writeMetadata("goal_summary", summary);
+    const state = this.readGoalState();
+    this.emitEvent({ data: state, type: "goal_state" });
+    return state;
+  }
+
+  /** Clear all goal state. */
+  clearGoal(): void {
+    for (const key of ["goal_text", "goal_status", "goal_set_at", "goal_turns_used", "goal_max_turns", "goal_summary", "goal_role"]) {
+      this.deleteMetadata(key);
+    }
+    this.emitEvent({ data: { status: "none" }, type: "goal_state" });
+  }
+
+  /** Increment the turn counter and return the new state. */
+  private incrementGoalTurns(): GoalState {
+    const state = this.readGoalState();
+    const next = state.turnsUsed + 1;
+    this.writeMetadata("goal_turns_used", String(next));
+    if (next >= state.maxTurns) {
+      this.writeMetadata("goal_status", "exhausted");
+    }
+    return this.readGoalState();
   }
 
   /**

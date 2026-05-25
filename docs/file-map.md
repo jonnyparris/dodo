@@ -12,12 +12,15 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 
 ## Agent core
 
-- `src/coding-agent.ts` — per-session agent DO (extends Think, chat via Think.chat(), fibers, workspace, git, cron, prompts, snapshots, SSE). **Contains the system prompt.**
+- `src/coding-agent.ts` — per-session agent DO (extends Think, chat via Think.chat(), fibers, workspace, git, cron, prompts, snapshots, SSE). **Contains the system prompt.** Also: goal state + `maybeAutoContinue` hook for goal-driven self-continuation.
+- `src/session-goal.ts` — pure helpers + types for session goals (status enum, system-prompt snippet renderer, continue-prompt builder). See `docs/session-goals.md`.
 - `src/think-adapter.ts` — Think integration boundary: re-exports, types (DodoConfig, MessageMetadata, SnapshotV2), adapter functions
-- `src/agentic.ts` — LLM provider construction (buildProvider), tool composition (buildToolsForThink), git tools
+- `src/agentic.ts` — LLM provider construction (buildProvider), tool composition (buildToolsForThink), git tools, `set_goal_status` tool
 - `src/executor.ts` — DynamicWorkerExecutor wrapper for sandboxed code execution (direct API route)
 - `src/typecheck.ts` — in-isolate `tsc --noEmit` tool
 - `src/presence.ts` — WebSocket presence tracking
+- `src/autopilot.ts` — self-diagnose loop: `buildDiagnoseGoal`, `buildSupervisorGoal`, owner resolution
+- `src/cloudflare-logs.ts` — Workers Observability wrapper for admin self-introspection
 
 ## Per-user / global state
 

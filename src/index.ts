@@ -626,32 +626,38 @@ app.post("/api/admin/health-check", adminGuard as never, async (c) => {
 // runs in the background (fiber-backed async prompt) — the admin can pop
 // open the session in the UI and watch it work.
 
+// Autopilot kickoff is now a thin convenience wrapper over the generic
+// goal-driven session flow:
+//
+//   1. POST /session         — make a session
+//   2. PUT  /session/:id/goal — set the diagnose goal
+//   3. POST /session/:id/prompt — send "Begin." (the goal section in the
+//      system prompt carries the actual instructions)
+//
+// The session self-continues until the model calls set_goal_status. This
+// endpoint stays only because it does (1)+(2)+(3) atomically and tags the
+// session for the admin UI. A user could do the same three calls manually.
 app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
   const adminEmail = c.get("userEmail") as string;
   const body = await c.req.raw.json().catch(() => ({})) as {
     targetArea?: string;
     contextNotes?: string;
     sinceHours?: number;
+    maxTurns?: number;
   };
 
-  // Lazy imports so a non-admin user's bundle doesn't pay the cost.
-  const { buildDiagnosePrompt, resolveAutopilotOwner } = await import("./autopilot");
+  const { buildDiagnoseGoal, resolveAutopilotOwner } = await import("./autopilot");
   let owner: string;
   try {
     owner = resolveAutopilotOwner(c.env);
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : "Autopilot unavailable" }, 500);
   }
-  // The kickoff route always acts on behalf of the admin who clicked the
-  // button. resolveAutopilotOwner just confirms ADMIN_EMAIL is set.
   if (adminEmail.toLowerCase() !== owner) {
     return c.json({ error: "Only the configured ADMIN_EMAIL can kick off autopilot" }, 403);
   }
 
   const sessionId = crypto.randomUUID();
-
-  // Create the session. No skill/MCP overrides — autopilot needs all tools
-  // available since it may need diagnose, audit-stubs, and git skills.
   const createRes = await proxyToUserControl(c.env, owner, "/sessions", {
     body: JSON.stringify({ id: sessionId, ownerEmail: owner, createdBy: owner }),
     headers: { "content-type": "application/json" },
@@ -662,15 +668,13 @@ app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
     return c.json({ error: `Failed to create autopilot session: ${text}` }, 500);
   }
 
-  // Tag the session as autopilot so the UI can badge it and so a future
-  // sweep can list autopilot runs distinctly from human sessions.
   const agentStub = await getAgentByName(c.env.CODING_AGENT as never, sessionId);
   await agentStub.fetch(`https://coding-agent/autopilot-flag`, {
     body: JSON.stringify({ isAutopilot: true, role: "worker-manual" }),
     headers: { "content-type": "application/json", "x-dodo-session-id": sessionId, "x-owner-email": owner },
     method: "PUT",
   });
-  // Use a recognisable title prefix so the session list shows what this is.
+
   const title = `[autopilot] ${body.targetArea ?? "diagnose " + new Date().toISOString().slice(0, 16)}`;
   await proxyToUserControl(c.env, owner, `/sessions/${encodeURIComponent(sessionId)}`, {
     body: JSON.stringify({ title }),
@@ -678,14 +682,24 @@ app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
     method: "PATCH",
   });
 
-  const prompt = buildDiagnosePrompt({
+  // Set the goal — the diagnose template becomes goal text, NOT a prompt.
+  // The model sees it every turn via the system prompt's goal section.
+  const goalText = buildDiagnoseGoal({
     targetArea: body.targetArea,
     contextNotes: body.contextNotes,
     sinceHours: body.sinceHours ?? 24,
   });
+  await agentStub.fetch("https://coding-agent/goal", {
+    body: JSON.stringify({ text: goalText, maxTurns: body.maxTurns ?? 50, role: "autopilot-worker" }),
+    headers: { "content-type": "application/json", "x-dodo-session-id": sessionId, "x-owner-email": owner },
+    method: "PUT",
+  });
+
+  // Kick off with a short trigger prompt. The model already has the full
+  // goal in its system prompt; this is just "go."
   const ownerConfigRes = await readConfig(c.env, owner);
   const promptRes = await agentStub.fetch(`https://coding-agent/prompt`, {
-    body: JSON.stringify({ content: prompt }),
+    body: JSON.stringify({ content: "Begin." }),
     headers: {
       "content-type": "application/json",
       "x-dodo-session-id": sessionId,
@@ -701,8 +715,7 @@ app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
   if (!promptRes.ok) {
     const text = await promptRes.text().catch(() => "");
     log("warn", "autopilot kickoff: prompt rejected", { sessionId, body: text.slice(0, 200) });
-    // Session still exists — admin can open it and prompt manually
-    return c.json({ id: sessionId, warning: `Session created but initial prompt failed: ${text.slice(0, 200)}` }, 201);
+    return c.json({ id: sessionId, warning: `Session + goal created but initial prompt failed: ${text.slice(0, 200)}` }, 201);
   }
 
   log("info", "Autopilot worker kicked off", { sessionId, targetArea: body.targetArea ?? null });
@@ -2592,6 +2605,32 @@ app.delete("/session/:id/skill-overrides/:skillName", async (c) => {
   return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides/${encodeURIComponent(skillName)}`, {
     method: "DELETE",
   });
+});
+
+// ─── Session goals (powers self-continuation) ───
+//
+// A session with a goal auto-continues each turn until the model calls
+// `set_goal_status` (done | blocked | needs_input) or the turn budget runs
+// out. Setting a goal here is what makes any session goal-directed —
+// autopilot, supervisor, or just a user who wants a long task to keep
+// running without manual nudges.
+
+app.get("/session/:id/goal", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/goal", undefined, c.get("sessionOwnerEmail") || c.get("userEmail"));
+});
+
+app.put("/session/:id/goal", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/goal", undefined, c.get("sessionOwnerEmail") || c.get("userEmail"));
+});
+
+app.delete("/session/:id/goal", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/goal", undefined, c.get("sessionOwnerEmail") || c.get("userEmail"));
 });
 
 // ─── Last-session preference memory (powers the pre-session picker) ───
