@@ -501,6 +501,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /** Pre-rendered `<available_skills>` block — recomputed when `_skills` changes. */
   private _skillManifest: string | null = null;
   /**
+   * Admin-managed global system-prompt prefix from SharedIndex. Cached on
+   * the DO with a TTL so we don't hit SharedIndex every turn. Refreshed by
+   * `warmGlobalPrompt()` before the prompt is composed.
+   */
+  private _adminPrefix: string | null = null;
+  private _adminPrefixFetchedAt = 0;
+  /** TTL in ms for the cached admin prefix. Short enough that admin edits propagate fast. */
+  private static readonly ADMIN_PREFIX_TTL_MS = 60_000;
+  /**
    * Per-tool-call attachment references captured during streaming. Populated
    * by the `onToolAttachments` callback threaded into `buildToolsForThink`.
    * Cleared per chat turn in `runThinkChat` so attachments from one prompt
@@ -578,6 +587,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       workspaceSummary,
       projectInstructions: this._projectInstructions ?? undefined,
       userPrefix: config?.systemPromptPrefix?.trim(),
+      adminPrefix: this._adminPrefix?.trim() || undefined,
     });
   }
 
@@ -698,6 +708,32 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       builtin: builtin.length,
       merged: merged.length,
     });
+  }
+
+  /**
+   * Fetch the admin-managed global system-prompt prefix from SharedIndex
+   * and cache it on this DO. Called from `onChatMessage()` before
+   * `getSystemPrompt()` so the sync accessor can read it. Caches with a
+   * short TTL so admin edits propagate to running sessions within a minute.
+   */
+  private async warmGlobalPrompt(): Promise<void> {
+    const now = Date.now();
+    if (now - this._adminPrefixFetchedAt < CodingAgent.ADMIN_PREFIX_TTL_MS) {
+      return;
+    }
+    try {
+      const stub = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
+      const response = await stub.fetch("https://shared-index/global-config/system_prompt_prefix");
+      const body = (await response.json()) as { value: string | null };
+      this._adminPrefix = body.value && body.value.trim() ? body.value : null;
+      this._adminPrefixFetchedAt = now;
+    } catch (error) {
+      log("warn", "admin-prefix-fetch-failed", {
+        sessionId: this.sessionId(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Leave the previous cached value in place — better stale than empty.
+    }
   }
 
   /**
@@ -830,6 +866,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // and the cache used by the `skill` tool. Refreshed every turn so newly
     // created/imported skills become visible without restarting the session.
     await this.warmSkills();
+
+    // Refresh the admin-managed global prompt prefix from SharedIndex.
+    // TTL-cached on the DO so this is a no-op for most turns.
+    await this.warmGlobalPrompt();
 
     const baseTools = this.getTools();
     const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
@@ -4980,6 +5020,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string }> {
     // Connect MCP servers before Think calls getTools()
     await this.connectMcpServers();
+
+    // Warm admin-managed global prompt prefix. TTL-cached so cheap. Covers
+    // the fiber-recovery and cron paths that bypass `onChatMessage`.
+    await this.warmGlobalPrompt();
 
     // Insert user message metadata
     const userMsgId = crypto.randomUUID();

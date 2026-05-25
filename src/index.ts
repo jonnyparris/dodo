@@ -546,6 +546,14 @@ app.get("/admin/seeds", async (c) => {
   return new Response("Seed cache admin page not available", { status: 404 });
 });
 
+// Global system-prompt admin page — same shape as /admin/seeds.
+app.get("/admin/system-prompt", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-system-prompt.html", c.req.url), c.req.raw));
+  }
+  return new Response("Admin page not available", { status: 404 });
+});
+
 // ─── Admin routes (admin only) ───
 
 const adminGuard = async (c: { get: (key: string) => unknown; env: Env; json: (data: unknown, status?: number) => Response }, next: () => Promise<void>): Promise<Response | void> => {
@@ -603,6 +611,33 @@ app.post("/api/admin/health-check", adminGuard as never, async (c) => {
   const report = await runHealthCheck(c.env, c.executionCtx);
   return c.json(report);
 });
+
+// ─── Admin: global system-prompt prefix ───
+//
+// A preamble prepended to the system prompt for every session across every
+// user. Capped at 4 KB on the SharedIndex side. Sessions pick up changes on
+// the next prompt turn (60-second TTL cache in CodingAgent).
+
+app.get("/api/admin/global-system-prompt", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/global-config/system_prompt_prefix"),
+);
+
+app.put("/api/admin/global-system-prompt", adminGuard as never, async (c) => {
+  const body = (await c.req.json()) as { value?: string };
+  const updatedBy = c.get("userEmail") as string;
+  if (typeof body.value !== "string") {
+    return c.json({ error: "value (string) required" }, 400);
+  }
+  return proxyToSharedIndex(c.env, "/global-config/system_prompt_prefix", {
+    body: JSON.stringify({ value: body.value, updatedBy }),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/admin/global-system-prompt", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/global-config/system_prompt_prefix", { method: "DELETE" }),
+);
 
 // Approved-MCPs admin routes use the shared `adminGuard` middleware so the
 // admin gate is applied consistently with every other /api/admin/* route.

@@ -609,6 +609,8 @@
             <input id="cfg-git-author-name" placeholder="Dodo" style="margin-bottom:6px"/>
             <label for="cfg-git-author-email" style="font-size:11px;color:var(--muted)">Git Author Email</label>
             <input id="cfg-git-author-email" type="email" placeholder="dodo@example.com" style="margin-bottom:6px"/>
+            <label for="cfg-system-prompt-prefix" style="font-size:11px;color:var(--muted)">System prompt prefix <span style="font-size:10px;opacity:.7">(prepended to every session, 4 KB max)</span></label>
+            <textarea id="cfg-system-prompt-prefix" placeholder="Personal preamble \u2014 writing style, conventions, tone\u2026" rows="4" style="width:100%;margin-bottom:6px;font-family:var(--mono,monospace);font-size:12px"></textarea>
             <button onclick="saveConfig()" style="margin-top:4px">Save</button>
           </div>
         </details>

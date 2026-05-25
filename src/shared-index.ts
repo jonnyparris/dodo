@@ -122,6 +122,42 @@ export class SharedIndex extends DurableObject<Env> {
         return Response.json({ browserEnabled: Number(row.browser_enabled) === 1, email });
       }
 
+      // ─── Global config ───
+      //
+      // Admin-only on the Worker side (gated by adminGuard). SharedIndex
+      // trusts the Worker to enforce authz — it sees pre-validated requests.
+
+      if (request.method === "GET" && url.pathname.match(/^\/global-config\/[^/]+$/)) {
+        const key = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        const entry = this.getGlobalConfigValue(key);
+        if (!entry) return Response.json({ key, value: null });
+        return Response.json({ key, ...entry });
+      }
+
+      if (request.method === "PUT" && url.pathname.match(/^\/global-config\/[^/]+$/)) {
+        const key = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        const body = z.object({
+          value: z.string().max(4_000),
+          updatedBy: z.string().email(),
+        }).parse(await request.json());
+        // Empty string deletes the row so callers can clear a value without
+        // needing a separate DELETE round-trip. Treat whitespace-only the
+        // same way — there's no meaningful prefix that's pure whitespace.
+        if (body.value.trim() === "") {
+          this.deleteGlobalConfigValue(key);
+          return Response.json({ key, value: null, cleared: true });
+        }
+        this.setGlobalConfigValue(key, body.value, body.updatedBy);
+        const entry = this.getGlobalConfigValue(key);
+        return Response.json({ key, ...entry });
+      }
+
+      if (request.method === "DELETE" && url.pathname.match(/^\/global-config\/[^/]+$/)) {
+        const key = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        this.deleteGlobalConfigValue(key);
+        return Response.json({ key, value: null, cleared: true });
+      }
+
       // ─── Host allowlist ───
 
       if (request.method === "GET" && url.pathname === "/allowlist") {
@@ -623,6 +659,18 @@ export class SharedIndex extends DurableObject<Env> {
     // Seed default stat keys
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO aggregate_stats (key, value) VALUES ('sessionCount', 0)");
 
+    // Admin-managed global config (system prompt prefix applied to every
+    // session across all users, etc.). Keyed by a short string so the table
+    // can hold future global knobs without schema churn.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS global_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        updated_by TEXT NOT NULL
+      )
+    `);
+
     // Client error reporting table
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS client_errors (
@@ -761,6 +809,39 @@ export class SharedIndex extends DurableObject<Env> {
       createdAt: epochToIso(row.created_at),
       lastSeenAt: epochToIso(row.last_seen_at),
     };
+  }
+
+  // ─── Global config ───
+  //
+  // Admin-managed key/value blob for settings that affect every session
+  // across every user. First key is `system_prompt_prefix` — a preamble
+  // prepended to the system prompt for every CodingAgent session.
+
+  private getGlobalConfigValue(key: string): { value: string; updatedAt: string; updatedBy: string } | null {
+    const row = Array.from(this.ctx.storage.sql.exec(
+      "SELECT value, updated_at, updated_by FROM global_config WHERE key = ?",
+      key,
+    ))[0] as SqlRow | undefined;
+    if (!row) return null;
+    return {
+      value: String(row.value),
+      updatedAt: epochToIso(row.updated_at),
+      updatedBy: String(row.updated_by),
+    };
+  }
+
+  private setGlobalConfigValue(key: string, value: string, updatedBy: string): void {
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO global_config (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?)",
+      key,
+      value,
+      nowEpoch(),
+      updatedBy,
+    );
+  }
+
+  private deleteGlobalConfigValue(key: string): void {
+    this.ctx.storage.sql.exec("DELETE FROM global_config WHERE key = ?", key);
   }
 
   // ─── Host allowlist ───
