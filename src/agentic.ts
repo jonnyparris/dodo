@@ -149,6 +149,85 @@ function middleTruncate(text: string, maxBytes: number): string {
 /** Max bytes for a codemode `logs` field; kept separate from result. */
 const CODEMODE_LOGS_MAX_BYTES = 4_000;
 
+// ─── Canonical tool name surfaces (for drift detection & docs) ───
+//
+// These four sets describe what `buildTools()` MAY register at the top level
+// across every session config. The UI's `src/tool-catalog.ts` describes the
+// same surface for humans; `test/tool-catalog-unit.test.ts` cross-checks the
+// two so a tool added/removed here without a matching catalog update fails
+// the build.
+//
+// Hot-path git tools stay top-level so the common edit-commit loop doesn't
+// pay a codemode round-trip; the rest live inside codemode's `git` provider.
+
+/** Git tools registered as top-level orchestrator tools. */
+export const KNOWN_TOP_LEVEL_GIT_TOOLS = [
+  "git_status",
+  "git_add",
+  "git_commit",
+  "git_diff",
+] as const;
+
+/** Git tools reachable only as `git.<name>` inside codemode. */
+export const KNOWN_CODEMODE_GIT_TOOLS = [
+  "git_clone",
+  "git_clone_known",
+  "git_push",
+  "git_push_checked",
+  "git_pull",
+  "git_branch",
+  "git_checkout",
+  "git_log",
+  "git_verify_remote_branch",
+  "pr_create",
+] as const;
+
+/**
+ * Tools that the orchestrator surfaces as `alwaysOn: true` in the UI
+ * catalog. These are either unconditional (`explore`, `read`, …) or
+ * conditional on infra a normal CodingAgent session always supplies
+ * (`skill`, `todo_*` — gated in code on `parentAgent.renderSkillForTool`
+ * / `options.todoStore`, both always set by CodingAgent.onChatMessage).
+ *
+ * Tools gated on env bindings or per-session config (codemode, browser_*)
+ * live in KNOWN_CONDITIONAL_TOOL_NAMES instead — they're catalog
+ * `alwaysOn: false`.
+ */
+export const KNOWN_ALWAYS_ON_TOOL_NAMES = [
+  // Subagents
+  "explore",
+  "task",
+  // Workspace ops (`list` and `find` are stripped — see agentic.ts comment)
+  "read",
+  "grep",
+  "write",
+  "edit",
+  "delete",
+  // Replace-all (dodo-specific addition alongside workspace tools)
+  "replace_all",
+  // Planning todos (always supplied by CodingAgent)
+  "todo_list",
+  "todo_add",
+  "todo_update",
+  "todo_clear",
+  // Skill loader (always supplied by CodingAgent)
+  "skill",
+  // Typecheck
+  "typecheck",
+  // Hot-path git
+  ...KNOWN_TOP_LEVEL_GIT_TOOLS,
+] as const;
+
+/**
+ * Tools registered top-level only when their env/config gate is set.
+ * Catalog lists them with `alwaysOn: false` plus a caveat explaining the gate.
+ */
+export const KNOWN_CONDITIONAL_TOOL_NAMES = [
+  "codemode",       // requires env.LOADER
+  "browser_search", // requires browser bindings + admin + session config
+  "browser_execute",
+] as const;
+
 export function capCodemodeResult(result: unknown, maxBytes: number): unknown {
   if (!result || typeof result !== "object") return result;
   const obj = result as { code?: unknown; result?: unknown; logs?: unknown };
@@ -1270,14 +1349,10 @@ function buildTools(
   });
 
   // Git tools — only the hot-path subset is exposed at the top level.
-  // The full set (clone/push/pr_create/branch/checkout/log/pull/verify) is
-  // reachable inside codemode via the `git` provider namespace, so we save
-  // ~1k tokens of tool-schema budget per turn without losing capability.
-  // Hot-path: git_status, git_add, git_commit, git_diff are called every
-  // turn the model touches a repo — keeping them top-level avoids the
-  // codemode JS round-trip on the common case.
-  const TOP_LEVEL_GIT_TOOLS = ["git_status", "git_add", "git_commit", "git_diff"] as const;
-  for (const name of TOP_LEVEL_GIT_TOOLS) {
+  // See KNOWN_TOP_LEVEL_GIT_TOOLS / KNOWN_CODEMODE_GIT_TOOLS module-scope
+  // constants (below) for the full split. The drift test in
+  // test/tool-catalog-unit.test.ts pivots on these names.
+  for (const name of KNOWN_TOP_LEVEL_GIT_TOOLS) {
     if (gitTools[name]) tools[name] = gitTools[name];
   }
 

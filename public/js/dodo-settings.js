@@ -432,7 +432,7 @@ async function loadSkillsAndTools(){
   try{
     const[skillsRes,toolsRes]=await Promise.all([
       api("/api/skills/all").catch(()=>({skills:[]})),
-      api("/api/tool-catalog").catch(()=>({orchestrator:[],subagent:[]})),
+      api("/api/tool-catalog").catch(()=>({orchestrator:[]})),
     ]);
     renderSkillCatalog(skillsRes.skills||[]);
     renderToolCatalog(toolsRes.orchestrator||[]);
@@ -468,8 +468,8 @@ function renderToolCatalog(tools){
   const el=$("tool-catalog-list");if(!el)return;
   if(!tools.length){el.innerHTML='<div class="empty">No tools available</div>';return}
   // Group by category for readability
-  const order=["subagent","discovery","files","edit","planning","skill","execution","git"];
-  const labels={subagent:"Subagents",discovery:"Discovery",files:"Files",edit:"Edit",planning:"Planning",skill:"Skills",execution:"Execution",git:"Git"};
+  const order=["subagent","discovery","files","edit","planning","skill","execution","browser","git"];
+  const labels={subagent:"Subagents",discovery:"Discovery",files:"Files",edit:"Edit",planning:"Planning",skill:"Skills",execution:"Execution",browser:"Browser",git:"Git"};
   const byCat={};
   for(const t of tools){(byCat[t.category]=byCat[t.category]||[]).push(t)}
   const sections=order.filter(c=>byCat[c]&&byCat[c].length).map(cat=>{
