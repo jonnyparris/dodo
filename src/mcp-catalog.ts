@@ -50,19 +50,19 @@ const DEFAULT_CLOUDFLARE_REMOTE_MCP_CATALOG: McpCatalogEntry[] = [
     auth_type: "oauth",
     knownHosts: ["browser.mcp.cloudflare.com"],
   },
-  {
-    id: "cf-portal",
-    name: "Cloudflare Portal",
-    description:
-      "Cloudflare internal MCP portal — Backstage catalog, Jira, GitLab, Sentry, Elasticsearch, Wiki, Prometheus, and more. Requires Cloudflare SSO.",
-    url: "https://portal.mcp.cfdata.org/mcp",
-    setupGuide:
-      "Connect with OAuth via Cloudflare Access SSO. Per-user Dynamic Client Registration; access token refreshes automatically.",
-    auth_type: "oauth",
-    // cf-mcp.cloudflareaccess.com is the OAuth dance host
-    // (authorization_endpoint / token_endpoint / registration_endpoint).
-    knownHosts: ["portal.mcp.cfdata.org", "cf-mcp.cloudflareaccess.com"],
-  },
+  // NOTE: cf-portal (https://portal.mcp.cfdata.org/mcp) was tested and is
+  // intentionally NOT in this catalog. Its OAuth authorize endpoint
+  // (cf-mcp.cloudflareaccess.com) only accepts redirect URIs pointing at
+  // loopback (http://127.0.0.1:*) or Cloudflare-managed domains (e.g.
+  // seal-nightly.cloudflare.dev). DCR succeeds, but the authorize step
+  // returns "Redirect URI not allowed by application configuration"
+  // for any other host. This is by design — cf-portal treats third-party
+  // hosted apps as untrusted clients. OpenCode/Cursor/Claude Desktop work
+  // because they run locally on 127.0.0.1; Dodo runs on a Worker, which
+  // can't bind 127.0.0.1 from the user's POV. See OpenCode's
+  // `McpOAuthProvider.redirectUrl` for reference. To use cf-portal tools
+  // in Dodo, run a local mcp-remote proxy and add it as a static-headers
+  // integration.
 ];
 
 export const DEPLOY_MCP_CATALOG_CONFIG: McpCatalogConfig = {

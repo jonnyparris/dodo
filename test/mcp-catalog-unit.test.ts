@@ -8,16 +8,12 @@ import { describe, expect, it } from "vitest";
 import { MCP_CATALOG } from "../src/mcp-catalog";
 
 describe("MCP_CATALOG", () => {
-  it("includes cf-portal as an OAuth catalog entry", () => {
+  it("does NOT include cf-portal — its OAuth authorize endpoint rejects non-loopback redirect URIs", () => {
+    // Documented in mcp-catalog.ts. cf-portal works for OpenCode/Cursor/etc
+    // because those clients use http://127.0.0.1:PORT/... redirect URIs.
+    // A hosted Worker can't do that, and cf-portal rejects everything else.
     const entry = MCP_CATALOG.find((e) => e.id === "cf-portal");
-    expect(entry).toBeDefined();
-    expect(entry?.url).toBe("https://portal.mcp.cfdata.org/mcp");
-    expect(entry?.auth_type).toBe("oauth");
-    // Both the MCP host AND the Cloudflare Access OAuth dance host must be
-    // in knownHosts — otherwise `isHostAllowed()` rejects the start-auth
-    // call and the token endpoint round-trip during the dance.
-    expect(entry?.knownHosts).toContain("portal.mcp.cfdata.org");
-    expect(entry?.knownHosts).toContain("cf-mcp.cloudflareaccess.com");
+    expect(entry).toBeUndefined();
   });
 
   it("includes browser-rendering as an OAuth catalog entry", () => {
