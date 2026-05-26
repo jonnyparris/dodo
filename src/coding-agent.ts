@@ -6327,12 +6327,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const url = server.server_url;
     const name = server.name ?? new URL(url).host;
     await this.removeMcpServer(mcpId);
-    // Mirror the /api/mcp/start-auth callback path. `/agents` (no trailing
-    // segment) doesn't match `app.all("/agents/*")` and returns 404 when
-    // the OAuth provider redirects there.
+    // Mirror the /api/mcp/start-auth callback path shape (Seal pattern):
+    // /agents/<kebab-class>/<instance-name>/callback. cf-portal rejects
+    // redirect URIs that don't follow this OAuth-callback shape.
     await this.addMcpServer(name, url, {
       callbackHost: this.env.WORKER_URL,
-      callbackPath: "/agents/oauth/callback",
+      callbackPath: `/agents/coding-agent/${this.name}/callback`,
     });
   }
 
