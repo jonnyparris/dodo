@@ -195,13 +195,14 @@ describe("refresh-token MCP — access token retrieval", () => {
     // Capture the request for post-call assertions — putting `expect`s
     // inside the mock function turns assertion failures into rejected
     // promises, which surface as opaque 502s from the DO endpoint.
-    let captured: { url: string; method?: string; body: string } | null = null;
+    type Captured = { url: string; method?: string; body: string };
+    const capturedHolder: { value: Captured | null } = { value: null };
     const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       let bodyStr = "";
       if (typeof init?.body === "string") bodyStr = init.body;
       else if (init?.body instanceof URLSearchParams) bodyStr = init.body.toString();
-      captured = { url: requestUrl, method: init?.method, body: bodyStr };
+      capturedHolder.value = { url: requestUrl, method: init?.method, body: bodyStr };
       return new Response(
         JSON.stringify({
           access_token: "fresh-token",
@@ -218,11 +219,11 @@ describe("refresh-token MCP — access token retrieval", () => {
     const body = (await tokenRes.json()) as { accessToken: string };
     expect(body.accessToken).toBe("fresh-token");
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(captured?.url).toBe(TOKEN_ENDPOINT);
-    expect(captured?.method).toBe("POST");
-    expect(captured?.body).toContain("grant_type=refresh_token");
-    expect(captured?.body).toContain("refresh_token=old-refresh");
-    expect(captured?.body).toContain("client_id=client-expired");
+    expect(capturedHolder.value?.url).toBe(TOKEN_ENDPOINT);
+    expect(capturedHolder.value?.method).toBe("POST");
+    expect(capturedHolder.value?.body).toContain("grant_type=refresh_token");
+    expect(capturedHolder.value?.body).toContain("refresh_token=old-refresh");
+    expect(capturedHolder.value?.body).toContain("client_id=client-expired");
   });
 
   it("force=1 refreshes even if the cached token has not yet expired", async () => {

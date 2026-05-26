@@ -162,6 +162,71 @@ const refreshTokenMcpUpsertSchema = z
   })
   .strict();
 
+/**
+ * Schema for `/oauth-dcr/start`: Dodo runs DCR against the upstream's
+ * registration endpoint, generates PKCE + state, and returns a fully-formed
+ * authorize URL for the local helper to open. The redirect_uri is loopback
+ * because the upstream's authorize endpoint demands it; Dodo never listens
+ * there — only the helper does.
+ */
+const oauthDcrStartSchema = z
+  .object({
+    mcpUrl: z.string().url().describe("MCP server URL — used as the OAuth `resource` parameter"),
+    mcpName: z.string().min(1).describe("Display name for the resulting mcp_configs row"),
+    redirectPort: z
+      .number()
+      .int()
+      .min(1024)
+      .max(65535)
+      .default(19876)
+      .describe("Port the local helper will bind on 127.0.0.1 to receive the callback"),
+    // OAuth endpoints — auto-discovered if not provided. Useful overrides for
+    // providers whose .well-known docs don't match runtime endpoints.
+    registrationEndpoint: z.string().url().optional(),
+    authorizationEndpoint: z.string().url().optional(),
+    tokenEndpoint: z.string().url().optional(),
+    scope: z.string().optional(),
+  })
+  .strict();
+
+/**
+ * Schema for `/oauth-dcr/complete`: the local helper hands back the auth code
+ * it caught on its loopback callback, plus the state nonce that ties this
+ * request to the pending dance.
+ */
+const oauthDcrCompleteSchema = z
+  .object({
+    state: z.string().min(1),
+    code: z.string().min(1),
+  })
+  .strict();
+
+/** Pending-DCR-flow record kept (encrypted) in `encrypted_secrets`. */
+interface OAuthDcrPending {
+  clientId: string;
+  codeVerifier: string;
+  redirectUri: string;
+  tokenEndpoint: string;
+  mcpUrl: string;
+  mcpName: string;
+  createdAt: number;
+}
+
+/** TTL for a pending OAuth DCR flow — the user has this long to complete SSO
+ *  before the helper has to start over. Authorize endpoint requests typically
+ *  complete in <2 minutes; 10 minutes is comfortable margin. */
+const OAUTH_DCR_PENDING_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * URL-safe base64 encoding without padding — required for PKCE
+ * `code_verifier` and `code_challenge` per RFC 7636 §4.1 / §4.2.
+ */
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 const workerRunStatusEnum = z.enum([
   "session_created",
   "repo_ready",
@@ -798,6 +863,36 @@ export class UserControl extends DurableObject<Env> {
             : await this.getMcpAccessToken(id, ownerEmail);
           if (!accessToken) return Response.json({ error: "no token" }, { status: 404 });
           return Response.json({ accessToken });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return Response.json({ error: message }, { status: 502 });
+        }
+      }
+
+      // Dodo-owned DCR flow: kick off a fresh OAuth dance against the upstream
+      // and return an authorize URL. A local helper opens the URL in a
+      // browser, catches the redirect on loopback, and posts the code back to
+      // /oauth-dcr/complete. This lets Dodo run its own DCR client (separate
+      // refresh chain from any local OpenCode / Cursor / etc) while still
+      // honouring the upstream's loopback-only redirect URI policy.
+      if (request.method === "POST" && url.pathname === "/oauth-dcr/start") {
+        const body = oauthDcrStartSchema.parse(await request.json());
+        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+        try {
+          const result = await this.startOauthDcrFlow(body, ownerEmail);
+          return Response.json(result);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return Response.json({ error: message }, { status: 502 });
+        }
+      }
+
+      if (request.method === "POST" && url.pathname === "/oauth-dcr/complete") {
+        const body = oauthDcrCompleteSchema.parse(await request.json());
+        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+        try {
+          const result = await this.completeOauthDcrFlow(body, ownerEmail);
+          return Response.json(result);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           return Response.json({ error: message }, { status: 502 });
@@ -2421,6 +2516,258 @@ export class UserControl extends DurableObject<Env> {
     await this.setSecret(`mcp:${configId}:expires_at`, String(newExpiresAt), ownerEmail);
 
     return payload.access_token;
+  }
+
+  // ─── DCR-driven OAuth flow ──────────────────────────────────────────────
+  //
+  // Dodo runs its own DCR client against the upstream and asks a local helper
+  // to handle the browser-side authorize step on loopback. Dodo then exchanges
+  // the auth code for tokens server-side and stores them in `mcp_configs`.
+  //
+  // This gives Dodo a refresh chain that doesn't share fate with any local
+  // OAuth client (OpenCode, Cursor, etc).
+
+  /**
+   * Discover OAuth endpoints from the MCP server's well-known docs, falling
+   * back to any explicit overrides the caller provided. Returns the full set
+   * of endpoints we need to run the dance.
+   */
+  private async resolveOauthEndpoints(
+    mcpUrl: string,
+    overrides: {
+      registrationEndpoint?: string;
+      authorizationEndpoint?: string;
+      tokenEndpoint?: string;
+    },
+  ): Promise<{ registrationEndpoint: string; authorizationEndpoint: string; tokenEndpoint: string }> {
+    // Allow caller to short-circuit discovery entirely.
+    if (
+      overrides.registrationEndpoint &&
+      overrides.authorizationEndpoint &&
+      overrides.tokenEndpoint
+    ) {
+      return {
+        registrationEndpoint: overrides.registrationEndpoint,
+        authorizationEndpoint: overrides.authorizationEndpoint,
+        tokenEndpoint: overrides.tokenEndpoint,
+      };
+    }
+
+    // The MCP server exposes its own `/.well-known/oauth-protected-resource`
+    // which points at the actual authorization server. That server then
+    // exposes `/.well-known/oauth-authorization-server` with the endpoints.
+    const protectedResourceUrl = new URL("/.well-known/oauth-protected-resource", mcpUrl).toString();
+    const prRes = await fetch(protectedResourceUrl, {
+      headers: { accept: "application/json" },
+    });
+    if (!prRes.ok) {
+      throw new Error(`oauth-protected-resource fetch failed (${prRes.status}) from ${protectedResourceUrl}`);
+    }
+    const pr = (await prRes.json()) as { authorization_servers?: string[] };
+    const issuer = pr.authorization_servers?.[0];
+    if (!issuer) {
+      throw new Error("No authorization_servers in oauth-protected-resource doc");
+    }
+
+    const asUrl = new URL("/.well-known/oauth-authorization-server", issuer).toString();
+    const asRes = await fetch(asUrl, { headers: { accept: "application/json" } });
+    if (!asRes.ok) {
+      throw new Error(`oauth-authorization-server fetch failed (${asRes.status}) from ${asUrl}`);
+    }
+    const as = (await asRes.json()) as {
+      registration_endpoint?: string;
+      authorization_endpoint?: string;
+      token_endpoint?: string;
+    };
+
+    return {
+      registrationEndpoint: overrides.registrationEndpoint ?? as.registration_endpoint ?? "",
+      authorizationEndpoint: overrides.authorizationEndpoint ?? as.authorization_endpoint ?? "",
+      tokenEndpoint: overrides.tokenEndpoint ?? as.token_endpoint ?? "",
+    };
+  }
+
+  /**
+   * Start a DCR-backed OAuth flow. Registers a new client (with a loopback
+   * redirect URI so the upstream accepts it), generates PKCE + state, persists
+   * the pending dance, and returns the authorize URL for the helper to open.
+   */
+  public async startOauthDcrFlow(
+    input: z.infer<typeof oauthDcrStartSchema>,
+    ownerEmail: string,
+  ): Promise<{ state: string; authUrl: string; redirectUri: string }> {
+    if (!ownerEmail || !this.hasKeyEnvelope()) {
+      throw new Error(
+        "DCR OAuth flow requires the user passkey envelope. Run /api/passkey/init first.",
+      );
+    }
+
+    const endpoints = await this.resolveOauthEndpoints(input.mcpUrl, {
+      registrationEndpoint: input.registrationEndpoint,
+      authorizationEndpoint: input.authorizationEndpoint,
+      tokenEndpoint: input.tokenEndpoint,
+    });
+    if (!endpoints.registrationEndpoint || !endpoints.authorizationEndpoint || !endpoints.tokenEndpoint) {
+      throw new Error(
+        `Missing OAuth endpoints (registration=${!!endpoints.registrationEndpoint} authorize=${!!endpoints.authorizationEndpoint} token=${!!endpoints.tokenEndpoint})`,
+      );
+    }
+
+    const redirectUri = `http://127.0.0.1:${input.redirectPort}/callback`;
+
+    // DCR registration. Public client with PKCE, exactly like OpenCode does it
+    // — matches the upstream's loopback redirect URI policy.
+    const dcrRes = await fetch(endpoints.registrationEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Dodo",
+        client_uri: "https://dodo.jonnyparris.workers.dev",
+        grant_types: ["authorization_code", "refresh_token"],
+        redirect_uris: [redirectUri],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+      }),
+    });
+    if (!dcrRes.ok) {
+      const text = await dcrRes.text().catch(() => "");
+      throw new Error(`DCR failed (${dcrRes.status}): ${text.slice(0, 200)}`);
+    }
+    const dcr = (await dcrRes.json()) as { client_id?: string };
+    if (!dcr.client_id) {
+      throw new Error("DCR response missing client_id");
+    }
+
+    // Generate PKCE pair (S256 — required by cf-portal and most modern providers).
+    const codeVerifierBytes = crypto.getRandomValues(new Uint8Array(32));
+    const codeVerifier = bytesToBase64Url(codeVerifierBytes);
+    const codeChallengeBytes = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier).buffer as ArrayBuffer),
+    );
+    const codeChallenge = bytesToBase64Url(codeChallengeBytes);
+
+    // State nonce — 32 random bytes hex.
+    const stateBytes = crypto.getRandomValues(new Uint8Array(32));
+    const state = Array.from(stateBytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+
+    // Persist the pending dance. Keyed by state so /oauth-dcr/complete can
+    // recover everything it needs from just the (untrusted) callback params.
+    const pending: OAuthDcrPending = {
+      clientId: dcr.client_id,
+      codeVerifier,
+      redirectUri,
+      tokenEndpoint: endpoints.tokenEndpoint,
+      mcpUrl: input.mcpUrl,
+      mcpName: input.mcpName,
+      createdAt: Date.now(),
+    };
+    await this.setSecret(
+      `oauth_dcr_pending:${state}`,
+      JSON.stringify(pending),
+      ownerEmail,
+    );
+
+    // Build the authorize URL the helper will open.
+    const authUrl = new URL(endpoints.authorizationEndpoint);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("client_id", dcr.client_id);
+    authUrl.searchParams.set("code_challenge", codeChallenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("state", state);
+    authUrl.searchParams.set("resource", input.mcpUrl);
+    if (input.scope) authUrl.searchParams.set("scope", input.scope);
+
+    return { state, authUrl: authUrl.toString(), redirectUri };
+  }
+
+  /**
+   * Exchange the auth code for tokens, store them via the existing
+   * `upsertRefreshTokenMcp` path, and clean up the pending state.
+   */
+  public async completeOauthDcrFlow(
+    input: z.infer<typeof oauthDcrCompleteSchema>,
+    ownerEmail: string,
+  ): Promise<{ id: string; name: string; url: string }> {
+    if (!ownerEmail || !this.hasKeyEnvelope()) {
+      throw new Error(
+        "DCR OAuth flow requires the user passkey envelope. Run /api/passkey/init first.",
+      );
+    }
+
+    const pendingRaw = await this.getSecret(
+      `oauth_dcr_pending:${input.state}`,
+      ownerEmail,
+    );
+    if (!pendingRaw) {
+      throw new Error("Unknown or expired state — start a new DCR flow");
+    }
+    const pending = JSON.parse(pendingRaw) as OAuthDcrPending;
+    if (Date.now() - pending.createdAt > OAUTH_DCR_PENDING_TTL_MS) {
+      // Best-effort cleanup; we still treat the dance as expired regardless.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM encrypted_secrets WHERE key = ?",
+        `oauth_dcr_pending:${input.state}`,
+      );
+      throw new Error("Pending DCR flow has expired (10 min TTL)");
+    }
+
+    // Token exchange — same shape as a normal authorization_code grant.
+    // redirect_uri must match the value we sent in the authorize request
+    // (RFC 6749 §4.1.3), so we use the stored value.
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      code: input.code,
+      redirect_uri: pending.redirectUri,
+      client_id: pending.clientId,
+      code_verifier: pending.codeVerifier,
+    });
+    const tokenRes = await fetch(pending.tokenEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    if (!tokenRes.ok) {
+      const text = await tokenRes.text().catch(() => "");
+      throw new Error(`Token exchange failed (${tokenRes.status}): ${text.slice(0, 200)}`);
+    }
+    const tokens = (await tokenRes.json()) as {
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+    };
+    if (!tokens.access_token || !tokens.refresh_token) {
+      throw new Error(
+        `Token exchange response missing tokens (access=${!!tokens.access_token} refresh=${!!tokens.refresh_token})`,
+      );
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expiresAt = tokens.expires_in ? nowSec + tokens.expires_in : 0;
+
+    // Store via the existing refresh-token MCP upsert path. Idempotent on
+    // mcpUrl, so re-running the dance just rotates the tokens in place.
+    const result = await this.upsertRefreshTokenMcp(
+      {
+        name: pending.mcpName,
+        url: pending.mcpUrl,
+        tokenEndpoint: pending.tokenEndpoint,
+        clientId: pending.clientId,
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        expiresAt,
+        enabled: true,
+      },
+      ownerEmail,
+    );
+
+    // Clean up the pending state — it's single-use.
+    this.ctx.storage.sql.exec(
+      "DELETE FROM encrypted_secrets WHERE key = ?",
+      `oauth_dcr_pending:${input.state}`,
+    );
+
+    return { id: result.id, name: result.name, url: result.url };
   }
 
   public async createUserMcpToken(email: string, label?: string): Promise<{ token: string; created_at: number }> {

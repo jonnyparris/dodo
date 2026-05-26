@@ -1529,6 +1529,91 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     },
   );
 
+  // Two-step DCR OAuth flow: Dodo runs DCR + token exchange server-side; a
+  // local helper handles only the loopback callback. Lets Dodo have its own
+  // refresh chain that doesn't share fate with any local OAuth client.
+  server.tool(
+    "start_dcr_oauth_flow",
+    [
+      "Start an OAuth flow against an MCP server. Dodo registers itself via",
+      "DCR (with a loopback redirect URI the upstream will accept) and",
+      "returns an authorize URL for a local helper to open. The helper",
+      "catches the redirect on 127.0.0.1, then calls",
+      "`complete_dcr_oauth_flow` with the auth code to finish the dance.",
+      "Use this for MCP servers whose OAuth provider only accepts loopback",
+      "redirect URIs (e.g. cf-portal). For servers that accept arbitrary",
+      "redirect URIs, the regular browser-based OAuth catalog entry works.",
+    ].join(" "),
+    {
+      mcpUrl: z.string().url().describe("MCP server URL — used as the OAuth `resource` parameter"),
+      mcpName: z.string().min(1).describe("Display name for the resulting integration"),
+      redirectPort: z
+        .number()
+        .int()
+        .min(1024)
+        .max(65535)
+        .default(19876)
+        .describe("Port the local helper will bind on 127.0.0.1 (default: 19876, matches OpenCode's default)"),
+      registrationEndpoint: z
+        .string()
+        .url()
+        .optional()
+        .describe("Override the auto-discovered OAuth registration endpoint"),
+      authorizationEndpoint: z
+        .string()
+        .url()
+        .optional()
+        .describe("Override the auto-discovered OAuth authorization endpoint"),
+      tokenEndpoint: z
+        .string()
+        .url()
+        .optional()
+        .describe("Override the auto-discovered OAuth token endpoint"),
+      scope: z.string().optional().describe("Optional OAuth scopes to request"),
+    },
+    async (input) => {
+      const res = await userControlFetch(env, "/oauth-dcr/start", {
+        body: JSON.stringify(input),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        return errorResult(err);
+      }
+      const payload = (await res.json()) as { state: string; authUrl: string; redirectUri: string };
+      return textResult(payload);
+    },
+  );
+
+  server.tool(
+    "complete_dcr_oauth_flow",
+    [
+      "Complete a DCR OAuth flow that was started with",
+      "`start_dcr_oauth_flow`. Pass the auth code and state nonce that the",
+      "local helper caught on its loopback callback. Dodo exchanges the",
+      "code for tokens server-side and stores them as a refresh_token MCP",
+      "integration that auto-refreshes as the access token expires.",
+    ].join(" "),
+    {
+      state: z.string().min(1).describe("The state nonce returned by start_dcr_oauth_flow"),
+      code: z.string().min(1).describe("The authorization code from the loopback callback's `?code=…` query param"),
+    },
+    async (input) => {
+      const res = await userControlFetch(env, "/oauth-dcr/complete", {
+        body: JSON.stringify(input),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        return errorResult(err);
+      }
+      const payload = (await res.json()) as { id: string; name: string; url: string };
+      return textResult(payload);
+    },
+  );
+
   server.tool("remove_mcp_config", "Remove an MCP integration by id", {
     id: z.string().describe("MCP config id to remove"),
   }, async ({ id }) => {
