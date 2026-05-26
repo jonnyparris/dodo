@@ -6475,7 +6475,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // even if the MCP config itself is enabled.
       const browserEnabled = this.readMetadata("browser_enabled") === "true";
 
-      // Filter to enabled HTTP configs with URLs
+      // Filter to enabled HTTP configs with URLs. `oauth` (SDK-managed) is
+      // federated through the per-user hub DO and never connected from
+      // session DOs directly. `refresh_token` is connected here with a
+      // bearer header sourced from UserControl, which owns the refresh.
       const enabled = configs.filter((c) => {
         if (!c.enabled || c.type !== "http" || !c.url) return false;
         if (c.auth_type === "oauth") return false;
@@ -6484,13 +6487,32 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
       if (enabled.length === 0) return;
 
+      // Helper: ask UserControl for a current access token. UserControl
+      // refreshes if expired (serialised by per-user DO single-threading).
+      const fetchRefreshTokenBearer = async (configId: string): Promise<string | null> => {
+        const tokenRes = await stub.fetch(
+          `https://user-control/mcp-configs/${encodeURIComponent(configId)}/access-token`,
+          { headers: { "x-owner-email": ownerEmail } },
+        );
+        if (!tokenRes.ok) return null;
+        const { accessToken } = (await tokenRes.json()) as { accessToken?: string };
+        return accessToken ?? null;
+      };
+
       // Resolve encrypted headers and connect each gatekeeper
       const connected: McpClient[] = [];
       for (const config of enabled) {
         try {
-          // Resolve headers via internal secret endpoint
+          // Resolve auth headers depending on the config's auth_type.
           let headers: Record<string, string> | undefined;
-          if (config.headerKeys?.length) {
+
+          if (config.auth_type === "refresh_token") {
+            const accessToken = await fetchRefreshTokenBearer(config.id);
+            if (!accessToken) {
+              throw new Error("No refresh-token access token available; run set_refresh_token_mcp again");
+            }
+            headers = { Authorization: `Bearer ${accessToken}` };
+          } else if (config.headerKeys?.length) {
             headers = {};
             for (const headerName of config.headerKeys) {
               const secretRes = await stub.fetch(
@@ -6504,21 +6526,60 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             }
           }
 
-          const gk = new HttpMcpClient({
+          let gk = new HttpMcpClient({
             ...config,
             headers,
           }, this.mcpDepth);
 
-          await gk.connect();
-          const tools = await gk.listTools(); // Pre-populate cache for synchronous getTools()
-          connected.push(gk);
-          this.mcpStatus.set(config.id, {
-            name: config.name,
-            url: config.url,
-            ok: true,
-            toolCount: tools.length,
-            lastCheckedAt: Date.now(),
-          });
+          try {
+            await gk.connect();
+            // Pre-populate cache for synchronous getTools()
+            const tools = await gk.listTools();
+            connected.push(gk);
+            this.mcpStatus.set(config.id, {
+              name: config.name,
+              url: config.url,
+              ok: true,
+              toolCount: tools.length,
+              lastCheckedAt: Date.now(),
+            });
+          } catch (innerErr) {
+            // For refresh-token configs, a 401/auth-style failure is
+            // recoverable: force a refresh and reconnect once. UserControl
+            // is the source of truth for the token, so we ask it to
+            // refresh rather than retry with the same (probably-expired)
+            // token we just used.
+            const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+            const looksLikeAuthFail = /401|403|unauthor/i.test(msg);
+            if (config.auth_type === "refresh_token" && looksLikeAuthFail) {
+              try { gk.disconnect(); } catch { /* best effort */ }
+              const refreshRes = await stub.fetch(
+                `https://user-control/mcp-configs/${encodeURIComponent(config.id)}/access-token?force=1`,
+                { headers: { "x-owner-email": ownerEmail } },
+              );
+              if (refreshRes.ok) {
+                const { accessToken } = (await refreshRes.json()) as { accessToken?: string };
+                if (accessToken) {
+                  gk = new HttpMcpClient({
+                    ...config,
+                    headers: { Authorization: `Bearer ${accessToken}` },
+                  }, this.mcpDepth);
+                  await gk.connect();
+                  const tools = await gk.listTools();
+                  connected.push(gk);
+                  this.mcpStatus.set(config.id, {
+                    name: config.name,
+                    url: config.url,
+                    ok: true,
+                    toolCount: tools.length,
+                    lastCheckedAt: Date.now(),
+                  });
+                  continue;
+                }
+              }
+            }
+            throw innerErr;
+          }
         } catch (error) {
           // Log but don't fail — one broken MCP server shouldn't block the session.
           // We also record the failure on `mcpStatus` so the UI can surface it

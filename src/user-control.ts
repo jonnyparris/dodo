@@ -126,6 +126,42 @@ const mcpConfigUpdateSchema = z
   })
   .strict();
 
+/**
+ * Schema for the loopback-OAuth piggyback path. A local helper performs the
+ * OAuth authorization-code flow (which the upstream's redirect-URI policy
+ * only allows for loopback) and then pushes the resulting tokens here.
+ * Tokens are stored encrypted; the access token auto-refreshes against the
+ * OAuth token endpoint as it expires.
+ */
+const refreshTokenMcpUpsertSchema = z
+  .object({
+    name: z.string().min(1).describe("Integration display name"),
+    url: z.string().url().describe("MCP server endpoint URL"),
+    tokenEndpoint: z
+      .string()
+      .url()
+      .describe("OAuth token endpoint used to refresh the access token"),
+    clientId: z
+      .string()
+      .min(1)
+      .describe("OAuth client_id issued to the local helper that ran DCR"),
+    accessToken: z.string().min(1).describe("Current OAuth access token"),
+    refreshToken: z
+      .string()
+      .min(1)
+      .describe("Current OAuth refresh token. Will rotate on each refresh."),
+    expiresAt: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Absolute expiry of the access token in unix seconds. When omitted, the access token is treated as expired and refreshed on first use.",
+      ),
+    enabled: z.boolean().default(true),
+  })
+  .strict();
+
 const workerRunStatusEnum = z.enum([
   "session_created",
   "repo_ready",
@@ -221,6 +257,24 @@ const scheduledSessionBaseSchema = z.object({
 function toAgentMode(value: string | undefined): "inprocess" | "facet" {
   return value === "facet" ? "facet" : "inprocess";
 }
+
+/**
+ * Coerce a stored `auth_type` value into the union the rest of the worker
+ * knows about. Falls back to `static_headers` for unknown / legacy values so
+ * a typo in the DB can never produce an `undefined` field.
+ */
+function normalizeAuthType(value: unknown): "oauth" | "static_headers" | "refresh_token" {
+  if (value === "oauth") return "oauth";
+  if (value === "refresh_token") return "refresh_token";
+  return "static_headers";
+}
+
+/**
+ * Minimum seconds remaining before we proactively refresh an OAuth access
+ * token. Set high enough to absorb network round-trip + slight clock drift
+ * between Cloudflare's edge and the OAuth issuer.
+ */
+const REFRESH_TOKEN_SAFETY_MARGIN_SECONDS = 30;
 
 /**
  * UserControl DO — one per user (`idFromName(email)`).
@@ -711,6 +765,43 @@ export class UserControl extends DurableObject<Env> {
         this.deleteMcpConfigSecrets(id);
         this.ctx.storage.sql.exec("DELETE FROM mcp_configs WHERE id = ?", id);
         return Response.json({ deleted: true, id });
+      }
+
+      // ─── Refresh-Token MCP (loopback-OAuth piggyback) ───
+      // Used for providers whose OAuth authorize endpoint only accepts
+      // loopback redirect URIs (e.g. cf-portal). A local helper performs
+      // the OAuth dance, then pushes the resulting tokens here.
+
+      if (request.method === "POST" && url.pathname === "/refresh-token-mcp") {
+        const body = refreshTokenMcpUpsertSchema.parse(await request.json());
+        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+        const result = await this.upsertRefreshTokenMcp(body, ownerEmail);
+        return Response.json(result, { status: 201 });
+      }
+
+      // Internal: session DOs read the current access token via this endpoint.
+      // UserControl serialises refresh-if-needed (single-threaded per user),
+      // which is what stops two parallel session DOs from racing on the
+      // single-use refresh token.
+      //
+      // Pass `?force=1` to skip the cache-expiry check and refresh
+      // unconditionally. Session DOs use that path when their connection
+      // fails with a 401 — the cached token must be stale even if its
+      // expires_at hasn't elapsed yet (clock skew, server-side revoke).
+      if (request.method === "GET" && url.pathname.match(/^\/mcp-configs\/[^/]+\/access-token$/)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const ownerEmail = request.headers.get("x-owner-email") ?? "";
+        const force = url.searchParams.get("force") === "1";
+        try {
+          const accessToken = force
+            ? await this.refreshMcpAccessToken(id, ownerEmail)
+            : await this.getMcpAccessToken(id, ownerEmail);
+          if (!accessToken) return Response.json({ error: "no token" }, { status: 404 });
+          return Response.json({ accessToken });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return Response.json({ error: message }, { status: 502 });
+        }
       }
 
       if (request.method === "POST" && url.pathname === "/user-mcp-tokens") {
@@ -1308,12 +1399,26 @@ export class UserControl extends DurableObject<Env> {
         url TEXT,
         headers_json TEXT,
         enabled INTEGER NOT NULL DEFAULT 1,
+        oauth_token_endpoint TEXT,
+        oauth_client_id TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )
     `);
     try {
       this.ctx.storage.sql.exec("ALTER TABLE mcp_configs ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'static_headers'");
+    } catch {
+      // Column already exists.
+    }
+    // Idempotent migrations for the refresh_token auth path. The columns are
+    // nullable because they only apply when `auth_type = 'refresh_token'`.
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE mcp_configs ADD COLUMN oauth_token_endpoint TEXT");
+    } catch {
+      // Column already exists.
+    }
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE mcp_configs ADD COLUMN oauth_client_id TEXT");
     } catch {
       // Column already exists.
     }
@@ -2130,6 +2235,194 @@ export class UserControl extends DurableObject<Env> {
     return Array.from(this.ctx.storage.sql.exec("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs ORDER BY name ASC")).map((row) => this.mapMcpConfigRowSafe(row));
   }
 
+  // ─── Refresh-Token MCP ─────────────────────────────────────────────────
+  //
+  // Persist + refresh OAuth tokens for MCP servers whose authorize endpoint
+  // only accepts loopback redirect URIs (e.g. portal.mcp.cfdata.org). A local
+  // helper does the DCR + browser auth flow on the user's machine, then
+  // pushes the resulting tokens into this DO via `upsertRefreshTokenMcp`.
+  //
+  // From then on UserControl owns the refresh chain. Refresh tokens rotate
+  // on every refresh, so two parallel refreshes would race and the second
+  // would fail with `invalid_grant` (this is the same bug Kenny Johnson's
+  // wiki page describes for the portal). UserControl is single-threaded per
+  // user, so we get the necessary serialisation for free — every session
+  // DO that needs the access token reads via `/mcp-configs/:id/access-token`
+  // which proxies into `getMcpAccessToken` here.
+
+  /**
+   * Find a refresh-token MCP config row keyed by URL. Used by the upsert
+   * path so re-pushing tokens for the same MCP URL updates the existing
+   * config instead of creating a duplicate.
+   */
+  private findRefreshTokenMcpByUrl(url: string): { id: string; name: string; enabled: number } | null {
+    const row = Array.from(this.ctx.storage.sql.exec(
+      "SELECT id, name, enabled FROM mcp_configs WHERE auth_type = 'refresh_token' AND url = ?",
+      url,
+    ))[0] as SqlRow | null;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      enabled: Number(row.enabled),
+    };
+  }
+
+  /**
+   * Look up the OAuth `token_endpoint` and `client_id` for a refresh-token MCP
+   * config. Returns null when either field is missing — callers treat that as
+   * an unconfigured / non-refresh-token config and skip the refresh path.
+   */
+  private getRefreshTokenMcpOAuthMetadata(configId: string): { tokenEndpoint: string; clientId: string } | null {
+    const row = Array.from(this.ctx.storage.sql.exec(
+      "SELECT oauth_token_endpoint, oauth_client_id, auth_type FROM mcp_configs WHERE id = ?",
+      configId,
+    ))[0] as SqlRow | null;
+    if (!row) return null;
+    if (row.auth_type !== "refresh_token") return null;
+    const tokenEndpoint = row.oauth_token_endpoint ? String(row.oauth_token_endpoint) : "";
+    const clientId = row.oauth_client_id ? String(row.oauth_client_id) : "";
+    if (!tokenEndpoint || !clientId) return null;
+    return { tokenEndpoint, clientId };
+  }
+
+  /**
+   * Atomically create or update a refresh-token MCP config. Stores the
+   * non-secret fields (token endpoint, client id) in `mcp_configs` and the
+   * secrets (access token, refresh token, expiry) in `encrypted_secrets`.
+   */
+  private async upsertRefreshTokenMcp(
+    input: z.infer<typeof refreshTokenMcpUpsertSchema>,
+    ownerEmail: string,
+  ): Promise<{ id: string; name: string; url: string; updated: boolean }> {
+    if (!ownerEmail || !this.hasKeyEnvelope()) {
+      throw new Error(
+        "Refresh-token MCP storage requires the user passkey envelope. Run /api/passkey/init first.",
+      );
+    }
+
+    const now = nowEpoch();
+    const existing = this.findRefreshTokenMcpByUrl(input.url);
+    const id = existing?.id ?? crypto.randomUUID();
+    const enabled = input.enabled ? 1 : 0;
+
+    if (existing) {
+      this.ctx.storage.sql.exec(
+        "UPDATE mcp_configs SET name = ?, type = 'http', auth_type = 'refresh_token', url = ?, headers_json = NULL, enabled = ?, oauth_token_endpoint = ?, oauth_client_id = ?, updated_at = ? WHERE id = ?",
+        input.name,
+        input.url,
+        enabled,
+        input.tokenEndpoint,
+        input.clientId,
+        now,
+        id,
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO mcp_configs (id, name, type, auth_type, url, headers_json, enabled, oauth_token_endpoint, oauth_client_id, created_at, updated_at) VALUES (?, ?, 'http', 'refresh_token', ?, NULL, ?, ?, ?, ?, ?)",
+        id,
+        input.name,
+        input.url,
+        enabled,
+        input.tokenEndpoint,
+        input.clientId,
+        now,
+        now,
+      );
+    }
+
+    // Tokens go in encrypted_secrets so plaintext never lands in the
+    // mcp_configs row dump. expires_at is bundled with the secrets so all
+    // three load together — slight over-encryption is fine.
+    await this.setSecret(`mcp:${id}:access_token`, input.accessToken, ownerEmail);
+    await this.setSecret(`mcp:${id}:refresh_token`, input.refreshToken, ownerEmail);
+    await this.setSecret(
+      `mcp:${id}:expires_at`,
+      String(input.expiresAt ?? 0),
+      ownerEmail,
+    );
+
+    return {
+      id,
+      name: input.name,
+      url: input.url,
+      updated: !!existing,
+    };
+  }
+
+  /**
+   * Public RPC entry point: return a valid access token for the given config,
+   * refreshing first if the cached token is expired or close to expiry.
+   *
+   * Called by session DOs via `/mcp-configs/:id/access-token`. Single-threaded
+   * per-user DO semantics serialise concurrent reads — two sessions calling
+   * here near expiry collapse into one refresh call.
+   */
+  public async getMcpAccessToken(configId: string, ownerEmail: string): Promise<string | null> {
+    if (!ownerEmail || !this.hasKeyEnvelope()) return null;
+    const accessToken = await this.getSecret(`mcp:${configId}:access_token`, ownerEmail);
+    const expiresAtRaw = await this.getSecret(`mcp:${configId}:expires_at`, ownerEmail);
+    if (!accessToken) return null;
+    const expiresAt = Number(expiresAtRaw ?? "0");
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (expiresAt > 0 && expiresAt - nowSec > REFRESH_TOKEN_SAFETY_MARGIN_SECONDS) {
+      return accessToken;
+    }
+    // Expired or close to expiry — refresh and return the new access token.
+    return this.refreshMcpAccessToken(configId, ownerEmail);
+  }
+
+  /**
+   * Force a token refresh against the OAuth token endpoint, then persist the
+   * rotated refresh token + new access token + new expiry. Returns the new
+   * access token, or null if the config is missing OAuth metadata.
+   *
+   * Errors are propagated to the caller so a session DO can choose between
+   * "show needs_reauth" and "treat as transient and retry".
+   */
+  public async refreshMcpAccessToken(configId: string, ownerEmail: string): Promise<string | null> {
+    if (!ownerEmail || !this.hasKeyEnvelope()) return null;
+    const meta = this.getRefreshTokenMcpOAuthMetadata(configId);
+    if (!meta) return null;
+    const refreshToken = await this.getSecret(`mcp:${configId}:refresh_token`, ownerEmail);
+    if (!refreshToken) return null;
+
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: meta.clientId,
+    });
+    const res = await fetch(meta.tokenEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Refresh failed (${res.status}): ${text.slice(0, 200)}`);
+    }
+    const payload = (await res.json()) as {
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+    };
+    if (!payload.access_token) {
+      throw new Error("Refresh response missing access_token");
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const newExpiresAt = payload.expires_in ? nowSec + payload.expires_in : 0;
+
+    await this.setSecret(`mcp:${configId}:access_token`, payload.access_token, ownerEmail);
+    // Some providers omit refresh_token on rotation; only update when present.
+    if (payload.refresh_token) {
+      await this.setSecret(`mcp:${configId}:refresh_token`, payload.refresh_token, ownerEmail);
+    }
+    await this.setSecret(`mcp:${configId}:expires_at`, String(newExpiresAt), ownerEmail);
+
+    return payload.access_token;
+  }
+
   public async createUserMcpToken(email: string, label?: string): Promise<{ token: string; created_at: number }> {
     const token = `dodo_${crypto.randomUUID().replace(/-/g, "")}`;
     const normalisedEmail = email.trim().toLowerCase();
@@ -2350,7 +2643,7 @@ export class UserControl extends DurableObject<Env> {
       id: String(row.id),
       name: String(row.name),
       type: String(row.type) as "http" | "service-binding",
-      auth_type: row.auth_type === "oauth" ? "oauth" : "static_headers",
+      auth_type: normalizeAuthType(row.auth_type),
       url: row.url === null ? undefined : String(row.url),
       headers: undefined, // Never expose header values in listing
       headerKeys,
@@ -2378,7 +2671,7 @@ export class UserControl extends DurableObject<Env> {
       id: String(row.id),
       name: String(row.name),
       type: String(row.type) as "http" | "service-binding",
-      auth_type: row.auth_type === "oauth" ? "oauth" : "static_headers",
+      auth_type: normalizeAuthType(row.auth_type),
       url: row.url === null ? undefined : String(row.url),
       headers: undefined,
       headerKeys,

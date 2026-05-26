@@ -64,7 +64,15 @@ export interface McpClientConfig {
   id: string;
   name: string;
   type: "http" | "service-binding";
-  auth_type: "oauth" | "static_headers";
+  /**
+   * - `static_headers` — fixed bearer/API-key headers stored in encrypted_secrets
+   * - `oauth` — Agents-SDK-managed OAuth (per-user hub DO). Filtered out of
+   *   the static MCP gatekeeper path in coding-agent.ts.
+   * - `refresh_token` — bearer token that auto-refreshes via OAuth refresh-token
+   *   grant. Use when the OAuth provider only allows loopback redirect URIs
+   *   (e.g. Cloudflare Portal) and DCR was performed by a local helper.
+   */
+  auth_type: "oauth" | "static_headers" | "refresh_token";
   url?: string;
   headers?: Record<string, string>;
   /** Header key names (without values) for display purposes. */

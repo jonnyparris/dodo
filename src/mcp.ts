@@ -1474,6 +1474,61 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     jsonFetch(env, "user", "/mcp-configs"),
   );
 
+  // Push a refresh-token MCP config (from a local helper that already ran
+  // DCR + browser OAuth for an MCP server whose authorize endpoint only
+  // accepts loopback redirect URIs — e.g. portal.mcp.cfdata.org). Idempotent
+  // on `url` so re-running the local helper just rotates the tokens in place.
+  server.tool(
+    "set_refresh_token_mcp",
+    [
+      "Register an MCP server that authenticates with an OAuth refresh token.",
+      "Use this when the upstream OAuth provider only accepts loopback",
+      "redirect URIs (so Dodo can't do the OAuth dance itself) and a local",
+      "helper has already completed the authorize+exchange flow. Dodo will",
+      "use the access token directly and refresh it via the OAuth token",
+      "endpoint as it expires. Idempotent on `url`: re-pushing for the same",
+      "MCP URL updates the stored tokens in place.",
+    ].join(" "),
+    {
+      name: z.string().describe("Integration display name"),
+      url: z.string().url().describe("MCP server endpoint URL"),
+      tokenEndpoint: z
+        .string()
+        .url()
+        .describe(
+          "OAuth token endpoint used to refresh the access token (e.g. https://cf-mcp.cloudflareaccess.com/cdn-cgi/access/oauth/token)",
+        ),
+      clientId: z
+        .string()
+        .min(1)
+        .describe("OAuth client_id from the local helper's DCR"),
+      accessToken: z.string().min(1).describe("Current OAuth access token"),
+      refreshToken: z
+        .string()
+        .min(1)
+        .describe("Current OAuth refresh token. Will rotate on each refresh."),
+      expiresAt: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Absolute expiry of the access token in unix seconds. When omitted, the access token is treated as expired and refreshed on first use."),
+    },
+    async (input) => {
+      const res = await userControlFetch(env, "/refresh-token-mcp", {
+        body: JSON.stringify(input),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        return errorResult(err);
+      }
+      const payload = (await res.json()) as { id: string; name: string; url: string; updated: boolean };
+      return textResult(payload);
+    },
+  );
+
   server.tool("remove_mcp_config", "Remove an MCP integration by id", {
     id: z.string().describe("MCP config id to remove"),
   }, async ({ id }) => {
