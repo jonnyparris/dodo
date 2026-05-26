@@ -166,6 +166,40 @@ describe("Dodo foundation", () => {
     expect(response.status).not.toBe(200);
   });
 
+  it("GET /api/mcp/oauth-servers returns the user's connected OAuth MCP servers", async () => {
+    // In dev mode the test user has no connected OAuth MCPs, but the
+    // endpoint should still return a well-formed { servers: [] } payload
+    // (not 500/404/etc.). This guards against the most likely regression:
+    // the endpoint hitting an exception in `getMcpServers()` proxying.
+    const res = await fetchJson("/api/mcp/oauth-servers", { method: "GET" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { servers: Array<{ id: string; name: string; url: string; state: string; toolCount: number }> };
+    expect(Array.isArray(body.servers)).toBe(true);
+    // Each server (if any) carries the expected shape.
+    for (const s of body.servers) {
+      expect(typeof s.id).toBe("string");
+      expect(typeof s.name).toBe("string");
+      expect(typeof s.url).toBe("string");
+      expect(typeof s.state).toBe("string");
+      expect(typeof s.toolCount).toBe("number");
+    }
+  });
+
+  it("GET /api/mcp/oauth-servers requires authentication", async () => {
+    // With ALLOW_UNAUTHENTICATED_DEV unset and CF Access env vars unset,
+    // verifyAccess() throws a 500 — the protected boundary refuses to
+    // serve the endpoint without an identity source. Same shape as the
+    // other "not publicly accessible" tests above.
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request(`${BASE_URL}/api/mcp/oauth-servers`, { method: "GET" }),
+      { ...(env as Env), ALLOW_UNAUTHENTICATED_DEV: "" } as Env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(response.status).not.toBe(200);
+  });
+
   it("POST /api/mcp/start-auth rejects invalid URLs and disallowed hosts", async () => {
     // Missing mcpUrl
     const r1 = await fetchJson("/api/mcp/start-auth", {

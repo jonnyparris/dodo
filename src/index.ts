@@ -1695,6 +1695,50 @@ app.post("/api/mcp/refresh-state", async (c) => {
   }
 });
 
+// List the user's connected OAuth MCP servers (Agents-SDK-managed). The
+// hub DO is keyed by the user's email; per-session DOs federate tools via
+// `loadOAuthToolsFromHub`, so a single list per user is the authoritative
+// source of truth across all of their sessions.
+app.get("/api/mcp/oauth-servers", async (c) => {
+  const userEmail = c.get("userEmail");
+  const id = c.env.CODING_AGENT.idFromName(userEmail);
+  const stub = c.env.CODING_AGENT.get(id) as unknown as {
+    getMcpServers: () => Promise<{
+      servers: Record<string, {
+        name?: string;
+        server_url?: string;
+        state?: string;
+        auth_url?: string | null;
+        error?: string | null;
+      }>;
+      tools: Array<{ serverId: string }>;
+    }>;
+  };
+  try {
+    const { servers, tools } = await stub.getMcpServers();
+    // Count tools per server so the UI can show "12 tools" next to each
+    // connected MCP server.
+    const toolCountByServer = new Map<string, number>();
+    for (const t of tools) {
+      toolCountByServer.set(t.serverId, (toolCountByServer.get(t.serverId) ?? 0) + 1);
+    }
+    const list = Object.entries(servers).map(([sid, s]) => ({
+      id: sid,
+      name: s.name ?? "",
+      url: s.server_url ?? "",
+      state: s.state ?? "unknown",
+      authUrl: s.auth_url ?? null,
+      error: s.error ?? null,
+      toolCount: toolCountByServer.get(sid) ?? 0,
+    }));
+    return c.json({ servers: list });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "/api/mcp/oauth-servers failed", { userEmail, error: msg });
+    return c.json({ error: `Failed to list MCP servers: ${msg}` }, 500);
+  }
+});
+
 // ─── MCP Catalog ───
 
 app.get("/api/mcp-catalog", async (c) => {
