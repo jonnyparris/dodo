@@ -6327,12 +6327,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const url = server.server_url;
     const name = server.name ?? new URL(url).host;
     await this.removeMcpServer(mcpId);
-    // Mirror the /api/mcp/start-auth callback path shape (Seal pattern):
-    // /agents/<kebab-class>/<instance-name>/callback. cf-portal rejects
-    // redirect URIs that don't follow this OAuth-callback shape.
+    // Mirror the /api/mcp/start-auth callback path shape.
+    // Use the UserControl DO ID hex (not email) to avoid URL-encoding
+    // mismatches when the OAuth client sends the redirect_uri as a query
+    // parameter — see the long comment in /api/mcp/start-auth.
+    const userId = this.env.USER_CONTROL.idFromName(this.name).toString();
     await this.addMcpServer(name, url, {
       callbackHost: this.env.WORKER_URL,
-      callbackPath: `/agents/coding-agent/${this.name}/callback`,
+      callbackPath: `/agents/coding-agent/${userId}/callback`,
     });
   }
 
