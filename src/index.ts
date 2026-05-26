@@ -1636,17 +1636,21 @@ app.post("/api/mcp/start-auth", async (c) => {
       : inferredHost;
     // callbackPath follows the Agents-SDK convention used by Seal et al:
     // `/agents/<kebab-class-name>/<instance-name>/callback`. The trailing
-    // /callback segment matters — some OAuth providers (cf-portal in
-    // particular) reject redirect URIs that don't end in a recognised
-    // OAuth-callback suffix with "Redirect URI not allowed by application
-    // configuration". Using the SDK's canonical shape also keeps us
-    // compatible with `/agents/*` routing on the way back.
+    // /callback segment matters — some OAuth providers reject redirect
+    // URIs that don't end in a recognised OAuth-callback suffix.
     //
-    // userEmail is already canonicalized (lowercased + trimmed) by the
-    // auth middleware so it's safe to embed in a URL path. Edge case:
-    // emails contain `@` and `.` which are valid in URL path segments
-    // per RFC 3986 — no encoding needed and no provider rejects them.
-    const callbackPath = `/agents/coding-agent/${userEmail}/callback`;
+    // Use the user's UserControl DO ID hex (not the email) as the
+    // instance segment. The `@` and `.` in an email — even though they
+    // are valid URL path characters per RFC 3986 — get URL-encoded by
+    // the OAuth client (`@` → `%40`) when included in the authorize
+    // request's redirect_uri query param. cf-portal's authorize endpoint
+    // appears to do a strict string comparison against the as-registered
+    // URI, so the encoded vs decoded forms don't match and the request
+    // is rejected with "Redirect URI not allowed by application
+    // configuration". Using a hex-only segment side-steps the encoding
+    // mismatch entirely.
+    const userId = c.env.USER_CONTROL.idFromName(userEmail).toString();
+    const callbackPath = `/agents/coding-agent/${userId}/callback`;
     const result = await stub.addMcpServer(displayName, mcpUrl, {
       callbackHost,
       callbackPath,
