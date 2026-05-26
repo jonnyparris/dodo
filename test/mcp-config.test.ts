@@ -182,21 +182,28 @@ describe("Approved MCP catalog admin operations", () => {
 });
 
 describe("MCP Catalog", () => {
-  it("returns catalog with at least 3 entries", async () => {
+  it("returns catalog with the expected default entries", async () => {
     const res = await fetchJson("/api/mcp-catalog");
     expect(res.status).toBe(200);
     const catalog = (await res.json()) as Array<{ id: string; name: string; description: string; url: string; setupGuide: string }>;
     expect(Array.isArray(catalog)).toBe(true);
-    // Catalog seed is config-driven (PR #48). Three entries land by default —
-    // dodo-self, github, browser-rendering — and admins can add more via
+    // Catalog seed is config-driven. The current defaults are
+    // dodo-self + browser-rendering. cf-portal is omitted (loopback-only
+    // OAuth — see mcp-catalog.ts comment) and github is omitted (its MCP
+    // server doesn't support DCR). Admins can add more via
     // /api/admin/approved-mcps.
-    expect(catalog.length).toBeGreaterThanOrEqual(3);
+    expect(catalog.length).toBeGreaterThanOrEqual(2);
 
     // Verify known entries exist
     const ids = catalog.map((c) => c.id);
     expect(ids).toContain("dodo-self");
-    expect(ids).toContain("github");
     expect(ids).toContain("browser-rendering");
+
+    // And confirm the catalog entries removed for compatibility reasons
+    // are indeed gone, so the next person to add them doesn't have to
+    // re-read all the audit history.
+    expect(ids).not.toContain("github");
+    expect(ids).not.toContain("cf-portal");
 
     // Verify each entry has required fields
     for (const entry of catalog) {

@@ -255,6 +255,12 @@ function renderIntegrations(){
   // Match catalog entries to OAuth-connected servers by hostname.
   const oauthByHostname=new Map();
   oauthServers.forEach(s=>{const h=getHostname(s.url);if(h)oauthByHostname.set(h,s);});
+  // Track which oauthServers we've rendered as part of a catalog entry so
+  // the leftover loop below can pick up the orphans. Without this, a
+  // hub-DO record for an MCP URL that's no longer in the catalog (e.g. a
+  // failed cf-portal attempt left behind after the catalog entry was
+  // removed) would never render → user has no UI handle to clear it.
+  const renderedOAuthServerIds=new Set();
   const connected=[],suggestions=[];
   const hasGithubToken=secretKeys.includes("github_token");
   mcpCatalog.forEach(cat=>{
@@ -271,6 +277,7 @@ function renderIntegrations(){
       for(const h of catHosts){if(oauthByHostname.has(h)){oauthServer=oauthByHostname.get(h);break;}}
       if(oauthServer){
         connected.push(renderOAuthCard(cat,oauthServer));
+        renderedOAuthServerIds.add(oauthServer.id);
       }else{
         suggestions.push(renderOAuthCard(cat,null));
       }
@@ -297,6 +304,16 @@ function renderIntegrations(){
     }else{
       connected.push(renderIntegCard(cfg.name,cfg.url||"Custom integration",null,cfg));
     }
+  });
+  // Render any orphaned OAuth servers — entries in the per-user hub DO
+  // whose URL doesn't match any current catalog entry. Usually leftovers
+  // from a failed OAuth attempt where the catalog entry has since been
+  // removed, or one-off MCP servers added directly via /api/mcp/start-auth.
+  // Surfacing them gives the user a "Clear" button instead of letting the
+  // zombie linger.
+  oauthServers.forEach(s=>{
+    if(renderedOAuthServerIds.has(s.id))return;
+    connected.push(renderOrphanedOAuthCard(s));
   });
   const cards=[...connected,...suggestions];
   $("integrations-list").innerHTML=cards.length?cards.join(""):'<div class="empty">No integrations</div>';
@@ -346,10 +363,12 @@ async function refreshIntegrationToken(id,displayName){
   }catch(e){toast("Refresh failed: "+(e.message||e),"error")}
 }
 
-// OAuth-MCP catalog entries render with different actions: "Connect with OAuth"
-// when not yet connected (opens the provider in a popup), and "Disconnect"
-// when already connected. The actual OAuth state is managed by the Agents SDK
-// in the user's hub DO, not in mcp_configs.
+// OAuth-MCP catalog entries render with different actions based on the
+// server's current state in the per-user hub DO. The Agents SDK transitions
+// between authenticating → connecting → discovering → ready (success path)
+// or → failed (terminal error). For terminal states the only sensible
+// action is to clear the entry; offering "Refresh" on a failed server
+// retries against the same broken config and confuses users.
 function renderOAuthCard(cat,server){
   const desc=cat.description||"";
   let statusHtml,actionsHtml;
@@ -362,12 +381,31 @@ function renderOAuthCard(cat,server){
       :server.state;
     const color=server.state==="ready"?"var(--text-success)":server.state==="failed"?"var(--text-error,#b91c1c)":"var(--text-subtle)";
     statusHtml=`<span class="integ-status" style="color:${color}">${esc(stateLabel)}</span>`;
-    actionsHtml=`<button class="sm" onclick="refreshOAuthServer('${esc(server.id)}')" aria-label="Refresh ${esc(cat.name)} connection">Refresh</button><button class="sm danger" onclick="disconnectOAuthServer('${esc(server.id)}','${esc(cat.name)}')" aria-label="Disconnect ${esc(cat.name)}">Disconnect</button>`;
+    const isReady=server.state==="ready";
+    const refreshBtn=isReady?`<button class="sm" onclick="refreshOAuthServer('${esc(server.id)}')" aria-label="Refresh ${esc(cat.name)} connection">Refresh</button>`:"";
+    const removeLabel=isReady?"Disconnect":"Clear";
+    actionsHtml=`${refreshBtn}<button class="sm danger" onclick="disconnectOAuthServer('${esc(server.id)}','${esc(cat.name)}')" aria-label="${esc(removeLabel)} ${esc(cat.name)}">${removeLabel}</button>`;
   }else{
     statusHtml=`<span class="integ-status" style="color:var(--text-subtle)">Not connected</span>`;
     actionsHtml=`<button class="sm primary" onclick="connectOAuthCatalog('${esc(cat.id)}','${esc(cat.url)}')" aria-label="Connect ${esc(cat.name)} with OAuth">Connect with OAuth</button>`;
   }
   return `<div class="integ-card"><div class="integ-name">${esc(cat.name)}</div><div class="integ-desc">${esc(desc)}</div>${statusHtml}<div class="integ-actions">${actionsHtml}</div></div>`;
+}
+
+// Render an OAuth server that has no matching catalog entry — either a
+// custom MCP added via `/api/mcp/start-auth`, or a leftover from a failed
+// attempt whose catalog entry has since been removed. Always offer a
+// "Clear" action so the user can wipe it; never offer "Refresh" since we
+// don't know what the original setup looked like.
+function renderOrphanedOAuthCard(server){
+  const stateLabel=server.state==="ready"?`Connected — ${server.toolCount} tool${server.toolCount!==1?'s':''}`
+    :server.state==="authenticating"?"Authenticating… (no longer reachable)"
+    :server.state==="failed"?(server.error?`Failed: ${server.error}`:"Failed")
+    :server.state;
+  const color=server.state==="ready"?"var(--text-success)":server.state==="failed"?"var(--text-error,#b91c1c)":"var(--text-subtle)";
+  const displayName=server.name||"OAuth MCP";
+  const desc=`${server.url} — orphaned entry, not in catalog`;
+  return `<div class="integ-card"><div class="integ-name">${esc(displayName)}</div><div class="integ-desc">${esc(desc)}</div><span class="integ-status" style="color:${color}">${esc(stateLabel)}</span><div class="integ-actions"><button class="sm danger" onclick="disconnectOAuthServer('${esc(server.id)}','${esc(displayName)}')" aria-label="Clear ${esc(displayName)}">Clear</button></div></div>`;
 }
 
 // Kick off the OAuth dance for a catalog entry. The server returns either
