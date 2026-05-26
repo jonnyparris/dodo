@@ -225,13 +225,22 @@ async function deleteBrowserConfig(){
 }
 
 // --- Integrations ---
-let mcpCatalog=[],mcpConfigs=[],secretKeys=[];
+let mcpCatalog=[],mcpConfigs=[],oauthServers=[],secretKeys=[];
 
 async function loadIntegrations(){
   try{
-    const[catalog,configsRes]=await Promise.all([api("/api/mcp-catalog"),api("/api/mcp-configs")]);
+    // OAuth-MCP servers live in the user's CodingAgent hub DO (keyed by email),
+    // not in mcp_configs — they're managed by the Agents SDK. Load them in
+    // parallel so the UI can show OAuth catalog entries as "Connected" when
+    // the user has already completed the OAuth dance.
+    const[catalog,configsRes,oauthRes]=await Promise.all([
+      api("/api/mcp-catalog"),
+      api("/api/mcp-configs"),
+      api("/api/mcp/oauth-servers").catch(()=>({servers:[]})),
+    ]);
     mcpCatalog=Array.isArray(catalog)?catalog:[];
     mcpConfigs=configsRes.configs||[];
+    oauthServers=oauthRes.servers||[];
     renderIntegrations();
     // Re-render the secrets list now that we know which MCP configs exist —
     // boot-time render may have shown raw "mcp:<uuid>:Authorization" entries
@@ -243,6 +252,9 @@ async function loadIntegrations(){
 function renderIntegrations(){
   const configMap=new Map(mcpConfigs.map(c=>[c.name.toLowerCase(),c]));
   const getHostname=url=>{try{return new URL(url).hostname;}catch{return null;}};
+  // Match catalog entries to OAuth-connected servers by hostname.
+  const oauthByHostname=new Map();
+  oauthServers.forEach(s=>{const h=getHostname(s.url);if(h)oauthByHostname.set(h,s);});
   const connected=[],suggestions=[];
   const hasGithubToken=secretKeys.includes("github_token");
   mcpCatalog.forEach(cat=>{
@@ -251,6 +263,19 @@ function renderIntegrations(){
     const catHostname=cat.url?getHostname(cat.url):null;
     const catHosts=new Set(cat.knownHosts||[]);
     if(catHostname)catHosts.add(catHostname);
+    // OAuth catalog entries: check if the user has a connected OAuth server
+    // for any of the known hostnames (the OAuth dance may resolve to a
+    // different effective URL than the catalog hint).
+    if(cat.auth_type==="oauth"){
+      let oauthServer=null;
+      for(const h of catHosts){if(oauthByHostname.has(h)){oauthServer=oauthByHostname.get(h);break;}}
+      if(oauthServer){
+        connected.push(renderOAuthCard(cat,oauthServer));
+      }else{
+        suggestions.push(renderOAuthCard(cat,null));
+      }
+      return;
+    }
     const configured=configMap.get(cat.name.toLowerCase())
       ||[...configMap.values()].find(c=>c.url&&catHosts.has(getHostname(c.url)));
     if(configured){
@@ -283,6 +308,83 @@ function renderIntegCard(name,description,catalogUrl,config){
     actionsHtml=`<a href="${esc(catalogUrl)}" target="_blank" rel="noopener noreferrer" style="font-size:11px;color:var(--text-link)">Setup guide</a>`;
   }
   return `<div class="integ-card"><div class="integ-name">${esc(name)}</div><div class="integ-desc">${esc(description)}</div>${statusHtml}<div class="integ-actions">${actionsHtml}</div></div>`;
+}
+
+// OAuth-MCP catalog entries render with different actions: "Connect with OAuth"
+// when not yet connected (opens the provider in a popup), and "Disconnect"
+// when already connected. The actual OAuth state is managed by the Agents SDK
+// in the user's hub DO, not in mcp_configs.
+function renderOAuthCard(cat,server){
+  const desc=cat.description||"";
+  let statusHtml,actionsHtml;
+  if(server){
+    const stateLabel=server.state==="ready"?`Connected — ${server.toolCount} tool${server.toolCount!==1?'s':''}`
+      :server.state==="authenticating"?"Authenticating…"
+      :server.state==="connecting"?"Connecting…"
+      :server.state==="discovering"?"Discovering…"
+      :server.state==="failed"?(server.error?`Failed: ${server.error}`:"Failed")
+      :server.state;
+    const color=server.state==="ready"?"var(--text-success)":server.state==="failed"?"var(--text-error,#b91c1c)":"var(--text-subtle)";
+    statusHtml=`<span class="integ-status" style="color:${color}">${esc(stateLabel)}</span>`;
+    actionsHtml=`<button class="sm" onclick="refreshOAuthServer('${esc(server.id)}')" aria-label="Refresh ${esc(cat.name)} connection">Refresh</button><button class="sm danger" onclick="disconnectOAuthServer('${esc(server.id)}','${esc(cat.name)}')" aria-label="Disconnect ${esc(cat.name)}">Disconnect</button>`;
+  }else{
+    statusHtml=`<span class="integ-status" style="color:var(--text-subtle)">Not connected</span>`;
+    actionsHtml=`<button class="sm primary" onclick="connectOAuthCatalog('${esc(cat.id)}','${esc(cat.url)}')" aria-label="Connect ${esc(cat.name)} with OAuth">Connect with OAuth</button>`;
+  }
+  return `<div class="integ-card"><div class="integ-name">${esc(cat.name)}</div><div class="integ-desc">${esc(desc)}</div>${statusHtml}<div class="integ-actions">${actionsHtml}</div></div>`;
+}
+
+// Kick off the OAuth dance for a catalog entry. The server returns either
+// {authUrl} (popup needed) or {message:"Connected"} (already authenticated).
+// The popup polls /api/mcp/oauth-servers after closing to detect the new
+// connection.
+async function connectOAuthCatalog(catalogId,mcpUrl){
+  try{
+    const result=await json("/api/mcp/start-auth",{mcpUrl});
+    if(result.authUrl){
+      const popup=window.open(result.authUrl,"dodo-oauth","width=560,height=720,menubar=no,toolbar=no");
+      if(!popup){
+        toast("Popup blocked. Allow popups for this site and try again.","error");
+        return;
+      }
+      // Poll for popup close + server-side connection — the Agents SDK
+      // handles the callback at /agents/oauth/callback and updates the
+      // hub DO's `getMcpServers()` state. We can't postMessage from the
+      // OAuth provider's domain, so we poll the popup's closed state and
+      // then refresh the integrations list.
+      const startedAt=Date.now();
+      const poll=setInterval(async()=>{
+        try{
+          if(popup.closed){clearInterval(poll);await loadIntegrations();return;}
+          if(Date.now()-startedAt>5*60*1000){
+            clearInterval(poll);try{popup.close();}catch{}
+            toast("OAuth flow timed out","warning");
+            await loadIntegrations();
+          }
+        }catch{/* cross-origin while on provider — ignore */}
+      },800);
+    }else{
+      toast(`Connected to ${catalogId}`,"success");
+      await loadIntegrations();
+    }
+  }catch(e){toast("Failed to start OAuth: "+(e.error||e.message||e),"error")}
+}
+
+async function disconnectOAuthServer(mcpId,displayName){
+  const ok=await appConfirm(`Disconnect ${displayName}?`);
+  if(!ok)return;
+  try{
+    await json("/api/mcp/delete-auth",{mcpId});
+    toast(`Disconnected ${displayName}`,"success");
+    await loadIntegrations();
+  }catch(e){toast("Disconnect failed: "+(e.error||e.message||e),"error")}
+}
+
+async function refreshOAuthServer(mcpId){
+  try{
+    await json("/api/mcp/refresh-state",{mcpId});
+    await loadIntegrations();
+  }catch(e){toast("Refresh failed: "+(e.error||e.message||e),"error")}
 }
 
 async function addIntegration(){

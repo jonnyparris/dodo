@@ -50,6 +50,19 @@ const DEFAULT_CLOUDFLARE_REMOTE_MCP_CATALOG: McpCatalogEntry[] = [
     auth_type: "oauth",
     knownHosts: ["browser.mcp.cloudflare.com"],
   },
+  {
+    id: "cf-portal",
+    name: "Cloudflare Portal",
+    description:
+      "Cloudflare internal MCP portal — Backstage catalog, Jira, GitLab, Sentry, Elasticsearch, Wiki, Prometheus, and more. Requires Cloudflare SSO.",
+    url: "https://portal.mcp.cfdata.org/mcp",
+    setupGuide:
+      "Connect with OAuth via Cloudflare Access SSO. Per-user Dynamic Client Registration; access token refreshes automatically.",
+    auth_type: "oauth",
+    // cf-mcp.cloudflareaccess.com is the OAuth dance host
+    // (authorization_endpoint / token_endpoint / registration_endpoint).
+    knownHosts: ["portal.mcp.cfdata.org", "cf-mcp.cloudflareaccess.com"],
+  },
 ];
 
 export const DEPLOY_MCP_CATALOG_CONFIG: McpCatalogConfig = {
