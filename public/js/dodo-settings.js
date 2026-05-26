@@ -288,7 +288,15 @@ function renderIntegrations(){
     }
   });
   configMap.forEach(cfg=>{
-    connected.push(renderIntegCard(cfg.name,cfg.url||"Custom integration",null,cfg));
+    // refresh_token configs need different action affordances — no Test
+    // button until /test understands them (it does, post-audit), AND a
+    // "Refresh token" button so users don't have to wait for the
+    // reconnect-once-on-401 path to fire. See renderRefreshTokenCard.
+    if(cfg.auth_type==="refresh_token"){
+      connected.push(renderRefreshTokenCard(cfg));
+    }else{
+      connected.push(renderIntegCard(cfg.name,cfg.url||"Custom integration",null,cfg));
+    }
   });
   const cards=[...connected,...suggestions];
   $("integrations-list").innerHTML=cards.length?cards.join(""):'<div class="empty">No integrations</div>';
@@ -308,6 +316,34 @@ function renderIntegCard(name,description,catalogUrl,config){
     actionsHtml=`<a href="${esc(catalogUrl)}" target="_blank" rel="noopener noreferrer" style="font-size:11px;color:var(--text-link)">Setup guide</a>`;
   }
   return `<div class="integ-card"><div class="integ-name">${esc(name)}</div><div class="integ-desc">${esc(description)}</div>${statusHtml}<div class="integ-actions">${actionsHtml}</div></div>`;
+}
+
+// refresh_token-MCP integrations (provisioned via set_refresh_token_mcp or
+// start_dcr_oauth_flow). Distinct from the SDK-managed OAuth path: the
+// access token lives in encrypted_secrets and Dodo refreshes it itself via
+// the OAuth token endpoint. Actions:
+//   - Enable toggle (just flips the row's `enabled` flag — safe)
+//   - Test (now uses the bearer-aware /test endpoint; works post-audit)
+//   - Refresh token (force-refresh via /api/mcp-configs/:id/refresh-token,
+//     useful when the cached token is dead for reasons other than expiry)
+//   - Delete (wipes config + all encrypted secrets for this MCP)
+function renderRefreshTokenCard(config){
+  const checked=config.enabled?"checked":"";
+  const desc=config.url||"Refresh-token MCP integration";
+  return `<div class="integ-card"><div class="integ-name">${esc(config.name)}</div><div class="integ-desc">${esc(desc)}</div><span class="integ-status" style="color:var(--text-success)">OAuth · auto-refresh</span><div class="integ-actions"><label class="toggle-switch" aria-label="Enable ${esc(config.name)}"><span class="visually-hidden">Enable ${esc(config.name)}</span><input type="checkbox" ${checked} onchange="toggleIntegration('${esc(config.id)}',this.checked)" aria-label="Enable ${esc(config.name)}"/><span class="slider" aria-hidden="true"></span></label><button class="sm" onclick="testIntegration('${esc(config.id)}')" aria-label="Test ${esc(config.name)} connection">Test</button><button class="sm" onclick="refreshIntegrationToken('${esc(config.id)}','${esc(config.name)}')" aria-label="Refresh ${esc(config.name)} access token">Refresh token</button><button class="sm danger" onclick="deleteIntegration('${esc(config.id)}')" aria-label="Delete ${esc(config.name)} integration">x</button></div></div>`;
+}
+
+async function refreshIntegrationToken(id,displayName){
+  try{
+    const result=await json(`/api/mcp-configs/${encodeURIComponent(id)}/refresh-token`,{});
+    if(result.accessToken){
+      toast(`${displayName} token refreshed`,"success");
+    }else if(result.error){
+      toast(`Refresh failed: ${result.error}`,"error");
+    }else{
+      toast(`Refresh failed: unexpected response`,"error");
+    }
+  }catch(e){toast("Refresh failed: "+(e.message||e),"error")}
 }
 
 // OAuth-MCP catalog entries render with different actions: "Connect with OAuth"
@@ -348,10 +384,11 @@ async function connectOAuthCatalog(catalogId,mcpUrl){
         return;
       }
       // Poll for popup close + server-side connection — the Agents SDK
-      // handles the callback at /agents/oauth/callback and updates the
-      // hub DO's `getMcpServers()` state. We can't postMessage from the
-      // OAuth provider's domain, so we poll the popup's closed state and
-      // then refresh the integrations list.
+      // handles the callback at /agents/coding-agent/<userId-hex>/callback
+      // (see api/mcp/start-auth in src/index.ts for why the path is shaped
+      // this way) and updates the hub DO's `getMcpServers()` state. We
+      // can't postMessage from the OAuth provider's domain, so we poll
+      // the popup's closed state and then refresh the integrations list.
       const startedAt=Date.now();
       const poll=setInterval(async()=>{
         try{

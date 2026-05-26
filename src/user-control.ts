@@ -119,7 +119,11 @@ const mcpConfigUpdateSchema = z
   .object({
     name: z.string().min(1).optional(),
     type: z.enum(["http", "service-binding"]).optional(),
-    auth_type: z.enum(["oauth", "static_headers"]).optional(),
+    // Accept refresh_token so a client that round-trips an existing config
+    // (GET → mutate enabled → PUT) doesn't get rejected. The handler still
+    // refuses to mutate refresh_token rows beyond the enabled flag — see
+    // updateMcpConfigEncrypted for the enforcement.
+    auth_type: z.enum(["oauth", "static_headers", "refresh_token"]).optional(),
     url: z.string().url().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     enabled: z.boolean().optional(),
@@ -922,10 +926,30 @@ export class UserControl extends DurableObject<Env> {
 
       if (request.method === "POST" && url.pathname.match(/^\/mcp-configs\/[^/]+\/test$/)) {
         const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-        const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, name, type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id))[0] as SqlRow | null);
+        // Select auth_type so the mapper can distinguish refresh_token configs
+        // — without it the row was downgraded to static_headers and we never
+        // injected the bearer, so every refresh_token Test click returned 401.
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, name, type, auth_type, url, headers_json, enabled FROM mcp_configs WHERE id = ?", id))[0] as SqlRow | null);
         if (!row) return Response.json({ error: `MCP config ${id} not found` }, { status: 404 });
         const ownerEmail = request.headers.get("x-owner-email") ?? "";
-        const config = await this.resolveMcpConfigHeaders(this.mapMcpConfigRow(row), ownerEmail);
+        let config = this.mapMcpConfigRow(row);
+
+        if (config.auth_type === "refresh_token") {
+          // refresh_token configs don't have headerKeys — they get their
+          // Authorization from the encrypted access_token (which is auto-
+          // refreshed by getMcpAccessToken if it's stale).
+          const accessToken = await this.getMcpAccessToken(id, ownerEmail);
+          if (!accessToken) {
+            return Response.json(
+              { ok: false, error: "No access token available — run set_refresh_token_mcp or start_dcr_oauth_flow to provision tokens" },
+              { status: 200 },
+            );
+          }
+          config = { ...config, headers: { Authorization: `Bearer ${accessToken}` } };
+        } else {
+          config = await this.resolveMcpConfigHeaders(config, ownerEmail);
+        }
+
         const gatekeeper = new HttpMcpClient(config);
         const result = await gatekeeper.testConnection();
         return Response.json(result);
@@ -2257,10 +2281,53 @@ export class UserControl extends DurableObject<Env> {
 
   /**
    * Update an MCP config, replacing encrypted header secrets if new headers provided.
+   *
+   * For `refresh_token` configs only the `enabled` flag may be flipped via
+   * this path. Mutating `headers`, `url`, `auth_type`, or `type` would
+   * corrupt the token chain (see Hole 2 in the PR #91 audit). Use
+   * `set_refresh_token_mcp` / `start_dcr_oauth_flow` to re-provision a
+   * refresh_token config instead of trying to PATCH it.
    */
-  private async updateMcpConfigEncrypted(id: string, patch: { name?: string; type?: string; auth_type?: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled?: boolean }, ownerEmail: string): Promise<McpClientConfig & { headerKeys?: string[] }> {
+  private async updateMcpConfigEncrypted(id: string, patch: { name?: string; type?: string; auth_type?: "oauth" | "static_headers" | "refresh_token"; url?: string; headers?: Record<string, string>; enabled?: boolean }, ownerEmail: string): Promise<McpClientConfig & { headerKeys?: string[] }> {
     const current = this.getMcpConfigSafe(id);
     const now = nowEpoch();
+
+    if (current.auth_type === "refresh_token") {
+      // Forbid every mutation that would break the OAuth token chain. The
+      // `enabled` toggle is safe because it doesn't touch encrypted_secrets
+      // or any of the oauth_* columns.
+      const forbidden: string[] = [];
+      if (patch.headers) forbidden.push("headers");
+      if (patch.url && patch.url !== current.url) forbidden.push("url");
+      if (patch.auth_type && patch.auth_type !== "refresh_token") forbidden.push("auth_type");
+      if (patch.type && patch.type !== current.type) forbidden.push("type");
+      if (forbidden.length > 0) {
+        throw new Error(
+          `Cannot mutate ${forbidden.join(", ")} on a refresh_token config (id=${id}). ` +
+          `Use set_refresh_token_mcp or start_dcr_oauth_flow to re-provision.`,
+        );
+      }
+
+      if (patch.enabled !== undefined && patch.enabled !== current.enabled) {
+        this.ctx.storage.sql.exec(
+          "UPDATE mcp_configs SET enabled = ?, name = ?, updated_at = ? WHERE id = ?",
+          patch.enabled ? 1 : 0,
+          patch.name ?? current.name,
+          now,
+          id,
+        );
+      } else if (patch.name && patch.name !== current.name) {
+        this.ctx.storage.sql.exec(
+          "UPDATE mcp_configs SET name = ?, updated_at = ? WHERE id = ?",
+          patch.name,
+          now,
+          id,
+        );
+      }
+
+      const updated = this.getMcpConfigSafe(id);
+      return { ...updated, headerKeys: updated.headerKeys ?? [] };
+    }
 
     let headerKeys: string[];
     if (patch.headers) {
@@ -2745,29 +2812,34 @@ export class UserControl extends DurableObject<Env> {
     const nowSec = Math.floor(Date.now() / 1000);
     const expiresAt = tokens.expires_in ? nowSec + tokens.expires_in : 0;
 
-    // Store via the existing refresh-token MCP upsert path. Idempotent on
-    // mcpUrl, so re-running the dance just rotates the tokens in place.
-    const result = await this.upsertRefreshTokenMcp(
-      {
-        name: pending.mcpName,
-        url: pending.mcpUrl,
-        tokenEndpoint: pending.tokenEndpoint,
-        clientId: pending.clientId,
-        accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token,
-        expiresAt,
-        enabled: true,
-      },
-      ownerEmail,
-    );
-
-    // Clean up the pending state — it's single-use.
-    this.ctx.storage.sql.exec(
-      "DELETE FROM encrypted_secrets WHERE key = ?",
-      `oauth_dcr_pending:${input.state}`,
-    );
-
-    return { id: result.id, name: result.name, url: result.url };
+    // Pending state is single-use whether the upsert succeeds or fails — a
+    // captured `code` can only be redeemed once at the OAuth provider, so
+    // leaving the row in place after an upsert error gains the user
+    // nothing (the code is dead) and just leaks ciphertext until the 10-min
+    // TTL elapses. Use try/finally to make the cleanup unconditional.
+    try {
+      // Store via the existing refresh-token MCP upsert path. Idempotent on
+      // mcpUrl, so re-running the dance just rotates the tokens in place.
+      const result = await this.upsertRefreshTokenMcp(
+        {
+          name: pending.mcpName,
+          url: pending.mcpUrl,
+          tokenEndpoint: pending.tokenEndpoint,
+          clientId: pending.clientId,
+          accessToken: tokens.access_token,
+          refreshToken: tokens.refresh_token,
+          expiresAt,
+          enabled: true,
+        },
+        ownerEmail,
+      );
+      return { id: result.id, name: result.name, url: result.url };
+    } finally {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM encrypted_secrets WHERE key = ?",
+        `oauth_dcr_pending:${input.state}`,
+      );
+    }
   }
 
   public async createUserMcpToken(email: string, label?: string): Promise<{ token: string; created_at: number }> {

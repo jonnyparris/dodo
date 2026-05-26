@@ -296,4 +296,174 @@ describe("refresh-token MCP — access token retrieval", () => {
     const tokenRes = await userControlFetch(`/mcp-configs/${encodeURIComponent(id)}/access-token`);
     expect(tokenRes.status).toBe(502);
   });
+
+  it("/mcp-configs/:id/test injects the refreshed bearer for refresh_token configs", async () => {
+    // Regression: before the audit fix, /test used resolveMcpConfigHeaders
+    // which doesn't know about refresh_token configs, so it built the
+    // HttpMcpClient with no Authorization header and every Test click on
+    // a refresh_token config returned a 401.
+    const url = "https://refresh-target-testable.example.com/mcp";
+    await userControlFetch("/refresh-token-mcp", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "Testable Target",
+        url,
+        tokenEndpoint: TOKEN_ENDPOINT,
+        clientId: "client-testable",
+        accessToken: "tok-testable",
+        refreshToken: "rt-testable",
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    const list = (await (await userControlFetch("/mcp-configs")).json()) as {
+      configs: Array<{ id: string; url?: string }>;
+    };
+    const id = list.configs.find((c) => c.url === url)!.id;
+
+    // Mock fetch to capture the Authorization header used on the MCP
+    // connection attempt. We return an unparseable response so the MCP
+    // client fails fast — we don't care about the connection success,
+    // only about the request shape.
+    let authHeader: string | null = null;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers ?? {});
+      if (headers.has("authorization")) authHeader = headers.get("authorization");
+      return new Response("not-mcp", { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const res = await userControlFetch(`/mcp-configs/${encodeURIComponent(id)}/test`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(200);
+    // Whatever the connection result, the request must have carried the
+    // bearer pulled from encrypted_secrets.
+    expect(authHeader).toBe("Bearer tok-testable");
+  });
+
+  it("PUT /mcp-configs/:id refuses to mutate headers/url/auth_type on a refresh_token config", async () => {
+    // Regression: before the audit fix, updateMcpConfigEncrypted treated
+    // refresh_token rows the same as static_headers, so a PUT with
+    // `headers` would wipe encrypted_secrets (destroying the token chain)
+    // and a PUT with `auth_type: "static_headers"` would silently downgrade.
+    const url = "https://refresh-target-protected.example.com/mcp";
+    await userControlFetch("/refresh-token-mcp", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "Protected Target",
+        url,
+        tokenEndpoint: TOKEN_ENDPOINT,
+        clientId: "client-protected",
+        accessToken: "tok-protected",
+        refreshToken: "rt-protected",
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    const list = (await (await userControlFetch("/mcp-configs")).json()) as {
+      configs: Array<{ id: string; url?: string }>;
+    };
+    const id = list.configs.find((c) => c.url === url)!.id;
+
+    // PUT headers — must be rejected.
+    const res1 = await userControlFetch(`/mcp-configs/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ headers: { Authorization: "Bearer evil" } }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(res1.status).toBeGreaterThanOrEqual(400);
+
+    // PUT auth_type downgrade — must be rejected.
+    const res2 = await userControlFetch(`/mcp-configs/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ auth_type: "static_headers" }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(res2.status).toBeGreaterThanOrEqual(400);
+
+    // PUT enabled — must be ALLOWED. This is the one mutation a UI
+    // toggle has to work for.
+    const res3 = await userControlFetch(`/mcp-configs/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ enabled: false }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(res3.status).toBe(200);
+
+    // Token chain still intact — a follow-up access-token read works
+    // without needing a refresh (no fetch should be called since the
+    // cached token is still valid).
+    let fetchCalled = false;
+    globalThis.fetch = (async () => {
+      fetchCalled = true;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const tokenRes = await userControlFetch(`/mcp-configs/${encodeURIComponent(id)}/access-token`);
+    expect(tokenRes.status).toBe(200);
+    expect(((await tokenRes.json()) as { accessToken: string }).accessToken).toBe("tok-protected");
+    expect(fetchCalled).toBe(false);
+  });
+
+  it("rotates the stored refresh token — second refresh uses the rotated value", async () => {
+    // Regression test for the audit's blind spot: the original suite mocked
+    // a rotated refresh token in the first response but never asserted that
+    // the rotated value was what got sent on the next refresh. If
+    // refreshMcpAccessToken accidentally re-used the *original* refresh
+    // token, a real provider would return invalid_grant on the second
+    // refresh (because rotation invalidates the previous token).
+    const url = "https://refresh-target-rotation.example.com/mcp";
+    await userControlFetch("/refresh-token-mcp", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "Rotation Target",
+        url,
+        tokenEndpoint: TOKEN_ENDPOINT,
+        clientId: "client-rotation",
+        accessToken: "access-v0",
+        refreshToken: "refresh-v0",
+        expiresAt: Math.floor(Date.now() / 1000) - 1,
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    const list = (await (await userControlFetch("/mcp-configs")).json()) as {
+      configs: Array<{ id: string; url?: string }>;
+    };
+    const id = list.configs.find((c) => c.url === url)!.id;
+
+    let call = 0;
+    const sentRefreshTokens: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const bodyStr = typeof init?.body === "string"
+        ? init.body
+        : init?.body instanceof URLSearchParams
+          ? init.body.toString()
+          : "";
+      const match = bodyStr.match(/refresh_token=([^&]+)/);
+      if (match) sentRefreshTokens.push(decodeURIComponent(match[1]));
+      call += 1;
+      const responses = [
+        { access_token: "access-v1", refresh_token: "refresh-v1", expires_in: -1 },
+        { access_token: "access-v2", refresh_token: "refresh-v2", expires_in: 900 },
+      ];
+      const payload = responses[call - 1] ?? responses[responses.length - 1];
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    // First refresh — should send refresh-v0 and rotate to refresh-v1.
+    const first = await userControlFetch(`/mcp-configs/${encodeURIComponent(id)}/access-token`);
+    expect(first.status).toBe(200);
+    expect((await first.json() as { accessToken: string }).accessToken).toBe("access-v1");
+
+    // Second refresh — should send refresh-v1 (the rotated value), not v0.
+    // expires_in=-1 on the first response means the cached token is already
+    // expired, so the access-token endpoint forces another refresh.
+    const second = await userControlFetch(`/mcp-configs/${encodeURIComponent(id)}/access-token`);
+    expect(second.status).toBe(200);
+    expect((await second.json() as { accessToken: string }).accessToken).toBe("access-v2");
+
+    expect(sentRefreshTokens).toEqual(["refresh-v0", "refresh-v1"]);
+  });
 });

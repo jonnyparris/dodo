@@ -1502,6 +1502,20 @@ app.post("/api/mcp-configs/:id/test", async (c) => {
   return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}/test`, { method: "POST" });
 });
 
+// Force-refresh the OAuth access token for a refresh_token MCP config.
+// Useful when the cached token has expired in some other way (revoked
+// server-side, clock drift) and the user wants to retry without waiting
+// for the next 401. UI surfaces this as a "Refresh token" button on
+// refresh_token integrations.
+app.post("/api/mcp-configs/:id/refresh-token", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(
+    c.env,
+    email,
+    `/mcp-configs/${encodeURIComponent(c.req.param("id"))}/access-token?force=1`,
+  );
+});
+
 // OAuth success redirect — shown to the user after MCP OAuth completes.
 // The Agents SDK redirects here once token exchange finishes. Points the
 // browser back to the app root with a query flag the UI can react to.
