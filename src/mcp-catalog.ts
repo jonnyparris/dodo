@@ -25,17 +25,15 @@ const CORE_MCP_CATALOG: McpCatalogEntry[] = [
     auth_type: "static_headers",
     knownHosts: [],
   },
-  {
-    id: "github",
-    name: "GitHub",
-    description:
-      "Structured tools for issues, PRs, actions, and code scanning (beyond basic git operations)",
-    url: "https://api.githubcopilot.com/mcp/",
-    setupGuide:
-      "Use the remote server at https://api.githubcopilot.com/mcp/ with OAuth, or deploy locally with a PAT",
-    auth_type: "oauth",
-    knownHosts: ["api.githubcopilot.com"],
-  },
+  // NOTE: GitHub Copilot's MCP server at https://api.githubcopilot.com/mcp/
+  // was tested and is intentionally NOT in this catalog as an OAuth entry.
+  // Its OAuth provider does NOT support Dynamic Client Registration —
+  // attempting to connect via the SDK-managed OAuth path errors with
+  // "Incompatible auth server: does not support dynamic client registration".
+  // To use GitHub MCP, add a github_token secret (Personal Access Token or
+  // GitHub App installation token); the existing static-headers path picks
+  // it up automatically and the UI hides the GitHub catalog entry when one
+  // is present.
 ];
 
 const DEFAULT_CLOUDFLARE_REMOTE_MCP_CATALOG: McpCatalogEntry[] = [
