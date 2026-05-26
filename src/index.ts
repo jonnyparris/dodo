@@ -1597,11 +1597,33 @@ app.post("/api/mcp/start-auth", async (c) => {
   // SDK's `addMcpServer` reads `this.name` to build the OAuth state.
   const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
     addMcpServer: (name: string, url: string, opts: { callbackHost: string; callbackPath: string }) => Promise<{ state: string; authUrl?: string; id: string }>;
+    getMcpServers: () => Promise<{ servers: Record<string, { server_url?: string; state?: string }> }>;
+    removeMcpServer: (id: string) => Promise<void>;
   };
 
   const displayName = parsedUrl.host;
 
   try {
+    // If a previous OAuth attempt for this MCP URL is still in storage,
+    // remove it before starting a new dance. Otherwise the SDK reuses the
+    // stale DCR registration (including the redirect_uri it was created
+    // with), which fails if we've since changed the callback path. The
+    // mismatch surfaces as "Redirect URI not allowed by application
+    // configuration" from the OAuth provider.
+    try {
+      const { servers } = await stub.getMcpServers();
+      for (const [sid, s] of Object.entries(servers)) {
+        if (s.server_url === mcpUrl) {
+          log("info", "start-auth: removing stale MCP server before re-auth", { userEmail, mcpUrl, mcpId: sid, prevState: s.state });
+          await stub.removeMcpServer(sid);
+        }
+      }
+    } catch (cleanupErr) {
+      // Cleanup failures shouldn't block a fresh DCR — the SDK will return
+      // a friendly error if the dance can't proceed.
+      log("warn", "start-auth: pre-auth cleanup failed", { userEmail, mcpUrl, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) });
+    }
+
     // Derive the callback host from the live request URL, falling back to
     // the env override if the worker is behind a known internal hostname.
     // The previous hard-coded WORKER_URL ("http://localhost:8787") would
@@ -1612,9 +1634,14 @@ app.post("/api/mcp/start-auth", async (c) => {
     const callbackHost = c.env.WORKER_URL && c.env.WORKER_URL !== "http://localhost:8787"
       ? c.env.WORKER_URL
       : inferredHost;
+    // callbackPath must point at a real route, not just the prefix. We
+    // mount `app.all("/agents/*")` (one path segment minimum). Registering
+    // `/agents` as the redirect_uri makes the OAuth provider redirect to a
+    // path that doesn't match the wildcard, and Dodo returns 404. Use a
+    // dedicated, stable subpath under `/agents/`.
     const result = await stub.addMcpServer(displayName, mcpUrl, {
       callbackHost,
-      callbackPath: "/agents",
+      callbackPath: "/agents/oauth/callback",
     });
     if (result.state === "authenticating") {
       return c.json({ authUrl: result.authUrl });
