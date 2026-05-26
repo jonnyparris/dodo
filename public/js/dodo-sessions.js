@@ -167,34 +167,36 @@ function renderPickerLists(){
   const mcpsHost = document.getElementById("picker-mcps");
   if (!skillsHost || !mcpsHost) return;
 
-  const skillRows = _picker.skills.filter((s) => matches(s.name, s.description)).map((s, i) => {
-    const idx = _picker.skills.indexOf(s);
-    const sourceLabel = s.source ? `<span style="font-size:10px;color:var(--muted);margin-left:6px">[${esc(s.source)}]</span>` : "";
-    return `<label class="picker-row" style="display:flex;align-items:flex-start;gap:8px;padding:4px 2px;font-size:12px;cursor:pointer">
-      <input type="checkbox" ${s.enabled ? "checked" : ""} onchange="_picker.skills[${idx}].enabled=this.checked"/>
-      <span style="flex:1;min-width:0">
-        <span style="font-weight:500">${esc(s.name)}</span>${sourceLabel}
-        <span style="display:block;color:var(--muted);font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${esc((s.description || "").slice(0, 200))}</span>
+  const renderRow = (kind, item, idx) => {
+    const tag = item.source ? `<span class="picker-tag">${esc(item.source)}</span>` : "";
+    const desc = item.description ? `<span class="picker-row-desc">${esc(item.description)}</span>` : "";
+    const checked = item.enabled ? "checked" : "";
+    return `<label class="picker-row">
+      <input type="checkbox" ${checked} onchange="_picker.${kind}[${idx}].enabled=this.checked"/>
+      <span class="picker-row-body">
+        <span class="picker-row-title"><span class="picker-row-name">${esc(item.name)}</span></span>
+        ${desc}
       </span>
+      ${tag}
     </label>`;
-  });
-  const mcpRows = _picker.mcps.filter((m) => matches(m.name, m.description)).map((m) => {
-    const idx = _picker.mcps.indexOf(m);
-    return `<label class="picker-row" style="display:flex;align-items:flex-start;gap:8px;padding:4px 2px;font-size:12px;cursor:pointer">
-      <input type="checkbox" ${m.enabled ? "checked" : ""} onchange="_picker.mcps[${idx}].enabled=this.checked"/>
-      <span style="flex:1;min-width:0">
-        <span style="font-weight:500">${esc(m.name)}</span>
-        <span style="display:block;color:var(--muted);font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${esc((m.description || "").slice(0, 200))}</span>
-      </span>
-    </label>`;
-  });
+  };
+
+  const skillRows = _picker.skills
+    .map((s, idx) => ({ s, idx }))
+    .filter(({ s }) => matches(s.name, s.description))
+    .map(({ s, idx }) => renderRow("skills", s, idx));
+
+  const mcpRows = _picker.mcps
+    .map((m, idx) => ({ m, idx }))
+    .filter(({ m }) => matches(m.name, m.description))
+    .map(({ m, idx }) => renderRow("mcps", m, idx));
 
   const skillSelected = _picker.skills.filter((s) => s.enabled).length;
   const mcpSelected = _picker.mcps.filter((m) => m.enabled).length;
-  document.getElementById("picker-skill-count").textContent = `${skillSelected}/${_picker.skills.length} on`;
-  document.getElementById("picker-mcp-count").textContent = `${mcpSelected}/${_picker.mcps.length} on`;
-  skillsHost.innerHTML = skillRows.length ? skillRows.join("") : '<div style="color:var(--muted);font-size:12px">No matches</div>';
-  mcpsHost.innerHTML = mcpRows.length ? mcpRows.join("") : '<div style="color:var(--muted);font-size:12px">No MCPs configured</div>';
+  document.getElementById("picker-skill-count").textContent = `${skillSelected} of ${_picker.skills.length} on`;
+  document.getElementById("picker-mcp-count").textContent = `${mcpSelected} of ${_picker.mcps.length} on`;
+  skillsHost.innerHTML = skillRows.length ? skillRows.join("") : '<div class="picker-empty">No matches</div>';
+  mcpsHost.innerHTML = mcpRows.length ? mcpRows.join("") : '<div class="picker-empty">No MCPs configured</div>';
 }
 
 async function createSessionFromPicker(){
