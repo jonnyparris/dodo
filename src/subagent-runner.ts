@@ -313,24 +313,22 @@ function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
 
-export function resolveWireModelId(modelId: string, activeGateway: "opencode" | "ai-gateway"): string {
+export function resolveWireModelId(modelId: string, _activeGateway: "opencode" | "ai-gateway"): string {
+  // Workers AI models (@cf/…) must be wire-prefixed with `workers-ai/` on
+  // BOTH gateways. The AI Gateway and the OpenCode gateway both proxy these
+  // via Cloudflare's unified OpenAI-compatible endpoint, which expects the
+  // `workers-ai/@cf/<vendor>/<model>` form.
   if (modelId.startsWith("@cf/")) {
-    if (activeGateway !== "ai-gateway") {
-      throw new Error(
-        `Workers AI model "${modelId}" requires the AI Gateway. ` +
-        `Switch gateway to "ai-gateway" in Settings (or via update_config).`,
-      );
-    }
     return `workers-ai/${modelId}`;
   }
   return modelId;
 }
 
 function resolveGatewayForModel(
-  modelId: string,
+  _modelId: string,
   mainGateway: "opencode" | "ai-gateway",
 ): "opencode" | "ai-gateway" {
-  if (modelId.startsWith("@cf/")) return "ai-gateway";
+  // Both gateways route Workers AI models. Honour the user's gateway choice.
   return mainGateway;
 }
 

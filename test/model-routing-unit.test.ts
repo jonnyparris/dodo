@@ -4,7 +4,8 @@
  * Covers:
  * - `resolveWireModelId`: translates user-facing model IDs (`@cf/…`) into the
  *   wire format that Cloudflare's AI Gateway unified API expects
- *   (`workers-ai/@cf/…`), and rejects Workers AI models on the opencode gateway.
+ *   (`workers-ai/@cf/…`). Both gateways route Workers AI models — the
+ *   OpenCode gateway proxies them via the same OpenAI-compat endpoint.
  * - The `isRoutableByOpencodeGateway` helper used to filter `/api/models`
  *   responses so the UI never offers a model that will fail on first prompt.
  *
@@ -23,11 +24,11 @@ const OPENCODE_BAD_SLUG_PREFIXES = [
 ];
 
 function isRoutableByOpencodeGateway(id: string): boolean {
+  if (id.startsWith("@cf/")) return true;
   const slashIdx = id.indexOf("/");
   if (slashIdx === -1) return false;
   const providerPrefix = id.slice(0, slashIdx);
   const slug = id.slice(slashIdx + 1);
-  if (id.startsWith("@cf/")) return false;
   if (!OPENCODE_SUPPORTED_PROVIDER_PREFIXES.has(providerPrefix)) return false;
   if (providerPrefix === "anthropic") {
     return !OPENCODE_BAD_SLUG_PREFIXES.some((bad) => slug.startsWith(bad));
@@ -47,16 +48,23 @@ describe("resolveWireModelId", () => {
     );
   });
 
+  it("prefixes @cf/ models with workers-ai/ on the opencode gateway too", () => {
+    // OpenCode gateway is also a proxy to Cloudflare's unified OpenAI-compat
+    // endpoint, which expects the workers-ai/ prefix on @cf/ models. Verified
+    // via live curl on 2026-05-26: HTTP 200 with workers-ai/@cf/..., HTTP 400
+    // "Invalid provider" with the unprefixed form.
+    expect(resolveWireModelId("@cf/moonshotai/kimi-k2.6", "opencode")).toBe(
+      "workers-ai/@cf/moonshotai/kimi-k2.6",
+    );
+    expect(resolveWireModelId("@cf/google/gemma-4-26b-a4b-it", "opencode")).toBe(
+      "workers-ai/@cf/google/gemma-4-26b-a4b-it",
+    );
+  });
+
   it("passes non-@cf/ models through unchanged on both gateways", () => {
     expect(resolveWireModelId("openai/gpt-5.4", "ai-gateway")).toBe("openai/gpt-5.4");
     expect(resolveWireModelId("openai/gpt-5.4", "opencode")).toBe("openai/gpt-5.4");
     expect(resolveWireModelId("anthropic/claude-sonnet-4-6", "opencode")).toBe("anthropic/claude-sonnet-4-6");
-  });
-
-  it("throws when a @cf/ model is used with the opencode gateway", () => {
-    expect(() => resolveWireModelId("@cf/moonshotai/kimi-k2.6", "opencode")).toThrow(
-      /requires the AI Gateway/,
-    );
   });
 });
 
@@ -80,9 +88,11 @@ describe("isRoutableByOpencodeGateway", () => {
     expect(isRoutableByOpencodeGateway("anthropic/grok-code")).toBe(false);
   });
 
-  it("rejects Workers AI @cf/ models (ai-gateway only)", () => {
-    expect(isRoutableByOpencodeGateway("@cf/moonshotai/kimi-k2.6")).toBe(false);
-    expect(isRoutableByOpencodeGateway("@cf/meta/llama-4-scout-17b-16e-instruct")).toBe(false);
+  it("accepts Workers AI @cf/ models (both gateways route them)", () => {
+    expect(isRoutableByOpencodeGateway("@cf/moonshotai/kimi-k2.6")).toBe(true);
+    expect(isRoutableByOpencodeGateway("@cf/meta/llama-4-scout-17b-16e-instruct")).toBe(true);
+    expect(isRoutableByOpencodeGateway("@cf/google/gemma-4-26b-a4b-it")).toBe(true);
+    expect(isRoutableByOpencodeGateway("@cf/qwen/qwen2.5-coder-32b-instruct")).toBe(true);
   });
 
   it("rejects unknown provider prefixes", () => {

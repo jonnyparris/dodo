@@ -25,11 +25,13 @@ const OPENCODE_BAD_SLUG_PREFIXES = [
 ];
 
 function isRoutableByOpencodeGateway(id: string): boolean {
+  // Workers AI models route via both gateways. The wire-format prefix
+  // (`workers-ai/`) is applied later in resolveWireModelId.
+  if (id.startsWith("@cf/")) return true;
   const slashIdx = id.indexOf("/");
   if (slashIdx === -1) return false;
   const providerPrefix = id.slice(0, slashIdx);
   const slug = id.slice(slashIdx + 1);
-  if (id.startsWith("@cf/")) return false; // Workers AI — ai-gateway only
   if (!OPENCODE_SUPPORTED_PROVIDER_PREFIXES.has(providerPrefix)) return false;
   if (providerPrefix === "anthropic") {
     // Filter models falsely labelled `anthropic/...` because of the models.dev fallback
@@ -191,16 +193,16 @@ export class SharedIndex extends DurableObject<Env> {
         // "opencode" → only providers the opencode gateway can actually route.
         // "ai-gateway" → upstream unified API models + Workers AI @cf/ models.
         // (omitted) → unfiltered (legacy callers).
+        //
+        // Both gateways proxy Workers AI via Cloudflare's unified OpenAI-compat
+        // endpoint, so the @cf/* catalogue is appended in both cases.
         const gateway = url.searchParams.get("gateway");
         const models = await this.getModels();
         const filteredBase = gateway === "opencode"
           ? models.filter((m) => isRoutableByOpencodeGateway(m.id))
           : models;
         const ids = new Set(filteredBase.map((m) => m.id));
-        // Workers AI models only appear when ai-gateway is the target (or no filter).
-        const extras = gateway === "opencode"
-          ? []
-          : WORKERS_AI_MODELS.filter((m) => !ids.has(m.id));
+        const extras = WORKERS_AI_MODELS.filter((m) => !ids.has(m.id));
         return Response.json({ models: [...filteredBase, ...extras] });
       }
 

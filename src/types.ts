@@ -115,8 +115,8 @@ export interface AppConfig {
    * getExploreModel() heuristic (cheap model by provider family), which
    * falls back to Kimi K2.6 for unfamiliar providers. Mixing providers is
    * supported — e.g. main model anthropic/claude-opus-4-7, explore model
-   * @cf/moonshotai/kimi-k2.6. The subagent's gateway is auto-selected
-   * from the model ID (@cf/* → ai-gateway, everything else → opencode).
+   * @cf/moonshotai/kimi-k2.6. The subagent follows the session's
+   * activeGateway; both gateways route Workers AI (`@cf/...`) models.
    */
   exploreModel?: string;
   /** Same as exploreModel but for the generic `task` subagent. */

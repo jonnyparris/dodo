@@ -101,7 +101,10 @@ describe("UserControl DO", () => {
     expect(flipped.activeGateway).toBe("ai-gateway");
     expect(flipped.model.startsWith("@cf/")).toBe(true);
 
-    // Flip back — model should revert to opencode-routable default.
+    // Flip back — both gateways now route Workers AI models, so the @cf/
+    // model is preserved (no forced swap). Only ai-gateway → opencode used
+    // to swap, and that was the bug — the OpenCode gateway proxies
+    // workers-ai/@cf/* just fine.
     const revertRes = await fetchJson("/api/config", {
       body: JSON.stringify({ activeGateway: "opencode" }),
       headers: { "content-type": "application/json" },
@@ -109,7 +112,7 @@ describe("UserControl DO", () => {
     });
     const reverted = (await revertRes.json()) as { activeGateway: string; model: string };
     expect(reverted.activeGateway).toBe("opencode");
-    expect(reverted.model.startsWith("@cf/")).toBe(false);
+    expect(reverted.model.startsWith("@cf/")).toBe(true);
 
     // Restore defaults
     await fetchJson("/api/config", {

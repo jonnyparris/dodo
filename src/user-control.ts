@@ -1782,13 +1782,17 @@ export class UserControl extends DurableObject<Env> {
     // Auto-swap model when the user changes gateway and the current model
     // isn't routable by the new gateway. Prevents the "Bad Request on first prompt"
     // failure mode reported in jonnyparris/dodo#30.
+    //
+    // The OpenCode gateway also routes Workers AI (`@cf/...`) models, so
+    // switching opencode → ai-gateway no longer requires a swap. Only the
+    // reverse direction needs a default — when the user flips to ai-gateway
+    // without specifying a model and the current pick is a non-Workers-AI
+    // model that ai-gateway can't proxy via the unified endpoint.
     const gatewayChanged = input.activeGateway && input.activeGateway !== current.activeGateway;
     const modelExplicit = Object.prototype.hasOwnProperty.call(input, "model");
     if (gatewayChanged && !modelExplicit) {
       if (input.activeGateway === "ai-gateway" && !nextConfig.model.startsWith("@cf/")) {
         nextConfig.model = this.env.AI_GATEWAY_DEFAULT_MODEL ?? "@cf/moonshotai/kimi-k2.6";
-      } else if (input.activeGateway === "opencode" && nextConfig.model.startsWith("@cf/")) {
-        nextConfig.model = this.env.DEFAULT_MODEL;
       }
     }
 
