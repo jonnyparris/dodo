@@ -1548,11 +1548,12 @@ app.get("/mcp-oauth-error", (c) => {
 </html>`, 400);
 });
 
-// OAuth callback route for MCP server auth flows
+// OAuth callback route for MCP server auth flows.
+// Uses getAgentByName so the hub DO's `.name` is set via setName before the
+// Agents SDK's OAuth callback handler reads it (workerd#2240).
 app.all("/agents/*", async (c) => {
   const userEmail = c.get("userEmail");
-  const id = c.env.CODING_AGENT.idFromName(userEmail);
-  const stub = c.env.CODING_AGENT.get(id);
+  const stub = await getAgentByName(c.env.CODING_AGENT as never, userEmail);
   const h = new Headers(c.req.raw.headers);
   h.set("x-owner-email", userEmail);
   const req = new Request(c.req.raw, { headers: h });
@@ -1590,8 +1591,11 @@ app.post("/api/mcp/start-auth", async (c) => {
   }
 
   const userEmail = c.get("userEmail");
-  const id = c.env.CODING_AGENT.idFromName(userEmail);
-  const stub = c.env.CODING_AGENT.get(id) as unknown as {
+  // Use getAgentByName so the DO's `.name` is set via setName before any
+  // RPC method runs. `idFromName` + `.get()` skips that bookkeeping, which
+  // makes `this.name` throw inside the Agents SDK (workerd#2240) — and the
+  // SDK's `addMcpServer` reads `this.name` to build the OAuth state.
+  const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
     addMcpServer: (name: string, url: string, opts: { callbackHost: string; callbackPath: string }) => Promise<{ state: string; authUrl?: string; id: string }>;
   };
 
@@ -1637,8 +1641,8 @@ app.post("/api/mcp/delete-auth", async (c) => {
   }
 
   const userEmail = c.get("userEmail");
-  const id = c.env.CODING_AGENT.idFromName(userEmail);
-  const stub = c.env.CODING_AGENT.get(id) as unknown as {
+  // See /api/mcp/start-auth above for why getAgentByName instead of idFromName.
+  const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
     getMcpServers: () => { servers: Record<string, unknown> };
     removeMcpServer: (id: string) => Promise<void>;
   };
@@ -1674,8 +1678,8 @@ app.post("/api/mcp/refresh-state", async (c) => {
   }
 
   const userEmail = c.get("userEmail");
-  const id = c.env.CODING_AGENT.idFromName(userEmail);
-  const stub = c.env.CODING_AGENT.get(id) as unknown as {
+  // See /api/mcp/start-auth above for why getAgentByName instead of idFromName.
+  const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
     getMcpServers: () => { servers: Record<string, unknown> };
     refreshMcpState: (id: string) => Promise<void>;
   };
@@ -1701,8 +1705,8 @@ app.post("/api/mcp/refresh-state", async (c) => {
 // source of truth across all of their sessions.
 app.get("/api/mcp/oauth-servers", async (c) => {
   const userEmail = c.get("userEmail");
-  const id = c.env.CODING_AGENT.idFromName(userEmail);
-  const stub = c.env.CODING_AGENT.get(id) as unknown as {
+  // See /api/mcp/start-auth above for why getAgentByName instead of idFromName.
+  const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
     getMcpServers: () => Promise<{
       servers: Record<string, {
         name?: string;

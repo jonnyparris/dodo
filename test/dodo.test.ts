@@ -148,20 +148,24 @@ describe("Dodo foundation", () => {
     expect(messages.messages[1].role).toBe("assistant");
   });
 
-  it("POST /api/mcp/start-auth is not publicly accessible", async () => {
+  it("POST /api/mcp/start-auth requires authentication", async () => {
+    // ALLOW_UNAUTHENTICATED_DEV is what `isDevMode` checks — DEV_MODE alone
+    // does nothing. Clearing ALLOW_UNAUTHENTICATED_DEV forces verifyAccess()
+    // through the production code path, which fails with 500 when CF Access
+    // env vars are also unset.
     const ctx = createExecutionContext();
     const response = await worker.fetch(new Request(`${BASE_URL}/api/mcp/start-auth`, {
       body: JSON.stringify({ mcpUrl: "https://browser.mcp.cloudflare.com/mcp" }),
       headers: { "content-type": "application/json" },
       method: "POST",
-    }), { ...(env as Env), DEV_MODE: "false" } as Env, ctx);
+    }), { ...(env as Env), ALLOW_UNAUTHENTICATED_DEV: "" } as Env, ctx);
     await waitOnExecutionContext(ctx);
     expect(response.status).not.toBe(200);
   });
 
-  it("/agents/* is not publicly accessible", async () => {
+  it("/agents/* requires authentication", async () => {
     const ctx = createExecutionContext();
-    const response = await worker.fetch(new Request(`${BASE_URL}/agents/test`, { method: "GET" }), { ...(env as Env), DEV_MODE: "false" } as Env, ctx);
+    const response = await worker.fetch(new Request(`${BASE_URL}/agents/test`, { method: "GET" }), { ...(env as Env), ALLOW_UNAUTHENTICATED_DEV: "" } as Env, ctx);
     await waitOnExecutionContext(ctx);
     expect(response.status).not.toBe(200);
   });
