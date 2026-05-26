@@ -911,16 +911,6 @@
           </details>
         </div>
         <div class="section">
-          <h2>Skills</h2>
-          <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Skills are SKILL.md files the agent loads on demand. Built-in skills ship with Dodo; personal skills you author here. Workspace skills (per-session, from <code>.dodo/skills/</code> etc.) are not shown here.</p>
-          <div id="skills-list"></div>
-        </div>
-        <div class="section">
-          <h2>Tools</h2>
-          <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Tools available to the agent. Dimmed entries are gated on session config (codemode, browser) or reachable only inside a codemode block (most git ops). Configure MCP integrations below to add more.</p>
-          <div id="tool-catalog-list"></div>
-        </div>
-        <div class="section">
           <h2>Integrations</h2>
           <div id="integrations-list"></div>
           <details style="margin-top:6px">
@@ -932,6 +922,20 @@
             <label for="integ-auth-header" class="visually-hidden">Auth header value, optional</label>
             <input id="integ-auth-header" placeholder="Auth header value (optional)" style="margin-bottom:4px"/>
             <button onclick="addIntegration()">Add</button>
+          </details>
+        </div>
+        <div class="section">
+          <details>
+            <summary><h2 style="display:inline;margin:0">Skills</h2></summary>
+            <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Skills are SKILL.md files the agent loads on demand. Built-in skills ship with Dodo; personal skills you author here. Workspace skills (per-session, from <code>.dodo/skills/</code> etc.) are not shown here.</p>
+            <div id="skills-list"></div>
+          </details>
+        </div>
+        <div class="section">
+          <details>
+            <summary><h2 style="display:inline;margin:0">Tools</h2></summary>
+            <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Tools available to the agent. Dimmed entries are gated on session config (codemode, browser) or reachable only inside a codemode block (most git ops). Configure MCP integrations above to add more.</p>
+            <div id="tool-catalog-list"></div>
           </details>
         </div>
         <div class="section">

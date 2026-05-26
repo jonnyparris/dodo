@@ -1468,25 +1468,29 @@ export class UserControl extends DurableObject<Env> {
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO user_config (key, value, updated_at) VALUES (?, ?, ?)", key, String(value), now);
     }
 
-    const existingCount = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM approved_mcps WHERE is_deleted = 0"))[0] as SqlRow | null);
-    if (Number(existingCount?.n ?? 0) === 0) {
-      const { getDeployMcpCatalog } = await import("./mcp-catalog");
-      const seedNow = Date.now();
-      for (const entry of getDeployMcpCatalog(this.env)) {
-        this.ctx.storage.sql.exec(
-          `INSERT INTO approved_mcps (mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status, is_deleted, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'enabled', 0, ?, ?)`,
-          entry.url,
-          entry.id,
-          entry.name,
-          entry.description ?? null,
-          entry.setupGuide ?? null,
-          JSON.stringify(entry.knownHosts ?? []),
-          entry.auth_type ?? "static_headers",
-          seedNow,
-          seedNow,
-        );
-      }
+    // Seed `approved_mcps` from the code-level catalog. We use `INSERT OR IGNORE`
+    // keyed by `mcp_url` so:
+    //   - On first run, every catalog entry is inserted.
+    //   - On subsequent runs, only NEW entries (not yet in the table) are
+    //     inserted; admin-edited rows and soft-deleted rows are preserved.
+    // This is how adding a new entry to `mcp-catalog.ts` propagates to all
+    // existing UserControl DOs without an explicit migration.
+    const { getDeployMcpCatalog } = await import("./mcp-catalog");
+    const seedNow = Date.now();
+    for (const entry of getDeployMcpCatalog(this.env)) {
+      this.ctx.storage.sql.exec(
+        `INSERT OR IGNORE INTO approved_mcps (mcp_url, id, display_name, description, setup_guide, known_hosts, auth_type, status, is_deleted, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'enabled', 0, ?, ?)`,
+        entry.url,
+        entry.id,
+        entry.name,
+        entry.description ?? null,
+        entry.setupGuide ?? null,
+        JSON.stringify(entry.knownHosts ?? []),
+        entry.auth_type ?? "static_headers",
+        seedNow,
+        seedNow,
+      );
     }
   }
 
