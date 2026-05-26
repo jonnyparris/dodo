@@ -1634,14 +1634,22 @@ app.post("/api/mcp/start-auth", async (c) => {
     const callbackHost = c.env.WORKER_URL && c.env.WORKER_URL !== "http://localhost:8787"
       ? c.env.WORKER_URL
       : inferredHost;
-    // callbackPath must point at a real route, not just the prefix. We
-    // mount `app.all("/agents/*")` (one path segment minimum). Registering
-    // `/agents` as the redirect_uri makes the OAuth provider redirect to a
-    // path that doesn't match the wildcard, and Dodo returns 404. Use a
-    // dedicated, stable subpath under `/agents/`.
+    // callbackPath follows the Agents-SDK convention used by Seal et al:
+    // `/agents/<kebab-class-name>/<instance-name>/callback`. The trailing
+    // /callback segment matters — some OAuth providers (cf-portal in
+    // particular) reject redirect URIs that don't end in a recognised
+    // OAuth-callback suffix with "Redirect URI not allowed by application
+    // configuration". Using the SDK's canonical shape also keeps us
+    // compatible with `/agents/*` routing on the way back.
+    //
+    // userEmail is already canonicalized (lowercased + trimmed) by the
+    // auth middleware so it's safe to embed in a URL path. Edge case:
+    // emails contain `@` and `.` which are valid in URL path segments
+    // per RFC 3986 — no encoding needed and no provider rejects them.
+    const callbackPath = `/agents/coding-agent/${userEmail}/callback`;
     const result = await stub.addMcpServer(displayName, mcpUrl, {
       callbackHost,
-      callbackPath: "/agents/oauth/callback",
+      callbackPath,
     });
     if (result.state === "authenticating") {
       return c.json({ authUrl: result.authUrl });
