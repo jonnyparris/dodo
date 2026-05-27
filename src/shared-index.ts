@@ -444,6 +444,76 @@ export class SharedIndex extends DurableObject<Env> {
         return Response.json({ cleared: true });
       }
 
+      // ─── Chat-monitor registry ───
+      //
+      // Source-of-truth lives in each ChatMonitorAgent DO; this is a
+      // global cache so the admin UI / MCP tools can enumerate monitors
+      // without scanning every user. Best-effort consistency — the DO
+      // pushes updates on create/start/stop/delete.
+
+      if (request.method === "POST" && url.pathname === "/chat-monitors") {
+        const body = (await request.json()) as {
+          ownerEmail?: string;
+          spaceId?: string;
+          enabled?: boolean;
+          pollIntervalSeconds?: number;
+          createdAt?: number;
+        };
+        if (!body.ownerEmail || !body.spaceId) {
+          return Response.json({ error: "ownerEmail and spaceId required" }, { status: 400 });
+        }
+        const now = Math.floor(Date.now() / 1000);
+        this.ctx.storage.sql.exec(
+          `INSERT INTO chat_monitors (owner_email, space_id, enabled, poll_interval_seconds, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (owner_email, space_id) DO UPDATE SET
+             enabled = excluded.enabled,
+             poll_interval_seconds = excluded.poll_interval_seconds,
+             updated_at = excluded.updated_at`,
+          body.ownerEmail.trim().toLowerCase(),
+          body.spaceId,
+          body.enabled ? 1 : 0,
+          body.pollIntervalSeconds ?? 0,
+          body.createdAt ?? now,
+          now,
+        );
+        return Response.json({ ok: true });
+      }
+
+      if (request.method === "GET" && url.pathname === "/chat-monitors") {
+        const rows = Array.from(
+          this.ctx.storage.sql.exec(
+            "SELECT owner_email, space_id, enabled, poll_interval_seconds, created_at, updated_at FROM chat_monitors ORDER BY updated_at DESC",
+          ),
+        );
+        const monitors = rows.map((row) => {
+          const r = row as unknown as Record<string, unknown>;
+          return {
+            ownerEmail: String(r.owner_email ?? ""),
+            spaceId: String(r.space_id ?? ""),
+            enabled: Number(r.enabled ?? 0) === 1,
+            pollIntervalSeconds: Number(r.poll_interval_seconds ?? 0),
+            createdAt: Number(r.created_at ?? 0),
+            updatedAt: Number(r.updated_at ?? 0),
+          };
+        });
+        return Response.json({ monitors });
+      }
+
+      {
+        const m = url.pathname.match(/^\/chat-monitors\/([^/]+)\/(.+)$/);
+        if (m && request.method === "DELETE") {
+          const owner = decodeURIComponent(m[1]);
+          const space = decodeURIComponent(m[2]);
+          this.ctx.storage.sql.exec(
+            "DELETE FROM chat_monitors WHERE owner_email = ? AND space_id = ?",
+            owner.trim().toLowerCase(),
+            space,
+          );
+          return Response.json({ ok: true });
+        }
+      }
+
       // ─── Admin stats ───
 
       if (request.method === "GET" && url.pathname === "/stats") {
@@ -724,6 +794,22 @@ export class SharedIndex extends DurableObject<Env> {
 
     // Phase 6: browser_enabled column (migration-safe)
     this.migrateAddBrowserEnabled();
+
+    // Chat-monitor registry — lets admin UI/tools enumerate
+    // ChatMonitorAgent DOs without scanning every UserControl. Each
+    // ChatMonitorAgent writes/deletes its own row in its `registerWithIndex`
+    // helper. Source-of-truth still lives in the DO; this is a cache.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS chat_monitors (
+        owner_email TEXT NOT NULL,
+        space_id TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 0,
+        poll_interval_seconds INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_email, space_id)
+      )
+    `);
   }
 
   // ─── Seed session registry ───

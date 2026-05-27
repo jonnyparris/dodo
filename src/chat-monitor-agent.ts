@@ -53,7 +53,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
-import { getUserControlStub } from "./auth";
+import { getSharedIndexStub, getUserControlStub } from "./auth";
 import { HttpMcpClient, type McpClientConfig } from "./mcp-client";
 import type { Env } from "./types";
 
@@ -87,6 +87,13 @@ const DECISION_MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 // ─── Schemas ───
 
+/**
+ * Sender resource pattern: `users/<digits>` as returned by Google Chat
+ * (e.g. `users/106320663698754747363`). Exported so the UI / tests can
+ * validate user input the same way.
+ */
+export const SENDER_RESOURCE_PATTERN = /^users\/\d+$/;
+
 export const createMonitorSchema = z
   .object({
     ownerEmail: z.string().email(),
@@ -104,6 +111,23 @@ export const createMonitorSchema = z
       .min(MIN_POLL_INTERVAL_SECONDS)
       .max(3600)
       .default(DEFAULT_POLL_INTERVAL_SECONDS),
+    /**
+     * Hard, code-level allowlist of sender resource names (e.g.
+     * `users/106320663698754747363`) whose messages may trigger a reply.
+     * When non-empty, any message whose sender is not on the list is
+     * skipped *before* the LLM is consulted — neither token spend nor
+     * prompt-injection risk.
+     *
+     * Empty array means "no allowlist enforcement" — every HUMAN message
+     * goes to the LLM (BOT messages are always blocked separately).
+     */
+    commandSenders: z
+      .array(z.string().regex(SENDER_RESOURCE_PATTERN))
+      .max(20)
+      .default([])
+      .describe(
+        "Resource names (e.g. 'users/106320663698754747363') whose messages may trigger a reply. Empty = no hard filter.",
+      ),
   })
   .strict();
 export type CreateMonitorInput = z.infer<typeof createMonitorSchema>;
@@ -113,11 +137,26 @@ interface MonitorRow {
   space_id: string;
   persona: string;
   poll_interval_seconds: number;
+  /** JSON-encoded string[]; "" when unset. */
+  command_senders_json: string;
   last_seen_iso: string | null;
   enabled: number;
   last_error: string | null;
   last_run_iso: string | null;
   created_at: number;
+}
+
+/** One row in the decisions log — what the monitor saw and what it did. */
+export interface DecisionLogEntry {
+  ts: number; // unix seconds
+  messageName: string;
+  senderResource: string;
+  senderType: "HUMAN" | "BOT" | "UNKNOWN";
+  sourceText: string;
+  reply: boolean;
+  replyText: string | null;
+  skipReason: string | null;
+  rawModelOutput: string | null;
 }
 
 interface ChatMessage {
@@ -175,6 +214,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         space_id TEXT NOT NULL,
         persona TEXT NOT NULL,
         poll_interval_seconds INTEGER NOT NULL,
+        command_senders_json TEXT NOT NULL DEFAULT '[]',
         last_seen_iso TEXT,
         enabled INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
@@ -183,12 +223,39 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         PRIMARY KEY (owner_email, space_id)
       )
     `);
+    // Idempotent column add for monitors created before commandSenders shipped.
+    // CREATE TABLE IF NOT EXISTS won't run when the table already exists, so
+    // pre-existing rows would be missing this column.
+    try {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE monitor_state ADD COLUMN command_senders_json TEXT NOT NULL DEFAULT '[]'",
+      );
+    } catch {
+      // Column already exists — fine.
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS replied_messages (
         message_name TEXT PRIMARY KEY,
         replied_at INTEGER NOT NULL
       )
     `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS decision_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        message_name TEXT NOT NULL,
+        sender_resource TEXT NOT NULL,
+        sender_type TEXT NOT NULL,
+        source_text TEXT NOT NULL,
+        reply INTEGER NOT NULL,
+        reply_text TEXT,
+        skip_reason TEXT,
+        raw_model_output TEXT
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS decision_log_ts ON decision_log(ts DESC)",
+    );
     this.migrated = true;
   }
 
@@ -203,17 +270,20 @@ export class ChatMonitorAgent extends DurableObject<Env> {
   private writeState(input: CreateMonitorInput): MonitorRow {
     this.ensureMigrations();
     const now = Math.floor(Date.now() / 1000);
+    const sendersJson = JSON.stringify(input.commandSenders);
     this.ctx.storage.sql.exec(
       `INSERT INTO monitor_state
-         (owner_email, space_id, persona, poll_interval_seconds, last_seen_iso, enabled, created_at)
-       VALUES (?, ?, ?, ?, NULL, 0, ?)
+         (owner_email, space_id, persona, poll_interval_seconds, command_senders_json, last_seen_iso, enabled, created_at)
+       VALUES (?, ?, ?, ?, ?, NULL, 0, ?)
        ON CONFLICT (owner_email, space_id) DO UPDATE SET
          persona = excluded.persona,
-         poll_interval_seconds = excluded.poll_interval_seconds`,
+         poll_interval_seconds = excluded.poll_interval_seconds,
+         command_senders_json = excluded.command_senders_json`,
       input.ownerEmail,
       input.spaceId,
       input.persona,
       input.pollIntervalSeconds,
+      sendersJson,
       now,
     );
     return this.readState()!;
@@ -273,6 +343,115 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     );
   }
 
+  /**
+   * Append one decision to the persistent log. Triggers retention (keep
+   * last 200 rows) opportunistically so we don't grow unbounded — chosen
+   * over a TTL because new monitors have low traffic and old rows still
+   * carry value, but a runaway monitor could otherwise eat unbounded
+   * SQLite quota.
+   */
+  private recordDecision(d: {
+    messageName: string;
+    senderResource: string;
+    senderType: ChatMessage["senderType"];
+    sourceText: string;
+    reply: boolean;
+    replyText?: string;
+    rawModelOutput?: string;
+    skipReason?: string;
+  }): void {
+    this.ensureMigrations();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO decision_log
+         (ts, message_name, sender_resource, sender_type, source_text, reply, reply_text, skip_reason, raw_model_output)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      Math.floor(Date.now() / 1000),
+      d.messageName,
+      d.senderResource,
+      d.senderType,
+      d.sourceText,
+      d.reply ? 1 : 0,
+      d.replyText ?? null,
+      d.skipReason ?? null,
+      d.rawModelOutput ?? null,
+    );
+    // Opportunistic retention — keep newest 200 rows. id is autoincrement
+    // so MAX(id) is the newest.
+    this.ctx.storage.sql.exec(
+      `DELETE FROM decision_log
+       WHERE id IN (
+         SELECT id FROM decision_log
+         ORDER BY id DESC
+         LIMIT -1 OFFSET 200
+       )`,
+    );
+  }
+
+  private readDecisions(limit: number): DecisionLogEntry[] {
+    this.ensureMigrations();
+    const capped = Math.max(1, Math.min(200, limit));
+    const rows = Array.from(
+      this.ctx.storage.sql.exec(
+        "SELECT ts, message_name, sender_resource, sender_type, source_text, reply, reply_text, skip_reason, raw_model_output FROM decision_log ORDER BY id DESC LIMIT ?",
+        capped,
+      ),
+    );
+    return rows.map((row) => {
+      const r = row as unknown as Record<string, unknown>;
+      return {
+        ts: Number(r.ts ?? 0),
+        messageName: String(r.message_name ?? ""),
+        senderResource: String(r.sender_resource ?? ""),
+        senderType: (String(r.sender_type ?? "UNKNOWN") as DecisionLogEntry["senderType"]),
+        sourceText: String(r.source_text ?? ""),
+        reply: Number(r.reply ?? 0) === 1,
+        replyText: r.reply_text === null || r.reply_text === undefined ? null : String(r.reply_text),
+        skipReason: r.skip_reason === null || r.skip_reason === undefined ? null : String(r.skip_reason),
+        rawModelOutput: r.raw_model_output === null || r.raw_model_output === undefined ? null : String(r.raw_model_output),
+      };
+    });
+  }
+
+  /**
+   * Tell SharedIndex about this monitor so admin UI / MCP tools can
+   * enumerate all monitors without iterating every UserControl DO. Idempotent;
+   * best-effort (a SharedIndex hiccup must not break a chat-monitor write).
+   */
+  private async registerWithIndex(row: MonitorRow): Promise<void> {
+    try {
+      const stub = getSharedIndexStub(this.env);
+      await stub.fetch("https://shared-index/chat-monitors", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ownerEmail: row.owner_email,
+          spaceId: row.space_id,
+          enabled: row.enabled === 1,
+          pollIntervalSeconds: row.poll_interval_seconds,
+          createdAt: row.created_at,
+        }),
+      });
+    } catch (err) {
+      log("warn", "chat-monitor SharedIndex register failed (non-fatal)", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async unregisterFromIndex(ownerEmail: string, spaceId: string): Promise<void> {
+    try {
+      const stub = getSharedIndexStub(this.env);
+      await stub.fetch(
+        `https://shared-index/chat-monitors/${encodeURIComponent(ownerEmail)}/${encodeURIComponent(spaceId)}`,
+        { method: "DELETE" },
+      );
+    } catch (err) {
+      log("warn", "chat-monitor SharedIndex unregister failed (non-fatal)", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   // ── HTTP surface (called by index.ts via proxy) ──
 
   override async fetch(request: Request): Promise<Response> {
@@ -282,6 +461,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       if (request.method === "POST" && url.pathname === "/create") {
         const body = createMonitorSchema.parse(await request.json());
         const row = this.writeState(body);
+        await this.registerWithIndex(row);
         return Response.json({ state: this.serializeState(row) });
       }
 
@@ -292,6 +472,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           return Response.json({ error: "monitor not created — POST /create first" }, { status: 400 });
         }
         await this.ctx.storage.setAlarm(Date.now() + row.poll_interval_seconds * 1000);
+        await this.registerWithIndex(row);
         log("info", "monitor started", { space: row.space_id, owner: row.owner_email, intervalS: row.poll_interval_seconds });
         return Response.json({ state: this.serializeState(row) });
       }
@@ -303,6 +484,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         try {
           await this.ctx.storage.deleteAlarm();
         } catch { /* best-effort */ }
+        await this.registerWithIndex(row);
         log("info", "monitor stopped", { space: row.space_id, owner: row.owner_email });
         return Response.json({ state: this.serializeState(row) });
       }
@@ -314,6 +496,13 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         return Response.json({ state: this.serializeState(row) });
       }
 
+      // GET /decisions?limit=N — recent decision log entries (newest first)
+      if (request.method === "GET" && url.pathname === "/decisions") {
+        const limitParam = url.searchParams.get("limit");
+        const limit = limitParam ? parseInt(limitParam, 10) || 50 : 50;
+        return Response.json({ decisions: this.readDecisions(limit) });
+      }
+
       // POST /tick — fire one cycle now (used for tests / manual debugging)
       if (request.method === "POST" && url.pathname === "/tick") {
         const result = await this.runTick();
@@ -322,12 +511,17 @@ export class ChatMonitorAgent extends DurableObject<Env> {
 
       // DELETE / — wipe storage entirely
       if (request.method === "DELETE" && url.pathname === "/") {
+        const existing = this.readState();
         try {
           await this.ctx.storage.deleteAlarm();
         } catch { /* best-effort */ }
         this.ctx.storage.sql.exec("DROP TABLE IF EXISTS monitor_state");
         this.ctx.storage.sql.exec("DROP TABLE IF EXISTS replied_messages");
+        this.ctx.storage.sql.exec("DROP TABLE IF EXISTS decision_log");
         this.migrated = false;
+        if (existing) {
+          await this.unregisterFromIndex(existing.owner_email, existing.space_id);
+        }
         return Response.json({ deleted: true });
       }
 
@@ -424,16 +618,27 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       skipReason?: string;
     }> = [];
 
-    // 3. For each, decide whether to reply.
+    const commandSenders = parseCommandSenders(row.command_senders_json);
+    const allowlistActive = commandSenders.length > 0;
+
+    // 3. For each, decide whether to reply. Gates layer in order:
     //
-    //    - BOT messages are skipped without consulting the LLM. This is a
-    //      hard rule: replying to a BOT (especially ARIA — which is what
-    //      *we* send through) closes a feedback loop and burns through
-    //      tokens forever.
-    //    - HUMAN / UNKNOWN messages go to the LLM with the configured persona.
+    //    a. BOT sender → skip (feedback-loop guard, never bypassable).
+    //    b. commandSenders allowlist (when non-empty) → skip if not on it.
+    //       This is a CODE-level filter; the LLM is not consulted at all,
+    //       so prompt-injection can't bypass it.
+    //    c. LLM decide() with the persona prompt → may still return reply=false.
     for (const msg of limited) {
       try {
         if (msg.senderType === "BOT") {
+          this.recordDecision({
+            messageName: msg.name,
+            senderResource: msg.senderResource,
+            senderType: msg.senderType,
+            sourceText: msg.text.slice(0, 200),
+            reply: false,
+            skipReason: "sender_is_bot",
+          });
           decisions.push({
             messageName: msg.name,
             senderResource: msg.senderResource,
@@ -446,7 +651,41 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           this.markReplied(msg.name);
           continue;
         }
+
+        if (allowlistActive && !commandSenders.includes(msg.senderResource)) {
+          // Hard skip — message author is not on the command allowlist.
+          // The LLM is never consulted; the decision is purely code-level.
+          this.recordDecision({
+            messageName: msg.name,
+            senderResource: msg.senderResource,
+            senderType: msg.senderType,
+            sourceText: msg.text.slice(0, 200),
+            reply: false,
+            skipReason: "sender_not_in_allowlist",
+          });
+          decisions.push({
+            messageName: msg.name,
+            senderResource: msg.senderResource,
+            senderType: msg.senderType,
+            sourceText: msg.text.slice(0, 200),
+            reply: false,
+            skipReason: "sender_not_in_allowlist",
+          });
+          skipped++;
+          this.markReplied(msg.name);
+          continue;
+        }
+
         const decision = await this.decide(row.persona, msg);
+        this.recordDecision({
+          messageName: msg.name,
+          senderResource: msg.senderResource,
+          senderType: msg.senderType,
+          sourceText: msg.text.slice(0, 200),
+          reply: decision.reply,
+          replyText: decision.text,
+          rawModelOutput: decision.raw?.slice(0, 200),
+        });
         decisions.push({
           messageName: msg.name,
           senderResource: msg.senderResource,
@@ -677,12 +916,26 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       spaceId: row.space_id,
       persona: row.persona,
       pollIntervalSeconds: row.poll_interval_seconds,
+      commandSenders: parseCommandSenders(row.command_senders_json),
       lastSeenIso: row.last_seen_iso,
       enabled: row.enabled === 1,
       lastError: row.last_error,
       lastRunIso: row.last_run_iso,
       createdAt: row.created_at,
     };
+  }
+}
+
+/** Parse the JSON-encoded commandSenders column. Tolerant to malformed
+ *  input (returns []) so a corrupted row can't kill the DO. Exported for tests. */
+export function parseCommandSenders(json: string | null | undefined): string[] {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((s): s is string => typeof s === "string");
+  } catch {
+    return [];
   }
 }
 
