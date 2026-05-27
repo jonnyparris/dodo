@@ -1153,12 +1153,17 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           `chat_get_messages tool not found on cf-portal; available: ${tools.slice(0, 5).map((t) => t.name).join(", ")}`,
         );
       }
+      // Pull newest-first and filter locally. Empirically the cf-portal
+      // tool's `after` parameter doesn't reliably narrow results when
+      // newestFirst=false (returns 0 even when newer messages exist).
+      // Asking for the newest 25 and applying the `lastSeenIso` filter
+      // in runTick is robust to that quirk and to clock-skew between
+      // Google and our cursor.
       const callArgs: Record<string, unknown> = {
         spaceName: spaceId,
         maxResults: 25,
-        newestFirst: false,
+        newestFirst: true,
       };
-      if (afterIso) callArgs.after = afterIso;
       const result = await client.callTool(chatTool.name, callArgs);
       if (result.isError) {
         const text = result.content.map((c) => c.text ?? "").join("\n");
