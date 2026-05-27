@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
+import { chatMonitorIdName, createMonitorSchema } from "./chat-monitor-agent";
 import { log } from "./logger";
 import { messageLimiter, promptLimiter } from "./rate-limit";
 import { createDraftPrForRun, createGithubRepo, pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-api";
@@ -1953,6 +1954,123 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
         messageCount: (messages.messages ?? messages.records ?? []).length,
         lastError,
       });
+    },
+  );
+
+  // ─── Admin: ChatMonitorAgent PoC tool surface ───
+  //
+  // Mirrors the HTTP routes in index.ts, but addressable as MCP tools
+  // from any client that holds a Dodo MCP token (admin service-mode or
+  // a per-user `dodo_*` token).
+  //
+  // All tools are admin-gated. The `ownerEmail` argument lets the admin
+  // operate against any user's UserControl DO — required because the
+  // cf-portal refresh-token MCP config is stored per-owner.
+
+  const chatMonitorStubFor = (ownerEmail: string, spaceId: string) => {
+    const id = env.CHAT_MONITOR.idFromName(chatMonitorIdName(ownerEmail, spaceId));
+    return env.CHAT_MONITOR.get(id);
+  };
+
+  const proxyChatMonitor = async (
+    ownerEmail: string,
+    spaceId: string,
+    path: string,
+    init?: RequestInit,
+  ): Promise<unknown> => {
+    const stub = chatMonitorStubFor(ownerEmail, spaceId);
+    const res = await stub.fetch(`https://chat-monitor${path}`, init);
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { status: res.status, body: text };
+    }
+  };
+
+  server.tool(
+    "chat_monitor_upsert",
+    "ADMIN-ONLY. Create or update a Google Chat monitor for (ownerEmail, spaceId). The monitor polls the space and decides replies via Kimi K2.6. After upsert, call `chat_monitor_start` to begin polling. Persona is free-form instructions for the decider model.",
+    createMonitorSchema.shape,
+    async (args) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const parsed = createMonitorSchema.parse(args);
+      const result = await proxyChatMonitor(parsed.ownerEmail, parsed.spaceId, "/create", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(parsed),
+      });
+      return textResult(result);
+    },
+  );
+
+  server.tool(
+    "chat_monitor_start",
+    "ADMIN-ONLY. Start the alarm-driven poll loop for a previously-upserted monitor.",
+    {
+      ownerEmail: z.string().email().describe("Owner whose UserControl holds the cf-portal MCP config."),
+      spaceId: z.string().min(1).regex(/^spaces\//).describe("Google Chat space resource name."),
+    },
+    async ({ ownerEmail, spaceId }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const result = await proxyChatMonitor(ownerEmail, spaceId, "/start", { method: "POST" });
+      return textResult(result);
+    },
+  );
+
+  server.tool(
+    "chat_monitor_stop",
+    "ADMIN-ONLY. Stop polling. The monitor config is preserved — call `chat_monitor_start` again to resume.",
+    {
+      ownerEmail: z.string().email(),
+      spaceId: z.string().min(1).regex(/^spaces\//),
+    },
+    async ({ ownerEmail, spaceId }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const result = await proxyChatMonitor(ownerEmail, spaceId, "/stop", { method: "POST" });
+      return textResult(result);
+    },
+  );
+
+  server.tool(
+    "chat_monitor_tick",
+    "ADMIN-ONLY. Fire one poll-decide-reply cycle immediately. Useful for debugging — returns counts (fetched/new/replied/skipped) and any per-message errors.",
+    {
+      ownerEmail: z.string().email(),
+      spaceId: z.string().min(1).regex(/^spaces\//),
+    },
+    async ({ ownerEmail, spaceId }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const result = await proxyChatMonitor(ownerEmail, spaceId, "/tick", { method: "POST" });
+      return textResult(result);
+    },
+  );
+
+  server.tool(
+    "chat_monitor_state",
+    "ADMIN-ONLY. Read the monitor's current state (persona, interval, lastSeenIso, enabled, lastError, lastRunIso).",
+    {
+      ownerEmail: z.string().email(),
+      spaceId: z.string().min(1).regex(/^spaces\//),
+    },
+    async ({ ownerEmail, spaceId }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const result = await proxyChatMonitor(ownerEmail, spaceId, "/state");
+      return textResult(result);
+    },
+  );
+
+  server.tool(
+    "chat_monitor_delete",
+    "ADMIN-ONLY. Wipe the monitor entirely (storage + alarm). Use this to reset state for a smoke test.",
+    {
+      ownerEmail: z.string().email(),
+      spaceId: z.string().min(1).regex(/^spaces\//),
+    },
+    async ({ ownerEmail, spaceId }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const result = await proxyChatMonitor(ownerEmail, spaceId, "/", { method: "DELETE" });
+      return textResult(result);
     },
   );
 
