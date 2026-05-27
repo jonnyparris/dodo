@@ -2839,7 +2839,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // + counters; DELETE removes the watchdog and cancels its
       // schedule. See src/watchdog.ts for the pure decision logic.
       if (request.method === "GET" && url.pathname === "/watchdog") {
-        return Response.json(this.readWatchdogState());
+        return Response.json(this.watchdogStore.read());
       }
       if (request.method === "PUT" && url.pathname === "/watchdog") {
         return await this.handleInstallWatchdog(request);
@@ -4025,30 +4025,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   // metadata for observability. The schedule id is also stored so
   // re-installs can cancel cleanly.
 
-  private readWatchdogConfig(): WatchdogConfig | null {
-    const raw = this.readMetadata("watchdog_config");
-    if (!raw) return null;
-    try {
-      return JSON.parse(raw) as WatchdogConfig;
-    } catch {
-      return null;
-    }
-  }
-
-  private readWatchdogState(): Record<string, unknown> {
-    const config = this.readWatchdogConfig();
-    const scheduleId = this.readMetadata("watchdog_schedule_id");
-    return {
-      armed: !!config && !!scheduleId,
-      config,
-      scheduleId,
-      lastCheckedAt: this.readMetadata("watchdog_last_checked_at"),
-      lastFiredAt: this.readMetadata("watchdog_last_fired_at"),
-      lastFiredForPromptId: this.readMetadata("watchdog_last_fired_for_prompt_id"),
-      fireCount: Number(this.readMetadata("watchdog_fire_count") ?? "0"),
-    };
-  }
-
   private async handleInstallWatchdog(request: Request): Promise<Response> {
     let raw: unknown;
     try {
@@ -4064,29 +4040,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
 
     // Cancel any existing watchdog schedule before installing the new one.
-    const prevScheduleId = this.readMetadata("watchdog_schedule_id");
+    const prevScheduleId = this.watchdogStore.readScheduleId();
     if (prevScheduleId) {
       try { await this.cancelSchedule(prevScheduleId); } catch { /* no-op */ }
     }
 
     const scheduled = await this.schedule(config.checkCron, "runWatchdogCheck", {});
-    this.writeMetadata("watchdog_config", JSON.stringify(config));
-    this.writeMetadata("watchdog_schedule_id", scheduled.id);
-    // Reset fire counters when (re)installing — a new config is a new
-    // contract; stale `lastFiredForPromptId` from a prior watchdog
-    // shouldn't block the new one.
-    this.writeMetadata("watchdog_last_fired_for_prompt_id", "");
-    this.writeMetadata("watchdog_fire_count", "0");
-    return Response.json(this.readWatchdogState(), { status: 201 });
+    this.watchdogStore.install(config, scheduled.id);
+    return Response.json(this.watchdogStore.read(), { status: 201 });
   }
 
   private async handleDeleteWatchdog(): Promise<Response> {
-    const scheduleId = this.readMetadata("watchdog_schedule_id");
+    const scheduleId = this.watchdogStore.readScheduleId();
     if (scheduleId) {
       try { await this.cancelSchedule(scheduleId); } catch { /* no-op */ }
     }
-    this.writeMetadata("watchdog_config", "");
-    this.writeMetadata("watchdog_schedule_id", "");
+    this.watchdogStore.uninstall();
     return Response.json({ deleted: true });
   }
 
@@ -4095,41 +4064,38 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    *  notifies, aborts, or nudges. Safe to call when no watchdog is
    *  installed — it just no-ops. */
   async runWatchdogCheck(): Promise<void> {
-    const config = this.readWatchdogConfig();
+    const config = this.watchdogStore.readConfig();
     if (!config) return;
 
     const now = nowEpoch();
-    this.writeMetadata("watchdog_last_checked_at", String(now));
+    this.watchdogStore.recordChecked(now);
 
     // Resolve last-activity timestamp. `updated_at` is stamped on every
     // metadata write — we parse the ISO string back to epoch seconds.
-    const updatedIso = this.readMetadata("updated_at");
-    const updatedAtEpoch = updatedIso ? Math.floor(Date.parse(updatedIso) / 1000) : null;
+    const snapshot = this.control.read();
+    const updatedAtEpoch = snapshot.updatedAt
+      ? Math.floor(Date.parse(snapshot.updatedAt) / 1000)
+      : null;
 
     const verdict = evaluateSession(
       {
-        status: this.readMetadata("status"),
-        activePromptId: this.readMetadata("active_prompt_id"),
+        status: snapshot.status,
+        activePromptId: snapshot.activePromptId,
         lastActivityAt: updatedAtEpoch ?? 0,
-        lastFiredForPromptId: this.readMetadata("watchdog_last_fired_for_prompt_id") || null,
+        lastFiredForPromptId: this.watchdogStore.readLastFiredForPromptId(),
         config,
       },
       now * 1000,
     );
     if (verdict.kind !== "stalled") return;
 
-    const sessionId = this.readMetadata("session_id") ?? "unknown";
-    const title = this.readMetadata("title") ?? sessionId;
-    const ownerEmail = this.readMetadata("owner_email") ?? undefined;
+    const sessionId = snapshot.sessionId ?? "unknown";
+    const title = snapshot.title ?? sessionId;
+    const ownerEmail = snapshot.ownerEmail ?? undefined;
 
     // Record fire BEFORE taking action so a retry of this same tick
     // (alarm replay) won't double-fire.
-    this.writeMetadata("watchdog_last_fired_at", String(now));
-    this.writeMetadata("watchdog_last_fired_for_prompt_id", verdict.activePromptId);
-    this.writeMetadata(
-      "watchdog_fire_count",
-      String(Number(this.readMetadata("watchdog_fire_count") ?? "0") + 1),
-    );
+    this.watchdogStore.recordFired(verdict.activePromptId, now);
 
     const body = formatStallBody(sessionId, verdict, config.action);
 
@@ -4383,14 +4349,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     // handleMessage is synchronous — callers (MCP, external integrations) expect the
     // assistant response in the HTTP reply. Queuing would lose the response. Keep 409.
-    if (this.readMetadata("active_prompt_id")) {
+    // This is the only path that doesn't go through SessionLifecycle (sync semantics
+    // mean we don't spawn a fiber); status/title management is done by hand using the
+    // typed control plane.
+    if (this.control.readActivePromptId()) {
       return Response.json({ error: "A prompt is already running" }, { status: 409 });
     }
 
-    const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
-    this.writeMetadata("title", title);
-    this.writeMetadata("status", "running");
+    const existingTitle = this.control.readTitle();
+    const title = existingTitle ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
+    if (!existingTitle) this.control.setTitle(title);
+    this.control.setStatus("running");
     await this.syncSessionIndex({ status: "running", title });
+
+    const notifyOwner = this.control.readOwnerEmail() ?? undefined;
 
     this.ensureThinkConfig(request);
     await this.readAppConfig();
@@ -4400,11 +4372,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // Guard: treat empty LLM response as a failure (same as runFiberPrompt)
       if (!result.text && !result.assistantMessageId) {
         const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
-        this.writeMetadata("status", "idle");
+        this.control.setStatus("idle");
         await this.syncSessionIndex({ status: "idle", title });
         this.emitEvent({ data: { message }, type: "error_message" });
         this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-        dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+        dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: notifyOwner });
         return Response.json({ error: message, sessionId }, { status: 502 });
       }
 
@@ -4414,20 +4386,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         { messageId: result.assistantMessageId, model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: result.tokenInput, tokenOutput: result.tokenOutput, authorEmail: null, createdAt: nowEpoch() },
       );
 
-      this.writeMetadata("status", "idle");
+      this.control.setStatus("idle");
       await this.syncSessionIndex({ status: "idle", title });
       this.emitEvent({ data: assistantRecord, type: "message" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-      dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+      dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: notifyOwner });
 
       return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, sessionId, steps: 0, toolCalls: [] });
     } catch (error) {
-      this.writeMetadata("status", "idle");
+      this.control.setStatus("idle");
       await this.syncSessionIndex({ status: "idle", title });
       const message = error instanceof Error ? error.message : "Unknown LLM failure";
       this.emitEvent({ data: { message }, type: "error_message" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-      dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
+      dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: notifyOwner });
       return Response.json({ error: message, sessionId }, { status: 502 });
     }
   }
@@ -4508,23 +4480,23 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return Response.json({ error: "No Think session" }, { status: 500 });
     }
 
-    // Reject when another prompt is already running so we don't corrupt
-    // `active_prompt_id` or dequeue another user's queued prompt on finish.
-    // Matches `handleMessage`'s 409 behaviour — /generate is synchronous so
-    // queueing would lose the response anyway.
-    if (this.readMetadata("active_prompt_id")) {
+    // Start a synchronous prompt via lifecycle. image-gen's policy rejects
+    // when busy (matches the pre-refactor 409 behaviour) and uses
+    // synchronous=true so no fiber is spawned — we run inline below.
+    const startResult = await this.lifecycle.start({
+      source: "image-gen",
+      content: opts.prompt,
+      authorEmail: opts.authorEmail,
+    });
+    if (startResult.kind === "rejected") {
       return Response.json({ error: "A prompt is already running" }, { status: 409 });
     }
-
-    const promptId = crypto.randomUUID();
-    const title = this.readMetadata("title") ?? (opts.prompt.length > 72 ? opts.prompt.slice(0, 72) + "…" : opts.prompt);
-
-    this.writeMetadata("title", title);
-    this.writeMetadata("active_prompt_id", promptId);
-    this.writeMetadata("status", "running");
-    this.insertPrompt(promptId, opts.prompt, "queued", opts.authorEmail);
-    await this.syncSessionIndex({ status: "running", title });
-    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    if (startResult.kind !== "started") {
+      // Shouldn't be reachable for source=image-gen, but be safe.
+      return Response.json({ error: "Unable to start image generation" }, { status: 500 });
+    }
+    const promptId = startResult.promptId;
+    const title = startResult.title;
 
     try {
       // 1. Persist user prompt message
@@ -5802,31 +5774,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private ensureMetadata(sessionId: string, ownerEmail?: string | null): void {
-    const now = nowEpoch();
-    if (!this.readMetadata("session_id")) {
-      this.writeMetadata("session_id", sessionId);
-      this.writeMetadata("created_at", new Date(now * 1000).toISOString());
-
-    }
-    if (ownerEmail && !this.readMetadata("owner_email")) {
-      this.writeMetadata("owner_email", ownerEmail);
-    }
-    if (!this.readMetadata("status")) {
-      this.writeMetadata("status", "idle");
-    }
-    this.writeMetadata("updated_at", new Date(now * 1000).toISOString());
+    this.control.ensureBootstrap(sessionId, ownerEmail);
   }
 
    private readSessionDetails(): SessionState {
-    const createdAt = this.readMetadata("created_at") ?? new Date().toISOString();
-    const updatedAt = this.readMetadata("updated_at") ?? createdAt;
-    const sessionId = this.readMetadata("session_id") ?? "";
-    const ownerEmail = this.readMetadata("owner_email") ?? undefined;
-    const activePromptId = this.readMetadata("active_prompt_id");
-    let status = (this.readMetadata("status") as SessionState["status"] | null) ?? "idle";
+    const snap = this.control.read();
+    const createdAt = snap.createdAt ?? new Date().toISOString();
+    const updatedAt = snap.updatedAt ?? createdAt;
+    const sessionId = snap.sessionId ?? "";
+    const ownerEmail = snap.ownerEmail ?? undefined;
+    const activePromptId = snap.activePromptId;
+    let status: SessionState["status"] = snap.status;
     // Reconcile stale "running" status when no prompt is active
     if (status === "running" && !activePromptId) {
-      this.writeMetadata("status", "idle");
+      this.control.setStatus("idle");
       status = "idle";
       // Fire-and-forget sync to UserControl
       void this.syncSessionIndex({ status: "idle" }).catch(() => {});

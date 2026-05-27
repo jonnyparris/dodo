@@ -18,7 +18,13 @@
 
 import { nowEpoch } from "./sql-helpers";
 
-export type SessionStatus = "idle" | "running" | "completed" | "failed" | "aborted";
+/**
+ * Session-level status (distinct from a prompt's status). Matches
+ * `SessionState["status"]` in `./types`. A session is `running` while
+ * any prompt is active; `idle` between prompts; `deleted` if soft-deleted.
+ * Prompt-level completed/failed/aborted statuses live on the prompts row.
+ */
+export type SessionStatus = "idle" | "running" | "deleted";
 
 export interface SessionControlSnapshot {
   sessionId: string | null;
