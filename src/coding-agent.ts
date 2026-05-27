@@ -2638,11 +2638,23 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     } as never);
 
     // Reconcile orphaned prompt queue — if no prompt is active but the queue
-    // has items, the DO likely evicted between finishPrompt() clearing
-    // active_prompt_id and dequeueAndRunNext() reading the queue.
-    if (!this.readMetadata("active_prompt_id")) {
-      this.dequeueAndRunNext();
+    // has items, the DO likely evicted between lifecycle.finish() clearing
+    // active_prompt_id and the queue dequeue running. Use lifecycle.start
+    // with source="queue" to drain a single item with the right policy.
+    if (!this.control.readActivePromptId()) {
+      void this.drainOneQueuedPrompt();
     }
+  }
+
+  private async drainOneQueuedPrompt(): Promise<void> {
+    const next = (Array.from(this.ctx.storage.sql.exec("SELECT id, content, author_email FROM prompt_queue ORDER BY position ASC LIMIT 1"))[0] as SqlRow | null);
+    if (!next) return;
+    const queuedId = String(next.id);
+    const content = String(next.content);
+    const authorEmail = next.author_email ? String(next.author_email) : null;
+    this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", queuedId);
+    this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
+    await this.lifecycle.start({ source: "queue", content, authorEmail });
   }
 
   /**
@@ -3194,68 +3206,30 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
       case "prompt": {
         const content = typeof parsed.content === "string" ? parsed.content.trim() : "";
-        if (!content) {
-          connection.send(JSON.stringify({ type: "error", error: "Empty prompt content" }));
-          return;
-        }
-        // Delegate to the existing prompt mechanism via internal request
         const entry = this.presence.get(connection.id);
-        const promptId = crypto.randomUUID();
         const sessionId = this.sessionId();
         if (!sessionId) {
           connection.send(JSON.stringify({ type: "error", error: "Session not initialized" }));
           return;
         }
-
-        if (this.readMetadata("active_prompt_id")) {
-          // Queue the prompt instead of rejecting — WS prompts are async (fire-and-forget)
-          const queueResponse = this.enqueuePrompt(content, entry?.email);
-          const queueBody = await queueResponse.json() as { promptId?: string; position?: number };
-          connection.send(JSON.stringify({ type: "prompt_queued", promptId: queueBody.promptId, position: queueBody.position, queued: true }));
-          return;
+        const r = await this.lifecycle.start({ source: "user", content, authorEmail: entry?.email });
+        if (r.kind === "rejected") {
+          connection.send(JSON.stringify({ type: "error", error: r.message }));
+        } else if (r.kind === "queued") {
+          connection.send(JSON.stringify({ type: "prompt_queued", promptId: r.promptId, position: r.position, queued: true }));
+        } else if (r.kind === "started") {
+          connection.send(JSON.stringify({ type: "prompt_queued", promptId: r.promptId }));
         }
-
-        await this.readAppConfig(); // Ensure Think config is populated
-        const existingTitle = this.readMetadata("title");
-        const title = existingTitle || (content.length > 50 ? content.slice(0, 50) + "..." : content);
-
-        if (!existingTitle) this.writeMetadata("title", title);
-        this.writeMetadata("active_prompt_id", promptId);
-        this.writeMetadata("status", "running");
-        this.insertPrompt(promptId, content, "queued", entry?.email);
-        await this.syncSessionIndex({ status: "running", title });
-        this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-
-        connection.send(JSON.stringify({ type: "prompt_queued", promptId }));
-        // Fiber-backed async prompt
-        const fId = this.spawnFiber("runFiberPrompt", {
-          promptId,
-          content,
-          authorEmail: entry?.email,
-          title,
-        }, { maxRetries: 3 });
-        this.setPromptFiberId(promptId, fId);
         break;
       }
 
       case "abort": {
-        const promptId = this.readMetadata("active_prompt_id");
-        if (!promptId) {
+        const r = await this.lifecycle.abortActive();
+        if (r.kind === "noop") {
           connection.send(JSON.stringify({ type: "error", error: "No active prompt" }));
-          return;
+        } else {
+          connection.send(JSON.stringify({ type: "aborted", promptId: r.promptId }));
         }
-        // Signal the AbortController to interrupt the running LLM call immediately
-        if (this._fiberAbortController) {
-          this._fiberAbortController.abort();
-          this._fiberAbortController = null;
-        }
-        // Cancel via fiber
-        const fiberId = this.readPromptFiberId(promptId);
-        if (fiberId) {
-          this.cancelFiber(fiberId);
-        }
-        await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
-        connection.send(JSON.stringify({ type: "aborted", promptId }));
         break;
       }
 
@@ -4172,21 +4146,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (verdict.recommend === "nudge") {
       const nudge = config.nudgePrompt ?? DEFAULT_NUDGE_PROMPT;
       try {
-        // Dispatch the nudge as a fresh fiber-backed prompt. Same
-        // shape as runCronPrompt — no HTTP round-trip needed since
-        // we're already in the owning DO.
-        const promptId = crypto.randomUUID();
-        this.writeMetadata("active_prompt_id", promptId);
-        this.writeMetadata("status", "running");
-        this.insertPrompt(promptId, nudge, "queued", "watchdog");
-        await this.readAppConfig();
-        const fiberId = this.spawnFiber("runFiberPrompt", {
-          promptId,
-          content: nudge,
-          authorEmail: "watchdog",
-          title,
-        }, { maxRetries: 1 });
-        this.setPromptFiberId(promptId, fiberId);
+        await this.lifecycle.start({ source: "watchdog", content: nudge });
       } catch (err) {
         log("warn", "watchdog: nudge dispatch failed", { sessionId, err: err instanceof Error ? err.message : String(err) });
       }
@@ -4215,25 +4175,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   async runCronPrompt(payload: { description: string; prompt: string }): Promise<void> {
-    if (this.readMetadata("active_prompt_id")) {
-      return;
+    // Pre-derive title from description when no title is set yet — cron
+    // is invoked from a schedule callback, not a user, so we want the
+    // schedule's description in the UI rather than a content-derived snippet.
+    if (!this.control.readTitle()) {
+      this.control.setTitle(payload.description);
     }
-
-    const title = this.readMetadata("title") ?? payload.description;
-    const promptId = crypto.randomUUID();
-    this.writeMetadata("active_prompt_id", promptId);
-    this.writeMetadata("status", "running");
-    this.insertPrompt(promptId, payload.prompt, "queued", "cron");
-
-    // Ensure Think config for cron path
-    await this.readAppConfig(); // This populates Think config as a side effect
-    const fiberId = this.spawnFiber("runFiberPrompt", {
-      promptId,
-      content: payload.prompt,
-      authorEmail: "cron",
-      title,
-    }, { maxRetries: 3 });
-    this.setPromptFiberId(promptId, fiberId);
+    await this.lifecycle.start({ source: "cron", content: payload.prompt });
   }
 
   private listCronJobs(): CronJobRecord[] {
@@ -4507,33 +4455,23 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
     }
 
-    // If a prompt is already running, queue this one
-    if (this.readMetadata("active_prompt_id")) {
-      return this.enqueuePrompt(input.content, authorEmail);
-    }
-
-    const promptId = crypto.randomUUID();
-    const title = this.readMetadata("title") ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
-
-    this.writeMetadata("title", title);
-    this.writeMetadata("active_prompt_id", promptId);
-    this.writeMetadata("status", "running");
-    this.insertPrompt(promptId, input.content, "queued", authorEmail);
-    await this.syncSessionIndex({ status: "running", title });
-
-    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-
-    // Fiber-backed async prompt
-    const fiberId = this.spawnFiber("runFiberPrompt", {
-      promptId,
+    const r = await this.lifecycle.start({
+      source: "user",
       content: input.content,
+      authorEmail,
       images: input.images,
-      authorEmail: authorEmail ?? undefined,
-      title,
-    }, { maxRetries: 3 });
-    this.setPromptFiberId(promptId, fiberId);
-
-    return Response.json({ promptId, status: "queued" }, { status: 202 });
+    });
+    if (r.kind === "rejected") {
+      return Response.json({ error: r.message }, { status: 400 });
+    }
+    if (r.kind === "queued") {
+      return Response.json({ status: "queued", promptId: r.promptId, position: r.position }, { status: 202 });
+    }
+    if (r.kind === "skipped") {
+      // Shouldn't happen for source=user, but be defensive.
+      return Response.json({ status: "skipped" }, { status: 409 });
+    }
+    return Response.json({ promptId: r.promptId, status: "queued" }, { status: 202 });
   }
 
   private async handleGenerate(request: Request): Promise<Response> {
@@ -4759,39 +4697,41 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private async handleAbort(): Promise<Response> {
-    const promptId = this.readMetadata("active_prompt_id");
-    if (!promptId) {
+    const r = await this.lifecycle.abortActive();
+    if (r.kind === "noop") {
       return Response.json({ error: "No active prompt" }, { status: 409 });
     }
-
-    // Signal the AbortController to interrupt the running LLM call immediately
-    if (this._fiberAbortController) {
-      this._fiberAbortController.abort();
-      this._fiberAbortController = null;
-    }
-
-    // Cancel via fiber
-    const fiberId = this.readPromptFiberId(promptId);
-    if (fiberId) {
-      this.cancelFiber(fiberId);
-    }
-    await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
-
-    return Response.json({ aborted: true, promptId });
+    return Response.json({ aborted: true, promptId: r.promptId });
   }
 
   // runAsyncPrompt removed — all async prompts now use fiber-backed runFiberPrompt
 
+  /**
+   * Legacy thin wrapper kept so call sites in runFiberPrompt /
+   * runImageGeneration / onFiberComplete still compile. New code should
+   * call `this.lifecycle.finish(...)` directly with a typed FinishCause.
+   */
   private async finishPrompt(
     promptId: string,
-    patch: { error?: string; resultMessageId?: string; status: PromptRecord["status"] },
+    patch: { error?: string; resultMessageId?: string; status: PromptRecord["status"]; text?: string },
   ): Promise<void> {
-    this.updatePrompt(promptId, patch);
-    this.deleteMetadata("active_prompt_id");
-    this.writeMetadata("status", "idle");
-
-    // Dequeue next prompt if any
-    this.dequeueAndRunNext();
+    if (patch.status === "completed") {
+      await this.lifecycle.finish(promptId, {
+        kind: "completed",
+        resultMessageId: patch.resultMessageId,
+        text: patch.text,
+      });
+    } else if (patch.status === "failed") {
+      await this.lifecycle.finish(promptId, {
+        kind: "failed",
+        error: patch.error ?? "Prompt failed",
+      });
+    } else {
+      await this.lifecycle.finish(promptId, {
+        kind: "aborted",
+        reason: patch.error,
+      });
+    }
   }
 
   // ─── Prompt queue management ───
@@ -4808,39 +4748,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     );
     this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
     return Response.json({ status: "queued", promptId: id, position }, { status: 202 });
-  }
-
-  private dequeueAndRunNext(): void {
-    const next = (Array.from(this.ctx.storage.sql.exec("SELECT id, content, author_email FROM prompt_queue ORDER BY position ASC LIMIT 1"))[0] as SqlRow | null);
-    if (!next) return;
-
-    const queuedId = String(next.id);
-    const content = String(next.content);
-    const authorEmail = next.author_email ? String(next.author_email) : undefined;
-
-    // Remove from queue
-    this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", queuedId);
-    this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
-
-    // Run as a new prompt via fiber
-    const promptId = crypto.randomUUID();
-    const title = this.readMetadata("title") ?? (content.length > 72 ? content.slice(0, 72) + "…" : content);
-
-    this.writeMetadata("active_prompt_id", promptId);
-    this.writeMetadata("status", "running");
-    this.insertPrompt(promptId, content, "queued", authorEmail);
-
-    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-
-    const fiberId = this.spawnFiber("runFiberPrompt", {
-      promptId,
-      content,
-      authorEmail,
-      title,
-    }, { maxRetries: 3 });
-    this.setPromptFiberId(promptId, fiberId);
-
-    void this.syncSessionIndex({ status: "running", title });
   }
 
   private readQueueState(): { queue: Array<{ id: string; content: string; position: number; createdAt: string }> } {
@@ -4912,8 +4819,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         if (signal.aborted) return;
         const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
         this.emitEvent({ data: { message }, type: "error_message" });
+        // lifecycle.finish dispatches the prompt-error notification per policy
         await this.finishPrompt(promptId, { error: message, status: "failed" });
-        dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
         return;
       }
 
@@ -4953,8 +4860,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       if (signal.aborted) return;
       const message = error instanceof Error ? error.message : "Prompt failed";
       this.emitEvent({ data: { message }, type: "error_message" });
+      // lifecycle.finish dispatches the prompt-error notification per policy
       await this.finishPrompt(promptId, { error: message, status: "failed" });
-      dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
     } finally {
       this._fiberAbortController = null;
       await this.syncSessionIndex({ status: "idle", title });
@@ -4963,12 +4870,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
   }
 
-  /** Finalize a prompt from fiber snapshot data. */
+  /**
+   * Finalize a prompt from fiber snapshot data. Emits the assistant
+   * message event (cosmetic — UI uses it for live updates) then routes
+   * state cleanup, completion notification, dequeue, and goal
+   * auto-continue through the SessionLifecycle.
+   */
   private async finalizePromptFromFiber(
     promptId: string,
     title: string,
     snapshot: { chatCompleted?: boolean; assistantMessageId?: string; text?: string; tokenInput?: number; tokenOutput?: number },
   ): Promise<void> {
+    void title; // emitted by lifecycle.finish via control.read().title
     const config = this.getConfig();
     const text = snapshot.text ?? "";
     const assistantRecord = uiMessageToChatRecord(
@@ -4976,64 +4889,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       { messageId: snapshot.assistantMessageId ?? "", model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: snapshot.tokenInput ?? 0, tokenOutput: snapshot.tokenOutput ?? 0, authorEmail: null, createdAt: nowEpoch() },
     );
 
-    await this.finishPrompt(promptId, { resultMessageId: snapshot.assistantMessageId, status: "completed" });
     this.emitEvent({ data: assistantRecord, type: "message" });
-    dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
-
-    // Self-continuation: if a goal is still active after this turn, fire
-    // the next continue prompt. The model declared it had work to do (by
-    // not calling set_goal_status) or hasn't been given the chance yet.
-    // Bumps the turn counter; flips to "exhausted" when the budget runs out.
-    this.maybeAutoContinue(title);
-  }
-
-  /**
-   * If a goal is active and the turn budget isn't spent, enqueue a
-   * "continue" prompt. Idempotent — checks `active_prompt_id` to avoid
-   * racing a concurrent prompt (queued user message, cron fire, etc.).
-   */
-  private maybeAutoContinue(title: string): void {
-    const before = this.readGoalState();
-    if (!shouldAutoContinue(before.status)) return;
-    if (this.readMetadata("active_prompt_id")) return; // queue/cron wins
-    if (this.ctx.storage.sql.exec("SELECT 1 FROM prompt_queue LIMIT 1").toArray().length > 0) {
-      // A queued user prompt will dequeue next via finishPrompt's
-      // dequeueAndRunNext — don't race it with a goal continue.
-      return;
-    }
-
-    const after = this.incrementGoalTurns();
-    if (isTerminalStatus(after.status)) {
-      // Just hit the budget. Notify the owner that the agent stopped.
-      dispatchNotification(this.env, this.ctx, {
-        kind: "prompt-error",
-        title: `Dodo: ${title} — goal exhausted`,
-        body: `Used all ${after.maxTurns} auto-continue turns without reaching a terminal state.`,
-        tags: "warning,robot",
-        priority: "high",
-        ownerEmail: this.readMetadata("owner_email") ?? undefined,
-      });
-      return;
-    }
-
-    const promptId = crypto.randomUUID();
-    const content = buildContinuePrompt(after);
-    this.writeMetadata("active_prompt_id", promptId);
-    this.writeMetadata("status", "running");
-    this.insertPrompt(promptId, content, "queued", "goal-autocontinue");
-
-    const fiberId = this.spawnFiber("runFiberPrompt", {
-      promptId,
-      content,
-      authorEmail: "goal-autocontinue",
-      title,
-    }, { maxRetries: 3 });
-    this.setPromptFiberId(promptId, fiberId);
-    log("info", "goal-autocontinue", {
-      sessionId: this.sessionId(),
-      promptId,
-      turnsUsed: after.turnsUsed,
-      maxTurns: after.maxTurns,
+    await this.lifecycle.finish(promptId, {
+      kind: "completed",
+      resultMessageId: snapshot.assistantMessageId,
+      text,
+      tokenInput: snapshot.tokenInput,
+      tokenOutput: snapshot.tokenOutput,
     });
   }
 
@@ -5097,14 +4959,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const fiber = this.getFiber(ctx.id);
 
     if (fiber?.status === "cancelled") {
+      // lifecycle.finish dispatches the prompt-aborted notification per policy
       await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
-      const title = this.readMetadata("title") ?? "Dodo prompt";
-      dispatchNotification(this.env, this.ctx, { kind: "prompt-aborted", title: `Dodo: ${title} (aborted)`, body: "Prompt was cancelled", tags: "stop_sign,robot", ownerEmail: this.readMetadata("owner_email") ?? undefined });
     } else if (fiber?.status === "failed") {
       const error = fiber.error ?? "Prompt failed after max retries";
+      // lifecycle.finish dispatches the prompt-error notification per policy
       await this.finishPrompt(promptId, { error, status: "failed" });
-      const title = this.readMetadata("title") ?? "Dodo prompt";
-      dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: error, tags: "x,robot", priority: "high", ownerEmail: this.readMetadata("owner_email") ?? undefined });
     }
 
     await this.syncSessionIndex({ status: "idle" });

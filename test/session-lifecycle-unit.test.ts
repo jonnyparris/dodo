@@ -269,7 +269,11 @@ describe("SessionLifecycle.finish", () => {
     // Goal exhausted; no second prompt spawned
     expect(h.goal.read().status).toBe("exhausted");
     expect(h.spawned).toHaveLength(1);
-    expect(h.notifications).toHaveLength(1);
+    // Two notifications: (1) prompt-complete from finish; (2) goal-exhausted
+    // from auto-continue at budget edge.
+    expect(h.notifications).toHaveLength(2);
+    expect((h.notifications[0] as { kind: string }).kind).toBe("prompt-complete");
+    expect((h.notifications[1] as { kind: string }).kind).toBe("prompt-error");
   });
 
   it("aborted finish does NOT trigger dequeue or auto-continue", async () => {

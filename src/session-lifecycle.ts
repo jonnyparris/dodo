@@ -376,6 +376,12 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps): SessionLifec
     }
 
     const title = current.title ?? promptId;
+    const ownerEmail = current.ownerEmail ?? undefined;
+    // Resolve the policy for the source of the *currently-active* prompt.
+    // We don't store the source on the prompt row today; default to the
+    // user policy which has the most permissive notification settings.
+    // TODO: persist source on prompts table and look up real policy here.
+    const policy = SOURCE_POLICIES.user;
 
     // 1. Write the prompt row
     if (cause.kind === "completed") {
@@ -399,7 +405,35 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps): SessionLifec
     // 3. Sync session index — always (covers both completed and aborted paths)
     await deps.syncIndex({ status: "idle", title }).catch(() => {});
 
-    // 4. Decide what happens next.
+    // 4. Dispatch notification per policy + cause
+    if (cause.kind === "completed" && policy.notifyOnComplete) {
+      deps.notify({
+        kind: "prompt-complete",
+        title: `Dodo: ${title}`,
+        body: (cause.text ?? "").slice(0, 200),
+        tags: "white_check_mark,robot",
+        ownerEmail,
+      });
+    } else if (cause.kind === "failed" && policy.notifyOnError) {
+      deps.notify({
+        kind: "prompt-error",
+        title: `Dodo: ${title} (failed)`,
+        body: cause.error,
+        tags: "x,robot",
+        priority: "high",
+        ownerEmail,
+      });
+    } else if (cause.kind === "aborted") {
+      deps.notify({
+        kind: "prompt-aborted",
+        title: `Dodo: ${title} (aborted)`,
+        body: cause.reason ?? "Prompt was cancelled",
+        tags: "stop_sign,robot",
+        ownerEmail,
+      });
+    }
+
+    // 5. Decide what happens next.
     //    Invariant: at most ONE of {dequeueNext, autoContinue} fires.
     //    Queued user prompts always win. Aborted prompts do not chain.
     if (cause.kind !== "aborted") {
