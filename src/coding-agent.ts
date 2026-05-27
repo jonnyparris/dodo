@@ -22,12 +22,9 @@ import { PresenceTracker } from "./presence";
 import { AgentConnectionTransport } from "./rpc";
 import { extractGeneratePrompt, FALLBACK_MODELS, FLUX_IMAGE_MEDIA_TYPE, FLUX_IMAGE_MODEL, FLUX_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import {
-  buildContinuePrompt,
   type GoalState,
   type GoalStatus,
-  isTerminalStatus,
   renderGoalSystemPromptSection,
-  shouldAutoContinue,
 } from "./session-goal";
 import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
 import {
@@ -37,10 +34,7 @@ import {
 } from "./session-control-plane";
 import {
   createSessionLifecycle,
-  type FiberPromptPayload,
-  type PromptSource,
   type SessionLifecycle,
-  type StartIntent,
 } from "./session-lifecycle";
 import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 import {
@@ -4496,7 +4490,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       return Response.json({ error: "Unable to start image generation" }, { status: 500 });
     }
     const promptId = startResult.promptId;
-    const title = startResult.title;
 
     try {
       // 1. Persist user prompt message
@@ -4707,20 +4700,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   // ─── Prompt queue management ───
-
-  private enqueuePrompt(content: string, authorEmail?: string | null): Response {
-    const id = crypto.randomUUID();
-    const now = nowEpoch();
-    // Position = max existing position + 1
-    const maxRow = (Array.from(this.ctx.storage.sql.exec("SELECT MAX(position) as max_pos FROM prompt_queue"))[0] as SqlRow | null);
-    const position = maxRow?.max_pos != null ? Number(maxRow.max_pos) + 1 : 1;
-    this.ctx.storage.sql.exec(
-      "INSERT INTO prompt_queue (id, content, author_email, created_at, position) VALUES (?, ?, ?, ?, ?)",
-      id, content, authorEmail ?? null, now, position,
-    );
-    this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
-    return Response.json({ status: "queued", promptId: id, position }, { status: 202 });
-  }
+  //
+  // Enqueueing is now done inside SessionLifecycle via the PromptRepo
+  // port (see the prompts.enqueue closure in the constructor). The queue
+  // can only be entered through lifecycle.start({source:"user"}) when a
+  // prompt is busy. drainOneQueuedPrompt() (above) handles the recovery
+  // case where the DO evicts mid-finish.
 
   private readQueueState(): { queue: Array<{ id: string; content: string; position: number; createdAt: string }> } {
     const rows = Array.from(this.ctx.storage.sql.exec("SELECT id, content, position, created_at FROM prompt_queue ORDER BY position ASC"));
@@ -6136,10 +6121,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.metadataKv.write(key, value);
   }
 
-  private deleteMetadata(key: string): void {
-    this.metadataKv.delete(key);
-  }
-
   // ─── Session goals ───
   //
   // A goal makes a session self-continuing. When `goal_status === "active"`,
@@ -6171,11 +6152,6 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   clearGoal(): void {
     this.goalStore.clear();
     this.emitEvent({ data: { status: "none" }, type: "goal_state" });
-  }
-
-  /** Increment the turn counter and return the new state. */
-  private incrementGoalTurns(): GoalState {
-    return this.goalStore.incrementTurns();
   }
 
   /**

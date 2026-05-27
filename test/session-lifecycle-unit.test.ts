@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createGoalStateStore } from "../src/goal-state-store";
 import { createInMemoryMetadataKv, createSessionControlPlane } from "../src/session-control-plane";
 import {
