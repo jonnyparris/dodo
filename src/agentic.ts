@@ -21,6 +21,7 @@ import {
   type AgentProfile,
 } from "./agent-profile";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
+import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";
 import type { AppConfig, Env, TodoStore } from "./types";
 
@@ -229,6 +230,8 @@ export const KNOWN_ALWAYS_ON_TOOL_NAMES = [
   "skill",
   // Typecheck
   "typecheck",
+  // Shell — busybox + /workspace mount, always-on (no env binding)
+  "shell",
   // Hot-path git
   ...KNOWN_TOP_LEVEL_GIT_TOOLS,
 ] as const;
@@ -1443,6 +1446,12 @@ function buildTools(
       return { path: normalized, replacements: count, old_string, new_string };
     },
   });
+
+  // Shell tool — busybox-in-a-worker with /workspace mounted. Pure-code,
+  // no env binding required (busybox.wasm + initramfs.wasm bundle into the
+  // Worker via wrangler's CompiledWasm rule). Lives alongside codemode:
+  // codemode for JS/API-shaped work, shell for pipelines and file ops.
+  tools.shell = createShellTool(workspace);
 
   // Git tools — only the hot-path subset is exposed at the top level.
   // See KNOWN_TOP_LEVEL_GIT_TOOLS / KNOWN_CODEMODE_GIT_TOOLS module-scope

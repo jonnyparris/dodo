@@ -13,6 +13,10 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-03-10",
   "compatibility_flags": ["nodejs_compat", "experimental"],
+  // Mirror wrangler.jsonc — required for shell tool's busybox.wasm imports.
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": false }
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "CODING_AGENT", "class_name": "CodingAgent" },

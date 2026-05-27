@@ -4,6 +4,14 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-03-10",
   "compatibility_flags": ["nodejs_compat", "experimental"],
+  // Allow `*.wasm` imports to resolve to `WebAssembly.Module` at deploy
+  // time. Required by `src/tools/shell.ts` which static-imports
+  // busybox.wasm + initramfs.wasm from vendor/wasm/busybox/. Wrangler
+  // forbids runtime `WebAssembly.compile`, so all our wasm modules must
+  // be imported this way.
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": false }
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "CODING_AGENT", "class_name": "CodingAgent" },
