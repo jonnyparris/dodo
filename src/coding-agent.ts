@@ -557,6 +557,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * SSE event with images produced by the tool.
    */
   private _toolAttachments: Map<string, AttachmentRef[]> = new Map();
+
+  /** Names of tools called during the current turn. Populated by
+   *  runThinkChat from the stream's `tool-input-available` chunks.
+   *  Used by runFiberPrompt's post-completion check (chat-monitor
+   *  brains nudge themselves if they didn't call chat_reply). */
+  private _toolCallNames: Set<string> = new Set();
   private readonly presence = new PresenceTracker();
   readonly stateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
@@ -4913,6 +4919,67 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       tokenInput: snapshot.tokenInput,
       tokenOutput: snapshot.tokenOutput,
     });
+
+    // Chat-monitor brain post-turn check: if this is a chat-monitor brain
+    // and the just-completed turn didn't call chat_reply (or chat_no_reply),
+    // the human in chat never heard back. Fire a one-shot nudge prompt to
+    // remind the model. Bounded retries via session metadata to prevent
+    // infinite loops if the model is genuinely stuck.
+    await this.maybeNudgeChatMonitorBrain().catch((err) => {
+      log("warn", "chat-monitor nudge check failed (non-fatal)", {
+        sessionId: this.sessionId(),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
+  /**
+   * Post-turn validator for chat-monitor brain sessions. Reads the
+   * per-turn tool-call set captured by runThinkChat — if `chat_reply`
+   * wasn't called, the human in the Google Chat space got nothing.
+   * Enqueues a follow-up prompt (capped at MAX_BRAIN_NUDGES retries via
+   * session metadata) so the model can recover from a one-off
+   * tool-calling miss.
+   *
+   * Safe to no-op when the session isn't a chat-monitor brain.
+   */
+  private async maybeNudgeChatMonitorBrain(): Promise<void> {
+    if (this.readMetadata("is_chat_monitor_brain") !== "true") return;
+    if (this._toolCallNames.has("chat_reply")) {
+      // Replied successfully — reset retry counter for the next turn.
+      this.writeMetadata("brain_nudge_count", "0");
+      return;
+    }
+    const MAX_BRAIN_NUDGES = 2;
+    const prior = parseInt(this.readMetadata("brain_nudge_count") || "0", 10) || 0;
+    if (prior >= MAX_BRAIN_NUDGES) {
+      log("warn", "chat-monitor brain exhausted nudge budget without calling chat_reply", {
+        sessionId: this.sessionId(),
+        nudges: prior,
+      });
+      this.writeMetadata("brain_nudge_count", "0");
+      return;
+    }
+    this.writeMetadata("brain_nudge_count", String(prior + 1));
+    log("info", "chat-monitor brain didn't call chat_reply — nudging", {
+      sessionId: this.sessionId(),
+      attempt: prior + 1,
+    });
+    const ownerEmail = this.readMetadata("owner_email") ?? undefined;
+    await this.lifecycle.start({
+      source: "user",
+      content:
+        `[System nudge — not from a human in chat]\n\n` +
+        `Your previous turn ended without calling the \`chat_reply\` MCP tool. ` +
+        `The human in the Google Chat space heard nothing. ` +
+        `If your previous answer was meant for them, send it now via \`chat_reply\` ` +
+        `(remember to pass your own sessionId). ` +
+        `If the previous message genuinely warranted no reply (e.g. it was idle ` +
+        `chatter not directed at you), call \`chat_reply\` with text="(no reply needed)" ` +
+        `as a tombstone so the system knows you saw it. ` +
+        `This is your reminder ${prior + 1} of ${MAX_BRAIN_NUDGES}.`,
+      authorEmail: ownerEmail,
+    });
   }
 
   /** Called by the set_goal_status tool from inside agentic.ts. */
@@ -5270,6 +5337,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // ensures attachments from a previous prompt don't leak into this turn's
     // tool_result events.
     this._toolAttachments.clear();
+    // Reset per-turn tool-call name set so the chat-monitor brain nudge
+    // checks against tools actually called THIS turn.
+    this._toolCallNames.clear();
     // Collect assistant-generated images streamed during this turn. Uploaded
     // to R2 at onDone() once we know the assistant message id.
     const generatedImages: Array<{ mediaType: string; url: string }> = [];
@@ -5287,6 +5357,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             this.emitEvent({ data: { delta }, type: "text_delta" });
           } else if (chunk.type === "tool-input-available") {
             // Tool arguments finalised — show the user that a tool is running.
+            this._toolCallNames.add(String(chunk.toolName));
             this.emitEvent({
               data: {
                 toolCallId: chunk.toolCallId,

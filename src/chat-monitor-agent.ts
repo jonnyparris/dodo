@@ -394,7 +394,7 @@ export function buildBrainGoalText(args: {
     senderList,
     `3. ${contextNote}`,
     "4. You can use MCP tools to gather information (cf-portal search, agent memory, browser, etc.) before deciding what to say. Take whatever tool actions you need.",
-    "5. If a message does not warrant a reply (greeting, idle observation, message clearly addressed to another person), simply do not call `chat_reply`. Returning without calling the tool is the equivalent of saying nothing.",
+    "5. EVERY turn must end with a `chat_reply` call. If a message warrants a real response, pass it as `text`. If it does NOT warrant a reply (greeting to someone else, idle observation, message clearly addressed to another person), call `chat_reply` with `text=\"<NO_REPLY>\"` — this is a tombstone that the system uses to confirm you decided silence was correct, and it does NOT post anything to chat. Never end a turn without one or the other; if you do, the system will nudge you and your context will fill up unnecessarily.",
     "6. Keep replies under 500 characters when you do call `chat_reply`. Plain text. Never include @mentions or fabricated links.",
     "",
     "Persona:",

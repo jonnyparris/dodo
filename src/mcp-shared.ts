@@ -50,10 +50,10 @@ function textResult(data: unknown): { content: Array<{ type: "text"; text: strin
 export function registerChatReplyTool(server: McpServer, env: Env, userEmail: string): void {
   server.tool(
     "chat_reply",
-    "Post a reply to a Google Chat space. Callable ONLY by a CodingAgent session flagged as a chat-monitor brain (the flag is set on session creation by ChatMonitorAgent). Posts to the brain's pre-registered space — the `spaceId` arg is ignored if it doesn't match. `threadName` is optional; supply it to reply in a specific thread.",
+    "Post a reply to a Google Chat space. Callable ONLY by a CodingAgent session flagged as a chat-monitor brain (the flag is set on session creation by ChatMonitorAgent). Posts to the brain's pre-registered space — the `spaceId` arg is ignored if it doesn't match. `threadName` is optional; supply it to reply in a specific thread. Pass text exactly `<NO_REPLY>` to acknowledge the message without posting anything to chat (use when you decided silence was correct).",
     {
       sessionId: z.string().min(1).describe("Your own session id (the brain session calling this tool)."),
-      text: z.string().min(1).max(2000).describe("Reply text. Plain text only; cards aren't supported."),
+      text: z.string().min(1).max(2000).describe("Reply text. Plain text only; cards aren't supported. Use the literal string `<NO_REPLY>` to mark the turn handled without posting to chat."),
       threadName: z.string().optional().describe("Full thread resource name (`spaces/X/threads/Y`) to reply in-thread. Omit to post at top-level."),
     },
     async ({ sessionId, text, threadName }) => {
@@ -73,6 +73,13 @@ export function registerChatReplyTool(server: McpServer, env: Env, userEmail: st
       }
       if (!flag.spaceId) {
         return errorResult({ error: "calling session has no registered chat_monitor_space_id" });
+      }
+      // Recognise the `<NO_REPLY>` tombstone: the brain wants to mark the
+      // turn as handled without sending anything to chat. Counts as a
+      // successful chat_reply call from the nudge-validator's POV (the
+      // tool name is what it checks, not whether bytes hit GChat).
+      if (text.trim() === "<NO_REPLY>") {
+        return textResult({ posted: false, reason: "no_reply_tombstone", spaceId: flag.spaceId });
       }
       // 2. Send via ARIA.
       const result = await sendChatReply(env, {
