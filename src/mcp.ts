@@ -8,7 +8,7 @@ import { messageLimiter, promptLimiter } from "./rate-limit";
 import { createDraftPrForRun, createGithubRepo, pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-api";
 import { getKnownRepo, listKnownRepos } from "./repos";
 import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
-import { errorResult, mcpUserEmail, propagateMcpDepth } from "./mcp-shared";
+import { errorResult, mcpUserEmail, propagateMcpDepth, registerChatReplyTool } from "./mcp-shared";
 import { queryRecentExceptions, querySessionLogs, queryWorkerLogs } from "./cloudflare-logs";
 import type { CodingAgent } from "./coding-agent";
 import type { Env, WorkerRunRecord } from "./types";
@@ -2093,44 +2093,9 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     },
   );
 
-  server.tool(
-    "chat_reply",
-    "Post a reply to a Google Chat space. Callable ONLY by a CodingAgent session flagged as a chat-monitor brain (the flag is set on session creation by ChatMonitorAgent). Posts to the brain's pre-registered space — the `spaceId` arg is ignored if it doesn't match. `threadName` is optional; supply it to reply in a specific thread.",
-    {
-      sessionId: z.string().min(1).describe("Your own session id (the brain session calling this tool)."),
-      text: z.string().min(1).max(2000).describe("Reply text. Plain text only; cards aren't supported."),
-      threadName: z.string().optional().describe("Full thread resource name (`spaces/X/threads/Y`) to reply in-thread. Omit to post at top-level."),
-    },
-    async ({ sessionId, text, threadName }) => {
-      // 1. Look up the calling session and verify the brain flag.
-      const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
-      const flagRes = await (agent as unknown as { fetch: (req: Request) => Promise<Response> }).fetch(
-        new Request("https://coding-agent/chat-monitor-flag", {
-          headers: { "x-dodo-session-id": sessionId, "x-owner-email": userEmail },
-        }),
-      );
-      if (!flagRes.ok) {
-        return errorResult({ error: "could not verify caller session", status: flagRes.status });
-      }
-      const flag = (await flagRes.json()) as { isChatMonitorBrain?: boolean; spaceId?: string };
-      if (!flag.isChatMonitorBrain) {
-        return errorResult({ error: "calling session is not a chat-monitor brain — chat_reply refused" });
-      }
-      if (!flag.spaceId) {
-        return errorResult({ error: "calling session has no registered chat_monitor_space_id" });
-      }
-      // 2. Send via ARIA.
-      const result = await sendChatReply(env, {
-        spaceId: flag.spaceId,
-        text,
-        threadName,
-      });
-      if (!result.ok) {
-        return errorResult({ error: `ARIA send failed`, status: result.status, body: result.body });
-      }
-      return textResult({ posted: true, spaceId: flag.spaceId, threadName: threadName ?? null });
-    },
-  );
+  // The chat_reply tool is implemented in mcp-shared so the codemode
+  // server (which exposes a tiny tool surface) can register it too.
+  registerChatReplyTool(server, env, userEmail);
 
   server.tool(
     "chat_monitor_delete",

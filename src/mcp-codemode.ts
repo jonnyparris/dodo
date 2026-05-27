@@ -2,7 +2,7 @@ import { getAgentByName } from "agents";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getUserControlStub } from "./auth";
-import { errorResult, mcpUserEmail, propagateMcpDepth } from "./mcp-shared";
+import { errorResult, mcpUserEmail, propagateMcpDepth, registerChatReplyTool } from "./mcp-shared";
 import type { Env } from "./types";
 
 // ─── API Catalog ───
@@ -123,6 +123,10 @@ function truncateResponse(data: unknown, maxChars = 16_000): string {
 
 export function createDodoCodeModeMcpServer(env: Env, userEmail: string | undefined, depth = 0): McpServer {
   const server = new McpServer({ name: "dodo-codemode", version: "0.4.0" });
+  // Resolve the caller email up front so chat_reply (registered below) can
+  // verify the brain-flag with the right identity.
+  const callerEmail = mcpUserEmail(env, userEmail, "mcp-codemode");
+  registerChatReplyTool(server, env, callerEmail);
 
   // --- Search tool: query the API catalog ---
   server.tool("search", `Search the Dodo API catalog to discover available endpoints.
