@@ -6,6 +6,8 @@ import {
   TASK_PROFILE,
   resolveProfileModel,
 } from "./agent-profile";
+import { lookupResultSchema } from "./result-schema-registry";
+import { generateStructured, type StructuredMode } from "./structured-output";
 import type { AppConfig, Env } from "./types";
 
 // ─── Tool Output Caps (OpenCode Pattern #1) ───
@@ -449,6 +451,16 @@ export interface SubagentRunInput {
   prepareStep?: ({ messages }: { messages: Array<ModelMessage> }) => { messages?: Array<ModelMessage> };
   env: Env;
   signal?: AbortSignal;
+  /**
+   * Optional structured-output schema name (from the result-schema
+   * registry). When set, the runner spends one extra LLM call after
+   * the tool-using loop finishes to coerce `finalText` into the
+   * schema's shape. The validated object lands on
+   * `SubagentResult.structured`; callers consume it without re-parsing.
+   *
+   * Per-call overrides the profile's `defaultResultSchemaName`.
+   */
+  resultSchemaName?: string;
 }
 
 /**
@@ -463,6 +475,19 @@ export interface SubagentInvocation extends SubagentRunInput {
   maxSteps: number;
 }
 
+/**
+ * Outcome of a structured-summary pass on top of a subagent run.
+ *
+ * Lives alongside the free-form transcript rather than replacing it
+ * so callers that opt into typed results still get the human-readable
+ * narrative for chat history. `ok: false` means the coercion failed
+ * even after retry — the caller should fall back to `finalText`.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type SubagentStructured =
+  | { ok: true; data: unknown; mode: StructuredMode; attempts: number; tokenInput: number; tokenOutput: number }
+  | { ok: false; lastError: string; rawText: string; mode: StructuredMode; attempts: number; tokenInput: number; tokenOutput: number };
+
 export interface SubagentResult {
   finalText: string;
   steps: number;
@@ -471,6 +496,12 @@ export interface SubagentResult {
   transcript: Array<{ role: string; content: string }>;
   tokenInput: number;
   tokenOutput: number;
+  /**
+   * Set when the caller (or the profile) requested a typed result and
+   * the runner ran the coercion pass. Undefined when no result schema
+   * was requested; the caller should fall back to `finalText`.
+   */
+  structured?: SubagentStructured;
 }
 
 /**
@@ -494,6 +525,7 @@ export function runSubagentForProfile(
     prepareStep: input.prepareStep,
     env: input.env,
     signal: input.signal,
+    resultSchemaName: input.resultSchemaName ?? profile.defaultResultSchemaName,
   });
 }
 
@@ -519,6 +551,7 @@ interface SubagentExecuteInput {
   prepareStep?: ({ messages }: { messages: Array<ModelMessage> }) => { messages?: Array<ModelMessage> };
   env: Env;
   signal?: AbortSignal;
+  resultSchemaName?: string;
 }
 
 async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentResult> {
@@ -562,6 +595,24 @@ async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentRes
       }),
     ];
 
+    let structured: SubagentStructured | undefined;
+    if (input.resultSchemaName && result.text.trim().length > 0) {
+      // One coercion pass over the subagent's free-form final text.
+      // We deliberately don't pipe the schema into the multi-step loop
+      // (the AI SDK can't combine `tools` + `generateObject`), so the
+      // subagent does its tool-driven investigation first and a small
+      // structured pass distils the summary into the requested shape.
+      // The extra call is one round-trip; tokens used are accounted
+      // for separately on `structured.tokenInput`/`tokenOutput`.
+      structured = await coerceStructured({
+        schemaName: input.resultSchemaName,
+        model,
+        finalText: result.text,
+        modelId: input.model,
+        signal: input.signal,
+      });
+    }
+
     return {
       finalText: result.text,
       steps,
@@ -570,6 +621,7 @@ async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentRes
       transcript,
       tokenInput: totalInput,
       tokenOutput: totalOutput,
+      structured,
     };
   } catch (error) {
     if (error instanceof DOMException) {
@@ -598,4 +650,62 @@ async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentRes
     }
     throw error;
   }
+}
+
+/**
+ * Coerce a subagent's free-form `finalText` into the registered schema
+ * named `schemaName`. Reuses the same chat model the subagent ran on
+ * so we don't take a second provider hop for a structured pass that
+ * the parent model could itself produce.
+ *
+ * The schema lookup throws on unknown names — that's a configuration
+ * error (a typo in a profile or per-call arg) and we want it loud.
+ */
+async function coerceStructured(input: {
+  schemaName: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  model: any;
+  finalText: string;
+  modelId: string;
+  signal?: AbortSignal;
+}): Promise<SubagentStructured> {
+  const schema = lookupResultSchema(input.schemaName);
+  const prompt = [
+    "Distill the following subagent output into the requested schema.",
+    "Do not invent fields. Use only information present in the text.",
+    "",
+    "Subagent output:",
+    "---",
+    input.finalText,
+    "---",
+  ].join("\n");
+  const out = await generateStructured({
+    modelId: input.modelId,
+    model: input.model,
+    schema,
+    prompt,
+    signal: input.signal,
+    // Coercion pass is fast — give it a tighter budget so a slow
+    // structured pass can't hold up the whole subagent call.
+    timeoutMs: 30_000,
+  });
+  if (out.ok) {
+    return {
+      ok: true,
+      data: out.data,
+      mode: out.mode,
+      attempts: out.attempts,
+      tokenInput: out.tokenInput,
+      tokenOutput: out.tokenOutput,
+    };
+  }
+  return {
+    ok: false,
+    lastError: out.lastError,
+    rawText: out.rawText,
+    mode: out.mode,
+    attempts: out.attempts,
+    tokenInput: out.tokenInput,
+    tokenOutput: out.tokenOutput,
+  };
 }

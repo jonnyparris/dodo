@@ -70,6 +70,13 @@ export function getSubagentFamilyModel(mainModel: string): string {
  * - `resolveDefaultModel` — strategy for picking the subagent's model
  *                   when neither the call args nor the per-session
  *                   default supply one. Defaulted to the family map.
+ * - `defaultResultSchemaName` — when set, the runner attempts a
+ *                   structured-output call against the schema registered
+ *                   under this name in `result-schema-registry.ts`.
+ *                   Per-call overrides win. Stored as a name rather than
+ *                   the schema object so profiles stay JSON-serialisable
+ *                   for snapshot diffing and the registry is the single
+ *                   source of truth.
  * - `kind`        — a stable lowercase identifier matching the keyword
  *                   `runSubagent` once used as `SubagentInvocation.kind`.
  *                   Kept so transcripts and tests can filter by kind.
@@ -83,6 +90,7 @@ export interface AgentProfile {
   readonly facetTimeoutMs?: number;
   readonly fallbackHint?: string;
   readonly resolveDefaultModel: (mainModel: string) => string;
+  readonly defaultResultSchemaName?: string;
 }
 
 // ─── EXPLORE ────────────────────────────────────────────────────────────

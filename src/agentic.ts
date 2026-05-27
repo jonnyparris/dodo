@@ -764,6 +764,12 @@ function buildSubagentTool(spec: {
         spec.config.model,
       );
       const userMessage = spec.getUserMessage(args);
+      // Per-call result schema. Validated against the registry —
+      // unknown names surface as a clear tool error rather than a
+      // silent fallback to free-form output.
+      const resultSchemaName = typeof args.resultSchemaName === "string" && args.resultSchemaName.trim().length > 0
+        ? args.resultSchemaName.trim()
+        : undefined;
 
       try {
         const result = await runSubagentForProfile(spec.profile, {
@@ -772,18 +778,39 @@ function buildSubagentTool(spec: {
           config: spec.config,
           toolset: spec.getTools(),
           env: spec.env,
+          resultSchemaName,
         });
 
         const usageLine = result.tokenInput > 0 || result.tokenOutput > 0
           ? `**Tokens:** ${result.tokenInput} in / ${result.tokenOutput} out | `
           : "";
 
-        return [
+        const lines = [
           `## ${spec.profile.name} results (model: ${modelId})`,
           `${usageLine}**Steps:** ${result.steps} | **Tools used:** ${result.toolCalls.join(", ") || "none"}`,
           "",
           result.finalText || "(No output — subagent ran its tool budget without emitting a summary. Try a narrower query or a higher-capability model via the `model` arg.)",
-        ].filter(Boolean).join("\n");
+        ];
+
+        // Append the structured-result block when the caller asked for
+        // one. The free-form text stays above so the model can see both
+        // representations — useful when the structured pass coerces a
+        // detail away that the orchestrator still wants to read.
+        if (result.structured) {
+          lines.push("");
+          if (result.structured.ok) {
+            lines.push("### Structured result");
+            lines.push("```json");
+            lines.push(JSON.stringify(result.structured.data, null, 2));
+            lines.push("```");
+          } else {
+            lines.push("### Structured result (failed)");
+            lines.push(`Coercion error: ${result.structured.lastError}`);
+            lines.push("The free-form output above is the authoritative result.");
+          }
+        }
+
+        return lines.filter(Boolean).join("\n");
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         const base = `${spec.profile.name} failed (model: ${modelId}): ${msg}`;
@@ -1134,6 +1161,9 @@ function buildTaskTool(
       ),
       model: z.string().optional().describe(
         "Optional model override for this call (e.g. 'anthropic/claude-haiku-4-5', '@cf/moonshotai/kimi-k2.6'). Leave unset to use the session default (configured via PUT /config taskModel, defaults to Haiku 4.5).",
+      ),
+      resultSchemaName: z.enum(["task-summary", "verify-run-summary", "dispatch-decision"]).optional().describe(
+        "Optional structured-result schema. When set, the subagent's free-form output is coerced into the named schema and returned in a ```json block alongside the narrative. 'task-summary' is the most common choice for delegated work; 'verify-run-summary' for typecheck/test-style runs; 'dispatch-decision' for supervisor-style fan-out planning.",
       ),
     })),
     getUserMessage: (args) => {
