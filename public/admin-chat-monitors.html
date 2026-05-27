@@ -129,14 +129,15 @@
         <div id="detailStatus" class="status"></div>
 
         <h3 style="margin-top:24px">Recent decisions</h3>
+        <p class="muted small">Privacy: source message text is never persisted. Each row shows a SHA-256 prefix derived from the message so you can correlate with the live chat without us storing message contents.</p>
         <table id="decisionsTable">
           <thead>
             <tr>
               <th>When</th>
               <th>Sender</th>
-              <th>Message</th>
+              <th>Source hash</th>
               <th>Outcome</th>
-              <th>Detail</th>
+              <th>Reply / model output</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -267,7 +268,7 @@
         tr.innerHTML = `
           <td class="small">${relTime(d.ts)}</td>
           <td class="small"><code>${escapeHtml(d.senderResource || "?")}</code><br><span class="muted">${d.senderType}</span></td>
-          <td class="truncate" title="${escapeHtml(d.sourceText || "")}">${escapeHtml(d.sourceText || "")}</td>
+          <td><code class="small">${escapeHtml(d.sourceHash || "—")}</code></td>
           <td>${outcome}</td>
           <td>${detailStr}</td>
         `;
