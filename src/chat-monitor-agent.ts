@@ -83,7 +83,7 @@ const CF_PORTAL_URL_SUBSTRING = "portal.mcp.cfdata.org";
  * tests.
  */
 export const CF_PORTAL_CHAT_TOOL_SUFFIX = "chat_get_messages";
-const DECISION_MODEL = "@cf/moonshotai/kimi-k2.6";
+const DECISION_MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 // ─── Schemas ───
 
@@ -567,9 +567,14 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     // Workers AI binding — direct call. The PoC doesn't need the full
     // subagent-runner stack since we have no tools, no system-prompt
     // chunking, no streaming.
-    // The Workers AI types are auto-generated from a fixed model list; Kimi
-    // K2.6 isn't in the published `AiModels` map yet, so the model id has to
-    // be cast through `string` to satisfy the binding's overloads.
+    // The Workers AI types are auto-generated from a fixed model list;
+    // Gemma 4 isn't in the published `AiModels` map yet, so the model id
+    // has to be cast through `string` to satisfy the binding's overloads.
+    //
+    // The binding returns slightly different shapes depending on the model
+    // family — most chat models return `{ response: string }`, but some
+    // also produce `{ result: { response: string } }` or a streaming
+    // `ReadableStream`. We handle the common JSON shapes.
     const aiResp = (await this.env.AI.run(
       DECISION_MODEL as unknown as Parameters<Ai["run"]>[0],
       {
@@ -577,12 +582,17 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           { role: "system", content: system },
           { role: "user", content: user },
         ],
-        max_tokens: 256,
+        max_tokens: 512,
       } as unknown as Parameters<Ai["run"]>[1],
-    )) as { response?: string };
+    )) as unknown;
 
-    const raw = (aiResp?.response ?? "").trim();
-    if (!raw) return { reply: false, raw: "(empty model output)" };
+    const raw = coerceAiResponseText(aiResp).trim();
+    if (!raw) {
+      return {
+        reply: false,
+        raw: `(empty model output; response shape: ${describeShape(aiResp)})`,
+      };
+    }
 
     // Try to find JSON in case the model wrapped it.
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -680,7 +690,7 @@ export function parseChatGetMessagesResult(
     const name = typeof obj.name === "string" ? obj.name : null;
     const createTime = typeof obj.createTime === "string" ? obj.createTime : null;
     if (!name || !createTime) continue;
-    const messageText = typeof obj.text === "string" ? obj.text : "";
+    const messageText = extractMessageText(obj);
     const sender = obj.sender as { displayName?: string } | undefined;
     const senderDisplay = sender?.displayName ?? "Unknown";
     const thread = obj.thread as { name?: string } | undefined;
@@ -693,6 +703,151 @@ export function parseChatGetMessagesResult(
     });
   }
   return out;
+}
+
+/**
+ * Pull the most useful human-readable text out of a Google Chat message.
+ *
+ * Google Chat messages can carry text in several places depending on how
+ * they were posted:
+ *   - `text` — plain-text messages (typed into the UI)
+ *   - `formattedText` — server-rendered text with markdown decorations
+ *   - `argumentText` — what was typed after an @mention
+ *   - `cardsV2[*].card.sections[*].widgets[*].textParagraph.text` — bot-sent
+ *     cards (e.g. anything via the ARIA chat middleware)
+ *   - `cardsV2[*].card.header.title` / `.subtitle` — card headers
+ *
+ * We collect whatever exists, deduplicate, and join with newlines so the
+ * downstream LLM can see what a human reader would see. Exported for
+ * tests.
+ */
+export function extractMessageText(message: Record<string, unknown>): string {
+  const parts: string[] = [];
+
+  const directText = pickString(message.text) ?? pickString(message.formattedText) ?? pickString(message.argumentText);
+  if (directText) parts.push(directText);
+
+  const cards = message.cardsV2;
+  if (Array.isArray(cards)) {
+    for (const wrapper of cards) {
+      if (!wrapper || typeof wrapper !== "object") continue;
+      const card = (wrapper as Record<string, unknown>).card;
+      if (!card || typeof card !== "object") continue;
+      const cardObj = card as Record<string, unknown>;
+
+      const header = cardObj.header;
+      if (header && typeof header === "object") {
+        const h = header as Record<string, unknown>;
+        const title = pickString(h.title);
+        const subtitle = pickString(h.subtitle);
+        if (title) parts.push(title);
+        if (subtitle) parts.push(subtitle);
+      }
+
+      const sections = cardObj.sections;
+      if (Array.isArray(sections)) {
+        for (const section of sections) {
+          if (!section || typeof section !== "object") continue;
+          const widgets = (section as Record<string, unknown>).widgets;
+          if (!Array.isArray(widgets)) continue;
+          for (const widget of widgets) {
+            if (!widget || typeof widget !== "object") continue;
+            const w = widget as Record<string, unknown>;
+
+            const tp = w.textParagraph as { text?: unknown } | undefined;
+            const tpText = pickString(tp?.text);
+            if (tpText) parts.push(tpText);
+
+            const dt = w.decoratedText as { text?: unknown; topLabel?: unknown; bottomLabel?: unknown } | undefined;
+            const dtText = pickString(dt?.text);
+            const dtTop = pickString(dt?.topLabel);
+            const dtBottom = pickString(dt?.bottomLabel);
+            if (dtTop) parts.push(dtTop);
+            if (dtText) parts.push(dtText);
+            if (dtBottom) parts.push(dtBottom);
+          }
+        }
+      }
+    }
+  }
+
+  // Deduplicate adjacent repeats (e.g. when the card title also appears in
+  // a body paragraph) without disturbing order.
+  const dedup: string[] = [];
+  for (const p of parts) {
+    const trimmed = p.trim();
+    if (!trimmed) continue;
+    if (dedup[dedup.length - 1] === trimmed) continue;
+    dedup.push(trimmed);
+  }
+  return dedup.join("\n");
+}
+
+function pickString(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const trimmed = v.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Pull text out of whatever shape Workers AI returns. Exported for tests.
+ *
+ * Known shapes:
+ *  - `{ response: string }` — most chat models
+ *  - `{ result: { response: string } }` — older Llama family
+ *  - `{ output: Array<{ content: Array<{ text: string }> }> }` — newer
+ *    OpenAI-compatible models (Gemma 4, some Mistrals)
+ *  - `string` — rare, direct content
+ *  - `ReadableStream` — only when `stream: true`, which we don't request
+ */
+export function coerceAiResponseText(resp: unknown): string {
+  if (resp == null) return "";
+  if (typeof resp === "string") return resp;
+  if (typeof resp !== "object") return "";
+  const r = resp as Record<string, unknown>;
+
+  if (typeof r.response === "string") return r.response;
+
+  if (r.result && typeof r.result === "object") {
+    const inner = r.result as Record<string, unknown>;
+    if (typeof inner.response === "string") return inner.response;
+  }
+
+  // OpenAI-compatible chat completions shape
+  if (Array.isArray(r.choices)) {
+    const first = r.choices[0] as { message?: { content?: unknown } } | undefined;
+    const content = first?.message?.content;
+    if (typeof content === "string") return content;
+  }
+
+  // `output` shape (responses API)
+  if (Array.isArray(r.output)) {
+    const collected: string[] = [];
+    for (const item of r.output) {
+      if (!item || typeof item !== "object") continue;
+      const content = (item as { content?: unknown }).content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          if (c && typeof c === "object") {
+            const t = (c as { text?: unknown }).text;
+            if (typeof t === "string") collected.push(t);
+          }
+        }
+      }
+    }
+    if (collected.length > 0) return collected.join("");
+  }
+
+  return "";
+}
+
+/** Short label describing the response shape, for debugging empty replies. */
+function describeShape(resp: unknown): string {
+  if (resp == null) return "null/undefined";
+  if (typeof resp === "string") return "string";
+  if (typeof resp !== "object") return typeof resp;
+  const keys = Object.keys(resp as Record<string, unknown>).slice(0, 5);
+  return `object{${keys.join(",")}}`;
 }
 
 function extractMessagesArray(payload: unknown): unknown[] {

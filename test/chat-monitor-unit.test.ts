@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   chatMonitorIdName,
+  coerceAiResponseText,
   createMonitorSchema,
+  extractMessageText,
   findChatGetMessagesTool,
   parseChatGetMessagesResult,
   pickCfPortalConfig,
@@ -231,6 +233,127 @@ describe("pickCfPortalConfig", () => {
     // requires refresh_token. Since neither URL is canonical, this should fall
     // through to the fallback and reject the static_header config.
     expect(cfg).toBeNull();
+  });
+});
+
+describe("extractMessageText", () => {
+  it("reads plain text from a typed message", () => {
+    expect(extractMessageText({ text: "hello" })).toBe("hello");
+  });
+
+  it("falls back to formattedText when text is missing", () => {
+    expect(extractMessageText({ formattedText: "**hi**" })).toBe("**hi**");
+  });
+
+  it("falls back to argumentText", () => {
+    expect(extractMessageText({ argumentText: "do thing" })).toBe("do thing");
+  });
+
+  it("pulls text out of a card sent by ARIA (textParagraph)", () => {
+    const msg = {
+      cardsV2: [
+        {
+          card: {
+            sections: [
+              { widgets: [{ textParagraph: { text: "pingbot ping" } }] },
+            ],
+          },
+        },
+      ],
+    };
+    expect(extractMessageText(msg)).toBe("pingbot ping");
+  });
+
+  it("includes header title + subtitle plus body widgets", () => {
+    const msg = {
+      cardsV2: [
+        {
+          card: {
+            header: { title: "Release", subtitle: "v0.4.1" },
+            sections: [
+              { widgets: [{ textParagraph: { text: "Deploy complete" } }] },
+            ],
+          },
+        },
+      ],
+    };
+    expect(extractMessageText(msg)).toBe("Release\nv0.4.1\nDeploy complete");
+  });
+
+  it("handles decoratedText widgets", () => {
+    const msg = {
+      cardsV2: [
+        {
+          card: {
+            sections: [
+              {
+                widgets: [
+                  { decoratedText: { topLabel: "Status", text: "OK", bottomLabel: "Updated 3s ago" } },
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    };
+    expect(extractMessageText(msg)).toBe("Status\nOK\nUpdated 3s ago");
+  });
+
+  it("dedupes adjacent identical strings", () => {
+    const msg = { text: "hi", formattedText: "hi" };
+    // direct text wins; formattedText is only tried as fallback
+    expect(extractMessageText(msg)).toBe("hi");
+  });
+
+  it("returns empty string when no text fields exist", () => {
+    expect(extractMessageText({})).toBe("");
+    expect(extractMessageText({ cardsV2: [] })).toBe("");
+  });
+
+  it("combines direct text with card content", () => {
+    const msg = {
+      text: "from a user",
+      cardsV2: [
+        {
+          card: { sections: [{ widgets: [{ textParagraph: { text: "and from a card" } }] }] },
+        },
+      ],
+    };
+    expect(extractMessageText(msg)).toBe("from a user\nand from a card");
+  });
+});
+
+describe("coerceAiResponseText", () => {
+  it("reads the standard { response } shape", () => {
+    expect(coerceAiResponseText({ response: "hi" })).toBe("hi");
+  });
+
+  it("reads a nested { result: { response } } shape", () => {
+    expect(coerceAiResponseText({ result: { response: "hi" } })).toBe("hi");
+  });
+
+  it("reads OpenAI-compatible choices[].message.content", () => {
+    expect(
+      coerceAiResponseText({ choices: [{ message: { content: "hi" } }] }),
+    ).toBe("hi");
+  });
+
+  it("reads the output[].content[].text shape", () => {
+    expect(
+      coerceAiResponseText({
+        output: [{ content: [{ text: "hi" }, { text: " there" }] }],
+      }),
+    ).toBe("hi there");
+  });
+
+  it("accepts a bare string", () => {
+    expect(coerceAiResponseText("hi")).toBe("hi");
+  });
+
+  it("returns empty string for unknown shapes", () => {
+    expect(coerceAiResponseText({ unrelated: true })).toBe("");
+    expect(coerceAiResponseText(null)).toBe("");
+    expect(coerceAiResponseText(42 as unknown)).toBe("");
   });
 });
 
