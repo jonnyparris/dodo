@@ -310,7 +310,9 @@ app.all("/mcp/codemode", async (c) => {
   // resolveAdminEmail (audit finding H2). This keeps per-user secrets,
   // session ACLs, and outbound auth scoped to the real caller.
   const server = createDodoCodeModeMcpServer(c.env, resolved.email, depth);
-  const handler = createMcpHandler(server);
+  // createMcpHandler defaults route to "/mcp" and rejects anything else with
+  // 404 — pass the actual mounted route so POSTs to /mcp/codemode are accepted.
+  const handler = createMcpHandler(server, { route: "/mcp/codemode" });
   return handler(c.req.raw, c.env, c.executionCtx);
 });
 
