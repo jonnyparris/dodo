@@ -121,11 +121,13 @@ interface MonitorRow {
 }
 
 interface ChatMessage {
-  /** Resource name, e.g. `spaces/AAA/messages/BBB.CCC` — used as dedupe key. */
+  /** Resource name, e.g. `spaces/AAA/messages/M1.T1` — used as dedupe key. */
   name: string;
   text: string;
-  /** Display name of the sender. */
-  senderDisplay: string;
+  /** Sender resource name, e.g. `users/106320663698754747363`. */
+  senderResource: string;
+  /** Sender type as reported by cf-portal: HUMAN, BOT, or UNKNOWN. */
+  senderType: "HUMAN" | "BOT" | "UNKNOWN";
   /** ISO timestamp. */
   createTime: string;
   /** Thread resource name (`spaces/AAA/threads/BBB`) if available. */
@@ -381,11 +383,14 @@ export class ChatMonitorAgent extends DurableObject<Env> {
      */
     decisions: Array<{
       messageName: string;
-      senderDisplay: string;
+      senderResource: string;
+      senderType: ChatMessage["senderType"];
       sourceText: string;
       reply: boolean;
       replyText?: string;
       rawModelOutput?: string;
+      /** Set when we skipped without calling the model (e.g. BOT sender). */
+      skipReason?: string;
     }>;
   }> {
     const row = this.readState();
@@ -410,20 +415,42 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     let skipped = 0;
     const decisions: Array<{
       messageName: string;
-      senderDisplay: string;
+      senderResource: string;
+      senderType: ChatMessage["senderType"];
       sourceText: string;
       reply: boolean;
       replyText?: string;
       rawModelOutput?: string;
+      skipReason?: string;
     }> = [];
 
-    // 3. For each, ask the model whether to reply; if yes, send it.
+    // 3. For each, decide whether to reply.
+    //
+    //    - BOT messages are skipped without consulting the LLM. This is a
+    //      hard rule: replying to a BOT (especially ARIA — which is what
+    //      *we* send through) closes a feedback loop and burns through
+    //      tokens forever.
+    //    - HUMAN / UNKNOWN messages go to the LLM with the configured persona.
     for (const msg of limited) {
       try {
+        if (msg.senderType === "BOT") {
+          decisions.push({
+            messageName: msg.name,
+            senderResource: msg.senderResource,
+            senderType: msg.senderType,
+            sourceText: msg.text.slice(0, 200),
+            reply: false,
+            skipReason: "sender_is_bot",
+          });
+          skipped++;
+          this.markReplied(msg.name);
+          continue;
+        }
         const decision = await this.decide(row.persona, msg);
         decisions.push({
           messageName: msg.name,
-          senderDisplay: msg.senderDisplay,
+          senderResource: msg.senderResource,
+          senderType: msg.senderType,
           sourceText: msg.text.slice(0, 200),
           reply: decision.reply,
           replyText: decision.text,
@@ -559,7 +586,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     ].join("\n");
 
     const user = [
-      `Sender: ${msg.senderDisplay}`,
+      `Sender: ${msg.senderResource} (${msg.senderType})`,
       `Time: ${msg.createTime}`,
       `Message: ${msg.text}`,
     ].join("\n");
@@ -691,13 +718,16 @@ export function parseChatGetMessagesResult(
     const createTime = typeof obj.createTime === "string" ? obj.createTime : null;
     if (!name || !createTime) continue;
     const messageText = extractMessageText(obj);
-    const sender = obj.sender as { displayName?: string } | undefined;
-    const senderDisplay = sender?.displayName ?? "Unknown";
+    const sender = obj.sender as { name?: unknown; type?: unknown; displayName?: unknown } | undefined;
+    const senderResource = typeof sender?.name === "string" ? sender.name : "";
+    const rawType = typeof sender?.type === "string" ? sender.type.toUpperCase() : "";
+    const senderType: ChatMessage["senderType"] = rawType === "HUMAN" || rawType === "BOT" ? rawType : "UNKNOWN";
     const thread = obj.thread as { name?: string } | undefined;
     out.push({
       name,
       text: messageText,
-      senderDisplay,
+      senderResource,
+      senderType,
       createTime,
       threadName: thread?.name,
     });

@@ -95,14 +95,14 @@ describe("parseChatGetMessagesResult", () => {
           name: "spaces/AAA/messages/M1.T1",
           text: "hello world",
           createTime: "2026-05-27T10:00:00Z",
-          sender: { displayName: "Alice" },
+          sender: { name: "users/100", type: "HUMAN" },
           thread: { name: "spaces/AAA/threads/T1" },
         },
         {
           name: "spaces/AAA/messages/M2.T1",
           text: "follow-up",
           createTime: "2026-05-27T10:01:00Z",
-          sender: { displayName: "Bob" },
+          sender: { name: "users/200", type: "BOT" },
           thread: { name: "spaces/AAA/threads/T1" },
         },
       ],
@@ -114,11 +114,13 @@ describe("parseChatGetMessagesResult", () => {
     expect(parsed[0]).toMatchObject({
       name: "spaces/AAA/messages/M1.T1",
       text: "hello world",
-      senderDisplay: "Alice",
+      senderResource: "users/100",
+      senderType: "HUMAN",
       createTime: "2026-05-27T10:00:00Z",
       threadName: "spaces/AAA/threads/T1",
     });
-    expect(parsed[1].senderDisplay).toBe("Bob");
+    expect(parsed[1].senderResource).toBe("users/200");
+    expect(parsed[1].senderType).toBe("BOT");
   });
 
   it("tolerates missing optional fields", () => {
@@ -135,8 +137,41 @@ describe("parseChatGetMessagesResult", () => {
     ]);
     expect(parsed).toHaveLength(1);
     expect(parsed[0].text).toBe("");
-    expect(parsed[0].senderDisplay).toBe("Unknown");
+    expect(parsed[0].senderResource).toBe("");
+    expect(parsed[0].senderType).toBe("UNKNOWN");
     expect(parsed[0].threadName).toBeUndefined();
+  });
+
+  it("normalises unknown sender.type to UNKNOWN", () => {
+    const payload = {
+      messages: [
+        {
+          name: "spaces/AAA/messages/M1.T1",
+          createTime: "2026-05-27T10:00:00Z",
+          sender: { name: "users/x", type: "weird-type" },
+        },
+      ],
+    };
+    const parsed = parseChatGetMessagesResult([
+      { type: "text", text: JSON.stringify(payload) },
+    ]);
+    expect(parsed[0].senderType).toBe("UNKNOWN");
+  });
+
+  it("uppercases mixed-case sender.type", () => {
+    const payload = {
+      messages: [
+        {
+          name: "spaces/AAA/messages/M1.T1",
+          createTime: "2026-05-27T10:00:00Z",
+          sender: { name: "users/x", type: "human" },
+        },
+      ],
+    };
+    const parsed = parseChatGetMessagesResult([
+      { type: "text", text: JSON.stringify(payload) },
+    ]);
+    expect(parsed[0].senderType).toBe("HUMAN");
   });
 
   it("skips entries with no name or createTime", () => {
