@@ -1990,7 +1990,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
 
   server.tool(
     "chat_monitor_upsert",
-    "ADMIN-ONLY. Create or update a Google Chat monitor for (ownerEmail, spaceId). The monitor polls the space and decides replies via Kimi K2.6. After upsert, call `chat_monitor_start` to begin polling. Persona is free-form instructions for the decider model.",
+    "ADMIN-ONLY. Create or update a Google Chat monitor for (ownerEmail, spaceId). The monitor polls the space and decides replies via Gemma 4. Persona is free-form instructions for the decider model. `commandSenders` is a HARD code-level allowlist — when non-empty, only messages from those sender resource names ever reach the LLM (prompt-injection-proof). After upsert, call `chat_monitor_start` to begin polling.",
     createMonitorSchema.shape,
     async (args) => {
       if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
@@ -2000,6 +2000,39 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
         headers: { "content-type": "application/json" },
         body: JSON.stringify(parsed),
       });
+      return textResult(result);
+    },
+  );
+
+  server.tool(
+    "chat_monitor_list",
+    "ADMIN-ONLY. List every chat monitor registered in SharedIndex (across all owners). Lightweight — does not hit each monitor DO. Use `chat_monitor_state` for per-monitor details.",
+    {},
+    async () => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const stub = getSharedIndexStub(env);
+      const res = await stub.fetch("https://shared-index/chat-monitors");
+      const text = await res.text();
+      try {
+        return textResult(JSON.parse(text));
+      } catch {
+        return errorResult({ status: res.status, body: text });
+      }
+    },
+  );
+
+  server.tool(
+    "chat_monitor_decisions",
+    "ADMIN-ONLY. Return the most-recent decisions made by a monitor (newest first, max 200). Useful for tuning the persona or auditing what the bot has been replying to.",
+    {
+      ownerEmail: z.string().email(),
+      spaceId: z.string().min(1).regex(/^spaces\//),
+      limit: z.number().int().min(1).max(200).optional().describe("Max entries to return (default 50)."),
+    },
+    async ({ ownerEmail, spaceId, limit }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const qs = limit ? `?limit=${limit}` : "";
+      const result = await proxyChatMonitor(ownerEmail, spaceId, `/decisions${qs}`);
       return textResult(result);
     },
   );

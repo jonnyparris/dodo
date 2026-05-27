@@ -562,6 +562,13 @@ app.get("/admin/autopilot", async (c) => {
   return new Response("Admin page not available", { status: 404 });
 });
 
+app.get("/admin/chat-monitors", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-chat-monitors.html", c.req.url), c.req.raw));
+  }
+  return new Response("Admin page not available", { status: 404 });
+});
+
 // ─── Admin routes (admin only) ───
 
 const adminGuard = async (c: { get: (key: string) => unknown; env: Env; json: (data: unknown, status?: number) => Response }, next: () => Promise<void>): Promise<Response | void> => {
@@ -664,6 +671,21 @@ app.post("/api/admin/chat-monitor", adminGuard as never, async (c) => {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(parsed.data),
   });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.get("/api/admin/chat-monitor", adminGuard as never, async (c) => {
+  // Global list from SharedIndex registry.
+  return proxyToSharedIndex(c.env, "/chat-monitors");
+});
+
+app.get("/api/admin/chat-monitor/:owner/:space/decisions", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const limit = c.req.query("limit");
+  const qs = limit ? `?limit=${encodeURIComponent(limit)}` : "";
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch(`https://chat-monitor/decisions${qs}`);
   return new Response(res.body, { status: res.status, headers: res.headers });
 });
 

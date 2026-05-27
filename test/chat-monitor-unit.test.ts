@@ -6,7 +6,9 @@ import {
   extractMessageText,
   findChatGetMessagesTool,
   parseChatGetMessagesResult,
+  parseCommandSenders,
   pickCfPortalConfig,
+  SENDER_RESOURCE_PATTERN,
 } from "../src/chat-monitor-agent";
 import type { McpClientConfig } from "../src/mcp-client";
 
@@ -59,6 +61,85 @@ describe("createMonitorSchema", () => {
       persona: "x",
     });
     expect(parsed.pollIntervalSeconds).toBe(10);
+  });
+
+  it("accepts valid commandSenders entries", () => {
+    const parsed = createMonitorSchema.parse({
+      ownerEmail: "a@b.com",
+      spaceId: "spaces/AAAA",
+      persona: "x",
+      commandSenders: ["users/106320663698754747363", "users/200"],
+    });
+    expect(parsed.commandSenders).toHaveLength(2);
+  });
+
+  it("defaults commandSenders to empty array", () => {
+    const parsed = createMonitorSchema.parse({
+      ownerEmail: "a@b.com",
+      spaceId: "spaces/AAAA",
+      persona: "x",
+    });
+    expect(parsed.commandSenders).toEqual([]);
+  });
+
+  it("rejects malformed sender resource names", () => {
+    const result = createMonitorSchema.safeParse({
+      ownerEmail: "a@b.com",
+      spaceId: "spaces/AAAA",
+      persona: "x",
+      commandSenders: ["alice@example.com"], // not a users/<digits>
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects more than 20 commandSenders", () => {
+    const result = createMonitorSchema.safeParse({
+      ownerEmail: "a@b.com",
+      spaceId: "spaces/AAAA",
+      persona: "x",
+      commandSenders: Array.from({ length: 21 }, (_, i) => `users/${i}`),
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe("SENDER_RESOURCE_PATTERN", () => {
+  it("matches valid resource names", () => {
+    expect(SENDER_RESOURCE_PATTERN.test("users/106320663698754747363")).toBe(true);
+    expect(SENDER_RESOURCE_PATTERN.test("users/1")).toBe(true);
+  });
+
+  it("rejects other shapes", () => {
+    expect(SENDER_RESOURCE_PATTERN.test("user/123")).toBe(false);
+    expect(SENDER_RESOURCE_PATTERN.test("users/abc")).toBe(false);
+    expect(SENDER_RESOURCE_PATTERN.test("alice@example.com")).toBe(false);
+  });
+});
+
+describe("parseCommandSenders", () => {
+  it("parses a valid JSON array", () => {
+    expect(parseCommandSenders('["users/1","users/2"]')).toEqual(["users/1", "users/2"]);
+  });
+
+  it("returns [] for null / undefined / empty string", () => {
+    expect(parseCommandSenders(null)).toEqual([]);
+    expect(parseCommandSenders(undefined)).toEqual([]);
+    expect(parseCommandSenders("")).toEqual([]);
+  });
+
+  it("returns [] for malformed JSON", () => {
+    expect(parseCommandSenders("not json")).toEqual([]);
+  });
+
+  it("returns [] when payload is not an array", () => {
+    expect(parseCommandSenders('{"foo":"bar"}')).toEqual([]);
+  });
+
+  it("filters out non-string entries", () => {
+    expect(parseCommandSenders('["users/1",42,null,"users/2"]')).toEqual([
+      "users/1",
+      "users/2",
+    ]);
   });
 });
 

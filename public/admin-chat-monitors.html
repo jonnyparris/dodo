@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Dodo — Chat Monitors (Admin)</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    :root{--bg:#f5f5f0;--panel:#fff;--text:#1a1a1a;--muted:#666;--accent:#0a7c66;--accent-bg:rgba(10,124,102,.06);--border:#e0e0e0;--radius:8px;--mono:"SFMono-Regular",Consolas,monospace;--brand:#6c47ff;--danger:#c62828;--success:#0a7c66;--warning:#e65100}
+    @media(prefers-color-scheme:dark){:root{--bg:#111;--panel:#1a1a1a;--text:#e5e5e5;--muted:#999;--accent:#4ecdc4;--accent-bg:rgba(78,205,196,.08);--border:#333;--brand:#9b7dff;--danger:#ef5350;--success:#4ecdc4;--warning:#ffb74d}}
+    *{box-sizing:border-box;margin:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
+    main{max-width:1100px;margin:0 auto;padding:32px 20px 80px}
+    h1{font-size:24px;margin-bottom:8px}
+    h2{font-size:16px;margin:24px 0 10px;color:var(--accent)}
+    h3{font-size:14px;margin:18px 0 8px}
+    p{color:var(--muted);margin-bottom:12px}
+    a{color:var(--accent)}
+    .back{display:inline-block;margin-bottom:24px;font-size:13px}
+    code{font-family:var(--mono);font-size:12px;background:var(--accent-bg);padding:2px 6px;border-radius:4px}
+    label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:14px 0 6px}
+    input,textarea{width:100%;font-family:inherit;font-size:13px;padding:8px 10px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px}
+    textarea{font-family:var(--mono);min-height:120px;line-height:1.5;resize:vertical}
+    input:focus,textarea:focus{outline:none;border-color:var(--accent)}
+    button{font-family:inherit;font-size:13px;padding:8px 14px;border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:6px;cursor:pointer;margin-right:6px;margin-top:12px}
+    button:hover{border-color:var(--accent);color:var(--accent)}
+    button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+    button.primary:hover{opacity:.9}
+    button.danger{color:var(--danger);border-color:var(--danger)}
+    button.danger:hover{background:var(--danger);color:#fff}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .status{font-size:12px;margin-top:14px;min-height:18px}
+    .status.error{color:var(--danger)}
+    .status.success{color:var(--success)}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:16px}
+    .row{display:grid;grid-template-columns:160px 1fr;gap:12px;font-size:12px;margin-bottom:6px;align-items:start}
+    .row span:first-child{color:var(--muted)}
+    .row code{word-break:break-all}
+    table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+    th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+    th{color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;font-size:11px}
+    .pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-family:var(--mono)}
+    .pill.on{background:rgba(10,124,102,.15);color:var(--success)}
+    .pill.off{background:var(--accent-bg);color:var(--muted)}
+    .pill.skip{background:rgba(230,81,0,.12);color:var(--warning)}
+    .pill.reply{background:rgba(108,71,255,.12);color:var(--brand)}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    @media(max-width:720px){.grid{grid-template-columns:1fr}}
+    .muted{color:var(--muted);font-size:12px}
+    .hide{display:none}
+    .truncate{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .small{font-size:11px}
+  </style>
+</head>
+<body>
+  <main>
+    <a href="/" class="back">&larr; Back to Dodo</a>
+    <h1>Chat Monitors</h1>
+    <p>Per-(owner, Google Chat space) poll-decide-reply Durable Objects. Replies are sent via the ARIA chat middleware; reads use the owner's cf-portal MCP refresh-token config. Decisions are made by Gemma 4 unless the message fails an earlier hard filter.</p>
+
+    <div id="globalStatus" class="status"></div>
+
+    <h2>Active monitors</h2>
+    <div class="panel">
+      <button id="refreshBtn">Refresh</button>
+      <table id="monitorsTable">
+        <thead>
+          <tr>
+            <th>Owner</th>
+            <th>Space</th>
+            <th>State</th>
+            <th>Poll (s)</th>
+            <th>Created</th>
+            <th>Updated</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div id="monitorsEmpty" class="muted hide">No monitors yet.</div>
+    </div>
+
+    <h2>Upsert monitor</h2>
+    <p>Creating an existing (owner, space) pair updates persona / interval / allowlist without resetting the dedupe state or stopping the alarm.</p>
+    <div class="panel">
+      <label for="ownerEmail">Owner email</label>
+      <input id="ownerEmail" placeholder="ruskin.constant@gmail.com"/>
+      <label for="spaceId">Space ID</label>
+      <input id="spaceId" placeholder="spaces/AAAA..."/>
+      <label for="pollInterval">Poll interval (seconds, ≥10)</label>
+      <input id="pollInterval" type="number" min="10" max="3600" value="15"/>
+      <label for="commandSenders">Command sender allowlist (one per line — e.g. <code>users/106320663698754747363</code>)</label>
+      <textarea id="commandSenders" placeholder="Optional. When set, only messages from these sender resources reach the LLM. Code-level filter — not bypassable via prompt injection."></textarea>
+      <label for="persona">Persona</label>
+      <textarea id="persona" placeholder="You are a polite bot that..."></textarea>
+      <button id="upsertBtn" class="primary">Upsert</button>
+      <button id="clearBtn">Clear form</button>
+      <div id="upsertStatus" class="status"></div>
+    </div>
+
+    <h2>Details</h2>
+    <div class="panel">
+      <p>Click a monitor in the table above to load its detail panel here.</p>
+      <div id="detail" class="hide">
+        <h3 id="detailTitle"></h3>
+        <div class="grid">
+          <div>
+            <div class="row"><span>Owner</span><code id="detailOwner"></code></div>
+            <div class="row"><span>Space</span><code id="detailSpace"></code></div>
+            <div class="row"><span>Enabled</span><span id="detailEnabled"></span></div>
+            <div class="row"><span>Interval</span><span id="detailInterval"></span></div>
+            <div class="row"><span>Last seen</span><span id="detailLastSeen"></span></div>
+            <div class="row"><span>Last run</span><span id="detailLastRun"></span></div>
+            <div class="row"><span>Last error</span><span id="detailLastError"></span></div>
+            <div class="row"><span>Command senders</span><span id="detailSenders"></span></div>
+          </div>
+          <div>
+            <h3>Persona</h3>
+            <pre id="detailPersona" style="white-space:pre-wrap;font-family:var(--mono);font-size:12px;background:var(--accent-bg);padding:10px;border-radius:6px"></pre>
+          </div>
+        </div>
+        <div style="margin-top:14px">
+          <button id="startBtn" class="primary">Start</button>
+          <button id="stopBtn">Stop</button>
+          <button id="tickBtn">Tick once</button>
+          <button id="reloadBtn">Reload state</button>
+          <button id="deleteBtn" class="danger">Delete</button>
+        </div>
+        <div id="detailStatus" class="status"></div>
+
+        <h3 style="margin-top:24px">Recent decisions</h3>
+        <table id="decisionsTable">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Sender</th>
+              <th>Message</th>
+              <th>Outcome</th>
+              <th>Detail</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div id="decisionsEmpty" class="muted hide">No decisions recorded yet.</div>
+      </div>
+    </div>
+  </main>
+
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+    const $$ = (sel) => document.querySelectorAll(sel);
+
+    function setStatus(el, msg, kind) {
+      el.textContent = msg || "";
+      el.className = "status" + (kind ? " " + kind : "");
+    }
+
+    function relTime(epochSec) {
+      if (!epochSec) return "never";
+      const now = Date.now() / 1000;
+      const d = now - epochSec;
+      if (d < 60) return Math.round(d) + "s ago";
+      if (d < 3600) return Math.round(d / 60) + "m ago";
+      if (d < 86400) return Math.round(d / 3600) + "h ago";
+      return new Date(epochSec * 1000).toISOString().slice(0, 10);
+    }
+
+    function relTimeIso(iso) {
+      if (!iso) return "never";
+      const epoch = Math.floor(new Date(iso).getTime() / 1000);
+      if (!isFinite(epoch)) return iso;
+      return relTime(epoch);
+    }
+
+    async function api(method, path, body) {
+      const res = await fetch(path, {
+        method,
+        headers: body ? { "content-type": "application/json" } : {},
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const text = await res.text();
+      let parsed = null;
+      try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { raw: text }; }
+      if (!res.ok) {
+        const message = parsed?.error || parsed?.raw || `${res.status}`;
+        throw new Error(message);
+      }
+      return parsed;
+    }
+
+    let selected = null;
+
+    async function loadMonitors() {
+      const { monitors } = await api("GET", "/api/admin/chat-monitor");
+      const tbody = $("monitorsTable").querySelector("tbody");
+      tbody.innerHTML = "";
+      $("monitorsEmpty").classList.toggle("hide", monitors.length > 0);
+      for (const m of monitors) {
+        const tr = document.createElement("tr");
+        tr.style.cursor = "pointer";
+        tr.innerHTML = `
+          <td><code>${m.ownerEmail}</code></td>
+          <td><code class="truncate">${m.spaceId}</code></td>
+          <td><span class="pill ${m.enabled ? "on" : "off"}">${m.enabled ? "running" : "stopped"}</span></td>
+          <td>${m.pollIntervalSeconds}</td>
+          <td class="small">${relTime(m.createdAt)}</td>
+          <td class="small">${relTime(m.updatedAt)}</td>
+          <td><button data-owner="${m.ownerEmail}" data-space="${m.spaceId}" class="small">Open</button></td>
+        `;
+        tr.querySelector("button").addEventListener("click", (e) => {
+          e.stopPropagation();
+          select(m.ownerEmail, m.spaceId);
+        });
+        tr.addEventListener("click", () => select(m.ownerEmail, m.spaceId));
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function select(owner, space) {
+      selected = { owner, space };
+      $("detail").classList.remove("hide");
+      $("detailTitle").textContent = `${owner} · ${space}`;
+      setStatus($("detailStatus"), "loading...", null);
+      try {
+        await Promise.all([loadDetail(), loadDecisions()]);
+        setStatus($("detailStatus"), "loaded", "success");
+        setTimeout(() => setStatus($("detailStatus"), ""), 1500);
+      } catch (e) {
+        setStatus($("detailStatus"), `load failed: ${e.message}`, "error");
+      }
+    }
+
+    async function loadDetail() {
+      const { owner, space } = selected;
+      const url = `/api/admin/chat-monitor/${encodeURIComponent(owner)}/${encodeURIComponent(space)}`;
+      const data = await api("GET", url);
+      const s = data.state || {};
+      $("detailOwner").textContent = s.ownerEmail || owner;
+      $("detailSpace").textContent = s.spaceId || space;
+      $("detailEnabled").innerHTML = `<span class="pill ${s.enabled ? "on" : "off"}">${s.enabled ? "running" : "stopped"}</span>`;
+      $("detailInterval").textContent = `${s.pollIntervalSeconds}s`;
+      $("detailLastSeen").textContent = s.lastSeenIso ? `${s.lastSeenIso} (${relTimeIso(s.lastSeenIso)})` : "never";
+      $("detailLastRun").textContent = s.lastRunIso ? `${s.lastRunIso} (${relTimeIso(s.lastRunIso)})` : "never";
+      $("detailLastError").innerHTML = s.lastError ? `<code style="color:var(--danger)">${escapeHtml(s.lastError)}</code>` : "<span class=\"muted\">none</span>";
+      $("detailSenders").innerHTML = Array.isArray(s.commandSenders) && s.commandSenders.length
+        ? s.commandSenders.map((x) => `<code>${escapeHtml(x)}</code>`).join("<br>")
+        : `<span class="muted">none (open — every HUMAN message reaches the LLM)</span>`;
+      $("detailPersona").textContent = s.persona || "";
+    }
+
+    async function loadDecisions() {
+      const { owner, space } = selected;
+      const url = `/api/admin/chat-monitor/${encodeURIComponent(owner)}/${encodeURIComponent(space)}/decisions?limit=50`;
+      const data = await api("GET", url);
+      const tbody = $("decisionsTable").querySelector("tbody");
+      tbody.innerHTML = "";
+      const decisions = data.decisions || [];
+      $("decisionsEmpty").classList.toggle("hide", decisions.length > 0);
+      for (const d of decisions) {
+        const tr = document.createElement("tr");
+        const outcome = d.reply
+          ? `<span class="pill reply">replied</span>`
+          : (d.skipReason ? `<span class="pill skip">skip (${escapeHtml(d.skipReason)})</span>` : `<span class="pill off">no reply</span>`);
+        const detailStr = d.replyText
+          ? escapeHtml(d.replyText)
+          : (d.rawModelOutput ? `<code class="small">${escapeHtml(d.rawModelOutput)}</code>` : "");
+        tr.innerHTML = `
+          <td class="small">${relTime(d.ts)}</td>
+          <td class="small"><code>${escapeHtml(d.senderResource || "?")}</code><br><span class="muted">${d.senderType}</span></td>
+          <td class="truncate" title="${escapeHtml(d.sourceText || "")}">${escapeHtml(d.sourceText || "")}</td>
+          <td>${outcome}</td>
+          <td>${detailStr}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    async function upsert() {
+      const ownerEmail = $("ownerEmail").value.trim();
+      const spaceId = $("spaceId").value.trim();
+      const pollIntervalSeconds = parseInt($("pollInterval").value, 10);
+      const persona = $("persona").value;
+      const commandSenders = $("commandSenders").value
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+
+      if (!ownerEmail || !spaceId || !persona) {
+        setStatus($("upsertStatus"), "ownerEmail, spaceId, and persona are required", "error");
+        return;
+      }
+      setStatus($("upsertStatus"), "upserting...", null);
+      try {
+        await api("POST", "/api/admin/chat-monitor", {
+          ownerEmail, spaceId, persona, pollIntervalSeconds, commandSenders,
+        });
+        setStatus($("upsertStatus"), "upserted (monitor not yet started)", "success");
+        await loadMonitors();
+        await select(ownerEmail, spaceId);
+      } catch (e) {
+        setStatus($("upsertStatus"), `failed: ${e.message}`, "error");
+      }
+    }
+
+    async function actOnSelected(verb) {
+      if (!selected) return;
+      const { owner, space } = selected;
+      setStatus($("detailStatus"), `${verb}ing...`, null);
+      try {
+        await api("POST", `/api/admin/chat-monitor/${encodeURIComponent(owner)}/${encodeURIComponent(space)}/${verb}`);
+        setStatus($("detailStatus"), `${verb} ok`, "success");
+        await Promise.all([loadMonitors(), loadDetail(), loadDecisions()]);
+      } catch (e) {
+        setStatus($("detailStatus"), `${verb} failed: ${e.message}`, "error");
+      }
+    }
+
+    async function deleteSelected() {
+      if (!selected) return;
+      if (!confirm(`Delete monitor for ${selected.owner} · ${selected.space}? This wipes config, decision log, and alarm.`)) return;
+      const { owner, space } = selected;
+      setStatus($("detailStatus"), "deleting...", null);
+      try {
+        await api("DELETE", `/api/admin/chat-monitor/${encodeURIComponent(owner)}/${encodeURIComponent(space)}`);
+        selected = null;
+        $("detail").classList.add("hide");
+        await loadMonitors();
+        setStatus($("globalStatus"), "monitor deleted", "success");
+        setTimeout(() => setStatus($("globalStatus"), ""), 2000);
+      } catch (e) {
+        setStatus($("detailStatus"), `delete failed: ${e.message}`, "error");
+      }
+    }
+
+    $("refreshBtn").addEventListener("click", () => loadMonitors().catch((e) => setStatus($("globalStatus"), e.message, "error")));
+    $("upsertBtn").addEventListener("click", upsert);
+    $("clearBtn").addEventListener("click", () => {
+      $("ownerEmail").value = "";
+      $("spaceId").value = "";
+      $("persona").value = "";
+      $("commandSenders").value = "";
+      $("pollInterval").value = "15";
+      setStatus($("upsertStatus"), "");
+    });
+    $("startBtn").addEventListener("click", () => actOnSelected("start"));
+    $("stopBtn").addEventListener("click", () => actOnSelected("stop"));
+    $("tickBtn").addEventListener("click", () => actOnSelected("tick"));
+    $("reloadBtn").addEventListener("click", async () => {
+      try {
+        await Promise.all([loadDetail(), loadDecisions()]);
+        setStatus($("detailStatus"), "reloaded", "success");
+      } catch (e) {
+        setStatus($("detailStatus"), e.message, "error");
+      }
+    });
+    $("deleteBtn").addEventListener("click", deleteSelected);
+
+    loadMonitors().catch((e) => setStatus($("globalStatus"), e.message, "error"));
+  </script>
+</body>
+</html>
