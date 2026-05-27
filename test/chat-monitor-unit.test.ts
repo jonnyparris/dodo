@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildBrainGoalText,
   chatMonitorIdName,
-  coerceAiResponseText,
   createMonitorSchema,
   extractMessageText,
   findChatGetMessagesTool,
@@ -61,7 +61,7 @@ describe("createMonitorSchema", () => {
       spaceId: "spaces/AAAA",
       persona: "x",
     });
-    expect(parsed.pollIntervalSeconds).toBe(10);
+    expect(parsed.pollIntervalSeconds).toBe(15);
   });
 
   it("accepts valid commandSenders entries", () => {
@@ -110,22 +110,16 @@ describe("createMonitorSchema", () => {
       persona: "x",
     });
     expect(parsed.contextMode).toBe("off");
-    expect(parsed.contextBufferMinutes).toBe(60);
-    expect(parsed.contextBufferSize).toBe(10);
   });
 
-  it("accepts contextMode 'recent' with custom buffer config", () => {
+  it("accepts contextMode 'recent'", () => {
     const parsed = createMonitorSchema.parse({
       ownerEmail: "a@b.com",
       spaceId: "spaces/AAAA",
       persona: "x",
       contextMode: "recent",
-      contextBufferMinutes: 30,
-      contextBufferSize: 25,
     });
     expect(parsed.contextMode).toBe("recent");
-    expect(parsed.contextBufferMinutes).toBe(30);
-    expect(parsed.contextBufferSize).toBe(25);
   });
 
   it("rejects an unknown contextMode value", () => {
@@ -137,43 +131,61 @@ describe("createMonitorSchema", () => {
     });
     expect(result.success).toBe(false);
   });
+});
 
-  it("rejects buffer TTL outside 5..360", () => {
-    expect(
-      createMonitorSchema.safeParse({
-        ownerEmail: "a@b.com",
-        spaceId: "spaces/AAAA",
-        persona: "x",
-        contextBufferMinutes: 4,
-      }).success,
-    ).toBe(false);
-    expect(
-      createMonitorSchema.safeParse({
-        ownerEmail: "a@b.com",
-        spaceId: "spaces/AAAA",
-        persona: "x",
-        contextBufferMinutes: 400,
-      }).success,
-    ).toBe(false);
+describe("buildBrainGoalText", () => {
+  it("names the space and the allowlisted command senders", () => {
+    const goal = buildBrainGoalText({
+      spaceId: "spaces/AAAA",
+      persona: "Be helpful.",
+      commandSenders: ["users/111", "users/222"],
+      contextMode: "off",
+    });
+    expect(goal).toContain("spaces/AAAA");
+    expect(goal).toContain("users/111");
+    expect(goal).toContain("users/222");
+    expect(goal).toContain("Be helpful.");
   });
 
-  it("rejects buffer size outside 1..50", () => {
-    expect(
-      createMonitorSchema.safeParse({
-        ownerEmail: "a@b.com",
-        spaceId: "spaces/AAAA",
-        persona: "x",
-        contextBufferSize: 0,
-      }).success,
-    ).toBe(false);
-    expect(
-      createMonitorSchema.safeParse({
-        ownerEmail: "a@b.com",
-        spaceId: "spaces/AAAA",
-        persona: "x",
-        contextBufferSize: 100,
-      }).success,
-    ).toBe(false);
+  it("notes that no senders are configured when allowlist is empty", () => {
+    const goal = buildBrainGoalText({
+      spaceId: "spaces/AAAA",
+      persona: "x",
+      commandSenders: [],
+      contextMode: "off",
+    });
+    expect(goal).toMatch(/none/);
+  });
+
+  it("describes the background-forwarding behaviour when contextMode is recent", () => {
+    const goal = buildBrainGoalText({
+      spaceId: "spaces/AAAA",
+      persona: "x",
+      commandSenders: ["users/1"],
+      contextMode: "recent",
+    });
+    expect(goal).toContain("[Background]");
+  });
+
+  it("describes the off behaviour when contextMode is off", () => {
+    const goal = buildBrainGoalText({
+      spaceId: "spaces/AAAA",
+      persona: "x",
+      commandSenders: ["users/1"],
+      contextMode: "off",
+    });
+    expect(goal).toContain("only ever see prompts from allowlisted");
+  });
+
+  it("emphasises that chat_reply is the only way to post", () => {
+    const goal = buildBrainGoalText({
+      spaceId: "spaces/AAAA",
+      persona: "x",
+      commandSenders: ["users/1"],
+      contextMode: "off",
+    });
+    expect(goal).toContain("chat_reply");
+    expect(goal).toContain("ONLY");
   });
 });
 
@@ -538,40 +550,6 @@ describe("extractMessageText", () => {
       ],
     };
     expect(extractMessageText(msg)).toBe("from a user\nand from a card");
-  });
-});
-
-describe("coerceAiResponseText", () => {
-  it("reads the standard { response } shape", () => {
-    expect(coerceAiResponseText({ response: "hi" })).toBe("hi");
-  });
-
-  it("reads a nested { result: { response } } shape", () => {
-    expect(coerceAiResponseText({ result: { response: "hi" } })).toBe("hi");
-  });
-
-  it("reads OpenAI-compatible choices[].message.content", () => {
-    expect(
-      coerceAiResponseText({ choices: [{ message: { content: "hi" } }] }),
-    ).toBe("hi");
-  });
-
-  it("reads the output[].content[].text shape", () => {
-    expect(
-      coerceAiResponseText({
-        output: [{ content: [{ text: "hi" }, { text: " there" }] }],
-      }),
-    ).toBe("hi there");
-  });
-
-  it("accepts a bare string", () => {
-    expect(coerceAiResponseText("hi")).toBe("hi");
-  });
-
-  it("returns empty string for unknown shapes", () => {
-    expect(coerceAiResponseText({ unrelated: true })).toBe("");
-    expect(coerceAiResponseText(null)).toBe("");
-    expect(coerceAiResponseText(42 as unknown)).toBe("");
   });
 });
 

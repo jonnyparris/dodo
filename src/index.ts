@@ -679,13 +679,13 @@ app.get("/api/admin/chat-monitor", adminGuard as never, async (c) => {
   return proxyToSharedIndex(c.env, "/chat-monitors");
 });
 
-app.get("/api/admin/chat-monitor/:owner/:space/decisions", adminGuard as never, async (c) => {
+app.get("/api/admin/chat-monitor/:owner/:space/forwards", adminGuard as never, async (c) => {
   const owner = decodeURIComponent(c.req.param("owner"));
   const space = decodeURIComponent(c.req.param("space"));
   const limit = c.req.query("limit");
   const qs = limit ? `?limit=${encodeURIComponent(limit)}` : "";
   const stub = chatMonitorStub(c.env, owner, space);
-  const res = await stub.fetch(`https://chat-monitor/decisions${qs}`);
+  const res = await stub.fetch(`https://chat-monitor/forwards${qs}`);
   return new Response(res.body, { status: res.status, headers: res.headers });
 });
 
@@ -721,13 +721,7 @@ app.post("/api/admin/chat-monitor/:owner/:space/tick", adminGuard as never, asyn
   return new Response(res.body, { status: res.status, headers: res.headers });
 });
 
-app.post("/api/admin/chat-monitor/:owner/:space/buffer/clear", adminGuard as never, async (c) => {
-  const owner = decodeURIComponent(c.req.param("owner"));
-  const space = decodeURIComponent(c.req.param("space"));
-  const stub = chatMonitorStub(c.env, owner, space);
-  const res = await stub.fetch("https://chat-monitor/buffer/clear", { method: "POST" });
-  return new Response(res.body, { status: res.status, headers: res.headers });
-});
+
 
 app.delete("/api/admin/chat-monitor/:owner/:space", adminGuard as never, async (c) => {
   const owner = decodeURIComponent(c.req.param("owner"));

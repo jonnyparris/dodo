@@ -3002,6 +3002,27 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return Response.json({ isAutopilot, role });
       }
 
+      // Chat-monitor brain flag — mirrors autopilot-flag. Set by
+      // ChatMonitorAgent when it spawns a brain session; the `chat_reply`
+      // MCP tool refuses to send unless the calling session has this flag.
+      if (request.method === "PUT" && url.pathname === "/chat-monitor-flag") {
+        const body = (await request.json()) as { isChatMonitorBrain?: boolean; spaceId?: string };
+        const flag = Boolean(body.isChatMonitorBrain);
+        this.writeMetadata("is_chat_monitor_brain", String(flag));
+        if (typeof body.spaceId === "string" && body.spaceId.length > 0) {
+          this.writeMetadata("chat_monitor_space_id", body.spaceId);
+        } else if (!flag) {
+          this.writeMetadata("chat_monitor_space_id", "");
+        }
+        return Response.json({ isChatMonitorBrain: flag, spaceId: body.spaceId ?? null });
+      }
+
+      if (request.method === "GET" && url.pathname === "/chat-monitor-flag") {
+        const flag = this.readMetadata("is_chat_monitor_brain") === "true";
+        const spaceId = this.readMetadata("chat_monitor_space_id") || null;
+        return Response.json({ isChatMonitorBrain: flag, spaceId });
+      }
+
       if (request.method === "GET" && url.pathname === "/files") {
         return await this.handleListFiles(url);
       }

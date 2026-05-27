@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
-import { chatMonitorIdName, createMonitorSchema } from "./chat-monitor-agent";
+import { chatMonitorIdName, createMonitorSchema, sendChatReply } from "./chat-monitor-agent";
 import { log } from "./logger";
 import { messageLimiter, promptLimiter } from "./rate-limit";
 import { createDraftPrForRun, createGithubRepo, pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-api";
@@ -1990,7 +1990,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
 
   server.tool(
     "chat_monitor_upsert",
-    "ADMIN-ONLY. Create or update a Google Chat monitor for (ownerEmail, spaceId). The monitor polls the space and decides replies via Gemma 4. Persona is free-form instructions for the decider model. `commandSenders` is a HARD code-level allowlist — when non-empty, only messages from those sender resource names ever reach the LLM (prompt-injection-proof). After upsert, call `chat_monitor_start` to begin polling.",
+    "ADMIN-ONLY. Create or update a Google Chat monitor for (ownerEmail, spaceId). The monitor polls the space and forwards allowlisted HUMAN messages to a dedicated CodingAgent 'brain' session. The persona becomes the brain session's goal text. `commandSenders` is a HARD code-level allowlist — non-allowlisted senders' messages either go to the brain as background context (contextMode='recent') or are dropped (default 'off'). The brain session uses cf-portal MCP + all of Dodo's normal tool surface; it posts to chat by calling the `chat_reply` MCP tool. After upsert, call `chat_monitor_start` to begin polling.",
     createMonitorSchema.shape,
     async (args) => {
       if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
@@ -2022,8 +2022,8 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   );
 
   server.tool(
-    "chat_monitor_decisions",
-    "ADMIN-ONLY. Return the most-recent decisions made by a monitor (newest first, max 200). Useful for tuning the persona or auditing what the bot has been replying to.",
+    "chat_monitor_forwards",
+    "ADMIN-ONLY. Return the most-recent forward-log entries for a monitor (newest first, max 200). Shows which messages were forwarded as commands, which as background, and which were skipped (and why). Replaces the pre-refactor `chat_monitor_decisions`.",
     {
       ownerEmail: z.string().email(),
       spaceId: z.string().min(1).regex(/^spaces\//),
@@ -2032,7 +2032,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     async ({ ownerEmail, spaceId, limit }) => {
       if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
       const qs = limit ? `?limit=${limit}` : "";
-      const result = await proxyChatMonitor(ownerEmail, spaceId, `/decisions${qs}`);
+      const result = await proxyChatMonitor(ownerEmail, spaceId, `/forwards${qs}`);
       return textResult(result);
     },
   );
@@ -2094,16 +2094,41 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   );
 
   server.tool(
-    "chat_monitor_clear_buffer",
-    "ADMIN-ONLY. Wipe the recent-messages context buffer for one monitor. Use when contextMode='recent' has accumulated activity you don't want the model to see anymore. Returns the number of rows cleared.",
+    "chat_reply",
+    "Post a reply to a Google Chat space. Callable ONLY by a CodingAgent session flagged as a chat-monitor brain (the flag is set on session creation by ChatMonitorAgent). Posts to the brain's pre-registered space — the `spaceId` arg is ignored if it doesn't match. `threadName` is optional; supply it to reply in a specific thread.",
     {
-      ownerEmail: z.string().email(),
-      spaceId: z.string().min(1).regex(/^spaces\//),
+      sessionId: z.string().min(1).describe("Your own session id (the brain session calling this tool)."),
+      text: z.string().min(1).max(2000).describe("Reply text. Plain text only; cards aren't supported."),
+      threadName: z.string().optional().describe("Full thread resource name (`spaces/X/threads/Y`) to reply in-thread. Omit to post at top-level."),
     },
-    async ({ ownerEmail, spaceId }) => {
-      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
-      const result = await proxyChatMonitor(ownerEmail, spaceId, "/buffer/clear", { method: "POST" });
-      return textResult(result);
+    async ({ sessionId, text, threadName }) => {
+      // 1. Look up the calling session and verify the brain flag.
+      const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
+      const flagRes = await (agent as unknown as { fetch: (req: Request) => Promise<Response> }).fetch(
+        new Request("https://coding-agent/chat-monitor-flag", {
+          headers: { "x-dodo-session-id": sessionId, "x-owner-email": userEmail },
+        }),
+      );
+      if (!flagRes.ok) {
+        return errorResult({ error: "could not verify caller session", status: flagRes.status });
+      }
+      const flag = (await flagRes.json()) as { isChatMonitorBrain?: boolean; spaceId?: string };
+      if (!flag.isChatMonitorBrain) {
+        return errorResult({ error: "calling session is not a chat-monitor brain — chat_reply refused" });
+      }
+      if (!flag.spaceId) {
+        return errorResult({ error: "calling session has no registered chat_monitor_space_id" });
+      }
+      // 2. Send via ARIA.
+      const result = await sendChatReply(env, {
+        spaceId: flag.spaceId,
+        text,
+        threadName,
+      });
+      if (!result.ok) {
+        return errorResult({ error: `ARIA send failed`, status: result.status, body: result.body });
+      }
+      return textResult({ posted: true, spaceId: flag.spaceId, threadName: threadName ?? null });
     },
   );
 

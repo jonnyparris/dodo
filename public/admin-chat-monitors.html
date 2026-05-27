@@ -56,7 +56,7 @@
   <main>
     <a href="/" class="back">&larr; Back to Dodo</a>
     <h1>Chat Monitors</h1>
-    <p>Per-(owner, Google Chat space) poll-decide-reply Durable Objects. Replies are sent via the ARIA chat middleware; reads use the owner's cf-portal MCP refresh-token config. Decisions are made by Gemma 4 unless the message fails an earlier hard filter.</p>
+    <p>Per-(owner, Google Chat space) Durable Objects. Each one polls the space and forwards allowlisted HUMAN messages to a dedicated CodingAgent brain session — which decides what to do, calls tools, and uses the <code>chat_reply</code> MCP tool to post back. The monitor itself never calls an LLM. Reads use the owner's cf-portal MCP refresh-token config; sends use the ARIA chat middleware via the brain.</p>
 
     <div id="globalStatus" class="status"></div>
 
@@ -93,18 +93,14 @@
       <textarea id="commandSenders" placeholder="Optional. When set, only messages from these sender resources reach the LLM. Code-level filter — not bypassable via prompt injection."></textarea>
 
       <h3>Context mode</h3>
-      <p class="muted small">When set to <code>recent</code> the monitor keeps a TTL'd buffer of recent space activity (HUMAN messages only). The buffer is only shown to the LLM when an allowlisted sender messages the bot — other users' messages enter the buffer but never trigger a decision themselves. Buffer is persisted in DO storage; wipe it any time with the button below.</p>
+      <p class="muted small">When set to <code>recent</code>, non-allowlisted HUMAN messages are forwarded to the brain session as background annotations. The brain sees them in its history (for cross-referencing) but they don't trigger new turns. Default <code>off</code> means the brain only ever sees allowlisted senders' messages.</p>
       <label for="contextMode">Mode</label>
       <select id="contextMode" style="font-family:inherit;font-size:13px;padding:8px 10px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;width:100%">
-        <option value="off">off — bot only ever sees the message it's deciding on</option>
-        <option value="recent">recent — bot sees TTL'd buffer of HUMAN messages as background</option>
+        <option value="off">off — brain only sees allowlisted senders' messages</option>
+        <option value="recent">recent — non-allowlisted messages forwarded as background</option>
       </select>
-      <label for="contextBufferMinutes">Buffer TTL (minutes, 5–360)</label>
-      <input id="contextBufferMinutes" type="number" min="5" max="360" value="60"/>
-      <label for="contextBufferSize">Buffer max rows (1–50)</label>
-      <input id="contextBufferSize" type="number" min="1" max="50" value="10"/>
 
-      <label for="persona">Persona</label>
+      <label for="persona">Persona (becomes the brain session's goal text)</label>
       <textarea id="persona" placeholder="You are a polite bot that..."></textarea>
       <button id="upsertBtn" class="primary">Create</button>
       <button id="clearBtn">Clear form</button>
@@ -127,7 +123,7 @@
             <div class="row"><span>Last error</span><span id="detailLastError"></span></div>
             <div class="row"><span>Command senders</span><span id="detailSenders"></span></div>
             <div class="row"><span>Context mode</span><span id="detailContextMode"></span></div>
-            <div class="row"><span>Buffer</span><span id="detailBuffer"></span></div>
+            <div class="row"><span>Brain session</span><span id="detailBrain"></span></div>
           </div>
           <div>
             <h3>Persona</h3>
@@ -140,26 +136,25 @@
           <button id="stopBtn">Stop</button>
           <button id="tickBtn">Tick once</button>
           <button id="reloadBtn">Reload state</button>
-          <button id="clearBufferBtn">Clear buffer</button>
           <button id="deleteBtn" class="danger">Delete</button>
         </div>
         <div id="detailStatus" class="status"></div>
 
-        <h3 style="margin-top:24px">Recent decisions</h3>
-        <p class="muted small">Privacy: source message text is never persisted. Each row shows a SHA-256 prefix derived from the message so you can correlate with the live chat without us storing message contents.</p>
-        <table id="decisionsTable">
+        <h3 style="margin-top:24px">Recent forwards</h3>
+        <p class="muted small">Privacy: source message text is never persisted in the monitor. Each row shows a SHA-256 prefix. To see the actual conversation the brain session had, open the brain session in the Dodo UI (link above).</p>
+        <table id="forwardsTable">
           <thead>
             <tr>
               <th>When</th>
               <th>Sender</th>
               <th>Source hash</th>
-              <th>Outcome</th>
-              <th>Reply / model output</th>
+              <th>Action</th>
+              <th>Detail</th>
             </tr>
           </thead>
           <tbody></tbody>
         </table>
-        <div id="decisionsEmpty" class="muted hide">No decisions recorded yet.</div>
+        <div id="forwardsEmpty" class="muted hide">No forwards recorded yet.</div>
       </div>
     </div>
   </main>
@@ -258,7 +253,7 @@
       $("detailTitle").textContent = `${owner} · ${space}`;
       setStatus($("detailStatus"), "loading...", null);
       try {
-        await Promise.all([loadDetail(), loadDecisions()]);
+        await Promise.all([loadDetail(), loadForwards()]);
         setStatus($("detailStatus"), "loaded", "success");
         setTimeout(() => setStatus($("detailStatus"), ""), 1500);
       } catch (e) {
@@ -282,38 +277,39 @@
         ? s.commandSenders.map((x) => `<code>${escapeHtml(x)}</code>`).join("<br>")
         : `<span class="muted">none (open — every HUMAN message reaches the LLM)</span>`;
       $("detailContextMode").innerHTML = s.contextMode === "recent"
-        ? `<code>recent</code> <span class="muted">(buffer TTL ${s.contextBufferMinutes}min, max ${s.contextBufferSize} rows)</span>`
-        : `<code>off</code>`;
-      $("detailBuffer").textContent = s.contextMode === "recent"
-        ? `${s.bufferCount ?? 0} message${(s.bufferCount === 1) ? "" : "s"} currently buffered`
-        : "—";
+        ? `<code>recent</code> <span class="muted">(non-allowlisted senders' messages forwarded as background)</span>`
+        : `<code>off</code> <span class="muted">(brain only sees allowlisted senders)</span>`;
+      $("detailBrain").innerHTML = s.brainSessionId
+        ? `<a href="/?session=${encodeURIComponent(s.brainSessionId)}" target="_blank"><code>${escapeHtml(s.brainSessionId)}</code></a> <span class="muted small">(opens in Dodo)</span>`
+        : `<span class="muted">not yet spawned (will be created on first command)</span>`;
       $("detailPersona").textContent = s.persona || "";
       // Remember the latest state on `selected` so editBtn can populate the form.
       selected.state = s;
     }
 
-    async function loadDecisions() {
+    async function loadForwards() {
       const { owner, space } = selected;
-      const url = `/api/admin/chat-monitor/${encodeURIComponent(owner)}/${encodeURIComponent(space)}/decisions?limit=50`;
+      const url = `/api/admin/chat-monitor/${encodeURIComponent(owner)}/${encodeURIComponent(space)}/forwards?limit=50`;
       const data = await api("GET", url);
-      const tbody = $("decisionsTable").querySelector("tbody");
+      const tbody = $("forwardsTable").querySelector("tbody");
       tbody.innerHTML = "";
-      const decisions = data.decisions || [];
-      $("decisionsEmpty").classList.toggle("hide", decisions.length > 0);
-      for (const d of decisions) {
+      const forwards = data.forwards || [];
+      $("forwardsEmpty").classList.toggle("hide", forwards.length > 0);
+      for (const f of forwards) {
         const tr = document.createElement("tr");
-        const outcome = d.reply
-          ? `<span class="pill reply">replied</span>`
-          : (d.skipReason ? `<span class="pill skip">skip (${escapeHtml(d.skipReason)})</span>` : `<span class="pill off">no reply</span>`);
-        const detailStr = d.replyText
-          ? escapeHtml(d.replyText)
-          : (d.rawModelOutput ? `<code class="small">${escapeHtml(d.rawModelOutput)}</code>` : "");
+        let actionPill;
+        if (f.kind === "command") actionPill = `<span class="pill reply">command → brain</span>`;
+        else if (f.kind === "background") actionPill = `<span class="pill off">background</span>`;
+        else actionPill = `<span class="pill skip">skip (${escapeHtml(f.skipReason || "?")})</span>`;
+        const detail = f.targetSessionId
+          ? `<a href="/?session=${encodeURIComponent(f.targetSessionId)}" target="_blank" class="small">session →</a>`
+          : "";
         tr.innerHTML = `
-          <td class="small">${relTime(d.ts)}</td>
-          <td class="small"><code>${escapeHtml(d.senderResource || "?")}</code><br><span class="muted">${d.senderType}</span></td>
-          <td><code class="small">${escapeHtml(d.sourceHash || "—")}</code></td>
-          <td>${outcome}</td>
-          <td>${detailStr}</td>
+          <td class="small">${relTime(f.ts)}</td>
+          <td class="small"><code>${escapeHtml(f.senderResource || "?")}</code><br><span class="muted">${f.senderType}</span></td>
+          <td><code class="small">${escapeHtml(f.sourceHash || "—")}</code></td>
+          <td>${actionPill}</td>
+          <td>${detail}</td>
         `;
         tbody.appendChild(tr);
       }
@@ -337,8 +333,6 @@
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
       const contextMode = $("contextMode").value;
-      const contextBufferMinutes = parseInt($("contextBufferMinutes").value, 10);
-      const contextBufferSize = parseInt($("contextBufferSize").value, 10);
 
       if (!ownerEmail || !spaceId || !persona) {
         setStatus($("upsertStatus"), "ownerEmail, spaceId, and persona are required", "error");
@@ -348,8 +342,7 @@
       setStatus($("upsertStatus"), wasEditing ? "saving..." : "creating...", null);
       try {
         await api("POST", "/api/admin/chat-monitor", {
-          ownerEmail, spaceId, persona, pollIntervalSeconds, commandSenders,
-          contextMode, contextBufferMinutes, contextBufferSize,
+          ownerEmail, spaceId, persona, pollIntervalSeconds, commandSenders, contextMode,
         });
         setStatus($("upsertStatus"), wasEditing ? "saved" : "created (monitor not yet started)", "success");
         await loadMonitors();
@@ -368,8 +361,6 @@
       $("pollInterval").value = String(s.pollIntervalSeconds ?? 15);
       $("commandSenders").value = (s.commandSenders || []).join("\n");
       $("contextMode").value = s.contextMode === "recent" ? "recent" : "off";
-      $("contextBufferMinutes").value = String(s.contextBufferMinutes ?? 60);
-      $("contextBufferSize").value = String(s.contextBufferSize ?? 10);
       $("persona").value = s.persona || "";
       setStatus($("upsertStatus"), "");
     }
@@ -381,7 +372,7 @@
       try {
         await api("POST", `/api/admin/chat-monitor/${encodeURIComponent(owner)}/${encodeURIComponent(space)}/${verb}`);
         setStatus($("detailStatus"), `${verb} ok`, "success");
-        await Promise.all([loadMonitors(), loadDetail(), loadDecisions()]);
+        await Promise.all([loadMonitors(), loadDetail(), loadForwards()]);
       } catch (e) {
         setStatus($("detailStatus"), `${verb} failed: ${e.message}`, "error");
       }
@@ -413,8 +404,6 @@
       $("commandSenders").value = "";
       $("pollInterval").value = "15";
       $("contextMode").value = "off";
-      $("contextBufferMinutes").value = "60";
-      $("contextBufferSize").value = "10";
       setFormMode("create");
     });
     $("editBtn").addEventListener("click", () => {
@@ -428,23 +417,10 @@
     $("tickBtn").addEventListener("click", () => actOnSelected("tick"));
     $("reloadBtn").addEventListener("click", async () => {
       try {
-        await Promise.all([loadDetail(), loadDecisions()]);
+        await Promise.all([loadDetail(), loadForwards()]);
         setStatus($("detailStatus"), "reloaded", "success");
       } catch (e) {
         setStatus($("detailStatus"), e.message, "error");
-      }
-    });
-    $("clearBufferBtn").addEventListener("click", async () => {
-      if (!selected) return;
-      if (!confirm(`Wipe the recent-messages buffer for ${selected.owner} · ${selected.space}? Persisted message text will be deleted; the monitor stays running.`)) return;
-      const { owner, space } = selected;
-      setStatus($("detailStatus"), "clearing buffer...", null);
-      try {
-        const res = await api("POST", `/api/admin/chat-monitor/${encodeURIComponent(owner)}/${encodeURIComponent(space)}/buffer/clear`);
-        setStatus($("detailStatus"), `cleared ${res?.cleared ?? 0} row(s)`, "success");
-        await loadDetail();
-      } catch (e) {
-        setStatus($("detailStatus"), `clear failed: ${e.message}`, "error");
       }
     });
     $("deleteBtn").addEventListener("click", deleteSelected);
