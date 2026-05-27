@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   chatMonitorIdName,
   createMonitorSchema,
+  findChatGetMessagesTool,
   parseChatGetMessagesResult,
   pickCfPortalConfig,
 } from "../src/chat-monitor-agent";
@@ -230,5 +231,34 @@ describe("pickCfPortalConfig", () => {
     // requires refresh_token. Since neither URL is canonical, this should fall
     // through to the fallback and reject the static_header config.
     expect(cfg).toBeNull();
+  });
+});
+
+describe("findChatGetMessagesTool", () => {
+  it("matches single-underscore separator (cf-portal style)", () => {
+    const tools = [
+      { name: "abc__google-workspace-mcp_chat_get_messages" },
+      { name: "abc__google-workspace-mcp_chat_search_messages" },
+    ];
+    const hit = findChatGetMessagesTool(tools);
+    expect(hit?.name).toBe("abc__google-workspace-mcp_chat_get_messages");
+  });
+
+  it("prefers a trailing `_chat_get_messages` over a bare `chat_get_messages`", () => {
+    const tools = [
+      { name: "weirdchat_get_messages" }, // bare suffix, ambiguous
+      { name: "abc__google-workspace-mcp_chat_get_messages" },
+    ];
+    const hit = findChatGetMessagesTool(tools);
+    expect(hit?.name).toBe("abc__google-workspace-mcp_chat_get_messages");
+  });
+
+  it("falls back to bare suffix when no underscored variant exists", () => {
+    const hit = findChatGetMessagesTool([{ name: "foo.bar.chat_get_messages" }]);
+    expect(hit?.name).toBe("foo.bar.chat_get_messages");
+  });
+
+  it("returns null when nothing matches", () => {
+    expect(findChatGetMessagesTool([{ name: "search" }, { name: "execute" }])).toBeNull();
   });
 });

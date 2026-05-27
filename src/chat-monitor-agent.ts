@@ -73,7 +73,16 @@ const CF_PORTAL_PREFERRED_URLS = [
 ];
 /** Substring fallback: any config whose URL hostname matches this hosts cf-portal. */
 const CF_PORTAL_URL_SUBSTRING = "portal.mcp.cfdata.org";
-const CF_PORTAL_CHAT_TOOL_ORIGINAL = "google-workspace-mcp__chat_get_messages";
+/**
+ * Substring used to locate the cf-portal "list chat messages" tool at
+ * runtime. cf-portal namespaces its child MCP tools with single-underscore
+ * separators (e.g. `google-workspace-mcp_chat_get_messages`), which is
+ * easy to get wrong if we hard-code the full name and the convention
+ * changes. We list portal's tools, find the unique one whose name ends
+ * with `chat_get_messages`, and call it by its real name. Exported for
+ * tests.
+ */
+export const CF_PORTAL_CHAT_TOOL_SUFFIX = "chat_get_messages";
 const DECISION_MODEL = "@cf/moonshotai/kimi-k2.6";
 
 // ─── Schemas ───
@@ -470,11 +479,19 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     );
     try {
       await client.connect();
-      // HttpMcpClient namespaces tool names as `<configId>__<originalName>`.
-      // The cf-portal-side tool name is `google-workspace-mcp__chat_get_messages`;
-      // we slot it under our dynamic config id.
-      const originalToolName = CF_PORTAL_CHAT_TOOL_ORIGINAL;
-      const namespacedName = `${cfg.id}__${originalToolName}`;
+      // HttpMcpClient.listTools() returns tools already namespaced as
+      // `<configId>__<originalName>`. callTool() strips the `<configId>__`
+      // prefix before forwarding, so we have to pass the namespaced form.
+      // We pick the unique `chat_get_messages` variant — cf-portal uses
+      // single-underscore separators (e.g. `google-workspace-mcp_chat_get_messages`),
+      // so a literal compile-time name is fragile.
+      const tools = await client.listTools();
+      const chatTool = findChatGetMessagesTool(tools);
+      if (!chatTool) {
+        throw new Error(
+          `chat_get_messages tool not found on cf-portal; available: ${tools.slice(0, 5).map((t) => t.name).join(", ")}`,
+        );
+      }
       const callArgs: Record<string, unknown> = {
         spaceName: spaceId,
         maxResults: 25,
@@ -482,7 +499,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       };
       if (afterIso) callArgs.after = afterIso;
 
-      const result = await client.callTool(namespacedName, callArgs);
+      const result = await client.callTool(chatTool.name, callArgs);
       if (result.isError) {
         const text = result.content.map((c) => c.text ?? "").join("\n");
         throw new Error(`chat_get_messages error: ${text.slice(0, 500)}`);
@@ -665,6 +682,24 @@ function extractMessagesArray(payload: unknown): unknown[] {
 /** Resolve the canonical DO id for a given (owner, space) pair. */
 export function chatMonitorIdName(ownerEmail: string, spaceId: string): string {
   return `${ownerEmail.toLowerCase()}:${spaceId}`;
+}
+
+/**
+ * Find the `chat_get_messages` tool in cf-portal's tool list. cf-portal's
+ * tool names look like `google-workspace-mcp_chat_get_messages` after
+ * HttpMcpClient adds its `<configId>__` namespace prefix — so the full
+ * name is `<configId>__google-workspace-mcp_chat_get_messages`. We
+ * tolerate small naming changes by matching against the suffix.
+ *
+ * Prefer an exact suffix match over substring matches so we don't pick up
+ * `chat_get_messages_history` or similar variants. Exported for tests.
+ */
+export function findChatGetMessagesTool<T extends { name: string }>(
+  tools: T[],
+): T | null {
+  const exact = tools.find((t) => t.name.endsWith(`_${CF_PORTAL_CHAT_TOOL_SUFFIX}`));
+  if (exact) return exact;
+  return tools.find((t) => t.name.endsWith(CF_PORTAL_CHAT_TOOL_SUFFIX)) ?? null;
 }
 
 /**
