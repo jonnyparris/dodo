@@ -477,11 +477,14 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     this.ensureMigrations();
     const now = Math.floor(Date.now() / 1000);
     const sendersJson = JSON.stringify(input.commandSenders);
+    // Seed last_seen_iso with the current time on first insert so the
+    // initial tick doesn't flood the brain with backlog from the space.
+    // Subsequent re-upserts (ON CONFLICT) preserve the existing cursor.
     this.ctx.storage.sql.exec(
       `INSERT INTO monitor_state
          (owner_email, space_id, persona, poll_interval_seconds, command_senders_json,
           context_mode, brain_session_id, last_seen_iso, enabled, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 0, ?)
        ON CONFLICT (owner_email, space_id) DO UPDATE SET
          persona = excluded.persona,
          poll_interval_seconds = excluded.poll_interval_seconds,
@@ -493,6 +496,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       input.pollIntervalSeconds,
       sendersJson,
       input.contextMode,
+      isoNow(),
       now,
     );
     return this.readState()!;
