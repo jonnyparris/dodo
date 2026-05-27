@@ -23,14 +23,26 @@ import { AgentConnectionTransport } from "./rpc";
 import { extractGeneratePrompt, FALLBACK_MODELS, FLUX_IMAGE_MEDIA_TYPE, FLUX_IMAGE_MODEL, FLUX_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import {
   buildContinuePrompt,
-  DEFAULT_GOAL_MAX_TURNS,
   type GoalState,
   type GoalStatus,
-  HARD_GOAL_MAX_TURNS,
   isTerminalStatus,
   renderGoalSystemPromptSection,
   shouldAutoContinue,
 } from "./session-goal";
+import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
+import {
+  createSessionControlPlane,
+  type MetadataKv,
+  type SessionControlPlane,
+} from "./session-control-plane";
+import {
+  createSessionLifecycle,
+  type FiberPromptPayload,
+  type PromptSource,
+  type SessionLifecycle,
+  type StartIntent,
+} from "./session-lifecycle";
+import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 import {
   createPersonalSkillClient,
   mergeSkills,
@@ -545,6 +557,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   readonly stateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
   readonly workspace: Workspace;
+  /**
+   * Typed stores wrapping the `metadata` k/v table. See ADR-0001.
+   * Constructed before the lifecycle so it can take them as dependencies.
+   */
+  private readonly metadataKv: MetadataKv;
+  private readonly control: SessionControlPlane;
+  private readonly goalStore: GoalStateStore;
+  private readonly watchdogStore: WatchdogState;
+  /**
+   * The single front door for prompt transitions. See ADR-0001 and
+   * src/session-lifecycle.ts. Consumes the four stores above plus a
+   * FiberDriver adapter over Think's inherited fiber methods.
+   */
+  private readonly lifecycle: SessionLifecycle;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -555,6 +581,86 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       sql: ctx.storage.sql,
     });
     this.stateBackend = createWorkspaceStateBackend(this.workspace);
+
+    // ─── Typed stores + SessionLifecycle wiring (ADR-0001) ───
+    //
+    // The MetadataKv port wraps the existing `metadata` SQL table so the
+    // stores have no DDL of their own yet — they're typed lenses over the
+    // same k/v rows that readMetadata/writeMetadata/deleteMetadata use.
+    this.metadataKv = {
+      read: (key) => {
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT value FROM metadata WHERE key = ?", key))[0] as SqlRow | null);
+        return row ? String(row.value) : null;
+      },
+      write: (key, value) => {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+          key,
+          value,
+          nowEpoch(),
+        );
+      },
+      delete: (key) => {
+        this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", key);
+      },
+    };
+    this.control = createSessionControlPlane(this.metadataKv);
+    this.goalStore = createGoalStateStore(this.metadataKv);
+    this.watchdogStore = createWatchdogState(this.metadataKv);
+
+    this.lifecycle = createSessionLifecycle({
+      control: this.control,
+      goal: this.goalStore,
+      fibers: {
+        spawnFiber: (method, payload, opts) =>
+          this.spawnFiber(method as never, payload as never, opts),
+        cancelFiber: (id) => this.cancelFiber(id),
+        readPromptFiberId: (promptId) => this.readPromptFiberId(promptId),
+        setPromptFiberId: (promptId, fiberId) => this.setPromptFiberId(promptId, fiberId),
+      },
+      prompts: {
+        insert: ({ promptId, content, status, source }) =>
+          this.insertPrompt(promptId, content, status, source),
+        update: (promptId, patch) => this.updatePrompt(promptId, patch),
+        enqueue: (content, authorEmail) => {
+          const id = crypto.randomUUID();
+          const now = nowEpoch();
+          const maxRow = (Array.from(this.ctx.storage.sql.exec("SELECT MAX(position) as max_pos FROM prompt_queue"))[0] as SqlRow | null);
+          const position = maxRow?.max_pos != null ? Number(maxRow.max_pos) + 1 : 1;
+          this.ctx.storage.sql.exec(
+            "INSERT INTO prompt_queue (id, content, author_email, created_at, position) VALUES (?, ?, ?, ?, ?)",
+            id,
+            content,
+            authorEmail ?? null,
+            now,
+            position,
+          );
+          this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
+          return { promptId: id, position };
+        },
+        dequeue: () => {
+          const next = (Array.from(this.ctx.storage.sql.exec("SELECT id, content, author_email FROM prompt_queue ORDER BY position ASC LIMIT 1"))[0] as SqlRow | null);
+          if (!next) return null;
+          const id = String(next.id);
+          this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", id);
+          return {
+            promptId: id,
+            content: String(next.content),
+            authorEmail: next.author_email ? String(next.author_email) : null,
+          };
+        },
+        emitQueueUpdate: () => this.emitEvent({ data: this.readQueueState(), type: "queue_update" }),
+      },
+      emit: (event) => this.emitEvent(event),
+      notify: (n) => dispatchNotification(this.env, this.ctx, n),
+      syncIndex: (patch) => this.syncSessionIndex(patch),
+      getAbortController: () => this._fiberAbortController,
+      setAbortController: (c) => {
+        this._fiberAbortController = c;
+      },
+      readAppConfig: () => this.readAppConfig(),
+      log: (level, message, fields) => log(level, message, fields ?? {}),
+    });
   }
 
   // ─── Think overrides ───
@@ -6196,22 +6302,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // If cache is null, the next read will clone fresh anyway.
   }
 
+  // Legacy thin wrappers that delegate to the typed metadataKv adapter.
+  // Most callers should migrate to the typed stores (`this.control`,
+  // `this.goalStore`, `this.watchdogStore`) per ADR-0001; these helpers
+  // remain for keys that haven't been folded into a store yet
+  // (browser_enabled, is_autopilot, autopilot_role, etc.).
   private readMetadata(key: string): string | null {
-    const row = (Array.from(this.ctx.storage.sql.exec("SELECT value FROM metadata WHERE key = ?", key))[0] as SqlRow | null);
-    return row ? String(row.value) : null;
+    return this.metadataKv.read(key);
   }
 
   private writeMetadata(key: string, value: string): void {
-    this.ctx.storage.sql.exec(
-      "INSERT INTO metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-      key,
-      value,
-      nowEpoch(),
-    );
+    this.metadataKv.write(key, value);
   }
 
   private deleteMetadata(key: string): void {
-    this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", key);
+    this.metadataKv.delete(key);
   }
 
   // ─── Session goals ───
@@ -6222,72 +6327,34 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   // or the turn budget runs out. Stored as plain keys in the `metadata`
   // table so no schema migration is needed.
 
-  /** Read the full goal state from metadata. Returns a record with sane
-   *  defaults when no goal is set. Safe to call anywhere. */
+  /** Read the full goal state. Safe to call anywhere. */
   readGoalState(): GoalState {
-    const status = (this.readMetadata("goal_status") as GoalStatus | null) ?? "none";
-    const maxRaw = this.readMetadata("goal_max_turns");
-    const turnsRaw = this.readMetadata("goal_turns_used");
-    const setAtRaw = this.readMetadata("goal_set_at");
-    return {
-      text: this.readMetadata("goal_text"),
-      status,
-      setAt: setAtRaw ? Number(setAtRaw) : null,
-      turnsUsed: turnsRaw ? Number(turnsRaw) : 0,
-      maxTurns: maxRaw ? Number(maxRaw) : DEFAULT_GOAL_MAX_TURNS,
-      summary: this.readMetadata("goal_summary"),
-      role: this.readMetadata("goal_role"),
-    };
+    return this.goalStore.read();
   }
 
   /** Set or replace the active goal. Resets turn counter. */
   setGoal(opts: { text: string; maxTurns?: number; role?: string }): GoalState {
-    const max = Math.min(
-      Math.max(1, Math.floor(opts.maxTurns ?? DEFAULT_GOAL_MAX_TURNS)),
-      HARD_GOAL_MAX_TURNS,
-    );
-    this.writeMetadata("goal_text", opts.text);
-    this.writeMetadata("goal_status", "active");
-    this.writeMetadata("goal_set_at", String(nowEpoch()));
-    this.writeMetadata("goal_turns_used", "0");
-    this.writeMetadata("goal_max_turns", String(max));
-    if (opts.role) {
-      this.writeMetadata("goal_role", opts.role);
-    } else {
-      this.deleteMetadata("goal_role");
-    }
-    this.deleteMetadata("goal_summary");
-    const state = this.readGoalState();
+    const state = this.goalStore.set(opts);
     this.emitEvent({ data: state, type: "goal_state" });
     return state;
   }
 
   /** Update the goal status (called from the `set_goal_status` tool). */
   updateGoalStatus(status: GoalStatus, summary?: string): GoalState {
-    this.writeMetadata("goal_status", status);
-    if (summary) this.writeMetadata("goal_summary", summary);
-    const state = this.readGoalState();
+    const state = this.goalStore.updateStatus(status, summary);
     this.emitEvent({ data: state, type: "goal_state" });
     return state;
   }
 
   /** Clear all goal state. */
   clearGoal(): void {
-    for (const key of ["goal_text", "goal_status", "goal_set_at", "goal_turns_used", "goal_max_turns", "goal_summary", "goal_role"]) {
-      this.deleteMetadata(key);
-    }
+    this.goalStore.clear();
     this.emitEvent({ data: { status: "none" }, type: "goal_state" });
   }
 
   /** Increment the turn counter and return the new state. */
   private incrementGoalTurns(): GoalState {
-    const state = this.readGoalState();
-    const next = state.turnsUsed + 1;
-    this.writeMetadata("goal_turns_used", String(next));
-    if (next >= state.maxTurns) {
-      this.writeMetadata("goal_status", "exhausted");
-    }
-    return this.readGoalState();
+    return this.goalStore.incrementTurns();
   }
 
   /**

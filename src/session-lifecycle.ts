@@ -36,9 +36,10 @@
  *    "aborted" status.
  */
 
-import type { GoalState, GoalStatus } from "./session-goal";
+import type { GoalState } from "./session-goal";
 import { buildContinuePrompt, isTerminalStatus, shouldAutoContinue } from "./session-goal";
 import type { GoalStateStore } from "./goal-state-store";
+import type { NotificationInput as NotifyInput } from "./notify";
 import type {
   SessionControlPlane,
   SessionControlSnapshot,
@@ -204,14 +205,8 @@ export interface PromptRepo {
   emitQueueUpdate(): void;
 }
 
-export interface NotificationInput {
-  kind: string;
-  title: string;
-  body: string;
-  tags: string;
-  priority?: "default" | "high" | "low";
-  ownerEmail?: string;
-}
+/** Re-export so callers don't need to import from notify.ts directly. */
+export type NotificationInput = NotifyInput;
 
 export type EmitEvent = (event: { type: string; data: unknown }) => void;
 export type Notify = (n: NotificationInput) => void;
