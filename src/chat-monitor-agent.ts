@@ -146,13 +146,33 @@ interface MonitorRow {
   created_at: number;
 }
 
-/** One row in the decisions log — what the monitor saw and what it did. */
+/**
+ * One row in the decisions log — what the monitor *did*, not what it
+ * saw. We intentionally do NOT store the source message text:
+ *
+ *  - Google Chat is already the system of record for messages people
+ *    write. A shadow copy in our SQLite would be a privacy footgun
+ *    (storing every message the bot sees, including ones it skips).
+ *  - For dedupe + correlation we keep the message resource name and a
+ *    short SHA-256 prefix of the original text — opaque to a human
+ *    reader, lets a developer confirm "we did see *that* message" when
+ *    they have access to the chat themselves.
+ *  - For audit we keep what we *posted* (`replyText`) and what the
+ *    model produced (`rawModelOutput`). Those are our own outputs.
+ *  - Skipped messages (BOT, allowlist failure, persona "no") never set
+ *    rawModelOutput unless the model was actually consulted.
+ */
 export interface DecisionLogEntry {
   ts: number; // unix seconds
   messageName: string;
   senderResource: string;
   senderType: "HUMAN" | "BOT" | "UNKNOWN";
-  sourceText: string;
+  /**
+   * First 16 hex chars of SHA-256(sourceText). Lets a human cross-check
+   * "did the monitor see the message I'm looking at?" without storing
+   * the message contents in our SQLite.
+   */
+  sourceHash: string;
   reply: boolean;
   replyText: string | null;
   skipReason: string | null;
@@ -246,13 +266,25 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         message_name TEXT NOT NULL,
         sender_resource TEXT NOT NULL,
         sender_type TEXT NOT NULL,
-        source_text TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
         reply INTEGER NOT NULL,
         reply_text TEXT,
         skip_reason TEXT,
         raw_model_output TEXT
       )
     `);
+    // Migration: earlier versions of this file stored the verbatim source
+    // message in a `source_text` column. We want that gone for privacy. If
+    // the column still exists, drop it; if a `source_hash` column is
+    // missing, add it. SQLite via DO storage supports DROP COLUMN since
+    // SQLite 3.35. The whole thing is best-effort — a failed migration on
+    // a brand-new DO is benign (table already has the right shape).
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE decision_log ADD COLUMN source_hash TEXT NOT NULL DEFAULT ''");
+    } catch { /* column may already exist */ }
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE decision_log DROP COLUMN source_text");
+    } catch { /* column may already be gone */ }
     this.ctx.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS decision_log_ts ON decision_log(ts DESC)",
     );
@@ -349,8 +381,11 @@ export class ChatMonitorAgent extends DurableObject<Env> {
    * over a TTL because new monitors have low traffic and old rows still
    * carry value, but a runaway monitor could otherwise eat unbounded
    * SQLite quota.
+   *
+   * Privacy: we do not persist the source message text. The caller
+   * passes it for hashing only; only the resulting digest is stored.
    */
-  private recordDecision(d: {
+  private async recordDecision(d: {
     messageName: string;
     senderResource: string;
     senderType: ChatMessage["senderType"];
@@ -359,17 +394,18 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     replyText?: string;
     rawModelOutput?: string;
     skipReason?: string;
-  }): void {
+  }): Promise<void> {
     this.ensureMigrations();
+    const sourceHash = await sha256Prefix(d.sourceText);
     this.ctx.storage.sql.exec(
       `INSERT INTO decision_log
-         (ts, message_name, sender_resource, sender_type, source_text, reply, reply_text, skip_reason, raw_model_output)
+         (ts, message_name, sender_resource, sender_type, source_hash, reply, reply_text, skip_reason, raw_model_output)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       Math.floor(Date.now() / 1000),
       d.messageName,
       d.senderResource,
       d.senderType,
-      d.sourceText,
+      sourceHash,
       d.reply ? 1 : 0,
       d.replyText ?? null,
       d.skipReason ?? null,
@@ -392,7 +428,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     const capped = Math.max(1, Math.min(200, limit));
     const rows = Array.from(
       this.ctx.storage.sql.exec(
-        "SELECT ts, message_name, sender_resource, sender_type, source_text, reply, reply_text, skip_reason, raw_model_output FROM decision_log ORDER BY id DESC LIMIT ?",
+        "SELECT ts, message_name, sender_resource, sender_type, source_hash, reply, reply_text, skip_reason, raw_model_output FROM decision_log ORDER BY id DESC LIMIT ?",
         capped,
       ),
     );
@@ -403,7 +439,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         messageName: String(r.message_name ?? ""),
         senderResource: String(r.sender_resource ?? ""),
         senderType: (String(r.sender_type ?? "UNKNOWN") as DecisionLogEntry["senderType"]),
-        sourceText: String(r.source_text ?? ""),
+        sourceHash: String(r.source_hash ?? ""),
         reply: Number(r.reply ?? 0) === 1,
         replyText: r.reply_text === null || r.reply_text === undefined ? null : String(r.reply_text),
         skipReason: r.skip_reason === null || r.skip_reason === undefined ? null : String(r.skip_reason),
@@ -579,7 +615,9 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       messageName: string;
       senderResource: string;
       senderType: ChatMessage["senderType"];
-      sourceText: string;
+      /** First 16 hex chars of SHA-256(message text). Source text itself
+       *  is not persisted; see DecisionLogEntry docs. */
+      sourceHash: string;
       reply: boolean;
       replyText?: string;
       rawModelOutput?: string;
@@ -611,7 +649,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       messageName: string;
       senderResource: string;
       senderType: ChatMessage["senderType"];
-      sourceText: string;
+      sourceHash: string;
       reply: boolean;
       replyText?: string;
       rawModelOutput?: string;
@@ -628,14 +666,19 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     //       This is a CODE-level filter; the LLM is not consulted at all,
     //       so prompt-injection can't bypass it.
     //    c. LLM decide() with the persona prompt → may still return reply=false.
+    //
+    // Privacy: we never persist the message text. `sourceHash` is a
+    // SHA-256-prefix derived for correlation/dedupe debugging only.
     for (const msg of limited) {
       try {
+        const sourceHash = await sha256Prefix(msg.text);
+
         if (msg.senderType === "BOT") {
-          this.recordDecision({
+          await this.recordDecision({
             messageName: msg.name,
             senderResource: msg.senderResource,
             senderType: msg.senderType,
-            sourceText: msg.text.slice(0, 200),
+            sourceText: msg.text,
             reply: false,
             skipReason: "sender_is_bot",
           });
@@ -643,7 +686,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
             messageName: msg.name,
             senderResource: msg.senderResource,
             senderType: msg.senderType,
-            sourceText: msg.text.slice(0, 200),
+            sourceHash,
             reply: false,
             skipReason: "sender_is_bot",
           });
@@ -655,11 +698,11 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         if (allowlistActive && !commandSenders.includes(msg.senderResource)) {
           // Hard skip — message author is not on the command allowlist.
           // The LLM is never consulted; the decision is purely code-level.
-          this.recordDecision({
+          await this.recordDecision({
             messageName: msg.name,
             senderResource: msg.senderResource,
             senderType: msg.senderType,
-            sourceText: msg.text.slice(0, 200),
+            sourceText: msg.text,
             reply: false,
             skipReason: "sender_not_in_allowlist",
           });
@@ -667,7 +710,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
             messageName: msg.name,
             senderResource: msg.senderResource,
             senderType: msg.senderType,
-            sourceText: msg.text.slice(0, 200),
+            sourceHash,
             reply: false,
             skipReason: "sender_not_in_allowlist",
           });
@@ -677,11 +720,11 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         }
 
         const decision = await this.decide(row.persona, msg);
-        this.recordDecision({
+        await this.recordDecision({
           messageName: msg.name,
           senderResource: msg.senderResource,
           senderType: msg.senderType,
-          sourceText: msg.text.slice(0, 200),
+          sourceText: msg.text,
           reply: decision.reply,
           replyText: decision.text,
           rawModelOutput: decision.raw?.slice(0, 200),
@@ -690,7 +733,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           messageName: msg.name,
           senderResource: msg.senderResource,
           senderType: msg.senderType,
-          sourceText: msg.text.slice(0, 200),
+          sourceHash,
           reply: decision.reply,
           replyText: decision.text,
           rawModelOutput: decision.raw?.slice(0, 200),
@@ -924,6 +967,27 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       createdAt: row.created_at,
     };
   }
+}
+
+/**
+ * Hash the source message text down to a 16-hex-char prefix of its
+ * SHA-256 digest. Lets developers cross-reference a decision-log entry
+ * against the live chat (computing the same hash by hand) without us
+ * storing the original text. Exported for tests.
+ *
+ * 16 hex chars = 64 bits of entropy — plenty for spotting collisions in
+ * a 200-row retention window, while keeping the column compact.
+ */
+export async function sha256Prefix(text: string): Promise<string> {
+  if (!text) return "";
+  const data = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const bytes = new Uint8Array(digest);
+  let hex = "";
+  for (let i = 0; i < 8; i++) {
+    hex += bytes[i].toString(16).padStart(2, "0");
+  }
+  return hex;
 }
 
 /** Parse the JSON-encoded commandSenders column. Tolerant to malformed

@@ -9,6 +9,7 @@ import {
   parseCommandSenders,
   pickCfPortalConfig,
   SENDER_RESOURCE_PATTERN,
+  sha256Prefix,
 } from "../src/chat-monitor-agent";
 import type { McpClientConfig } from "../src/mcp-client";
 
@@ -113,6 +114,34 @@ describe("SENDER_RESOURCE_PATTERN", () => {
     expect(SENDER_RESOURCE_PATTERN.test("user/123")).toBe(false);
     expect(SENDER_RESOURCE_PATTERN.test("users/abc")).toBe(false);
     expect(SENDER_RESOURCE_PATTERN.test("alice@example.com")).toBe(false);
+  });
+});
+
+describe("sha256Prefix", () => {
+  it("returns empty string for empty input", async () => {
+    expect(await sha256Prefix("")).toBe("");
+  });
+
+  it("is deterministic", async () => {
+    const a = await sha256Prefix("hello world");
+    const b = await sha256Prefix("hello world");
+    expect(a).toBe(b);
+  });
+
+  it("returns a 16-character hex prefix", async () => {
+    const h = await sha256Prefix("test message");
+    expect(h).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it("matches the known SHA-256 prefix of 'hello'", async () => {
+    // SHA-256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+    expect(await sha256Prefix("hello")).toBe("2cf24dba5fb0a30e");
+  });
+
+  it("produces different hashes for different inputs", async () => {
+    const a = await sha256Prefix("pingbot ping");
+    const b = await sha256Prefix("pongbot pong");
+    expect(a).not.toBe(b);
   });
 });
 
