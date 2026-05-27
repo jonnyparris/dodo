@@ -102,6 +102,79 @@ describe("createMonitorSchema", () => {
     });
     expect(result.success).toBe(false);
   });
+
+  it("defaults contextMode to 'off'", () => {
+    const parsed = createMonitorSchema.parse({
+      ownerEmail: "a@b.com",
+      spaceId: "spaces/AAAA",
+      persona: "x",
+    });
+    expect(parsed.contextMode).toBe("off");
+    expect(parsed.contextBufferMinutes).toBe(60);
+    expect(parsed.contextBufferSize).toBe(10);
+  });
+
+  it("accepts contextMode 'recent' with custom buffer config", () => {
+    const parsed = createMonitorSchema.parse({
+      ownerEmail: "a@b.com",
+      spaceId: "spaces/AAAA",
+      persona: "x",
+      contextMode: "recent",
+      contextBufferMinutes: 30,
+      contextBufferSize: 25,
+    });
+    expect(parsed.contextMode).toBe("recent");
+    expect(parsed.contextBufferMinutes).toBe(30);
+    expect(parsed.contextBufferSize).toBe(25);
+  });
+
+  it("rejects an unknown contextMode value", () => {
+    const result = createMonitorSchema.safeParse({
+      ownerEmail: "a@b.com",
+      spaceId: "spaces/AAAA",
+      persona: "x",
+      contextMode: "unbounded",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects buffer TTL outside 5..360", () => {
+    expect(
+      createMonitorSchema.safeParse({
+        ownerEmail: "a@b.com",
+        spaceId: "spaces/AAAA",
+        persona: "x",
+        contextBufferMinutes: 4,
+      }).success,
+    ).toBe(false);
+    expect(
+      createMonitorSchema.safeParse({
+        ownerEmail: "a@b.com",
+        spaceId: "spaces/AAAA",
+        persona: "x",
+        contextBufferMinutes: 400,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects buffer size outside 1..50", () => {
+    expect(
+      createMonitorSchema.safeParse({
+        ownerEmail: "a@b.com",
+        spaceId: "spaces/AAAA",
+        persona: "x",
+        contextBufferSize: 0,
+      }).success,
+    ).toBe(false);
+    expect(
+      createMonitorSchema.safeParse({
+        ownerEmail: "a@b.com",
+        spaceId: "spaces/AAAA",
+        persona: "x",
+        contextBufferSize: 100,
+      }).success,
+    ).toBe(false);
+  });
 });
 
 describe("SENDER_RESOURCE_PATTERN", () => {

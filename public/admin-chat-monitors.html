@@ -80,8 +80,8 @@
       <div id="monitorsEmpty" class="muted hide">No monitors yet.</div>
     </div>
 
-    <h2>Upsert monitor</h2>
-    <p>Creating an existing (owner, space) pair updates persona / interval / allowlist without resetting the dedupe state or stopping the alarm.</p>
+    <h2 id="formTitle">Create monitor</h2>
+    <p>Owner email is the user whose cf-portal MCP refresh token reads the chat. Posting an existing (owner, space) pair edits in place — dedupe state and the alarm are preserved.</p>
     <div class="panel">
       <label for="ownerEmail">Owner email</label>
       <input id="ownerEmail" placeholder="ruskin.constant@gmail.com"/>
@@ -91,9 +91,22 @@
       <input id="pollInterval" type="number" min="10" max="3600" value="15"/>
       <label for="commandSenders">Command sender allowlist (one per line — e.g. <code>users/106320663698754747363</code>)</label>
       <textarea id="commandSenders" placeholder="Optional. When set, only messages from these sender resources reach the LLM. Code-level filter — not bypassable via prompt injection."></textarea>
+
+      <h3>Context mode</h3>
+      <p class="muted small">When set to <code>recent</code> the monitor keeps a TTL'd buffer of recent space activity (HUMAN messages only). The buffer is only shown to the LLM when an allowlisted sender messages the bot — other users' messages enter the buffer but never trigger a decision themselves. Buffer is persisted in DO storage; wipe it any time with the button below.</p>
+      <label for="contextMode">Mode</label>
+      <select id="contextMode" style="font-family:inherit;font-size:13px;padding:8px 10px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;width:100%">
+        <option value="off">off — bot only ever sees the message it's deciding on</option>
+        <option value="recent">recent — bot sees TTL'd buffer of HUMAN messages as background</option>
+      </select>
+      <label for="contextBufferMinutes">Buffer TTL (minutes, 5–360)</label>
+      <input id="contextBufferMinutes" type="number" min="5" max="360" value="60"/>
+      <label for="contextBufferSize">Buffer max rows (1–50)</label>
+      <input id="contextBufferSize" type="number" min="1" max="50" value="10"/>
+
       <label for="persona">Persona</label>
       <textarea id="persona" placeholder="You are a polite bot that..."></textarea>
-      <button id="upsertBtn" class="primary">Upsert</button>
+      <button id="upsertBtn" class="primary">Create</button>
       <button id="clearBtn">Clear form</button>
       <div id="upsertStatus" class="status"></div>
     </div>
@@ -113,6 +126,8 @@
             <div class="row"><span>Last run</span><span id="detailLastRun"></span></div>
             <div class="row"><span>Last error</span><span id="detailLastError"></span></div>
             <div class="row"><span>Command senders</span><span id="detailSenders"></span></div>
+            <div class="row"><span>Context mode</span><span id="detailContextMode"></span></div>
+            <div class="row"><span>Buffer</span><span id="detailBuffer"></span></div>
           </div>
           <div>
             <h3>Persona</h3>
@@ -120,10 +135,12 @@
           </div>
         </div>
         <div style="margin-top:14px">
+          <button id="editBtn">Edit in form</button>
           <button id="startBtn" class="primary">Start</button>
           <button id="stopBtn">Stop</button>
           <button id="tickBtn">Tick once</button>
           <button id="reloadBtn">Reload state</button>
+          <button id="clearBufferBtn">Clear buffer</button>
           <button id="deleteBtn" class="danger">Delete</button>
         </div>
         <div id="detailStatus" class="status"></div>
@@ -190,6 +207,24 @@
     }
 
     let selected = null;
+    let editingKey = null; // "owner|space" when the form is editing an existing monitor
+
+    function setFormMode(mode, owner, space) {
+      // mode: "create" | "edit"
+      if (mode === "edit") {
+        editingKey = `${owner}|${space}`;
+        $("formTitle").textContent = `Edit monitor — ${owner} · ${space}`;
+        $("upsertBtn").textContent = "Save";
+        $("ownerEmail").readOnly = true;
+        $("spaceId").readOnly = true;
+      } else {
+        editingKey = null;
+        $("formTitle").textContent = "Create monitor";
+        $("upsertBtn").textContent = "Create";
+        $("ownerEmail").readOnly = false;
+        $("spaceId").readOnly = false;
+      }
+    }
 
     async function loadMonitors() {
       const { monitors } = await api("GET", "/api/admin/chat-monitor");
@@ -246,7 +281,15 @@
       $("detailSenders").innerHTML = Array.isArray(s.commandSenders) && s.commandSenders.length
         ? s.commandSenders.map((x) => `<code>${escapeHtml(x)}</code>`).join("<br>")
         : `<span class="muted">none (open — every HUMAN message reaches the LLM)</span>`;
+      $("detailContextMode").innerHTML = s.contextMode === "recent"
+        ? `<code>recent</code> <span class="muted">(buffer TTL ${s.contextBufferMinutes}min, max ${s.contextBufferSize} rows)</span>`
+        : `<code>off</code>`;
+      $("detailBuffer").textContent = s.contextMode === "recent"
+        ? `${s.bufferCount ?? 0} message${(s.bufferCount === 1) ? "" : "s"} currently buffered`
+        : "—";
       $("detailPersona").textContent = s.persona || "";
+      // Remember the latest state on `selected` so editBtn can populate the form.
+      selected.state = s;
     }
 
     async function loadDecisions() {
@@ -293,22 +336,42 @@
         .split("\n")
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
+      const contextMode = $("contextMode").value;
+      const contextBufferMinutes = parseInt($("contextBufferMinutes").value, 10);
+      const contextBufferSize = parseInt($("contextBufferSize").value, 10);
 
       if (!ownerEmail || !spaceId || !persona) {
         setStatus($("upsertStatus"), "ownerEmail, spaceId, and persona are required", "error");
         return;
       }
-      setStatus($("upsertStatus"), "upserting...", null);
+      const wasEditing = !!editingKey;
+      setStatus($("upsertStatus"), wasEditing ? "saving..." : "creating...", null);
       try {
         await api("POST", "/api/admin/chat-monitor", {
           ownerEmail, spaceId, persona, pollIntervalSeconds, commandSenders,
+          contextMode, contextBufferMinutes, contextBufferSize,
         });
-        setStatus($("upsertStatus"), "upserted (monitor not yet started)", "success");
+        setStatus($("upsertStatus"), wasEditing ? "saved" : "created (monitor not yet started)", "success");
         await loadMonitors();
         await select(ownerEmail, spaceId);
+        // After a successful save, stay in edit mode for the same monitor
+        // so subsequent edits don't accidentally create a new one.
+        setFormMode("edit", ownerEmail, spaceId);
       } catch (e) {
         setStatus($("upsertStatus"), `failed: ${e.message}`, "error");
       }
+    }
+
+    function populateFormFromState(s) {
+      $("ownerEmail").value = s.ownerEmail || "";
+      $("spaceId").value = s.spaceId || "";
+      $("pollInterval").value = String(s.pollIntervalSeconds ?? 15);
+      $("commandSenders").value = (s.commandSenders || []).join("\n");
+      $("contextMode").value = s.contextMode === "recent" ? "recent" : "off";
+      $("contextBufferMinutes").value = String(s.contextBufferMinutes ?? 60);
+      $("contextBufferSize").value = String(s.contextBufferSize ?? 10);
+      $("persona").value = s.persona || "";
+      setStatus($("upsertStatus"), "");
     }
 
     async function actOnSelected(verb) {
@@ -349,7 +412,16 @@
       $("persona").value = "";
       $("commandSenders").value = "";
       $("pollInterval").value = "15";
-      setStatus($("upsertStatus"), "");
+      $("contextMode").value = "off";
+      $("contextBufferMinutes").value = "60";
+      $("contextBufferSize").value = "10";
+      setFormMode("create");
+    });
+    $("editBtn").addEventListener("click", () => {
+      if (!selected?.state) return;
+      populateFormFromState(selected.state);
+      setFormMode("edit", selected.state.ownerEmail, selected.state.spaceId);
+      $("formTitle").scrollIntoView({ behavior: "smooth", block: "start" });
     });
     $("startBtn").addEventListener("click", () => actOnSelected("start"));
     $("stopBtn").addEventListener("click", () => actOnSelected("stop"));
@@ -360,6 +432,19 @@
         setStatus($("detailStatus"), "reloaded", "success");
       } catch (e) {
         setStatus($("detailStatus"), e.message, "error");
+      }
+    });
+    $("clearBufferBtn").addEventListener("click", async () => {
+      if (!selected) return;
+      if (!confirm(`Wipe the recent-messages buffer for ${selected.owner} · ${selected.space}? Persisted message text will be deleted; the monitor stays running.`)) return;
+      const { owner, space } = selected;
+      setStatus($("detailStatus"), "clearing buffer...", null);
+      try {
+        const res = await api("POST", `/api/admin/chat-monitor/${encodeURIComponent(owner)}/${encodeURIComponent(space)}/buffer/clear`);
+        setStatus($("detailStatus"), `cleared ${res?.cleared ?? 0} row(s)`, "success");
+        await loadDetail();
+      } catch (e) {
+        setStatus($("detailStatus"), `clear failed: ${e.message}`, "error");
       }
     });
     $("deleteBtn").addEventListener("click", deleteSelected);
