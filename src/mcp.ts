@@ -2094,6 +2094,20 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
   );
 
   server.tool(
+    "chat_monitor_clear_buffer",
+    "ADMIN-ONLY. Wipe the recent-messages context buffer for one monitor. Use when contextMode='recent' has accumulated activity you don't want the model to see anymore. Returns the number of rows cleared.",
+    {
+      ownerEmail: z.string().email(),
+      spaceId: z.string().min(1).regex(/^spaces\//),
+    },
+    async ({ ownerEmail, spaceId }) => {
+      if (!isAdmin(userEmail, env)) return errorResult({ error: "Admin access required" });
+      const result = await proxyChatMonitor(ownerEmail, spaceId, "/buffer/clear", { method: "POST" });
+      return textResult(result);
+    },
+  );
+
+  server.tool(
     "chat_monitor_delete",
     "ADMIN-ONLY. Wipe the monitor entirely (storage + alarm). Use this to reset state for a smoke test.",
     {
