@@ -1,4 +1,5 @@
 import type { Artifacts } from "./artifacts-types";
+import type { ChatMonitorAgent } from "./chat-monitor-agent";
 import type { CodingAgent } from "./coding-agent";
 import type { SharedIndex } from "./shared-index";
 import type { UserControl } from "./user-control";
@@ -46,6 +47,8 @@ export interface Env {
   CODING_AGENT: DurableObjectNamespace<CodingAgent>;
   USER_CONTROL: DurableObjectNamespace<UserControl>;
   SHARED_INDEX: DurableObjectNamespace<SharedIndex>;
+  /** PoC: per-(owner,space) Google Chat monitor with alarm-driven poll. */
+  CHAT_MONITOR: DurableObjectNamespace<ChatMonitorAgent>;
 
   // Secrets (wrangler secret)
   SECRETS_MASTER_KEY?: string;
@@ -81,6 +84,13 @@ export interface Env {
    */
   NTFY_TOKEN?: string;
   OPENCODE_GATEWAY_TOKEN?: string;
+
+  /**
+   * Auth key for the ARIA chat middleware (Google Chat send path).
+   * Used by ChatMonitorAgent to post replies. Wrangler secret:
+   *   `wrangler secret put ARIA_CHAT_AUTH_KEY`
+   */
+  ARIA_CHAT_AUTH_KEY?: string;
 }
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";

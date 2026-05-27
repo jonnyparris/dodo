@@ -8,7 +8,8 @@
     "bindings": [
       { "name": "CODING_AGENT", "class_name": "CodingAgent" },
       { "name": "USER_CONTROL", "class_name": "UserControl" },
-      { "name": "SHARED_INDEX", "class_name": "SharedIndex" }
+      { "name": "SHARED_INDEX", "class_name": "SharedIndex" },
+      { "name": "CHAT_MONITOR", "class_name": "ChatMonitorAgent" }
     ]
   },
   "worker_loaders": [{ "binding": "LOADER" }],
@@ -49,6 +50,12 @@
       // deploy fails with code 10064 (missing class).
       "tag": "v6",
       "deleted_classes": ["OutboundProxy"]
+    },
+    {
+      // ChatMonitorAgent — PoC Google Chat monitor (DO with alarm loop).
+      // See src/chat-monitor-agent.ts.
+      "tag": "v7",
+      "new_sqlite_classes": ["ChatMonitorAgent"]
     }
   ],
   "r2_buckets": [

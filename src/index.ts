@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { fetchAttachment } from "./attachments";
 import { AuthError, canonicalizeEmail, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, resolveAdminEmail, verifyAccess } from "./auth";
+import { ChatMonitorAgent, chatMonitorIdName, createMonitorSchema } from "./chat-monitor-agent";
 import { CodingAgent } from "./coding-agent";
 import { ExploreAgent } from "./explore-agent";
 import { runHealthCheck } from "./health-check";
@@ -629,6 +630,81 @@ app.delete("/api/admin/errors", adminGuard as never, async (c) => proxyToSharedI
 app.post("/api/admin/health-check", adminGuard as never, async (c) => {
   const report = await runHealthCheck(c.env, c.executionCtx);
   return c.json(report);
+});
+
+// ─── Admin: ChatMonitorAgent PoC ───
+//
+// Per-(owner,space) Google Chat poll-decide-reply loop, backed by a
+// Durable Object alarm. See src/chat-monitor-agent.ts.
+//
+// Routes (all admin-only):
+//   POST   /api/admin/chat-monitor                    create/update
+//   POST   /api/admin/chat-monitor/:owner/:space/start
+//   POST   /api/admin/chat-monitor/:owner/:space/stop
+//   POST   /api/admin/chat-monitor/:owner/:space/tick   (one-shot debug fire)
+//   GET    /api/admin/chat-monitor/:owner/:space
+//   DELETE /api/admin/chat-monitor/:owner/:space
+//
+// `:space` is URL-encoded form of the full `spaces/AAAA...` resource name.
+
+function chatMonitorStub(env: Env, ownerEmail: string, spaceId: string) {
+  const id = env.CHAT_MONITOR.idFromName(chatMonitorIdName(ownerEmail, spaceId));
+  return env.CHAT_MONITOR.get(id);
+}
+
+app.post("/api/admin/chat-monitor", adminGuard as never, async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = createMonitorSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: "invalid body", issues: parsed.error.issues }, 400);
+  }
+  const stub = chatMonitorStub(c.env, parsed.data.ownerEmail, parsed.data.spaceId);
+  const res = await stub.fetch("https://chat-monitor/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(parsed.data),
+  });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.get("/api/admin/chat-monitor/:owner/:space", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/state");
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.post("/api/admin/chat-monitor/:owner/:space/start", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/start", { method: "POST" });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.post("/api/admin/chat-monitor/:owner/:space/stop", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/stop", { method: "POST" });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.post("/api/admin/chat-monitor/:owner/:space/tick", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/tick", { method: "POST" });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.delete("/api/admin/chat-monitor/:owner/:space", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/", { method: "DELETE" });
+  return new Response(res.body, { status: res.status, headers: res.headers });
 });
 
 // ─── Admin: autopilot self-diagnose kickoff ───
@@ -2790,7 +2866,7 @@ app.get("/api/admin/account-permissions", adminGuard as never, async (c) => {
   return proxyToSharedIndex(c.env, `/account-permissions?owner=${encodeURIComponent(owner)}`);
 });
 
-export { AllowlistOutbound, CodingAgent, ExploreAgent, SharedIndex, TaskAgent, UserControl };
+export { AllowlistOutbound, ChatMonitorAgent, CodingAgent, ExploreAgent, SharedIndex, TaskAgent, UserControl };
 
 export default {
   fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {
