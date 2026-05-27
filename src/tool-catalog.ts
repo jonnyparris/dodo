@@ -103,6 +103,13 @@ const ORCHESTRATOR_TOOLS: ToolCatalogEntry[] = [
     category: "execution",
     alwaysOn: true,
   },
+  {
+    name: "shell",
+    description:
+      "Run busybox shell commands against the session workspace — pipes, redirection, coreutils.",
+    category: "execution",
+    alwaysOn: true,
+  },
   // Browser tools — gated on BROWSER + LOADER bindings, session-enabled
   // browser config, and admin owner. Listed so users know they exist even
   // when their current session has them off.

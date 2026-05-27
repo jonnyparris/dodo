@@ -19,6 +19,7 @@
       "scripts/**/*.mjs",
       "scripts/**/*.ts",
       "!!**/src/typecheck-libs.generated.ts",
+      "!!**/src/runtime/busyworker/**",
       "!!**/node_modules",
       "!!**/dist",
       "!!**/.wrangler",

@@ -13,5 +13,11 @@
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
+  // Vendored busyworker upstream — kept out of tsc to avoid churning every
+  // refresh against Dodo's stricter compiler settings. esbuild/wrangler
+  // still bundle these files at deploy time; the adapter (workspace-fs.ts)
+  // lives in the same dir and rides the same exclusion. Lint exclusion
+  // mirrors biome.jsonc.
+  "exclude": ["src/runtime/busyworker/**"]
 }
