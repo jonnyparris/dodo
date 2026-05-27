@@ -3,7 +3,20 @@ import {
   chatMonitorIdName,
   createMonitorSchema,
   parseChatGetMessagesResult,
+  pickCfPortalConfig,
 } from "../src/chat-monitor-agent";
+import type { McpClientConfig } from "../src/mcp-client";
+
+function mkCfg(over: Partial<McpClientConfig>): McpClientConfig {
+  return {
+    id: "abc",
+    name: "x",
+    type: "http",
+    auth_type: "refresh_token",
+    enabled: true,
+    ...over,
+  } as McpClientConfig;
+}
 
 describe("createMonitorSchema", () => {
   it("accepts a valid input", () => {
@@ -142,6 +155,14 @@ describe("parseChatGetMessagesResult", () => {
     expect(parsed[0].name).toBe("spaces/AAA/messages/M1.T1");
   });
 
+  it("handles a top-level object that doesn't match either shape", () => {
+    expect(
+      parseChatGetMessagesResult([
+        { type: "text", text: JSON.stringify({ unrelated: true }) },
+      ]),
+    ).toEqual([]);
+  });
+
   it("handles cf-portal's { result: { messages } } wrapper", () => {
     const payload = {
       result: {
@@ -160,5 +181,54 @@ describe("parseChatGetMessagesResult", () => {
     ]);
     expect(parsed).toHaveLength(1);
     expect(parsed[0].text).toBe("wrapped");
+  });
+});
+
+describe("pickCfPortalConfig", () => {
+  it("prefers the canonical portal URL over the codemode variant", () => {
+    const cfg = pickCfPortalConfig([
+      mkCfg({ id: "1", url: "https://portal.mcp.cfdata.org/mcp?codemode=search_and_execute" }),
+      mkCfg({ id: "2", url: "https://portal.mcp.cfdata.org/mcp" }),
+    ]);
+    expect(cfg?.id).toBe("2");
+  });
+
+  it("returns the canonical match when it's the only one", () => {
+    const cfg = pickCfPortalConfig([
+      mkCfg({ id: "only", url: "https://portal.mcp.cfdata.org/mcp" }),
+    ]);
+    expect(cfg?.id).toBe("only");
+  });
+
+  it("falls back to a non-codemode portal URL via substring", () => {
+    const cfg = pickCfPortalConfig([
+      mkCfg({ id: "x", url: "https://portal.mcp.cfdata.org/mcp/variant" }),
+    ]);
+    expect(cfg?.id).toBe("x");
+  });
+
+  it("ignores codemode-only URLs when no canonical match exists", () => {
+    const cfg = pickCfPortalConfig([
+      mkCfg({ id: "x", url: "https://portal.mcp.cfdata.org/mcp?codemode=search_and_execute" }),
+    ]);
+    expect(cfg).toBeNull();
+  });
+
+  it("returns null when no portal config is present", () => {
+    expect(
+      pickCfPortalConfig([
+        mkCfg({ id: "other", url: "https://example.com/mcp" }),
+      ]),
+    ).toBeNull();
+  });
+
+  it("ignores static_header configs even if URL matches", () => {
+    const cfg = pickCfPortalConfig([
+      mkCfg({ id: "static", url: "https://portal.mcp.cfdata.org/mcp/static", auth_type: "static_headers" }),
+    ]);
+    // The canonical-URL preference goes by URL only, but the substring fallback
+    // requires refresh_token. Since neither URL is canonical, this should fall
+    // through to the fallback and reject the static_header config.
+    expect(cfg).toBeNull();
   });
 });

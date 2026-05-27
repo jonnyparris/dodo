@@ -61,8 +61,19 @@ const MIN_POLL_INTERVAL_SECONDS = 10;
 const DEFAULT_POLL_INTERVAL_SECONDS = 10;
 const MAX_MESSAGES_PER_TICK = 5;
 const ARIA_MIDDLEWARE_URL = "https://chat-middleware.project-aria.workers.dev/api/post-message";
-const CF_PORTAL_MCP_CONFIG_ID = "cf-portal";
-const CF_PORTAL_CHAT_TOOL = "google-workspace-mcp__chat_get_messages";
+/**
+ * URLs we'll accept as "the cf-portal MCP server" when looking up the
+ * owner's refresh-token MCP config. Both the normal and codemode variants
+ * are registered side-by-side after running `/dodo-dcr-oauth` — we prefer
+ * the normal one so individual chat tools (not the codemode search+execute
+ * pair) are exposed.
+ */
+const CF_PORTAL_PREFERRED_URLS = [
+  "https://portal.mcp.cfdata.org/mcp",
+];
+/** Substring fallback: any config whose URL hostname matches this hosts cf-portal. */
+const CF_PORTAL_URL_SUBSTRING = "portal.mcp.cfdata.org";
+const CF_PORTAL_CHAT_TOOL_ORIGINAL = "google-workspace-mcp__chat_get_messages";
 const DECISION_MODEL = "@cf/moonshotai/kimi-k2.6";
 
 // ─── Schemas ───
@@ -419,20 +430,9 @@ export class ChatMonitorAgent extends DurableObject<Env> {
   ): Promise<ChatMessage[]> {
     const stub = getUserControlStub(this.env, ownerEmail);
 
-    // Resolve current access token for the cf-portal config.
-    const tokenRes = await stub.fetch(
-      `https://user-control/mcp-configs/${encodeURIComponent(CF_PORTAL_MCP_CONFIG_ID)}/access-token`,
-      { headers: { "x-owner-email": ownerEmail } },
-    );
-    if (!tokenRes.ok) {
-      throw new Error(
-        `cf-portal access-token fetch failed (${tokenRes.status}). Run /sync-cf-portal-to-dodo for ${ownerEmail}.`,
-      );
-    }
-    const { accessToken } = (await tokenRes.json()) as { accessToken?: string };
-    if (!accessToken) throw new Error("cf-portal returned no access token");
-
-    // Look up the config (no GET-single endpoint, so list + find).
+    // 1. Look up the cf-portal config. Configs are listed by id (UUID after
+    //    DCR), so we have to match on URL. Prefer the canonical portal URL
+    //    over the codemode variant.
     const cfgRes = await stub.fetch("https://user-control/mcp-configs", {
       headers: { "x-owner-email": ownerEmail },
     });
@@ -440,13 +440,26 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       throw new Error(`cf-portal config list failed (${cfgRes.status})`);
     }
     const { configs } = (await cfgRes.json()) as { configs: McpClientConfig[] };
-    const cfg = configs.find((c) => c.id === CF_PORTAL_MCP_CONFIG_ID);
+    const cfg = pickCfPortalConfig(configs);
     if (!cfg) {
       throw new Error(
-        `cf-portal MCP config not found for ${ownerEmail}. Run /sync-cf-portal-to-dodo first.`,
+        `cf-portal MCP config not found for ${ownerEmail}. Run /dodo-dcr-oauth first.`,
       );
     }
     if (!cfg.url) throw new Error("cf-portal config has no url");
+
+    // 2. Resolve current access token by the resolved config's ID.
+    const tokenRes = await stub.fetch(
+      `https://user-control/mcp-configs/${encodeURIComponent(cfg.id)}/access-token`,
+      { headers: { "x-owner-email": ownerEmail } },
+    );
+    if (!tokenRes.ok) {
+      throw new Error(
+        `cf-portal access-token fetch failed (${tokenRes.status}) for config ${cfg.id}.`,
+      );
+    }
+    const { accessToken } = (await tokenRes.json()) as { accessToken?: string };
+    if (!accessToken) throw new Error("cf-portal returned no access token");
 
     const client = new HttpMcpClient(
       {
@@ -457,8 +470,11 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     );
     try {
       await client.connect();
-      // The cf-portal tool name in HttpMcpClient's namespaced form is
-      // `<configId>__<originalName>`. callTool() strips the prefix.
+      // HttpMcpClient namespaces tool names as `<configId>__<originalName>`.
+      // The cf-portal-side tool name is `google-workspace-mcp__chat_get_messages`;
+      // we slot it under our dynamic config id.
+      const originalToolName = CF_PORTAL_CHAT_TOOL_ORIGINAL;
+      const namespacedName = `${cfg.id}__${originalToolName}`;
       const callArgs: Record<string, unknown> = {
         spaceName: spaceId,
         maxResults: 25,
@@ -466,10 +482,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       };
       if (afterIso) callArgs.after = afterIso;
 
-      const result = await client.callTool(
-        `${CF_PORTAL_MCP_CONFIG_ID}__${CF_PORTAL_CHAT_TOOL.split("__")[1]}`,
-        callArgs,
-      );
+      const result = await client.callTool(namespacedName, callArgs);
       if (result.isError) {
         const text = result.content.map((c) => c.text ?? "").join("\n");
         throw new Error(`chat_get_messages error: ${text.slice(0, 500)}`);
@@ -652,4 +665,32 @@ function extractMessagesArray(payload: unknown): unknown[] {
 /** Resolve the canonical DO id for a given (owner, space) pair. */
 export function chatMonitorIdName(ownerEmail: string, spaceId: string): string {
   return `${ownerEmail.toLowerCase()}:${spaceId}`;
+}
+
+/**
+ * Pick the cf-portal MCP config from a user's config list.
+ *
+ * After `/dodo-dcr-oauth` two configs land side-by-side: the canonical
+ * URL and the `?codemode=search_and_execute` variant. The codemode
+ * variant exposes only `search` and `execute`, not the individual
+ * `chat_get_messages` tool — so we prefer the canonical URL.
+ *
+ * Falls back to any config whose URL contains `portal.mcp.cfdata.org`.
+ * Returns null if nothing matches. Exported for tests.
+ */
+export function pickCfPortalConfig(
+  configs: McpClientConfig[],
+): McpClientConfig | null {
+  for (const preferred of CF_PORTAL_PREFERRED_URLS) {
+    const hit = configs.find((c) => c.url === preferred);
+    if (hit) return hit;
+  }
+  const fallback = configs.find(
+    (c) =>
+      c.auth_type === "refresh_token" &&
+      typeof c.url === "string" &&
+      c.url.includes(CF_PORTAL_URL_SUBSTRING) &&
+      !c.url.includes("codemode"),
+  );
+  return fallback ?? null;
 }
