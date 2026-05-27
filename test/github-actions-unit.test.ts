@@ -25,6 +25,8 @@ const baseRun: WorkerRunRecord = {
   verifyWorkflow: "dodo-verify.yml",
   verifyWorkflowRunId: null,
   verifyWorkflowHtmlUrl: null,
+  workflowName: "repo-prompt",
+  result: null,
 };
 
 const ADMIN_EMAIL = "admin@test.local";

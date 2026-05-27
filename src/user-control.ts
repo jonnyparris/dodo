@@ -259,6 +259,11 @@ const workerRunCreateSchema = z.object({
   expectedFiles: z.array(z.string()).default([]),
   status: workerRunStatusEnum.default("session_created"),
   verifyWorkflow: z.string().min(1).nullable().optional(),
+  // Workflow-abstraction columns. Optional on the create path so the
+  // legacy callers (which set `strategy` directly) still work — the
+  // create method derives `workflowName` when omitted.
+  workflowName: z.enum(["repo-prompt", "repo-edits", "verify-run"]).optional(),
+  result: z.record(z.string(), z.unknown()).nullable().optional(),
 }).strict();
 
 const workerRunUpdateSchema = z.object({
@@ -269,6 +274,10 @@ const workerRunUpdateSchema = z.object({
   verification: z.record(z.string(), z.unknown()).nullable().optional(),
   verifyWorkflowRunId: z.string().nullable().optional(),
   verifyWorkflowHtmlUrl: z.string().nullable().optional(),
+  // Typed terminal-state result. Writers set this when the workflow
+  // reaches a terminal state; the legacy `verification` / `prUrl`
+  // columns stay as the back-compat read path for old rows.
+  result: z.record(z.string(), z.unknown()).nullable().optional(),
 }).strict();
 
 const failureSnapshotCreateSchema = z.object({
@@ -1496,6 +1505,23 @@ export class UserControl extends DurableObject<Env> {
       "ALTER TABLE worker_runs ADD COLUMN verify_workflow TEXT",
       "ALTER TABLE worker_runs ADD COLUMN verify_workflow_run_id TEXT",
       "ALTER TABLE worker_runs ADD COLUMN verify_workflow_html_url TEXT",
+      // Workflow-abstraction columns (Steal #2). The underlying table
+      // keeps its historical name because there's no safe way to do an
+      // atomic rename + backfill across all live DOs, but every layer
+      // above the DB exposes it as `workflow_runs`.
+      //
+      // `workflow_name` records the typed workflow the row came from
+      // (`repo-prompt` | `repo-edits` | `verify-run`). For legacy rows
+      // it stays NULL; the read layer derives a name from `strategy`
+      // (`agent` → `repo-prompt`, `deterministic` → `repo-edits`) so
+      // there's no UI / API drift.
+      //
+      // `result_json` is the typed terminal-state result validated by
+      // the workflow's `resultSchema`. On legacy rows it's NULL and
+      // the read layer falls back to materialising one from the
+      // existing `prUrl` / `verification_json` columns.
+      "ALTER TABLE worker_runs ADD COLUMN workflow_name TEXT",
+      "ALTER TABLE worker_runs ADD COLUMN result_json TEXT",
     ]) {
       try { this.ctx.storage.sql.exec(ddl); } catch { /* column already exists */ }
     }
@@ -1888,13 +1914,19 @@ export class UserControl extends DurableObject<Env> {
   private createWorkerRun(input: z.infer<typeof workerRunCreateSchema>): WorkerRunRecord {
     const id = crypto.randomUUID();
     const now = nowEpoch();
+    // Workflow name: prefer the explicit field on the create input
+    // (set by callers wired through `runWorkflow`); fall back to
+    // mapping `strategy` for legacy direct-write callers.
+    const workflowName =
+      input.workflowName ??
+      (input.strategy === "agent" ? "repo-prompt" : "repo-edits");
     this.ctx.storage.sql.exec(
       `INSERT INTO worker_runs (
         id, session_id, parent_session_id, repo_id, repo_url, repo_dir, branch, base_branch,
         strategy, title, commit_message, expected_files_json, verification_json, last_error,
         failure_snapshot_id, pr_url, verify_workflow, verify_workflow_run_id, verify_workflow_html_url,
-        status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        status, created_at, updated_at, workflow_name, result_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       input.sessionId,
       input.parentSessionId ?? null,
@@ -1917,6 +1949,8 @@ export class UserControl extends DurableObject<Env> {
       input.status,
       now,
       now,
+      workflowName,
+      input.result === undefined || input.result === null ? null : JSON.stringify(input.result),
     );
     return this.getWorkerRun(id);
   }
@@ -1933,6 +1967,7 @@ export class UserControl extends DurableObject<Env> {
            verification_json = ?,
            verify_workflow_run_id = ?,
            verify_workflow_html_url = ?,
+           result_json = ?,
            updated_at = ?
        WHERE id = ?`,
       patch.status ?? current.status,
@@ -1944,6 +1979,9 @@ export class UserControl extends DurableObject<Env> {
         : (patch.verification === null ? null : JSON.stringify(patch.verification)),
       patch.verifyWorkflowRunId === undefined ? (current.verifyWorkflowRunId ?? null) : patch.verifyWorkflowRunId,
       patch.verifyWorkflowHtmlUrl === undefined ? (current.verifyWorkflowHtmlUrl ?? null) : patch.verifyWorkflowHtmlUrl,
+      patch.result === undefined
+        ? (current.result === null ? null : JSON.stringify(current.result))
+        : (patch.result === null ? null : JSON.stringify(patch.result)),
       nowEpoch(),
       id,
     );
@@ -1966,6 +2004,15 @@ export class UserControl extends DurableObject<Env> {
   }
 
   private mapWorkerRunRow(row: SqlRow): WorkerRunRecord {
+    const strategy = String(row.strategy) as WorkerRunRecord["strategy"];
+    // Derive the workflow name for legacy rows where `workflow_name`
+    // is NULL. Mapping is deterministic: `agent` → `repo-prompt`,
+    // `deterministic` → `repo-edits`. `verify-run` only appears on
+    // rows written by the new layer so a legacy NULL never maps to it.
+    const workflowName =
+      row.workflow_name == null
+        ? (strategy === "agent" ? "repo-prompt" : "repo-edits")
+        : (String(row.workflow_name) as WorkerRunRecord["workflowName"]);
     return {
       baseBranch: String(row.base_branch),
       branch: String(row.branch),
@@ -1982,13 +2029,15 @@ export class UserControl extends DurableObject<Env> {
       repoUrl: String(row.repo_url),
       sessionId: String(row.session_id),
       status: String(row.status) as WorkerRunStatus,
-      strategy: String(row.strategy) as WorkerRunRecord["strategy"],
+      strategy,
       title: String(row.title),
       updatedAt: epochToIso(row.updated_at),
       verification: row.verification_json === null ? null : JSON.parse(String(row.verification_json)) as Record<string, unknown>,
       verifyWorkflow: row.verify_workflow == null ? null : String(row.verify_workflow),
       verifyWorkflowHtmlUrl: row.verify_workflow_html_url == null ? null : String(row.verify_workflow_html_url),
       verifyWorkflowRunId: row.verify_workflow_run_id == null ? null : String(row.verify_workflow_run_id),
+      workflowName,
+      result: row.result_json == null ? null : JSON.parse(String(row.result_json)) as Record<string, unknown>,
     };
   }
 

@@ -270,7 +270,29 @@ export interface WorkerRunRecord {
   verifyWorkflowRunId?: string | null;
   /** Public URL of the workflow run for humans to inspect. */
   verifyWorkflowHtmlUrl?: string | null;
+  /**
+   * Workflow-abstraction fields (Steal #2 of the flue-inspired plan).
+   *
+   * `workflowName` records the typed workflow that produced this row
+   * (`repo-prompt`, `repo-edits`, `verify-run`). On legacy rows it's
+   * derived from `strategy` so consumers don't have to special-case.
+   *
+   * `result` is the typed terminal-state result validated by the
+   * workflow's `resultSchema`. Carries the same data as
+   * `verification` + `prUrl` for legacy rows; new code should read
+   * `result` and treat the legacy columns as the source for
+   * back-compat reads only.
+   */
+  workflowName: "repo-prompt" | "repo-edits" | "verify-run";
+  result: Record<string, unknown> | null;
 }
+
+/**
+ * Public-facing workflow run shape. Same data as `WorkerRunRecord`
+ * but presented at the new abstraction layer — the historical SQL
+ * table name (`worker_runs`) is hidden from callers.
+ */
+export type WorkflowRunRecord = WorkerRunRecord;
 
 export interface FailureSnapshotRecord {
   createdAt: string;

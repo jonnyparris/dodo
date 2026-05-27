@@ -969,6 +969,8 @@ describe("auto-PR creation", () => {
     title: "t",
     updatedAt: "",
     verification: null,
+    workflowName: "repo-prompt" as const,
+    result: null,
   };
 
   it("parses github.com URLs", async () => {
@@ -1453,6 +1455,8 @@ describe("Worker run notifications", () => {
     title: "Ship notifications",
     updatedAt: "2026-04-17T00:00:00.000Z",
     verification: null,
+    workflowName: "repo-prompt" as const,
+    result: null,
   };
 
   it("fires ntfy when a run transitions to done", () => {

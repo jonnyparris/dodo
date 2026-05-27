@@ -11,6 +11,10 @@ import { errorResult, mcpUserEmail, propagateMcpDepth } from "./mcp-shared";
 import { queryRecentExceptions, querySessionLogs, queryWorkerLogs } from "./cloudflare-logs";
 import type { CodingAgent } from "./coding-agent";
 import type { Env, WorkerRunRecord } from "./types";
+import { dispatchWorkflow } from "./workflows/mcp-adapter";
+import { makeRepoEditsWorkflow, type RepoEditsDeps } from "./workflows/repo-edits";
+import { makeRepoPromptWorkflow, type RepoPromptDeps } from "./workflows/repo-prompt";
+import { makeVerifyRunWorkflow, type VerifyRunDeps, type WorkerRunSnapshot } from "./workflows/verify-run";
 
 /**
  * Check whether the caller has at least `required` permission on the session.
@@ -404,100 +408,10 @@ async function acquireFreshClone(env: Env, repo: { defaultBranch: string; dir: s
  */
 const VERIFY_GATE_TIMEOUT_MS = 30 * 60 * 1000;
 
-/**
- * After a run reaches `done` (or we explicitly decide to open a PR without
- * blocking on verify), attempt to open a draft PR. PR failures are non-fatal
- * so they don't regress the run.
- *
- * If a prior call already opened a PR (e.g. the caller is double-polling
- * `verify_worker_run` and both see a terminal state), skip the second
- * attempt — `createDraftPrForRun` has no existing-PR check and would
- * otherwise open duplicates.
- */
-async function finalizePr(env: Env, run: WorkerRunRecord, ownerEmail: string | undefined, verification: Record<string, unknown>): Promise<{ content: Array<{ type: "text"; text: string }> }> {
-  if (run.prUrl) {
-    return textResult({ run, verification });
-  }
-  const prUrl = await createDraftPrForRun(env, run, ownerEmail);
-  if (prUrl) {
-    const withPr = await updateWorkerRun(env, run.id, { prUrl });
-    return textResult({ run: withPr, verification });
-  }
-  return textResult({ run, verification });
-}
-
-/** Read the startedAt ISO string from the verifyGate record. Null if missing. */
-function getVerifyGateStartedAt(run: WorkerRunRecord): number | null {
-  const gate = (run.verification as Record<string, unknown> | null)?.verifyGate as Record<string, unknown> | undefined;
-  const raw = gate?.startedAt;
-  if (typeof raw !== "string") return null;
-  const ms = Date.parse(raw);
-  return Number.isFinite(ms) ? ms : null;
-}
-
-/**
- * Poll the verify-gate workflow run for a worker run that's currently
- * `checks_running`. If the workflow is still in flight, return a running
- * response. On success: transition `checks_passed` → auto-PR → `done`. On
- * failure (or timeout): capture the workflow URL in a failure snapshot and
- * mark `failed`.
- */
-async function pollAndFinalize(env: Env, run: WorkerRunRecord, ownerEmail: string | undefined): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: true }> {
-  const verification = (run.verification ?? {}) as Record<string, unknown>;
-  const pollResult = await pollVerifyWorkflow({ env, run, ownerEmail });
-
-  if (!pollResult) {
-    // Still running — but check the timeout cap first so we don't poll forever.
-    const startedAt = getVerifyGateStartedAt(run);
-    if (startedAt !== null && Date.now() - startedAt > VERIFY_GATE_TIMEOUT_MS) {
-      const htmlUrl = run.verifyWorkflowHtmlUrl ?? null;
-      const message = `Verify workflow timed out after ${Math.round(VERIFY_GATE_TIMEOUT_MS / 60000)} minutes${htmlUrl ? ` — see ${htmlUrl}` : ""}`;
-      const failure = await createFailureSnapshot(env, run.id, {
-        reason: "verify_gate_timeout",
-        htmlUrl,
-        startedAt: new Date(startedAt).toISOString(),
-        timeoutMs: VERIFY_GATE_TIMEOUT_MS,
-        verifyWorkflow: run.verifyWorkflow,
-      });
-      const updated = await updateWorkerRun(env, run.id, {
-        status: "failed",
-        lastError: message,
-        failureSnapshotId: String(failure.id),
-        verification: { ...verification, verifyGate: { ...(verification.verifyGate as Record<string, unknown> | undefined), conclusion: "timed_out", htmlUrl, timedOutAt: new Date().toISOString() } },
-      });
-      return errorResult({ error: message, failureSnapshotId: failure.id, run: updated, verifyWorkflowHtmlUrl: htmlUrl });
-    }
-    return textResult({ run, status: "checks_running", verifyWorkflowHtmlUrl: run.verifyWorkflowHtmlUrl });
-  }
-
-  if (pollResult.conclusion === "success") {
-    const passed = await updateWorkerRun(env, run.id, {
-      status: "checks_passed",
-      verification: { ...verification, verifyGate: { ...(verification.verifyGate as Record<string, unknown> | undefined), conclusion: "success", htmlUrl: pollResult.htmlUrl, completedAt: pollResult.completedAt } },
-    });
-    // Immediately transition to `done` so the caller sees a single terminal
-    // state, and open the draft PR.
-    const done = await updateWorkerRun(env, run.id, { status: "done" });
-    return await finalizePr(env, done, ownerEmail, passed.verification ?? {});
-  }
-
-  // Non-success conclusion — record a failure snapshot pointing at the run.
-  const failure = await createFailureSnapshot(env, run.id, {
-    reason: "verify_gate_failed",
-    conclusion: pollResult.conclusion,
-    htmlUrl: pollResult.htmlUrl,
-    completedAt: pollResult.completedAt,
-    verifyWorkflow: run.verifyWorkflow,
-  });
-  const message = `Verify workflow concluded '${pollResult.conclusion}' — see ${pollResult.htmlUrl}`;
-  const updated = await updateWorkerRun(env, run.id, {
-    status: "failed",
-    lastError: message,
-    failureSnapshotId: String(failure.id),
-    verification: { ...verification, verifyGate: { ...(verification.verifyGate as Record<string, unknown> | undefined), conclusion: pollResult.conclusion, htmlUrl: pollResult.htmlUrl, completedAt: pollResult.completedAt } },
-  });
-  return errorResult({ error: message, failureSnapshotId: failure.id, run: updated, verifyWorkflowHtmlUrl: pollResult.htmlUrl });
-}
+// The `finalizePr`, `pollAndFinalize`, and `getVerifyGateStartedAt`
+// helpers that used to live here moved into the `verify-run` workflow
+// (`src/workflows/verify-run.ts`). The MCP handler now delegates to
+// the workflow via `buildVerifyRunDeps` + `dispatchWorkflow`.
 
 function textResult(data: unknown): { content: Array<{ type: "text"; text: string }> } {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -517,6 +431,219 @@ async function jsonFetch(env: Env, fetcher: "user" | "shared" | "agent", path: s
     return errorResult(data);
   }
   return textResult(data);
+}
+
+// ─── Workflow dep adapters ───
+// Wire the workflow contracts in src/workflows/ to the existing
+// MCP-layer helpers. Each builder returns a fresh deps bag closing
+// over `env`, `userEmail`, and the current MCP `depth` so the
+// workflow body can call back through `userJson` / `agentJson`
+// without re-resolving auth on every step.
+
+function buildRepoEditsDeps(env: Env, userEmail: string | undefined, depth: number): RepoEditsDeps {
+  return {
+    getRepo: (repoId: string) => {
+      const repo = getKnownRepo(repoId);
+      return { dir: repo.dir, url: repo.url };
+    },
+    acquireRepoSession: async (input) => {
+      const repo = getKnownRepo(input.repoId);
+      const acquireStart = Date.now();
+      const acquired = await acquireRepoSession(env, repo, input.baseBranch, input.title, depth, userEmail);
+      log("info", "workflow.repo-edits: repo session acquired", {
+        repoId: repo.id,
+        baseBranch: input.baseBranch,
+        sessionId: acquired.sessionId,
+        viaCache: acquired.viaCache,
+        reason: acquired.reason,
+        ms: Date.now() - acquireStart,
+      });
+      return { sessionId: acquired.sessionId, viaCache: acquired.viaCache, reason: acquired.reason };
+    },
+    createRun: async (input) => {
+      const repo = getKnownRepo(input.repoId);
+      const run = await createWorkerRun(env, {
+        baseBranch: input.baseBranch,
+        branch: input.branch,
+        commitMessage: input.commitMessage,
+        expectedFiles: input.expectedFiles,
+        parentSessionId: null,
+        repoDir: repo.dir,
+        repoId: repo.id,
+        repoUrl: repo.url,
+        sessionId: input.sessionId,
+        status: "repo_ready",
+        strategy: "deterministic",
+        title: input.title,
+      });
+      return { id: String(run.id) };
+    },
+    updateRun: async (id, patch) => {
+      await updateWorkerRun(env, id, patch);
+    },
+    prepareRepoBranch: async ({ sessionId, repoDir, branch, baseBranch }) =>
+      prepareRepoBranch(env, sessionId, repoDir, branch, baseBranch, depth),
+    applyEdit: async ({ sessionId, path, search, replacement }) => {
+      await agentJson(env, sessionId, `/file?path=${encodeURIComponent(path)}`, {
+        body: JSON.stringify({ replacement, search }),
+        headers: { "content-type": "application/json" },
+        method: "PATCH",
+      }, depth);
+    },
+    gitStatus: async ({ sessionId, repoDir }) =>
+      agentJson<{ entries: unknown[] }>(
+        env, sessionId, `/git/status?dir=${encodeURIComponent(repoDir)}`, undefined, depth,
+      ),
+    gitAdd: async ({ sessionId, repoDir, filepath }) => {
+      await agentJson(env, sessionId, "/git/add", {
+        body: JSON.stringify({ dir: repoDir, filepath }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth);
+    },
+    gitCommit: async ({ sessionId, repoDir, message }) => {
+      await agentJson(env, sessionId, "/git/commit", {
+        body: JSON.stringify({ dir: repoDir, message }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth);
+    },
+    gitPushChecked: async ({ sessionId, repoDir, baseRef, ref, expectedFiles }) =>
+      agentJson<Record<string, unknown>>(env, sessionId, "/git/push-checked", {
+        body: JSON.stringify({ baseRef, dir: repoDir, expectedFiles, ref }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth),
+    captureFailure: async ({ runId, sessionId, repoDir }) =>
+      captureFailureSnapshot(env, runId, sessionId, repoDir, depth) as Promise<{ id: string }>,
+  };
+}
+
+function buildRepoPromptDeps(env: Env, userEmail: string | undefined, depth: number): RepoPromptDeps {
+  return {
+    getRepo: (repoId: string) => {
+      const repo = getKnownRepo(repoId);
+      return { dir: repo.dir, url: repo.url };
+    },
+    acquireRepoSession: async (input) => {
+      const repo = getKnownRepo(input.repoId);
+      const acquireStart = Date.now();
+      const acquired = await acquireRepoSession(env, repo, input.baseBranch, input.title, depth, userEmail);
+      log("info", "workflow.repo-prompt: repo session acquired", {
+        repoId: repo.id,
+        baseBranch: input.baseBranch,
+        sessionId: acquired.sessionId,
+        viaCache: acquired.viaCache,
+        reason: acquired.reason,
+        ms: Date.now() - acquireStart,
+      });
+      return { sessionId: acquired.sessionId, viaCache: acquired.viaCache, reason: acquired.reason };
+    },
+    createRun: async (input) => {
+      const repo = getKnownRepo(input.repoId);
+      const run = await createWorkerRun(env, {
+        baseBranch: input.baseBranch,
+        branch: input.branch,
+        commitMessage: input.commitMessage,
+        expectedFiles: input.expectedFiles,
+        parentSessionId: null,
+        repoDir: repo.dir,
+        repoId: repo.id,
+        repoUrl: repo.url,
+        sessionId: input.sessionId,
+        status: "repo_ready",
+        strategy: "agent",
+        title: input.title,
+        verifyWorkflow: input.verifyWorkflow,
+      });
+      return { id: String(run.id) };
+    },
+    updateRun: async (id, patch) => {
+      await updateWorkerRun(env, id, patch);
+    },
+    prepareRepoBranch: async ({ sessionId, repoDir, branch, baseBranch }) =>
+      prepareRepoBranch(env, sessionId, repoDir, branch, baseBranch, depth),
+    dispatchPrompt: async ({ sessionId, content }) =>
+      agentJson<Record<string, unknown>>(env, sessionId, "/prompt", {
+        body: JSON.stringify({ content }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth),
+    captureFailure: async ({ runId, sessionId, repoDir }) =>
+      captureFailureSnapshot(env, runId, sessionId, repoDir, depth) as Promise<{ id: string }>,
+  };
+}
+
+function buildVerifyRunDeps(env: Env, ownerEmail: string, depth: number): VerifyRunDeps {
+  // The verify-run workflow's WorkerRunSnapshot shape is a strict
+  // subset of WorkerRunRecord — every field maps directly. The cast
+  // here is the boundary; we keep the workflow contract narrow by
+  // copying only what the body needs, so a future change to
+  // WorkerRunRecord doesn't have to ripple through the workflow.
+  const snapshot = (run: WorkerRunRecord): WorkerRunSnapshot => ({
+    id: run.id,
+    sessionId: run.sessionId,
+    status: run.status,
+    strategy: run.strategy,
+    baseBranch: run.baseBranch,
+    branch: run.branch,
+    repoDir: run.repoDir,
+    expectedFiles: run.expectedFiles,
+    verification: run.verification,
+    verifyWorkflow: run.verifyWorkflow ?? null,
+    verifyWorkflowRunId: run.verifyWorkflowRunId ?? null,
+    verifyWorkflowHtmlUrl: run.verifyWorkflowHtmlUrl ?? null,
+    prUrl: run.prUrl ?? null,
+  });
+  return {
+    verifyGateTimeoutMs: VERIFY_GATE_TIMEOUT_MS,
+    getRun: async (id) =>
+      snapshot(await userJson<WorkerRunRecord>(env, `/worker-runs/${encodeURIComponent(id)}`)),
+    updateRun: async (id, patch) => snapshot(await updateWorkerRun(env, id, patch)),
+    listSessionPrompts: async (sessionId) => {
+      const { prompts } = await agentJson<{
+        prompts: Array<{ error: string | null; status: string }>;
+      }>(env, sessionId, "/prompts", undefined, depth);
+      return prompts;
+    },
+    verifyBranch: async ({ sessionId, repoDir, baseRef, ref, expectedFiles }) =>
+      agentJson<Record<string, unknown>>(env, sessionId, "/git/verify-branch", {
+        body: JSON.stringify({ baseRef, dir: repoDir, expectedFiles, ref }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }, depth),
+    triggerVerifyWorkflow: async (run) => {
+      const r: WorkerRunRecord = {
+        ...(run as unknown as WorkerRunRecord),
+      };
+      return triggerVerifyWorkflow({ env, run: r, ownerEmail });
+    },
+    pollVerifyWorkflow: async (run) => {
+      const r: WorkerRunRecord = {
+        ...(run as unknown as WorkerRunRecord),
+      };
+      const result = await pollVerifyWorkflow({ env, run: r, ownerEmail });
+      if (!result) return null;
+      // Map github-api's "conclusion" into the workflow's typed enum.
+      // Anything unrecognised collapses to "failure" — safer than
+      // leaking provider strings into the workflow contract.
+      const c = String(result.conclusion ?? "").toLowerCase();
+      const conclusion: "success" | "failure" | "timed_out" =
+        c === "success" ? "success" : c === "timed_out" ? "timed_out" : "failure";
+      return {
+        conclusion,
+        htmlUrl: String(result.htmlUrl ?? ""),
+      };
+    },
+    createDraftPr: async (run) => {
+      const r: WorkerRunRecord = {
+        ...(run as unknown as WorkerRunRecord),
+      };
+      return createDraftPrForRun(env, r, ownerEmail);
+    },
+    captureFailure: async ({ runId, sessionId, repoDir }) =>
+      captureFailureSnapshot(env, runId, sessionId, repoDir, depth) as Promise<{ id: string }>,
+  };
 }
 
 export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): McpServer {
@@ -783,84 +910,31 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
       replacement: z.string().describe("Replacement text"),
     })).min(1).describe("Deterministic text edits to apply in order"),
   }, async ({ repoId, title, branch, baseBranch, commitMessage, expectedFiles, edits }) => {
-    const repo = getKnownRepo(repoId);
-    // Acquire a worker session with the repo already at HEAD of baseBranch.
-    // Uses the global seed cache when available, falls back to fresh clone
-    // on any error so the orchestrator never blocks on cache misses.
-    const acquireStart = Date.now();
-    const acquired = await acquireRepoSession(env, repo, baseBranch, title, depth, userEmail);
-    log("info", "run_repo_edits: repo session acquired", {
-      repoId: repo.id,
-      baseBranch,
-      sessionId: acquired.sessionId,
-      viaCache: acquired.viaCache,
-      reason: acquired.reason,
-      ms: Date.now() - acquireStart,
-    });
-    const run = await createWorkerRun(env, {
-      baseBranch,
-      branch,
-      commitMessage,
-      expectedFiles,
-      parentSessionId: null,
-      repoDir: repo.dir,
-      repoId: repo.id,
-      repoUrl: repo.url,
-      sessionId: acquired.sessionId,
-      status: "repo_ready",
-      strategy: "deterministic",
-      title,
-    });
-    const workerSessionId = acquired.sessionId;
-
+    const deps = buildRepoEditsDeps(env, userEmail, depth);
+    const workflow = makeRepoEditsWorkflow(deps);
     try {
-      await prepareRepoBranch(env, workerSessionId, repo.dir, branch, baseBranch, depth);
-      await updateWorkerRun(env, String(run.id), { status: "branch_created" });
-
-      for (const edit of edits) {
-        await agentJson(env, workerSessionId, `/file?path=${encodeURIComponent(edit.path)}`, {
-          body: JSON.stringify({ replacement: edit.replacement, search: edit.search }),
-          headers: { "content-type": "application/json" },
-          method: "PATCH",
-        }, depth);
+      const dispatched = await dispatchWorkflow({
+        workflow,
+        sessionId: "pending",
+        payload: { repoId, title, branch, baseBranch, commitMessage, expectedFiles, edits },
+      });
+      const r = dispatched.result;
+      if (r.status === "failed") {
+        return errorResult({
+          error: r.error,
+          failureSnapshotId: r.failureSnapshotId,
+          sessionId: r.sessionId,
+          runId: dispatched.runId,
+        });
       }
-      await updateWorkerRun(env, String(run.id), { status: "edit_applied" });
-
-      const status = await agentJson<{ entries?: unknown[] }>(env, workerSessionId, `/git/status?dir=${encodeURIComponent(repo.dir)}`, undefined, depth);
-      if (!Array.isArray(status.entries) || status.entries.length === 0) {
-        throw new Error("No changed files detected after applying deterministic edits");
-      }
-
-      // Stage files — git add needs repo-relative paths, not workspace-absolute
-      const repoPrefix = repo.dir.endsWith("/") ? repo.dir : `${repo.dir}/`;
-      for (const file of Array.from(new Set(edits.map((edit) => edit.path)))) {
-        const relPath = file.startsWith(repoPrefix) ? file.slice(repoPrefix.length) : file;
-        await agentJson(env, workerSessionId, "/git/add", {
-          body: JSON.stringify({ dir: repo.dir, filepath: relPath }),
-          headers: { "content-type": "application/json" },
-          method: "POST",
-        }, depth);
-      }
-
-      await agentJson(env, workerSessionId, "/git/commit", {
-        body: JSON.stringify({ dir: repo.dir, message: commitMessage }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      }, depth);
-      await updateWorkerRun(env, String(run.id), { status: "commit_created" });
-
-      const push = await agentJson<Record<string, unknown>>(env, workerSessionId, "/git/push-checked", {
-        body: JSON.stringify({ baseRef: baseBranch, dir: repo.dir, expectedFiles, ref: branch }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      }, depth);
-      await updateWorkerRun(env, String(run.id), { status: "done", verification: push });
-      return textResult({ run, sessionId: workerSessionId, verification: push });
+      return textResult({
+        sessionId: r.sessionId,
+        runId: dispatched.runId,
+        verification: r.verification,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failure = await captureFailureSnapshot(env, String(run.id), workerSessionId, repo.dir, depth);
-      await updateWorkerRun(env, String(run.id), { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
-      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: workerSessionId });
+      return errorResult({ error: message });
     }
   });
 
@@ -880,151 +954,65 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     // (audit follow-up F3)
     const limited = checkPromptBudget(mcpUserEmail(env, userEmail));
     if (limited) return limited;
-    const repo = getKnownRepo(repoId);
-    // Acquire a worker session with the repo at HEAD of baseBranch — seed
-    // cache when available, fresh clone fallback otherwise.
-    const acquireStart = Date.now();
-    const acquired = await acquireRepoSession(env, repo, baseBranch, title, depth, userEmail);
-    log("info", "dispatch_repo_prompt: repo session acquired", {
-      repoId: repo.id,
-      baseBranch,
-      sessionId: acquired.sessionId,
-      viaCache: acquired.viaCache,
-      reason: acquired.reason,
-      ms: Date.now() - acquireStart,
-    });
-    const run = await createWorkerRun(env, {
-      baseBranch,
-      branch,
-      commitMessage,
-      expectedFiles,
-      parentSessionId: null,
-      repoDir: repo.dir,
-      repoId: repo.id,
-      repoUrl: repo.url,
-      sessionId: acquired.sessionId,
-      status: "repo_ready",
-      strategy: "agent",
-      title,
-      verifyWorkflow: verifyWorkflow ?? null,
-    });
-    const workerSessionId = acquired.sessionId;
-
+    const deps = buildRepoPromptDeps(env, userEmail, depth);
+    const workflow = makeRepoPromptWorkflow(deps);
     try {
-      await prepareRepoBranch(env, workerSessionId, repo.dir, branch, baseBranch, depth);
-      await updateWorkerRun(env, String(run.id), { status: "branch_created" });
-
-      const content = [
-        `Repository is already cloned at ${repo.dir}.`,
-        `You are on the ${baseBranch} branch. Push to remote branch '${branch}' when done.`,
-        `Do not clone again. Do not change branch names.`,
-        `Do NOT run git_pull or git_fetch — the clone is singleBranch+shallow. The repository is already on the correct branch.`,
-        `Use commit message: ${commitMessage}`,
-        `Push with git_push_checked and ref set to '${branch}'.`,
-        `Use the in-isolate \`typecheck\` tool to verify TypeScript compiles before pushing — it runs \`tsc --noEmit\` against the workspace and returns structured diagnostics. \`npm test\` and \`npm install\` are still unavailable; the dispatching system will run them externally if a verify workflow is configured.`,
-        prompt,
-      ].join("\n\n");
-
-      const promptRes = await agentJson<Record<string, unknown>>(env, workerSessionId, "/prompt", {
-        body: JSON.stringify({ content }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      }, depth);
-      await updateWorkerRun(env, String(run.id), { status: "prompt_running" });
-      return textResult({ prompt: promptRes, run, sessionId: workerSessionId });
+      const dispatched = await dispatchWorkflow({
+        workflow,
+        sessionId: "pending",
+        payload: { repoId, title, branch, baseBranch, commitMessage, expectedFiles, prompt, verifyWorkflow: verifyWorkflow ?? null },
+      });
+      const r = dispatched.result;
+      if (r.status === "failed") {
+        return errorResult({
+          error: r.error,
+          failureSnapshotId: r.failureSnapshotId,
+          sessionId: r.sessionId,
+          runId: dispatched.runId,
+        });
+      }
+      return textResult({
+        sessionId: r.sessionId,
+        runId: dispatched.runId,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failure = await captureFailureSnapshot(env, String(run.id), workerSessionId, repo.dir, depth);
-      await updateWorkerRun(env, String(run.id), { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
-      return errorResult({ error: message, failureSnapshotId: failure.id, runId: run.id, sessionId: workerSessionId });
+      return errorResult({ error: message });
     }
   });
 
   server.tool("verify_worker_run", "Verify a tracked worker run. For prompt-based runs, waits for prompt completion, verifies the remote branch, optionally runs a GitHub Actions verify workflow (typecheck/tests), then opens a draft PR and marks the run done.", {
     runId: z.string().min(1).describe("Worker run id"),
   }, async ({ runId }) => {
-    const run = await userJson<WorkerRunRecord>(env, `/worker-runs/${encodeURIComponent(runId)}`);
-
-    if (run.strategy === "deterministic" && run.status === "done") {
-      return textResult(run);
-    }
-
     const ownerEmail = mcpUserEmail(env, userEmail);
-
+    const deps = buildVerifyRunDeps(env, ownerEmail, depth);
+    const workflow = makeVerifyRunWorkflow(deps);
     try {
-      // Resume a verify-gate poll if we're mid-check on a prior call.
-      if (run.status === "checks_running" && run.verifyWorkflowRunId) {
-        return await pollAndFinalize(env, run, ownerEmail);
-      }
-
-      // Don't re-trigger the verify gate if we already passed and an auto-PR
-      // attempt simply didn't land a URL. Let the caller retry that path
-      // separately if they want.
-      if (run.status === "checks_passed") {
-        return textResult({ run, note: "checks already passed; call again to retry PR creation" });
-      }
-
-      const prompts = await agentJson<{ prompts: Array<{ error: string | null; status: string }> }>(env, run.sessionId, "/prompts", undefined, depth);
-      const active = prompts.prompts[0];
-      if (!active || active.status === "queued" || active.status === "running") {
-        return textResult({ runId, sessionId: run.sessionId, status: "running" });
-      }
-      if (active.status === "failed" || active.status === "aborted") {
-        const failure = await captureFailureSnapshot(env, runId, run.sessionId, run.repoDir, depth);
-        const message = active.error ?? `Worker prompt ${active.status}`;
-        const updated = await updateWorkerRun(env, runId, { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
-        return errorResult({ failureSnapshotId: failure.id, run: updated });
-      }
-
-      const verification = await agentJson<Record<string, unknown>>(env, run.sessionId, "/git/verify-branch", {
-        body: JSON.stringify({ baseRef: run.baseBranch, dir: run.repoDir, expectedFiles: run.expectedFiles, ref: run.branch }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      }, depth);
-
-      // Verify gate (optional, opt-in). If the caller set verifyWorkflow on
-      // dispatch, trigger GitHub Actions here and return `checks_running` —
-      // the caller should call verify_worker_run again to poll.
-      if (run.verifyWorkflow) {
-        const triggered = await triggerVerifyWorkflow({ env, run, ownerEmail });
-        if (!triggered) {
-          // Couldn't trigger — don't gate the run on an infrastructure failure.
-          // Log a non-fatal note in the verification record and proceed to PR.
-          const afterVerify = await updateWorkerRun(env, runId, {
-            status: "done",
-            verification: { ...verification, verifyGate: { triggered: false, reason: "workflow_dispatch failed or missing token" } },
-          });
-          return await finalizePr(env, afterVerify, ownerEmail, verification);
-        }
-        const afterTrigger = await updateWorkerRun(env, runId, {
-          status: "checks_running",
-          verification: {
-            ...verification,
-            verifyGate: {
-              startedAt: new Date().toISOString(),
-              workflow: run.verifyWorkflow,
-              runId: triggered.runId,
-              htmlUrl: triggered.htmlUrl,
-            },
-          },
-          verifyWorkflowRunId: triggered.runId,
-          verifyWorkflowHtmlUrl: triggered.htmlUrl,
-        });
-        return textResult({
-          run: afterTrigger,
-          status: "checks_running",
-          verifyWorkflowHtmlUrl: triggered.htmlUrl,
+      const dispatched = await dispatchWorkflow({
+        workflow,
+        sessionId: "pending",
+        payload: { runId },
+      });
+      const r = dispatched.result;
+      if (r.status === "failed") {
+        return errorResult({
+          error: r.error,
+          failureSnapshotId: r.failureSnapshotId,
+          run: await userJson<WorkerRunRecord>(env, `/worker-runs/${encodeURIComponent(runId)}`).catch(() => null),
         });
       }
-
-      // No verify gate — mark done and open PR (existing behavior).
-      const updated = await updateWorkerRun(env, runId, { status: "done", verification });
-      return await finalizePr(env, updated, ownerEmail, verification);
+      // For ongoing runs the caller polls back; for done runs return
+      // the persisted record so existing UI shows the same shape as
+      // before.
+      const persisted = await userJson<WorkerRunRecord>(env, `/worker-runs/${encodeURIComponent(runId)}`).catch(() => null);
+      return textResult({
+        run: persisted,
+        status: r.status,
+        verifyWorkflowHtmlUrl: r.verifyWorkflowHtmlUrl,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failure = await captureFailureSnapshot(env, runId, run.sessionId, run.repoDir, depth);
-      const updated = await updateWorkerRun(env, runId, { failureSnapshotId: String(failure.id), lastError: message, status: "failed" });
-      return errorResult({ error: message, failureSnapshotId: failure.id, run: updated });
+      return errorResult({ error: message });
     }
   });
 
