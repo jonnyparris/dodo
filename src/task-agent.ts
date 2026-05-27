@@ -9,13 +9,8 @@ import {
   createWriteTool,
   createEditTool,
 } from "./think-adapter";
-import {
-  runSubagent,
-  resolveSubagentModel,
-  TASK_SYSTEM_PROMPT,
-  TASK_MAX_STEPS,
-  TASK_FACET_TIMEOUT_MS,
-} from "./subagent-runner";
+import { runSubagentForProfile } from "./subagent-runner";
+import { TASK_PROFILE, resolveProfileModel } from "./agent-profile";
 import type { AppConfig, Env } from "./types";
 import type { CodingAgent } from "./coding-agent";
 
@@ -218,7 +213,12 @@ export class TaskAgent extends Agent<Env> {
     const parentSessionId = opts.parentSessionId;
     const workspaceMode: "shared" | "scratch" = opts.workspaceMode ?? "shared";
 
-    const modelId = resolveSubagentModel({ model: opts.model }, config.taskModel, config.model);
+    const modelId = resolveProfileModel(
+      TASK_PROFILE,
+      { model: opts.model },
+      config.taskModel,
+      config.model,
+    );
 
     const parent = (await getAgentByName(
       this.env.CODING_AGENT as never,
@@ -255,19 +255,16 @@ export class TaskAgent extends Agent<Env> {
 
     // Facets always get the extended timeout regardless of workspace
     // mode — the point of moving task into a facet DO is to escape the
-    // parent's turn budget, and a 180s ceiling defeats that. In-process
-    // mode keeps the 180s TASK_TIMEOUT_MS (see buildTaskTool).
-    const timeoutMs = TASK_FACET_TIMEOUT_MS;
+    // parent's turn budget, and the inprocess ceiling defeats that.
+    // In-process mode keeps profile.timeoutMs (see buildTaskTool).
+    const timeoutMs = TASK_PROFILE.facetTimeoutMs ?? TASK_PROFILE.timeoutMs;
 
     try {
-      const result = await runSubagent({
-        kind: "task",
+      const result = await runSubagentForProfile(TASK_PROFILE, {
         prompt: userMessage,
         model: modelId,
         config,
         toolset: taskTools,
-        systemPrompt: TASK_SYSTEM_PROMPT,
-        maxSteps: TASK_MAX_STEPS,
         timeoutMs,
         env: this.env,
       });

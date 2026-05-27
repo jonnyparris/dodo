@@ -5,14 +5,8 @@ import {
   createFindTool,
   createGrepTool,
 } from "./think-adapter";
-import {
-  runSubagent,
-  EXPLORE_SYSTEM_PROMPT,
-  EXPLORE_MAX_STEPS,
-  EXPLORE_TIMEOUT_MS,
-  EXPLORE_FALLBACK_HINT,
-  resolveSubagentModel,
-} from "./subagent-runner";
+import { runSubagentForProfile } from "./subagent-runner";
+import { EXPLORE_PROFILE, resolveProfileModel } from "./agent-profile";
 import type { AppConfig, Env } from "./types";
 import type { CodingAgent } from "./coding-agent";
 
@@ -151,7 +145,12 @@ export class ExploreAgent extends Agent<Env> {
     const config = opts.parentConfig;
     const parentSessionId = opts.parentSessionId;
 
-    const modelId = resolveSubagentModel({ model: opts.model }, config.exploreModel, config.model);
+    const modelId = resolveProfileModel(
+      EXPLORE_PROFILE,
+      { model: opts.model },
+      config.exploreModel,
+      config.model,
+    );
 
     // Get the parent stub and build read-only workspace tools that proxy
     // through the parent's workspace — see `CodingAgent.facetReadFile`.
@@ -192,15 +191,11 @@ export class ExploreAgent extends Agent<Env> {
     this.recordTranscript("user", userMessage, { model: modelId });
 
     try {
-      const result = await runSubagent({
-        kind: "explore",
+      const result = await runSubagentForProfile(EXPLORE_PROFILE, {
         prompt: userMessage,
         model: modelId,
         config,
         toolset: readOnlyTools,
-        systemPrompt: EXPLORE_SYSTEM_PROMPT,
-        maxSteps: EXPLORE_MAX_STEPS,
-        timeoutMs: EXPLORE_TIMEOUT_MS,
         env: this.env,
       });
 
@@ -234,7 +229,7 @@ export class ExploreAgent extends Agent<Env> {
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      const failureSummary = `Explore failed (model: ${modelId}) [facet: ${this.name}]: ${msg}\n${EXPLORE_FALLBACK_HINT}`;
+      const failureSummary = `Explore failed (model: ${modelId}) [facet: ${this.name}]: ${msg}\n${EXPLORE_PROFILE.fallbackHint ?? ""}`;
       this.recordTranscript("assistant", failureSummary, { model: modelId });
       return {
         ok: true,

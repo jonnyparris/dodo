@@ -1,5 +1,11 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, stepCountIs, type ModelMessage, type ToolSet } from "ai";
+import type { AgentProfile } from "./agent-profile";
+import {
+  EXPLORE_PROFILE,
+  TASK_PROFILE,
+  resolveProfileModel,
+} from "./agent-profile";
 import type { AppConfig, Env } from "./types";
 
 // ─── Tool Output Caps (OpenCode Pattern #1) ───
@@ -371,105 +377,90 @@ export function buildProviderForModel(modelId: string, config: AppConfig, env: E
   });
 }
 
-// ─── Subagent constants ───
+// ─── Subagent profile re-exports ───
+// The runtime constants are defined on agent-profile.ts as part of
+// EXPLORE_PROFILE / TASK_PROFILE. The named re-exports below keep
+// the historical import surface stable for callers (tests, agentic.ts,
+// the facet DOs) while the profile remains the single source of truth.
 
-export const EXPLORE_MAX_STEPS = 16;
-export const EXPLORE_TIMEOUT_MS = 60_000;
+export const EXPLORE_MAX_STEPS = EXPLORE_PROFILE.maxSteps;
+export const EXPLORE_TIMEOUT_MS = EXPLORE_PROFILE.timeoutMs;
+export const EXPLORE_SYSTEM_PROMPT = EXPLORE_PROFILE.systemPrompt;
+// The fallback hint lives on the profile; the non-null assertion is
+// safe because EXPLORE_PROFILE always declares one. We keep the named
+// export so callers can render it next to free-form error messages
+// without having to import the profile and remember the field name.
+export const EXPLORE_FALLBACK_HINT = EXPLORE_PROFILE.fallbackHint as string;
+
+export const TASK_MAX_STEPS = TASK_PROFILE.maxSteps;
+export const TASK_TIMEOUT_MS = TASK_PROFILE.timeoutMs;
+// Facet timeout is profile-optional (only TASK has one today). The
+// fallback to TASK_PROFILE.timeoutMs keeps the export defined when a
+// future profile drops the facet override.
+export const TASK_FACET_TIMEOUT_MS = TASK_PROFILE.facetTimeoutMs ?? TASK_PROFILE.timeoutMs;
+export const TASK_SYSTEM_PROMPT = TASK_PROFILE.systemPrompt;
 
 /**
- * Standard hint appended to every explore failure summary. Tells the
- * orchestrator that the failure is transient and points it at the
- * direct read-only tools so it can complete the task without explore.
+ * Resolve a subagent's model id from the caller's args, the
+ * per-session default, and the main session's model id — delegating
+ * to the profile's own resolution strategy.
  *
- * Why this exists: we saw three real sessions where explore returned
- * "internal API error" and the orchestrator (small model, no recovery
- * heuristic) declared the task impossible and stopped — instead of
- * just running `list` + `grep` directly. The hint short-circuits that
- * dead-end.
+ * Historical name kept for callers that still pass an `args` record
+ * directly. New code should reach for `resolveProfileModel` and pick
+ * the profile up-front.
+ *
+ * @deprecated Use `resolveProfileModel` with an explicit profile.
  */
-export const EXPLORE_FALLBACK_HINT = [
-  "",
-  "Recovery: explore is unavailable on this call. Continue the task using `list`,",
-  "`find`, `grep`, and `read` directly — they are always available. If the",
-  "workspace appears empty, the repo has not been cloned yet; use `git_clone`",
-  "or `git_clone_known` first. Do NOT report the task as impossible just",
-  "because explore failed.",
-].join("\n");
-
-export const EXPLORE_SYSTEM_PROMPT = [
-  "You are a search assistant. Your job is to find files and code relevant to the user's query.",
-  "",
-  "## Rules",
-  "- Use grep, find, list, and read to search the workspace.",
-  "- Be thorough: try multiple search terms if the first doesn't find results.",
-  `- You have a hard budget of ${EXPLORE_MAX_STEPS} steps. **Reserve the last 2 steps for your summary** — at step ${EXPLORE_MAX_STEPS - 2} or earlier, stop calling tools and write your findings.`,
-  "- Return a concise summary when done: file paths, relevant line numbers, and key observations.",
-  "- Do NOT return full file contents — only the relevant snippets (max 10 lines per file).",
-  "- If you find too many results, narrow your search with more specific patterns.",
-  "- Focus on answering the user's specific question, not cataloguing everything.",
-  "- Emitting SOME summary beats hitting the step limit silent. A rough summary is recoverable; no summary wastes the caller's retry budget.",
-].join("\n");
-
-const EXPLORE_MODELS: Record<string, string> = {
-  "anthropic/": "anthropic/claude-haiku-4-5",
-  "openai/": "openai/gpt-4.1-mini",
-  "google/": "google/gemini-2.5-flash",
-  "deepseek/": "deepseek/deepseek-chat",
-};
-
-function getExploreModel(mainModel: string): string {
-  for (const [prefix, model] of Object.entries(EXPLORE_MODELS)) {
-    if (mainModel.startsWith(prefix)) return model;
-  }
-  return mainModel;
-}
-
-export const TASK_MAX_STEPS = 20;
-export const TASK_TIMEOUT_MS = 180_000;
-export const TASK_FACET_TIMEOUT_MS = 600_000;
-
-export const TASK_SYSTEM_PROMPT = [
-  "You are a focused subagent dispatched by the main Dodo agent to handle one bounded task.",
-  "",
-  "## Rules",
-  "- You have a subset of the main agent's tools. Use them to complete the task and ONLY the task.",
-  "- Do not ask clarifying questions — make a best-effort attempt with the info given.",
-  `- You have a hard budget of ${TASK_MAX_STEPS} steps. **Reserve the last 2 steps for your summary** — at step ${TASK_MAX_STEPS - 2} or earlier, stop calling tools and write your summary.`,
-  "- Return a compact text summary when done. Include: what you did, paths/line numbers touched, test results if any.",
-  "- Do NOT dump large tool outputs into your final message — summarize in 5-15 lines.",
-  "- If you hit your step budget without finishing, report what was done and what remains. Your caller will retry.",
-  "- Emitting SOME summary beats hitting the step limit silent. A rough summary is recoverable; no summary wastes the caller's retry budget.",
-].join("\n");
-
 export function resolveSubagentModel(
   args: Record<string, unknown>,
   sessionDefault: string | undefined,
   mainModel: string,
+  profile: AgentProfile = EXPLORE_PROFILE,
 ): string {
-  const rawArgModel = args.model;
-  if (typeof rawArgModel === "string" && rawArgModel.trim().length > 0) {
-    return rawArgModel.trim();
-  }
-  if (typeof sessionDefault === "string" && sessionDefault.trim().length > 0) {
-    return sessionDefault.trim();
-  }
-  return getExploreModel(mainModel);
+  return resolveProfileModel(profile, args, sessionDefault, mainModel);
 }
 
 // ─── Subagent runner ───
 
-export interface SubagentInvocation {
-  kind: "explore" | "task";
+/**
+ * Runtime-only inputs to a subagent run. Everything that varies per
+ * call lives here; the policy (prompt, step budget, timeouts) comes
+ * from the `AgentProfile`.
+ */
+export interface SubagentRunInput {
+  /** The natural-language prompt the subagent's model sees. */
   prompt: string;
+  /** Resolved model id to invoke (see `resolveProfileModel`). */
   model: string;
+  /** Per-session config — supplies provider, gateway, base URLs. */
   config: AppConfig;
+  /** Tool subset the subagent can call. */
   toolset: ToolSet;
-  systemPrompt: string;
-  maxSteps: number;
+  /**
+   * Override for the wall-clock cap. Falls back to the profile's
+   * timeoutMs (or facetTimeoutMs when running inside a facet DO).
+   */
   timeoutMs?: number;
+  /**
+   * Optional prepareStep hook — defaults to the standard subagent
+   * history-pruning window. Override only when a caller needs custom
+   * message rewriting (e.g. forced tool-call orderings in tests).
+   */
   prepareStep?: ({ messages }: { messages: Array<ModelMessage> }) => { messages?: Array<ModelMessage> };
   env: Env;
   signal?: AbortSignal;
+}
+
+/**
+ * Legacy invocation shape — the previous public surface. Callers that
+ * supplied `systemPrompt` and `maxSteps` inline get routed through
+ * `runSubagent(profile, input)` internally; existing test snapshots and
+ * external imports keep working without churn.
+ */
+export interface SubagentInvocation extends SubagentRunInput {
+  kind: "explore" | "task";
+  systemPrompt: string;
+  maxSteps: number;
 }
 
 export interface SubagentResult {
@@ -482,7 +473,55 @@ export interface SubagentResult {
   tokenOutput: number;
 }
 
+/**
+ * Run a subagent against an `AgentProfile`. Preferred entry point for
+ * new code — the profile owns the prompt, step count, and timeouts so
+ * callers can't drift those out of sync with the other end of the
+ * subagent contract (the parent DO's transcript formatting, the tool
+ * description in `agentic.ts`).
+ */
+export function runSubagentForProfile(
+  profile: AgentProfile,
+  input: SubagentRunInput,
+): Promise<SubagentResult> {
+  return executeSubagent({
+    profile,
+    prompt: input.prompt,
+    model: input.model,
+    config: input.config,
+    toolset: input.toolset,
+    timeoutMs: input.timeoutMs ?? profile.timeoutMs,
+    prepareStep: input.prepareStep,
+    env: input.env,
+    signal: input.signal,
+  });
+}
+
+/**
+ * Legacy entry point. Looks up the profile by `kind` and forwards. Any
+ * `systemPrompt` / `maxSteps` carried on `SubagentInvocation` is
+ * ignored — the profile is canonical. We accept the fields to keep
+ * existing call sites compiling; the next pass will drop them in favour
+ * of `runSubagentForProfile`.
+ */
 export async function runSubagent(input: SubagentInvocation): Promise<SubagentResult> {
+  const profile = input.kind === "explore" ? EXPLORE_PROFILE : TASK_PROFILE;
+  return runSubagentForProfile(profile, input);
+}
+
+interface SubagentExecuteInput {
+  profile: AgentProfile;
+  prompt: string;
+  model: string;
+  config: AppConfig;
+  toolset: ToolSet;
+  timeoutMs: number;
+  prepareStep?: ({ messages }: { messages: Array<ModelMessage> }) => { messages?: Array<ModelMessage> };
+  env: Env;
+  signal?: AbortSignal;
+}
+
+async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentResult> {
   const provider = buildProviderForModel(input.model, input.config, input.env);
   const model = provider.chatModel(input.model);
 
@@ -491,10 +530,10 @@ export async function runSubagent(input: SubagentInvocation): Promise<SubagentRe
   try {
     const result = await generateText({
       model,
-      system: input.systemPrompt,
+      system: input.profile.systemPrompt,
       messages,
       tools: input.toolset,
-      stopWhen: stepCountIs(input.maxSteps),
+      stopWhen: stepCountIs(input.profile.maxSteps),
       maxOutputTokens: 4000,
       prepareStep: input.prepareStep ?? subagentPrepareStep(),
       abortSignal: input.signal ?? (input.timeoutMs ? AbortSignal.timeout(input.timeoutMs) : undefined),
@@ -506,7 +545,7 @@ export async function runSubagent(input: SubagentInvocation): Promise<SubagentRe
     );
     const totalInput = result.steps.reduce((sum, s) => sum + (s.usage?.inputTokens ?? 0), 0);
     const totalOutput = result.steps.reduce((sum, s) => sum + (s.usage?.outputTokens ?? 0), 0);
-    const stoppedReason = steps >= input.maxSteps ? "max-steps" : "tool-call-final";
+    const stoppedReason = steps >= input.profile.maxSteps ? "max-steps" : "tool-call-final";
 
     const transcript: Array<{ role: string; content: string }> = [
       { role: "user", content: input.prompt },

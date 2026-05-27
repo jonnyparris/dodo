@@ -109,6 +109,17 @@ export const runSubagent = vi.fn().mockImplementation(async (input: {
   };
 });
 
+// Profile-aware entry point — facet DOs and the in-process subagent
+// tool factory both call `runSubagentForProfile(profile, input)`. The
+// mock forwards to the same default shape used by `runSubagent` so
+// existing assertions on the returned transcript still work.
+export const runSubagentForProfile = vi.fn().mockImplementation(async (
+  profile: { kind: "explore" | "task" },
+  input: { prompt: string; model: string },
+) => {
+  return runSubagent({ kind: profile.kind, prompt: input.prompt, model: input.model });
+});
+
 // ─── Internal helpers copied from agentic-mock ───
 
 type PromptPart = { type?: string; text?: string };

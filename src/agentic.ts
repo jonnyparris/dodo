@@ -12,16 +12,14 @@ import { getKnownRepo, listKnownRepos, parseRemoteSpec } from "./repos";
 import {
   buildProviderForModel,
   capToolOutputs,
-  EXPLORE_FALLBACK_HINT,
-  EXPLORE_MAX_STEPS,
-  EXPLORE_SYSTEM_PROMPT,
-  EXPLORE_TIMEOUT_MS,
-  resolveSubagentModel,
-  runSubagent,
-  TASK_MAX_STEPS,
-  TASK_SYSTEM_PROMPT,
-  TASK_TIMEOUT_MS,
+  runSubagentForProfile,
 } from "./subagent-runner";
+import {
+  EXPLORE_PROFILE,
+  TASK_PROFILE,
+  resolveProfileModel,
+  type AgentProfile,
+} from "./agent-profile";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import { runTypecheck } from "./typecheck";
 import type { AppConfig, Env, TodoStore } from "./types";
@@ -745,16 +743,13 @@ function buildSkillTool(parent: NonNullable<BuildToolsOptions["parentAgent"]>): 
 }
 
 function buildSubagentTool(spec: {
-  name: string;
+  profile: AgentProfile;
   description: string;
-  systemPrompt: string;
   inputSchema: AnyTool;
   getUserMessage: (args: Record<string, unknown>) => string;
   getTools: () => Record<string, AnyTool>;
   config: AppConfig;
   env: Env;
-  maxSteps: number;
-  timeoutMs: number;
   /** Per-session default for this subagent's model (from AppConfig). */
   sessionDefaultModel: string | undefined;
 }): AnyTool {
@@ -762,19 +757,20 @@ function buildSubagentTool(spec: {
     description: spec.description,
     inputSchema: spec.inputSchema,
     execute: async (args: Record<string, unknown>) => {
-      const modelId = resolveSubagentModel(args, spec.sessionDefaultModel, spec.config.model);
+      const modelId = resolveProfileModel(
+        spec.profile,
+        args,
+        spec.sessionDefaultModel,
+        spec.config.model,
+      );
       const userMessage = spec.getUserMessage(args);
 
       try {
-        const result = await runSubagent({
-          kind: spec.name.toLowerCase() as "explore" | "task",
+        const result = await runSubagentForProfile(spec.profile, {
           prompt: userMessage,
           model: modelId,
           config: spec.config,
           toolset: spec.getTools(),
-          systemPrompt: spec.systemPrompt,
-          maxSteps: spec.maxSteps,
-          timeoutMs: spec.timeoutMs,
           env: spec.env,
         });
 
@@ -783,18 +779,20 @@ function buildSubagentTool(spec: {
           : "";
 
         return [
-          `## ${spec.name} results (model: ${modelId})`,
+          `## ${spec.profile.name} results (model: ${modelId})`,
           `${usageLine}**Steps:** ${result.steps} | **Tools used:** ${result.toolCalls.join(", ") || "none"}`,
           "",
           result.finalText || "(No output — subagent ran its tool budget without emitting a summary. Try a narrower query or a higher-capability model via the `model` arg.)",
         ].filter(Boolean).join("\n");
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        const base = `${spec.name} failed (model: ${modelId}): ${msg}`;
-        // Only Explore gets the read-only fallback hint — Task subagent
-        // failures don't have a clean fallback path (they can write, and
-        // the orchestrator can't reliably substitute).
-        return spec.name === "Explore" ? `${base}\n${EXPLORE_FALLBACK_HINT}` : base;
+        const base = `${spec.profile.name} failed (model: ${modelId}): ${msg}`;
+        // The fallback hint is profile-defined — explore declares one,
+        // task does not. Profiles without a hint just get the plain
+        // failure summary (task subagent failures don't have a clean
+        // fallback path because they can write, and the orchestrator
+        // can't reliably substitute).
+        return spec.profile.fallbackHint ? `${base}\n${spec.profile.fallbackHint}` : base;
       }
     },
   });
@@ -885,7 +883,7 @@ function buildExploreTool(
             return result.summary;
           } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
-            return `Explore failed (facet mode): ${msg}\n${EXPLORE_FALLBACK_HINT}`;
+            return `Explore failed (facet mode): ${msg}\n${EXPLORE_PROFILE.fallbackHint ?? ""}`;
           }
         }
 
@@ -920,7 +918,7 @@ function buildExploreTool(
         // Only attach the global recovery hint if every query failed —
         // partial success is still useful and the per-query failure
         // lines stand on their own.
-        if (allFailed) blocks.push(EXPLORE_FALLBACK_HINT);
+        if (allFailed && EXPLORE_PROFILE.fallbackHint) blocks.push(EXPLORE_PROFILE.fallbackHint);
         return blocks.join("\n").trimEnd();
       },
     });
@@ -940,9 +938,8 @@ function buildExploreTool(
   // parallelise (generateText blocks its caller), so multi-query
   // requests run sequentially and the result header flags that.
   const singleQueryTool = buildSubagentTool({
-    name: "Explore",
+    profile: EXPLORE_PROFILE,
     description: "internal — wrapped below",
-    systemPrompt: EXPLORE_SYSTEM_PROMPT,
     inputSchema: zodSchema(z.object({
       query: z.string().min(1),
       scope: z.string().optional(),
@@ -956,8 +953,6 @@ function buildExploreTool(
     getTools: () => readOnlyTools,
     config,
     env,
-    maxSteps: EXPLORE_MAX_STEPS,
-    timeoutMs: EXPLORE_TIMEOUT_MS,
     sessionDefaultModel: config.exploreModel,
   });
 
@@ -1121,7 +1116,7 @@ function buildTaskTool(
   });
 
   return buildSubagentTool({
-    name: "Task",
+    profile: TASK_PROFILE,
     description: [
       "Delegate a focused, bounded sub-task to a subagent with its own context window.",
       "The subagent gets workspace tools (read, list, find, grep, write, edit) and returns a compact summary.",
@@ -1130,7 +1125,6 @@ function buildTaskTool(
       "Do NOT use for one-shot operations (just call the tool directly) or anything requiring git/codemode/browser.",
       "NOTE: in-process mode always shares the main workspace. Switch to taskMode=facet to enable scratch workspaces.",
     ].join(" "),
-    systemPrompt: TASK_SYSTEM_PROMPT,
     inputSchema: zodSchema(z.object({
       prompt: z.string().min(1).describe(
         "The task to perform. Be specific and self-contained — the subagent has no access to your conversation. Include file paths, names, and acceptance criteria.",
@@ -1150,8 +1144,6 @@ function buildTaskTool(
     getTools: () => taskTools,
     config,
     env,
-    maxSteps: TASK_MAX_STEPS,
-    timeoutMs: TASK_TIMEOUT_MS,
     sessionDefaultModel: config.taskModel,
   });
 }

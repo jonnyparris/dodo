@@ -26,14 +26,17 @@ vi.mock("../src/notify", () => ({
   dispatchNotification: vi.fn(),
 }));
 
-// Override runSubagent to throw — covers the catch block in
-// ExploreAgent.query() which formats the EXPLORE_FALLBACK_HINT into
-// the summary.
+// Override the subagent runner entry points to throw — covers the catch
+// block in ExploreAgent.query() which formats the EXPLORE_FALLBACK_HINT
+// into the summary. The facet calls `runSubagentForProfile`; the legacy
+// `runSubagent` is mocked too so tests that hit either path still see
+// the failure surfaced as a fallback hint.
 vi.mock("../src/subagent-runner", async () => {
   const base = await import("./helpers/subagent-runner-mock");
   return {
     ...base,
     runSubagent: vi.fn().mockRejectedValue(new Error("internal API error")),
+    runSubagentForProfile: vi.fn().mockRejectedValue(new Error("internal API error")),
   };
 });
 
