@@ -112,6 +112,42 @@ describe("shell tool — tracer bullet", () => {
     expect(result.results[1].stdout).toBe("still-here\n");
   });
 
+  it("path translation: fs `/foo` is shell `/workspace/foo` (no double prefix)", async () => {
+    // This test documents the path-translation contract that bit a real
+    // session: the agent wrote to `/workspace/probe.txt` thinking that
+    // would match shell's `/workspace/probe.txt`. Result: file ended up
+    // at workspace path `/workspace/probe.txt`, visible to shell as
+    // `/workspace/workspace/probe.txt`. Confusing.
+    //
+    // The contract: write-tool paths and shell-tool paths sit on opposite
+    // sides of the mount. The shell mount prepends `/workspace` to every
+    // workspace path. So:
+    //
+    //   write({ path: "/foo" })            → workspace path /foo
+    //                                       → shell sees /workspace/foo  ✓
+    //   write({ path: "/workspace/foo" }) → workspace path /workspace/foo
+    //                                       → shell sees /workspace/workspace/foo  ✗ surprise!
+    //
+    // The system prompt + tool description must spell this out. This test
+    // pins the underlying behaviour so a future refactor doesn't silently
+    // change it.
+    const fs = freshFs();
+    fs.writeFileSync("/at-root.txt", "i live at /\n");
+    fs.mkdirSync("/workspace", { recursive: true });
+    fs.writeFileSync("/workspace/nested.txt", "i live at /workspace\n");
+
+    const result = await runShellBatch(fs, {
+      commands: [
+        "cat /workspace/at-root.txt",
+        "cat /workspace/workspace/nested.txt",
+      ],
+    });
+    expect(result.results[0].exit).toBe(0);
+    expect(result.results[0].stdout).toBe("i live at /\n");
+    expect(result.results[1].exit).toBe(0);
+    expect(result.results[1].stdout).toBe("i live at /workspace\n");
+  });
+
   it("composes pipelines that use multiple busybox applets", async () => {
     const fs = freshFs();
     // Use `find` so each entry lands on its own line — busybox `ls`
