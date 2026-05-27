@@ -373,6 +373,20 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     replied: number;
     skipped: number;
     errors: string[];
+    /**
+     * Per-message decisions (PoC-only). One entry per candidate that the
+     * model evaluated, regardless of replied/skipped outcome. Helpful for
+     * tuning personas and verifying the model is parsing input correctly.
+     * Truncated to first 200 chars of model output.
+     */
+    decisions: Array<{
+      messageName: string;
+      senderDisplay: string;
+      sourceText: string;
+      reply: boolean;
+      replyText?: string;
+      rawModelOutput?: string;
+    }>;
   }> {
     const row = this.readState();
     if (!row) throw new Error("runTick: no state");
@@ -394,11 +408,27 @@ export class ChatMonitorAgent extends DurableObject<Env> {
 
     let replied = 0;
     let skipped = 0;
+    const decisions: Array<{
+      messageName: string;
+      senderDisplay: string;
+      sourceText: string;
+      reply: boolean;
+      replyText?: string;
+      rawModelOutput?: string;
+    }> = [];
 
     // 3. For each, ask the model whether to reply; if yes, send it.
     for (const msg of limited) {
       try {
         const decision = await this.decide(row.persona, msg);
+        decisions.push({
+          messageName: msg.name,
+          senderDisplay: msg.senderDisplay,
+          sourceText: msg.text.slice(0, 200),
+          reply: decision.reply,
+          replyText: decision.text,
+          rawModelOutput: decision.raw?.slice(0, 200),
+        });
         if (decision.reply && decision.text) {
           await this.sendReply(row.space_id, msg, decision.text);
           replied++;
@@ -421,7 +451,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       .pop();
     this.recordTick(newestSeen ?? row.last_seen_iso);
 
-    return { fetched: messages.length, new: candidates.length, replied, skipped, errors };
+    return { fetched: messages.length, new: candidates.length, replied, skipped, errors, decisions };
   }
 
   // ── cf-portal MCP read path ──
