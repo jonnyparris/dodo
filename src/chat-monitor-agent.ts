@@ -342,8 +342,8 @@ function log(level: "info" | "warn" | "error", msg: string, fields?: Record<stri
 // ─── Brain-session goal preamble ───
 
 /**
- * Build the goal text that the brain session sees on every turn. The
- * user-supplied persona is wrapped in a hard rules section that:
+ * Build the system-prompt prefix the brain session sees on every turn.
+ * The user-supplied persona is wrapped in a hard rules section that:
  *   - Tells the model it is a Google Chat agent in space X.
  *   - Names the allowlisted command senders so the model can identify
  *     them in user prompts (where the sender is included as a header).
@@ -352,7 +352,13 @@ function log(level: "info" | "warn" | "error", msg: string, fields?: Record<stri
  *     to surface anything to humans in the space is `chat_reply`.
  *   - Treats `[Background]` system annotations as read-only context.
  *
- * Exported for tests.
+ * Note: chat-monitor brain sessions are event-driven (one user-prompt
+ * per forwarded message), so this is installed as a per-session
+ * system-prompt prefix, NOT as a Dodo "goal" — there's no autocontinue
+ * loop and no turn budget to exhaust.
+ *
+ * Exported for tests. The name retains `Goal` for backward compatibility
+ * with existing tests; see also the alias `buildBrainPersonaPrefix`.
  */
 export function buildBrainGoalText(args: {
   spaceId: string;
@@ -813,16 +819,19 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       sessionId,
     );
 
-    // Set the goal text from the persona + hard rules.
-    await this.setBrainGoal(sessionId, ownerEmail, row);
+    // Install the persona + hard rules as a per-session system-prompt
+    // prefix. Chat-monitor brains don't use the goal+autocontinue
+    // mechanism — they're event-driven (one user-prompt per forwarded
+    // message) so a goal would either burn turns idling or get exhausted.
+    await this.setBrainPersona(sessionId, ownerEmail, row);
 
     log("info", "brain session created", { sessionId, owner: ownerEmail, space: row.space_id });
     return sessionId;
   }
 
-  /** Set or refresh the brain session's goal text. */
-  private async setBrainGoal(sessionId: string, ownerEmail: string, row: MonitorRow): Promise<void> {
-    const goalText = buildBrainGoalText({
+  /** Install or refresh the brain session's system-prompt prefix. */
+  private async setBrainPersona(sessionId: string, ownerEmail: string, row: MonitorRow): Promise<void> {
+    const personaText = buildBrainGoalText({
       spaceId: row.space_id,
       persona: row.persona,
       commandSenders: parseCommandSenders(row.command_senders_json),
@@ -830,26 +839,46 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     });
     const agentStub = await getAgentByName(this.env.CODING_AGENT as never, sessionId);
     const res = await (agentStub as unknown as { fetch: (req: Request) => Promise<Response> }).fetch(
-      new Request("https://coding-agent/goal", {
+      new Request("https://coding-agent/system-prompt-prefix", {
         method: "PUT",
         headers: {
           "content-type": "application/json",
           "x-dodo-session-id": sessionId,
           "x-owner-email": ownerEmail,
         },
-        body: JSON.stringify({ text: goalText, role: "chat-monitor-brain" }),
+        body: JSON.stringify({ text: personaText }),
       }),
     );
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`failed to set brain goal: ${res.status} ${text.slice(0, 200)}`);
+      throw new Error(`failed to set brain persona: ${res.status} ${text.slice(0, 200)}`);
     }
   }
 
-  /** Refresh the goal for an existing brain session (after upsert). */
+  /** Refresh the persona for an existing brain session (after upsert).
+   *  Also clears any active goal — chat-monitor brains are event-driven
+   *  and should not autocontinue between forwarded messages. */
   private async updateBrainGoal(row: MonitorRow): Promise<void> {
     if (!row.brain_session_id) return;
-    await this.setBrainGoal(row.brain_session_id, row.owner_email, row);
+    await this.setBrainPersona(row.brain_session_id, row.owner_email, row);
+    // Best-effort: clear any goal that earlier monitor versions installed,
+    // so the autocontinue loop stops.
+    try {
+      const agentStub = await getAgentByName(this.env.CODING_AGENT as never, row.brain_session_id);
+      await (agentStub as unknown as { fetch: (req: Request) => Promise<Response> }).fetch(
+        new Request("https://coding-agent/goal", {
+          method: "DELETE",
+          headers: {
+            "x-dodo-session-id": row.brain_session_id,
+            "x-owner-email": row.owner_email,
+          },
+        }),
+      );
+    } catch (err) {
+      log("warn", "brain goal clear failed (non-fatal)", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**
@@ -1182,3 +1211,7 @@ export async function sendChatReply(
  *  when callers don't need it. (Kept in the import for future admin
  *  enforcement of who can POST to /create across owners.) */
 export const _resolveAdminEmail = resolveAdminEmail;
+
+/** Alias for `buildBrainGoalText` reflecting its current role as a
+ *  per-session system-prompt prefix rather than a Dodo goal. */
+export const buildBrainPersonaPrefix = buildBrainGoalText;

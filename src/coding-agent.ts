@@ -720,6 +720,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const goalState = this.readGoalState();
     const goalSection = renderGoalSystemPromptSection(goalState) ?? undefined;
 
+    // Per-session prefix (e.g. chat-monitor brain persona). Layered above
+    // userPrefix so it can override the user's default style for sessions
+    // with a specific role.
+    const sessionPrefix = (this.readMetadata("session_system_prompt_prefix") || "").trim() || undefined;
+    const composedUserPrefix = sessionPrefix
+      ? config?.systemPromptPrefix?.trim()
+        ? `${sessionPrefix}\n\n---\n\n${config.systemPromptPrefix.trim()}`
+        : sessionPrefix
+      : config?.systemPromptPrefix?.trim();
+
     return assembleSystemPrompt({
       staticBase: SYSTEM_PROMPT,
       skillManifest: this._skillManifest ?? undefined,
@@ -727,7 +737,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       goalSection,
       workspaceSummary,
       projectInstructions: this._projectInstructions ?? undefined,
-      userPrefix: config?.systemPromptPrefix?.trim(),
+      userPrefix: composedUserPrefix,
       adminPrefix: this._adminPrefix?.trim() || undefined,
     });
   }
@@ -3021,6 +3031,24 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         const flag = this.readMetadata("is_chat_monitor_brain") === "true";
         const spaceId = this.readMetadata("chat_monitor_space_id") || null;
         return Response.json({ isChatMonitorBrain: flag, spaceId });
+      }
+
+      // Per-session system-prompt prefix. Mirrors the user-level
+      // `systemPromptPrefix` but is local to this session. Used by
+      // ChatMonitorAgent to install the chat-monitor brain's persona +
+      // hard rules. Layered ABOVE user/admin prefixes in getSystemPrompt.
+      if (request.method === "PUT" && url.pathname === "/system-prompt-prefix") {
+        const body = (await request.json()) as { text?: string };
+        if (typeof body.text === "string") {
+          this.writeMetadata("session_system_prompt_prefix", body.text);
+        } else {
+          this.writeMetadata("session_system_prompt_prefix", "");
+        }
+        return Response.json({ ok: true });
+      }
+
+      if (request.method === "GET" && url.pathname === "/system-prompt-prefix") {
+        return Response.json({ text: this.readMetadata("session_system_prompt_prefix") || "" });
       }
 
       if (request.method === "GET" && url.pathname === "/files") {
