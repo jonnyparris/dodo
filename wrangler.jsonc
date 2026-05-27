@@ -106,7 +106,13 @@
     "command": "npm run build"
   },
   "assets": {
-    "directory": "./public"
+    "directory": "./public",
+    // Required so `c.env.ASSETS.fetch(...)` works inside route handlers.
+    // Without the binding declaration, `env.ASSETS` is undefined and any
+    // page route that relies on the binding (e.g. /admin/seeds,
+    // /admin/autopilot, /admin/chat-monitors) falls through to its
+    // "Admin page not available" fallback.
+    "binding": "ASSETS"
   },
   "ai": {
     "binding": "AI"
