@@ -826,6 +826,30 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       }),
     );
 
+    // Enable the built-in admin-only browser tools (browser_search +
+    // browser_execute) by default. The chat-monitor brain runs on the
+    // admin's account so the binding-level admin check passes; the
+    // per-session flag is what we flip here. The tools are only useful
+    // for owners answering questions like "what does this page look
+    // like?" — best-effort: if the bindings aren't configured the
+    // tools-builder skips them, this PUT just sets the flag.
+    await (agentStub as unknown as { fetch: (req: Request) => Promise<Response> }).fetch(
+      new Request("https://coding-agent/browser", {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          "x-dodo-session-id": sessionId,
+          "x-owner-email": ownerEmail,
+        },
+        body: JSON.stringify({ enabled: true }),
+      }),
+    ).catch((err) => {
+      log("warn", "failed to enable browser on chat-monitor brain", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
     // Persist the session id on the monitor row.
     this.ctx.storage.sql.exec(
       "UPDATE monitor_state SET brain_session_id = ? WHERE 1=1",
