@@ -846,20 +846,70 @@ export class ChatMonitorAgent extends DurableObject<Env> {
    * Returns the brain session id.
    */
   private async ensureBrainSession(row: MonitorRow): Promise<string> {
-    if (row.brain_session_id) {
-      return row.brain_session_id;
-    }
-
-    // Create a new session owned by the monitor's ownerEmail. The
-    // monitor's ownerEmail must already exist on UserControl — that's
-    // where cf-portal MCP credentials live; the monitor wouldn't be
-    // working at all otherwise.
-    const sessionId = crypto.randomUUID();
     const ownerEmail = row.owner_email;
     const ucStub = getUserControlStub(this.env, ownerEmail);
+
+    // Self-heal path: an existing brain_session_id may not be registered
+    // in UserControl. This happens when an old monitor lost its session
+    // row (manual cleanup, idle-sweep race during creation, schema reset)
+    // while the CodingAgent DO and brain_session_id pointer survived.
+    // Symptom: the brain replies on GChat but the session is invisible in
+    // the UI session list. POST /sessions is idempotent (ON CONFLICT
+    // DO NOTHING), so re-registering an already-known id is a cheap no-op
+    // on the happy path and the fix-up on the broken path.
+    if (row.brain_session_id) {
+      const existingId = row.brain_session_id;
+      try {
+        const checkRes = await ucStub.fetch(
+          `https://user-control/sessions/${encodeURIComponent(existingId)}/check`,
+          { method: "GET", headers: { "x-owner-email": ownerEmail } },
+        );
+        if (checkRes.status === 404) {
+          log("warn", "brain session missing from UserControl — re-registering", {
+            sessionId: existingId,
+            owner: ownerEmail,
+            space: row.space_id,
+          });
+          const reRegister = await ucStub.fetch("https://user-control/sessions", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-owner-email": ownerEmail },
+            body: JSON.stringify({ id: existingId, ownerEmail, createdBy: ownerEmail }),
+          });
+          if (reRegister.ok) {
+            // Restore the title so the listing isn't blank.
+            await ucStub
+              .fetch(`https://user-control/sessions/${encodeURIComponent(existingId)}`, {
+                method: "PATCH",
+                headers: { "content-type": "application/json", "x-owner-email": ownerEmail },
+                body: JSON.stringify({ title: `[chat-monitor] ${row.space_id}` }),
+              })
+              .catch(() => {});
+          } else {
+            const text = await reRegister.text().catch(() => "");
+            log("error", "brain session re-register failed", {
+              sessionId: existingId,
+              status: reRegister.status,
+              body: text.slice(0, 200),
+            });
+          }
+        }
+      } catch (err) {
+        // Best-effort — never fail the whole tick over a self-heal probe.
+        log("warn", "brain session re-register probe failed (non-fatal)", {
+          sessionId: existingId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return existingId;
+    }
+
+    // Fresh-create path. The monitor's ownerEmail must already exist on
+    // UserControl — that's where cf-portal MCP credentials live; the
+    // monitor wouldn't be working at all otherwise.
+    const sessionId = crypto.randomUUID();
     const createRes = await ucStub.fetch("https://user-control/sessions", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-owner-email": ownerEmail },
       body: JSON.stringify({ id: sessionId, ownerEmail, createdBy: ownerEmail }),
     });
     if (!createRes.ok) {
@@ -871,7 +921,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     await ucStub
       .fetch(`https://user-control/sessions/${encodeURIComponent(sessionId)}`, {
         method: "PATCH",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "x-owner-email": ownerEmail },
         body: JSON.stringify({ title: `[chat-monitor] ${row.space_id}` }),
       })
       .catch(() => {});
@@ -1276,13 +1326,19 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           continue;
         }
 
-        // We need a brain session.
+        // We need a brain session. ensureBrainSession is idempotent: it
+        // returns the existing id immediately on the happy path, and
+        // re-registers the session in UserControl if the row is missing
+        // (self-heal for orphaned brain sessions).
         if (!brainSessionId) {
           brainSessionId = await this.ensureBrainSession(row);
           this.ctx.storage.sql.exec(
             "UPDATE monitor_state SET brain_session_id = ? WHERE 1=1",
             brainSessionId,
           );
+        } else {
+          // Best-effort self-heal probe — does not change brainSessionId.
+          await this.ensureBrainSession(row);
         }
 
         await this.forwardToBrain(brainSessionId, row.owner_email, row.space_id, msg, kind === "command");
