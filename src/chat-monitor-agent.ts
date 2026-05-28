@@ -1121,20 +1121,6 @@ export class ChatMonitorAgent extends DurableObject<Env> {
 
     const errors: string[] = [];
 
-    // Watchdog: if the brain has been working on a prompt for longer than
-    // BRAIN_PROMPT_TIMEOUT_SECONDS, abort it and apologise in chat.
-    // gemma-4 sometimes hangs indefinitely on complex multi-tool queries;
-    // without this, the monitor keeps forwarding new messages but the
-    // brain can't make progress (replies pile up unread).
-    if (row.brain_session_id && row.last_brain_forward_ts) {
-      const ageSec = Math.floor(Date.now() / 1000) - row.last_brain_forward_ts;
-      if (ageSec > BRAIN_PROMPT_TIMEOUT_SECONDS) {
-        await this.watchdogAbortBrain(row, ageSec).catch((err) => {
-          errors.push(`watchdog abort failed: ${err instanceof Error ? err.message : String(err)}`);
-        });
-      }
-    }
-
     const messages = await this.fetchMessages(row.owner_email, row.space_id, row.last_seen_iso);
 
     // Filter to never-seen-before + after last_seen_iso.
@@ -1146,6 +1132,26 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     }
     candidates.sort((a, b) => a.createTime.localeCompare(b.createTime));
     const limited = candidates.slice(0, MAX_MESSAGES_PER_TICK);
+
+    // Watchdog: if the brain has been working on a prompt for longer than
+    // BRAIN_PROMPT_TIMEOUT_SECONDS, abort it before piling on more work.
+    // Only abort when there are actual new messages waiting — if the queue
+    // is empty, clear the deadline so a nudge (or idle brain) doesn't get
+    // killed falsely.
+    if (row.brain_session_id && row.last_brain_forward_ts) {
+      const ageSec = Math.floor(Date.now() / 1000) - row.last_brain_forward_ts;
+      if (ageSec > BRAIN_PROMPT_TIMEOUT_SECONDS) {
+        if (limited.length > 0) {
+          await this.watchdogAbortBrain(row, ageSec).catch((err) => {
+            errors.push(`watchdog abort failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        } else {
+          this.ctx.storage.sql.exec(
+            "UPDATE monitor_state SET last_brain_forward_ts = NULL WHERE 1=1",
+          );
+        }
+      }
+    }
 
     const commandSenders = parseCommandSenders(row.command_senders_json);
     const allowlistActive = commandSenders.length > 0;
