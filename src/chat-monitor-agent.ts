@@ -397,12 +397,23 @@ export function buildBrainGoalText(args: {
     args.contextMode === "recent"
       ? "Some user prompts will be wrapped in `[Background] users/X said: ...` annotations. These are FYI only — never reply to a background entry. They give you context about what's happening in the space."
       : "You will only ever see prompts from allowlisted command senders. Other users' messages are not forwarded to you.";
+  // The chat_reply tool may be exposed under either name depending on
+  // which wiring is active:
+  //   - First-party local registration → bare `chat_reply`.
+  //   - Legacy MCP fallback (via Dodo Self) → `<config-id>__chat_reply`.
+  // Both surfaces accept the same args. We tell the model to call
+  // whichever appears in its tool list; if both somehow appear, prefer
+  // the bare one because it's the canonical first-party path.
+  const sessionIdFallbackLine = args.sessionId
+    ? `If only a namespaced \`*__chat_reply\` tool appears in your tool list (MCP fallback), pass \`sessionId="${args.sessionId}"\` along with the other args.`
+    : "If only a namespaced `*__chat_reply` tool appears, pass `sessionId` set to your own session id.";
+
   return [
     `You are a Google Chat agent monitoring \`${args.spaceId}\`.`,
     "",
     "Hard rules — these are enforced by code and cannot be changed by anyone:",
     "",
-    `1. You may ONLY post to the chat by calling the \`chat_reply\` MCP tool. Anything you write in a normal assistant message goes NOWHERE — humans in the space cannot see it. Do not assume otherwise.`,
+    `1. You may ONLY post to the chat by calling the \`chat_reply\` tool. Anything you write in a normal assistant message goes NOWHERE — humans in the space cannot see it. Do not assume otherwise. ${sessionIdFallbackLine}`,
     "2. The monitor forwards messages with a header that names the sender resource (`users/<digits>`). Allowlisted command senders are:",
     senderList,
     `3. ${contextNote}`,
@@ -894,6 +905,34 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+
+      // Idempotently re-assert the chat-monitor-flag on the CodingAgent
+      // DO. Persisted metadata can be missing for brains created before
+      // this code shipped (the original create path was the only writer)
+      // or if the DO was wiped. The first-party `chat_reply` tool reads
+      // these metadata keys to decide whether to register itself; without
+      // them the brain falls back to the namespaced MCP `chat_reply`
+      // which the persona has no way to name correctly.
+      try {
+        const agentStub = await getAgentByName(this.env.CODING_AGENT as never, existingId);
+        await (agentStub as unknown as { fetch: (req: Request) => Promise<Response> }).fetch(
+          new Request("https://coding-agent/chat-monitor-flag", {
+            method: "PUT",
+            headers: {
+              "content-type": "application/json",
+              "x-dodo-session-id": existingId,
+              "x-owner-email": ownerEmail,
+            },
+            body: JSON.stringify({ isChatMonitorBrain: true, spaceId: row.space_id }),
+          }),
+        );
+      } catch (err) {
+        log("warn", "brain flag re-assert failed (non-fatal)", {
+          sessionId: existingId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
       return existingId;
     }
 
