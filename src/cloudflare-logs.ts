@@ -166,8 +166,22 @@ export async function queryWorkerLogs(env: Env, options: LogQueryOptions = {}): 
     };
   }
 
+  // The Workers Observability `telemetry/query` endpoint returns a nested
+  // shape — `result.events.events` for the `events` view, and
+  // `result.invocations.invocations` for `invocations`. Earlier versions
+  // of this helper assumed `result.events` was the array itself, which
+  // produced `rawEvents.map is not a function` once the API stabilised.
+  // The records themselves are also nested (source/$workers/$metadata
+  // sub-objects) rather than flat dotted keys, so we read both shapes.
   const payload = await response.json().catch(() => null) as
-    | { success?: boolean; result?: { events?: unknown[]; invocations?: unknown[]; total?: number } }
+    | {
+        success?: boolean;
+        result?: {
+          events?: { events?: unknown[]; total?: number } | unknown[];
+          invocations?: { invocations?: unknown[]; total?: number } | unknown[];
+          total?: number;
+        };
+      }
     | null;
 
   if (!payload || payload.success === false) {
@@ -178,20 +192,61 @@ export async function queryWorkerLogs(env: Env, options: LogQueryOptions = {}): 
     };
   }
 
-  const rawEvents = (payload.result?.events ?? payload.result?.invocations ?? []) as Array<Record<string, unknown>>;
+  type RawRecord = Record<string, unknown> & {
+    source?: Record<string, unknown>;
+    timestamp?: number;
+    $metadata?: Record<string, unknown>;
+    $workers?: Record<string, unknown>;
+  };
+
+  const eventsContainer = payload.result?.events;
+  const invocationsContainer = payload.result?.invocations;
+  const rawEvents: RawRecord[] = Array.isArray(eventsContainer)
+    ? (eventsContainer as RawRecord[])
+    : Array.isArray((eventsContainer as { events?: unknown[] } | undefined)?.events)
+      ? ((eventsContainer as { events: unknown[] }).events as RawRecord[])
+      : Array.isArray(invocationsContainer)
+        ? (invocationsContainer as RawRecord[])
+        : Array.isArray((invocationsContainer as { invocations?: unknown[] } | undefined)?.invocations)
+          ? ((invocationsContainer as { invocations: unknown[] }).invocations as RawRecord[])
+          : [];
+
+  const pickString = (record: RawRecord, paths: string[]): string | undefined => {
+    for (const path of paths) {
+      const segments = path.split(".");
+      let cursor: unknown = record;
+      for (const seg of segments) {
+        if (cursor && typeof cursor === "object" && seg in (cursor as Record<string, unknown>)) {
+          cursor = (cursor as Record<string, unknown>)[seg];
+        } else {
+          cursor = undefined;
+          break;
+        }
+      }
+      if (typeof cursor === "string" && cursor.length > 0) return cursor;
+    }
+    return undefined;
+  };
+
   const events: LogEvent[] = rawEvents.map((raw) => ({
-    timestamp: Number((raw["$workers.eventTimestampMs"] as number) ?? (raw.timestamp as number) ?? 0),
-    outcome: typeof raw["$workers.outcome"] === "string" ? raw["$workers.outcome"] as string : undefined,
-    message: typeof raw["$metadata.message"] === "string" ? raw["$metadata.message"] as string : undefined,
-    service: typeof raw["$metadata.service"] === "string" ? raw["$metadata.service"] as string : undefined,
-    error: typeof raw["$metadata.error"] === "string" ? raw["$metadata.error"] as string : undefined,
+    timestamp: Number(raw.timestamp ?? raw["$workers.eventTimestampMs"] ?? 0),
+    outcome: pickString(raw, ["$workers.outcome", "source.outcome"]),
+    message: pickString(raw, ["source.msg", "source.message", "$metadata.message"]),
+    service: pickString(raw, ["$workers.scriptName", "$metadata.service"]),
+    error: pickString(raw, ["source.error", "$metadata.error"]),
     raw,
   }));
+
+  // The nested `events.total` is the authoritative count when the API
+  // returns the container shape; fall back to result.total or array length.
+  const containerTotal =
+    (eventsContainer && !Array.isArray(eventsContainer) ? (eventsContainer as { total?: number }).total : undefined) ??
+    (invocationsContainer && !Array.isArray(invocationsContainer) ? (invocationsContainer as { total?: number }).total : undefined);
 
   return {
     ok: true,
     events,
-    total: Number(payload.result?.total ?? events.length),
+    total: Number(containerTotal ?? payload.result?.total ?? events.length),
     fromMs,
     toMs,
   };
@@ -211,8 +266,12 @@ export async function queryRecentExceptions(env: Env, options: { sinceHours?: nu
     limit: options.limit ?? 50,
     view: "events",
     filters: [
+      // Events with an `error` field set by the Workers logger. The
+      // filter API accepts the bare field name (`error`) for the
+      // log-line shape used by `log("error", ..., { error })`. Lives at
+      // `source.error` in the response payload.
       {
-        key: "$metadata.error",
+        key: "error",
         operation: "exists",
         type: "string",
         value: "",
