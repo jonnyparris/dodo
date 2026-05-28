@@ -57,6 +57,11 @@ import type { Env } from "./types";
 const MIN_POLL_INTERVAL_SECONDS = 10;
 const DEFAULT_POLL_INTERVAL_SECONDS = 15;
 const MAX_MESSAGES_PER_TICK = 5;
+/** How long a brain prompt may run before runTick treats it as hung and
+ *  aborts it. gemma-4 has been observed to chew on complex multi-tool
+ *  queries indefinitely; this cap keeps the monitor from spinning
+ *  forever on a stuck brain. */
+const BRAIN_PROMPT_TIMEOUT_SECONDS = 180;
 /** URLs we'll accept as the cf-portal MCP server when resolving the
  *  owner's refresh-token config. Codemode variant is excluded so the
  *  individual chat_get_messages tool is exposed. */
@@ -133,6 +138,9 @@ interface MonitorRow {
   last_error: string | null;
   last_run_iso: string | null;
   created_at: number;
+  /** Unix seconds of the most recent /prompt POST to the brain. Used by
+   *  the runTick watchdog to abort hung brain prompts. */
+  last_brain_forward_ts: number | null;
 }
 
 interface ChatMessage {
@@ -438,6 +446,11 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     addCol("ALTER TABLE monitor_state ADD COLUMN command_senders_json TEXT NOT NULL DEFAULT '[]'");
     addCol("ALTER TABLE monitor_state ADD COLUMN context_mode TEXT NOT NULL DEFAULT 'off'");
     addCol("ALTER TABLE monitor_state ADD COLUMN brain_session_id TEXT");
+    // Unix-second timestamp of the most recent /prompt POST to the brain.
+    // The watchdog in runTick uses it to detect hung brain prompts (gemma
+    // can chew on complex tool-using queries indefinitely without
+    // returning) and abort them.
+    addCol("ALTER TABLE monitor_state ADD COLUMN last_brain_forward_ts INTEGER");
 
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS replied_messages (
@@ -920,6 +933,62 @@ export class ChatMonitorAgent extends DurableObject<Env> {
   }
 
   /**
+   * Watchdog: abort a hung brain prompt and apologise in chat.
+   *
+   * Called from runTick when the brain has been working on a single
+   * prompt for longer than BRAIN_PROMPT_TIMEOUT_SECONDS. Posts an
+   * apology to the GChat space (best-effort) then signals the brain's
+   * AbortController via POST /abort so the next message can be picked
+   * up. Clears last_brain_forward_ts so subsequent ticks don't fire
+   * the watchdog again until the next /prompt POST resets the clock.
+   */
+  private async watchdogAbortBrain(row: MonitorRow, ageSec: number): Promise<void> {
+    log("warn", "brain prompt watchdog firing — aborting", {
+      sessionId: row.brain_session_id,
+      ageSec,
+      space: row.space_id,
+    });
+    // 1. Best-effort: post apology to chat. We bypass chat_reply (which
+    //    requires the brain's identity) and call sendChatReply directly
+    //    with the monitor's pre-registered space.
+    await sendChatReply(this.env, {
+      spaceId: row.space_id,
+      text:
+        "Sorry — I got stuck on that one. The query timed out after " +
+        `${Math.floor(ageSec / 60)} min and I had to give up. ` +
+        "Try rephrasing or breaking it into smaller pieces.",
+    }).catch((err) => {
+      log("warn", "watchdog apology to chat failed (non-fatal)", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    // 2. Signal the brain's AbortController.
+    if (row.brain_session_id) {
+      try {
+        const agentStub = await getAgentByName(this.env.CODING_AGENT as never, row.brain_session_id);
+        await (agentStub as unknown as { fetch: (req: Request) => Promise<Response> }).fetch(
+          new Request("https://coding-agent/abort", {
+            method: "POST",
+            headers: {
+              "x-dodo-session-id": row.brain_session_id,
+              "x-owner-email": row.owner_email,
+            },
+          }),
+        );
+      } catch (err) {
+        log("warn", "watchdog abort POST failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // 3. Clear the deadline so the watchdog won't refire on the next
+    //    tick — only a fresh forward will set a new deadline.
+    this.ctx.storage.sql.exec(
+      "UPDATE monitor_state SET last_brain_forward_ts = NULL WHERE 1=1",
+    );
+  }
+
+  /**
    * Forward a single chat message to the brain session.
    *
    * - When `asCommand` is true, the message is sent as a `user`-role
@@ -974,6 +1043,15 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         const text = await res.text().catch(() => "");
         throw new Error(`brain prompt rejected: ${res.status} ${text.slice(0, 200)}`);
       }
+      // Record the forward time so the watchdog in runTick can detect
+      // hung brain prompts. We use the *latest* forward as the deadline
+      // anchor — multiple queued forwards reset the clock so a slow
+      // legitimate prompt followed by a fresh trivial one doesn't get
+      // killed prematurely.
+      this.ctx.storage.sql.exec(
+        "UPDATE monitor_state SET last_brain_forward_ts = ? WHERE 1=1",
+        Math.floor(Date.now() / 1000),
+      );
       return;
     }
 
@@ -1035,6 +1113,21 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     if (!row) throw new Error("runTick: no state");
 
     const errors: string[] = [];
+
+    // Watchdog: if the brain has been working on a prompt for longer than
+    // BRAIN_PROMPT_TIMEOUT_SECONDS, abort it and apologise in chat.
+    // gemma-4 sometimes hangs indefinitely on complex multi-tool queries;
+    // without this, the monitor keeps forwarding new messages but the
+    // brain can't make progress (replies pile up unread).
+    if (row.brain_session_id && row.last_brain_forward_ts) {
+      const ageSec = Math.floor(Date.now() / 1000) - row.last_brain_forward_ts;
+      if (ageSec > BRAIN_PROMPT_TIMEOUT_SECONDS) {
+        await this.watchdogAbortBrain(row, ageSec).catch((err) => {
+          errors.push(`watchdog abort failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
+    }
+
     const messages = await this.fetchMessages(row.owner_email, row.space_id, row.last_seen_iso);
 
     // Filter to never-seen-before + after last_seen_iso.
