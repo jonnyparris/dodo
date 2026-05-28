@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
-import { chatMonitorIdName, createMonitorSchema, sendChatReply } from "./chat-monitor-agent";
+import { chatMonitorIdName, createMonitorSchema } from "./chat-monitor-agent";
 import { log } from "./logger";
 import { messageLimiter, promptLimiter } from "./rate-limit";
 import { createDraftPrForRun, createGithubRepo, pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-api";
