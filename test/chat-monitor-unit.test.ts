@@ -45,12 +45,14 @@ describe("createMonitorSchema", () => {
     expect(result.success).toBe(false);
   });
 
-  it("rejects polling below the 10s floor", () => {
+  it("rejects polling below the 1s floor", () => {
+    // MIN_POLL_INTERVAL_SECONDS was lowered to 1 in commit 1bfc930 to allow
+    // tight test loops. 0 (and negatives) still rejects.
     const result = createMonitorSchema.safeParse({
       ownerEmail: "ruskin@cloudflare.com",
       spaceId: "spaces/AAAA",
       persona: "x",
-      pollIntervalSeconds: 5,
+      pollIntervalSeconds: 0,
     });
     expect(result.success).toBe(false);
   });
