@@ -4975,8 +4975,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         `If your previous answer was meant for them, send it now via \`chat_reply\` ` +
         `(remember to pass your own sessionId). ` +
         `If the previous message genuinely warranted no reply (e.g. it was idle ` +
-        `chatter not directed at you), call \`chat_reply\` with text="(no reply needed)" ` +
-        `as a tombstone so the system knows you saw it. ` +
+        `chatter not directed at you, or this is a confirmation to yourself ` +
+        `that you've already replied), call \`chat_reply\` with text="<NO_REPLY>" ` +
+        `(EXACT literal — that string is the tombstone the system recognises). ` +
+        `Do not type prose explaining what you did — call the tool. ` +
         `This is your reminder ${prior + 1} of ${MAX_BRAIN_NUDGES}.`,
       authorEmail: ownerEmail,
     });
