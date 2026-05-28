@@ -57,6 +57,10 @@ import type { Env } from "./types";
 const MIN_POLL_INTERVAL_SECONDS = 1;
 const DEFAULT_POLL_INTERVAL_SECONDS = 15;
 const MAX_MESSAGES_PER_TICK = 5;
+/** Emoji added to a message while the brain is processing a reply. */
+const LOADING_EMOJI = ":loading-loading-forever:";
+/** Emoji added to a message after the brain has replied. */
+const DONE_EMOJI = ":b-yes-check:";
 /** How long a brain prompt may run before runTick treats it as hung and
  *  aborts it. gemma-4 has been observed to chew on complex multi-tool
  *  queries indefinitely; this cap keeps the monitor from spinning
@@ -411,6 +415,7 @@ export function buildBrainGoalText(args: {
     "4. You can use MCP tools to gather information (cf-portal search, agent memory, browser, etc.) before deciding what to say. Take whatever tool actions you need.",
     "5. EVERY turn must end with a `chat_reply` call. If a message warrants a real response, pass it as `text`. If it does NOT warrant a reply (greeting to someone else, idle observation, message clearly addressed to another person), call `chat_reply` with `text=\"<NO_REPLY>\"` — this is a tombstone that the system uses to confirm you decided silence was correct, and it does NOT post anything to chat. Never end a turn without one or the other; if you do, the system will nudge you and your context will fill up unnecessarily.",
     "6. Keep replies under 500 characters when you do call `chat_reply`. Plain text. Never include @mentions or fabricated links.",
+    "7. When calling `chat_reply`, you MUST pass the `messageName` parameter (it appears in the prompt header as `[Message resource: ...]`). This lets the system manage the loading/check reactions on the original message. If you omit it, the reactions won't be cleaned up.",
     "",
     "Persona:",
     "",
@@ -485,6 +490,13 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     this.ctx.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS forward_log_ts ON forward_log(ts DESC)",
     );
+
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS pending_reactions (
+        message_name TEXT PRIMARY KEY,
+        added_at INTEGER NOT NULL
+      )
+    `);
 
     // Best-effort drop of legacy tables from the pre-refactor monitor.
     // These held LLM decisions and the context buffer; the brain session
@@ -580,6 +592,31 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       messageName,
       Math.floor(Date.now() / 1000),
     );
+  }
+
+  private recordPendingReaction(messageName: string): void {
+    this.ensureMigrations();
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO pending_reactions (message_name, added_at) VALUES (?, ?)",
+      messageName,
+      Math.floor(Date.now() / 1000),
+    );
+  }
+
+  private clearPendingReaction(messageName: string): void {
+    this.ensureMigrations();
+    this.ctx.storage.sql.exec(
+      "DELETE FROM pending_reactions WHERE message_name = ?",
+      messageName,
+    );
+  }
+
+  private listPendingReactions(): string[] {
+    this.ensureMigrations();
+    const rows = Array.from(
+      this.ctx.storage.sql.exec("SELECT message_name FROM pending_reactions ORDER BY added_at DESC"),
+    );
+    return rows.map((r) => String((r as unknown as Record<string, unknown>).message_name ?? ""));
   }
 
   private async appendForwardLog(entry: Omit<ForwardLogEntry, "ts">): Promise<void> {
@@ -742,6 +779,14 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       if (request.method === "POST" && url.pathname === "/tick") {
         const result = await this.runTick();
         return Response.json(result);
+      }
+
+      if (request.method === "POST" && url.pathname === "/clear-reaction") {
+        const body = (await request.json()) as { messageName?: string };
+        if (body.messageName) {
+          this.clearPendingReaction(body.messageName);
+        }
+        return Response.json({ cleared: body.messageName ?? null });
       }
 
       if (request.method === "DELETE" && url.pathname === "/") {
@@ -1013,6 +1058,22 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     msg: ChatMessage,
     asCommand: boolean,
   ): Promise<void> {
+    // Best-effort: add a loading reaction so the human knows the message
+    // was received and is being processed.
+    if (asCommand) {
+      await sendChatReaction(this.env, {
+        messageName: msg.name,
+        emoji: LOADING_EMOJI,
+        action: "add",
+      }).catch((err) => {
+        log("warn", "failed to add loading reaction (non-fatal)", {
+          messageName: msg.name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+      this.recordPendingReaction(msg.name);
+    }
+
     const agentStub = await getAgentByName(this.env.CODING_AGENT as never, sessionId);
     const fetcher = (agentStub as unknown as { fetch: (req: Request) => Promise<Response> }).fetch.bind(agentStub);
 
@@ -1351,6 +1412,34 @@ export async function sendChatReply(
       "X-Chat-Middleware-Auth-Key": key,
     },
     body: JSON.stringify(body),
+  });
+  const text = await res.text().catch(() => "");
+  return { ok: res.ok, status: res.status, body: text.slice(0, 500) };
+}
+
+/**
+ * Add or remove an emoji reaction on a Google Chat message via the ARIA
+ * chat middleware. Best-effort — failures are non-fatal.
+ */
+export async function sendChatReaction(
+  env: Env,
+  args: { messageName: string; emoji: string; action: "add" | "remove" },
+): Promise<{ ok: boolean; status: number; body: string }> {
+  const key = env.ARIA_CHAT_AUTH_KEY;
+  if (!key) {
+    return { ok: false, status: 500, body: "ARIA_CHAT_AUTH_KEY not set on the Worker" };
+  }
+  const res = await fetch("https://chat-middleware.project-aria.workers.dev/api/react", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Chat-Middleware-Auth-Key": key,
+    },
+    body: JSON.stringify({
+      messageName: args.messageName,
+      action: args.action,
+      emoji: args.emoji,
+    }),
   });
   const text = await res.text().catch(() => "");
   return { ok: res.ok, status: res.status, body: text.slice(0, 500) };
