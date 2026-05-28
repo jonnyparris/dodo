@@ -5,7 +5,7 @@
  * These helpers are pure and fast — the generator method that uses them
  * (onChatMessage) is covered by higher-level integration suites.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ModelMessage } from "ai";
 import { estimateMessageTokens, estimateMessagesTokens } from "../src/coding-agent";
 
@@ -67,5 +67,55 @@ describe("estimateMessagesTokens", () => {
     const tokens = estimateMessagesTokens([large]);
     const budget200k = Math.floor(200_000 * 0.8);
     expect(tokens / budget200k).toBeGreaterThan(0.5);
+  });
+});
+
+describe("estimateMessageTokens caching", () => {
+  // Per-message WeakMap cache eliminates the per-turn JSON.stringify storm.
+  // estimateMessagesTokens is called 3–4 times per chat step, so any
+  // accidental cache miss costs O(messages × stringify) every turn.
+
+  it("memoises by message reference", () => {
+    const msg: ModelMessage = { role: "user", content: "first message" };
+    const stringifySpy = vi.spyOn(JSON, "stringify");
+
+    const first = estimateMessageTokens(msg);
+    const callsAfterFirst = stringifySpy.mock.calls.filter((c) => c[0] === msg).length;
+
+    const second = estimateMessageTokens(msg);
+    const callsAfterSecond = stringifySpy.mock.calls.filter((c) => c[0] === msg).length;
+
+    expect(second).toBe(first);
+    expect(callsAfterFirst).toBe(1);
+    // Second call must hit the cache — zero additional stringify of this msg.
+    expect(callsAfterSecond).toBe(1);
+
+    stringifySpy.mockRestore();
+  });
+
+  it("estimateMessagesTokens only stringifies new messages on a repeat call", () => {
+    const a: ModelMessage = { role: "user", content: "alpha alpha alpha" };
+    const b: ModelMessage = { role: "assistant", content: "beta beta beta" };
+    const c: ModelMessage = { role: "user", content: "gamma gamma gamma" };
+
+    // Prime the cache for a and b.
+    estimateMessagesTokens([a, b]);
+
+    const stringifySpy = vi.spyOn(JSON, "stringify");
+
+    // Re-estimate with a third message — only c should hit JSON.stringify.
+    const total = estimateMessagesTokens([a, b, c]);
+
+    const stringifiedMessages = stringifySpy.mock.calls.filter(
+      (call) => call[0] === a || call[0] === b || call[0] === c,
+    );
+    expect(stringifiedMessages.length).toBe(1);
+    expect(stringifiedMessages[0]![0]).toBe(c);
+
+    expect(total).toBe(
+      estimateMessageTokens(a) + estimateMessageTokens(b) + estimateMessageTokens(c),
+    );
+
+    stringifySpy.mockRestore();
   });
 });

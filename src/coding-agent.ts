@@ -150,26 +150,80 @@ function charsPerTokenFor(sample: string): number {
 }
 
 /**
- * Token estimate for a single ModelMessage. Content-aware: picks a
- * chars-per-token ratio based on whether the serialized message looks
- * like JSON, code, prose, or mixed.
+ * Pure cache-decision helper. Returns true when a cached value is fresh
+ * enough to reuse (non-zero `cachedAt` and within the TTL window). Pulled
+ * out of `connectMcpServers()` / `warmSkills()` so it can be unit-tested
+ * without spinning up a Durable Object.
  *
- * The estimate is used by the autocompaction guard (trigger at 60% of
- * budget), the pre-step budget check, and the compaction cutoff walk. All
- * three prefer over-estimates — a false-positive compaction is cheap, a
+ * `cachedAt === 0` is the convention for "no cache yet, must (re)fetch".
+ */
+export function isCacheFresh(cachedAt: number, ttlMs: number, now = Date.now()): boolean {
+  if (cachedAt === 0) return false;
+  return now - cachedAt < ttlMs;
+}
+
+/**
+ * Pure helper that returns true when a TTL-cached value with a fingerprint
+ * is still valid. Used by `connectMcpServers()` to decide whether to skip
+ * the reconnect storm. The fingerprint guards against the case where the
+ * cache is "fresh" by TTL but the underlying inputs have changed (e.g.
+ * user toggled an MCP server off).
+ */
+export function isFingerprintedCacheFresh(
+  cachedAt: number,
+  cachedFingerprint: string | null,
+  currentFingerprint: string,
+  ttlMs: number,
+  now = Date.now(),
+): boolean {
+  if (cachedAt === 0) return false;
+  if (cachedFingerprint !== currentFingerprint) return false;
+  return now - cachedAt < ttlMs;
+}
+
+/**
+ * Per-message token-estimate cache. Messages are immutable once appended to
+ * a Think conversation, so the estimate is stable for the lifetime of the
+ * object — keyed by the ModelMessage reference so it gets garbage-collected
+ * when the message drops out of the conversation array.
+ *
+ * Eliminates the per-turn JSON.stringify storm: `estimateMessagesTokens()`
+ * is called 3–4 times per step (pre-step budget check, oversized-prompt
+ * guard, compaction threshold checks), and each call previously re-walked
+ * every message. With this cache, only newly-appended messages get
+ * stringified.
+ */
+const tokenEstimateCache = new WeakMap<ModelMessage, number>();
+
+/**
+ * Token estimate for a single ModelMessage. Content-aware: picks a
+ * chars-per-token ratio based on the message role/shape so prose, JSON
+ * tool args, and code blocks all land within ~10% of the real count.
+ *
+ * Used for our pre-step budget check and the loop-entry oversized-prompt
+ * guard. We trade a tiny bit of accuracy for not having to ship a real
+ * tokenizer into the Worker — a false-positive triggers compaction, a
  * false-negative "just squeeze it in" is a 429.
  *
- * Cheap enough to call on every message each step.
+ * Cached per-message reference via `tokenEstimateCache` — cheap to call
+ * repeatedly within a turn.
  */
 export function estimateMessageTokens(msg: ModelMessage): number {
+  const cached = tokenEstimateCache.get(msg);
+  if (cached !== undefined) return cached;
   const serialized = JSON.stringify(msg);
   const cpt = charsPerTokenFor(serialized);
-  return Math.ceil(serialized.length / cpt);
+  const result = Math.ceil(serialized.length / cpt);
+  tokenEstimateCache.set(msg, result);
+  return result;
 }
 
 /**
  * Sum of estimateMessageTokens across an array. Used by the pre-step budget
  * check and the loop-entry oversized-prompt guard in onChatMessage().
+ *
+ * Hits the per-message cache so calling this repeatedly within a turn is
+ * O(messages) lookups, not O(messages × stringify-cost).
  */
 export function estimateMessagesTokens(messages: ModelMessage[]): number {
   let total = 0;
@@ -487,6 +541,24 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   /** Connected MCP gatekeepers, populated by connectMcpServers(). */
   private mcpGatekeepers: McpClient[] = [];
   /**
+   * Epoch ms of the last successful (non-empty) `connectMcpServers()` run.
+   * Used together with `MCP_REFRESH_TTL_MS` and `mcpEnabledConfigsFingerprint`
+   * to short-circuit the per-turn reconnect storm. Previously every chat turn
+   * disconnected and reconnected every enabled MCP gatekeeper (7+ servers
+   * including two cf-portal instances exposing ~200 tools each), which cost
+   * 500ms–2s per turn. With the cache, reconnect happens at most once per
+   * TTL window or when the enabled-config set actually changes.
+   */
+  private mcpConnectedAt = 0;
+  /**
+   * Fingerprint of the enabled MCP config IDs from the last successful
+   * connect. If this changes (user enables/disables a server, session
+   * override flips), we drop the cache and reconnect.
+   */
+  private mcpEnabledConfigsFingerprint: string | null = null;
+  /** TTL in ms for the cached MCP gatekeeper set. */
+  private static readonly MCP_REFRESH_TTL_MS = 5 * 60_000;
+  /**
    * Per-config connect status from the most recent `connectMcpServers()` call.
    * Surfaced via `GET /mcp-status` so the UI can show "✗ tools/list failed:
    * Invalid Bearer token format" instead of silently dropping tools.
@@ -540,6 +612,17 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private _skills: Skill[] | null = null;
   /** Pre-rendered `<available_skills>` block — recomputed when `_skills` changes. */
   private _skillManifest: string | null = null;
+  /**
+   * Last successful `warmSkills()` epoch ms. Used together with `SKILLS_TTL_MS`
+   * to short-circuit the personal-skill HTTP fetch + workspace SKILL.md scan
+   * on subsequent turns. Mutations happen out-of-process (skill_write MCP tool
+   * writes to UserControl from a different Worker), so we can't push-invalidate
+   * — a short TTL is the right trade-off. `bumpSkillsGeneration()` provides
+   * an explicit invalidation hook for in-DO callers.
+   */
+  private _skillsWarmedAt = 0;
+  /** TTL in ms for the cached skills manifest. Mirrors ADMIN_PREFIX_TTL_MS. */
+  private static readonly SKILLS_TTL_MS = 60_000;
   /**
    * Admin-managed global system-prompt prefix from SharedIndex. Cached on
    * the DO with a TTL so we don't hit SharedIndex every turn. Refreshed by
@@ -816,17 +899,37 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
+   * Force the next `warmSkills()` call to re-fetch from UserControl and
+   * re-scan the workspace. Call this from any in-DO path that mutates the
+   * skill state (session overrides, workspace SKILL.md writes) so the
+   * change is visible immediately rather than waiting up to SKILLS_TTL_MS.
+   */
+  bumpSkillsGeneration(): void {
+    this._skillsWarmedAt = 0;
+  }
+
+  /**
    * Warm the skill registry. Loads personal skills from UserControl,
    * scans the workspace for SKILL.md files, and merges built-in skills.
    * Caches the merged list and the rendered manifest on this instance so
    * `getSystemPrompt()` can read them synchronously.
    *
-   * Called from `onChatMessage()` before each turn. Cheap on the warm path —
-   * the personal-skill HTTP fetch is the only network hop and skips on miss.
-   * If everything fails the session continues with no skills (degrade gracefully,
-   * never block the chat turn).
+   * Called from `onChatMessage()` before each turn. TTL-cached (SKILLS_TTL_MS)
+   * so subsequent turns within the window skip the personal-skill HTTP fetch
+   * and workspace scan entirely — this was a 100-300ms per-turn overhead
+   * before the cache landed. If everything fails the session continues with
+   * no skills (degrade gracefully, never block the chat turn).
    */
   private async warmSkills(): Promise<void> {
+    // TTL guard — skip re-warm if we have a recent successful result.
+    // Mutations bump _skillsWarmedAt to 0 via bumpSkillsGeneration().
+    if (
+      this._skills !== null &&
+      isCacheFresh(this._skillsWarmedAt, CodingAgent.SKILLS_TTL_MS)
+    ) {
+      return;
+    }
+
     const ownerEmail = this.readMetadata("owner_email");
     const personal: Skill[] = [];
     let sessionOverrides: Array<{ skillName: string; enabled: boolean }> = [];
@@ -889,6 +992,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     this._skills = merged;
     this._skillManifest = renderSkillManifest(merged) || null;
+    this._skillsWarmedAt = Date.now();
     log("info", "skills-warmed", {
       sessionId: this.sessionId(),
       personal: personal.length,
@@ -6320,6 +6424,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
     this.mcpGatekeepers = [];
     this.mcpStatus.clear();
+    // Invalidate the TTL cache so the next connectMcpServers() rebuilds.
+    this.mcpConnectedAt = 0;
+    this.mcpEnabledConfigsFingerprint = null;
   }
 
   /**
@@ -6336,7 +6443,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     log("info", "owner identity drift", { storedEmail: stored ?? null, incomingEmail: normalisedIncoming });
     await this.clearAllMcpConnections();
     this.writeMetadata("owner_email", normalisedIncoming);
-    await this.connectMcpServers();
+    // Owner changed, fingerprint/timestamp are now meaningless — force a
+    // fresh connect.
+    this.mcpConnectedAt = 0;
+    this.mcpEnabledConfigsFingerprint = null;
+    await this.connectMcpServers({ forceReconnect: true });
   }
 
   async refreshMcpState(mcpId: string): Promise<void> {
@@ -6458,22 +6569,25 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * overrides), resolves encrypted headers, connects each gatekeeper, and
    * pre-fetches tool listings so getTools() can read them synchronously.
    *
-   * Safe to call multiple times — disconnects previous gatekeepers first.
+   * **TTL-cached.** Repeated calls within `MCP_REFRESH_TTL_MS` are a no-op
+   * as long as the enabled-config set hasn't changed. This matters because
+   * `onChatMessage()` calls this on every turn — without the cache, every
+   * turn paid the full reconnect + listTools cost (500ms–2s with a typical
+   * 7-server config). Use `forceReconnect: true` from explicit paths like
+   * `reconcileOwnerIdentity()` and post-auth-failure retries to bypass it.
+   *
+   * Per-config auth-header resolution is parallelised — previously the loop
+   * was sequential, so every additional server added a serial round-trip to
+   * UserControl.
    */
-  private async connectMcpServers(): Promise<void> {
+  private async connectMcpServers(options?: { forceReconnect?: boolean }): Promise<void> {
     const ownerEmail = this.readMetadata("owner_email");
     if (!ownerEmail) return;
 
     const sessionId = this.sessionId();
     if (!sessionId) return;
 
-    // Disconnect any previously connected gatekeepers
-    for (const gk of this.mcpGatekeepers) {
-      gk.disconnect();
-    }
-    this.mcpGatekeepers = [];
-    // Clear status from the previous attempt — we're about to repopulate.
-    this.mcpStatus.clear();
+    const forceReconnect = options?.forceReconnect === true;
 
     try {
       const stub = getUserControlStub(this.env, ownerEmail);
@@ -6504,7 +6618,49 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         if (c.id === "browser-rendering" && !browserEnabled) return false;
         return true;
       });
-      if (enabled.length === 0) return;
+      if (enabled.length === 0) {
+        // Edge: previously connected, now everything is disabled. Drop the
+        // old gatekeepers — leaving stale `mcpGatekeepers` would surface
+        // tools the user has just disabled.
+        if (this.mcpGatekeepers.length > 0) {
+          for (const gk of this.mcpGatekeepers) {
+            try { gk.disconnect(); } catch { /* best effort */ }
+          }
+          this.mcpGatekeepers = [];
+          this.mcpStatus.clear();
+        }
+        this.mcpConnectedAt = 0;
+        this.mcpEnabledConfigsFingerprint = "";
+        return;
+      }
+
+      // Fingerprint the enabled set so we know when to invalidate.
+      // Stable sort + join — config IDs are stable opaque strings.
+      const fingerprint = enabled.map((c) => c.id).sort().join(",");
+
+      // TTL fast-path: skip the reconnect storm if we have a recent
+      // successful connect with the same enabled set. mcpGatekeepers stays
+      // populated, so getTools() keeps seeing the same tool list.
+      if (
+        !forceReconnect &&
+        this.mcpGatekeepers.length > 0 &&
+        isFingerprintedCacheFresh(
+          this.mcpConnectedAt,
+          this.mcpEnabledConfigsFingerprint,
+          fingerprint,
+          CodingAgent.MCP_REFRESH_TTL_MS,
+        )
+      ) {
+        return;
+      }
+
+      // We're going to rebuild — disconnect the previous gatekeepers and
+      // clear status from the previous attempt.
+      for (const gk of this.mcpGatekeepers) {
+        try { gk.disconnect(); } catch { /* best effort */ }
+      }
+      this.mcpGatekeepers = [];
+      this.mcpStatus.clear();
 
       // Helper: ask UserControl for a current access token. UserControl
       // refreshes if expired (serialised by per-user DO single-threading).
@@ -6518,33 +6674,66 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return accessToken ?? null;
       };
 
-      // Resolve encrypted headers and connect each gatekeeper
-      const connected: McpClient[] = [];
-      for (const config of enabled) {
-        try {
-          // Resolve auth headers depending on the config's auth_type.
-          let headers: Record<string, string> | undefined;
+      // Resolve auth headers for every config in parallel. Each config's
+      // headers are independent — previously this was a serial for-loop.
+      type ResolvedHeaders =
+        | { ok: true; config: typeof enabled[number]; headers: Record<string, string> | undefined }
+        | { ok: false; config: typeof enabled[number]; error: string };
 
+      const resolveHeadersFor = async (config: typeof enabled[number]): Promise<ResolvedHeaders> => {
+        try {
           if (config.auth_type === "refresh_token") {
             const accessToken = await fetchRefreshTokenBearer(config.id);
             if (!accessToken) {
-              throw new Error("No refresh-token access token available; run set_refresh_token_mcp again");
+              return { ok: false, config, error: "No refresh-token access token available; run set_refresh_token_mcp again" };
             }
-            headers = { Authorization: `Bearer ${accessToken}` };
-          } else if (config.headerKeys?.length) {
-            headers = {};
-            for (const headerName of config.headerKeys) {
-              const secretRes = await stub.fetch(
-                `https://user-control/internal/secret/mcp:${encodeURIComponent(config.id)}:${encodeURIComponent(headerName)}`,
-                { headers: { "x-owner-email": ownerEmail } },
-              );
-              if (secretRes.ok) {
-                const { value } = (await secretRes.json()) as { value: string };
-                headers[headerName] = value;
-              }
-            }
+            return { ok: true, config, headers: { Authorization: `Bearer ${accessToken}` } };
           }
+          if (config.headerKeys?.length) {
+            const headers: Record<string, string> = {};
+            // Parallelise the per-header secret fetches too — they're
+            // independent UserControl reads.
+            const fetched = await Promise.all(
+              config.headerKeys.map(async (headerName) => {
+                const secretRes = await stub.fetch(
+                  `https://user-control/internal/secret/mcp:${encodeURIComponent(config.id)}:${encodeURIComponent(headerName)}`,
+                  { headers: { "x-owner-email": ownerEmail } },
+                );
+                if (!secretRes.ok) return null;
+                const { value } = (await secretRes.json()) as { value: string };
+                return { headerName, value };
+              }),
+            );
+            for (const r of fetched) {
+              if (r) headers[r.headerName] = r.value;
+            }
+            return { ok: true, config, headers };
+          }
+          return { ok: true, config, headers: undefined };
+        } catch (err) {
+          return { ok: false, config, error: err instanceof Error ? err.message : String(err) };
+        }
+      };
 
+      const resolved = await Promise.all(enabled.map(resolveHeadersFor));
+
+      // Connect each gatekeeper. We keep the inner connect/listTools work
+      // sequential because connect() opens long-lived streams and we want
+      // determinism + bounded concurrency rather than a 7-way connect burst.
+      const connected: McpClient[] = [];
+      for (const r of resolved) {
+        if (!r.ok) {
+          this.mcpStatus.set(r.config.id, {
+            name: r.config.name,
+            url: r.config.url,
+            ok: false,
+            error: r.error,
+            lastCheckedAt: Date.now(),
+          });
+          continue;
+        }
+        const { config, headers } = r;
+        try {
           let gk = new HttpMcpClient({
             ...config,
             headers,
@@ -6619,12 +6808,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
 
       this.mcpGatekeepers = connected;
+      this.mcpConnectedAt = Date.now();
+      this.mcpEnabledConfigsFingerprint = fingerprint;
 
       // Federate OAuth MCP tools from the per-user hub DO. Tools themselves
       // live in the hub; session DOs only hold a cached list for synchronous
       // getTools() reads and route callTool through `callOAuthToolViaHub`.
       await this.loadOAuthToolsFromHub(ownerEmail);
     } catch (error) {
+      // Don't mark this as a fresh connect on failure — leave the previous
+      // fingerprint/timestamp in place so the next call retries.
+      this.mcpConnectedAt = 0;
+      this.mcpEnabledConfigsFingerprint = null;
       console.warn("connectMcpServers failed:", error instanceof Error ? error.message : error);
     }
   }
