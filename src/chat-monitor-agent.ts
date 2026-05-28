@@ -54,7 +54,7 @@ import { getSharedIndexStub, getUserControlStub, resolveAdminEmail } from "./aut
 import { HttpMcpClient, type McpClientConfig } from "./mcp-client";
 import type { Env } from "./types";
 
-const MIN_POLL_INTERVAL_SECONDS = 10;
+const MIN_POLL_INTERVAL_SECONDS = 1;
 const DEFAULT_POLL_INTERVAL_SECONDS = 15;
 const MAX_MESSAGES_PER_TICK = 5;
 /** How long a brain prompt may run before runTick treats it as hung and
