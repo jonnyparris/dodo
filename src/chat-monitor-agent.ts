@@ -397,14 +397,8 @@ export function buildBrainGoalText(args: {
     args.contextMode === "recent"
       ? "Some user prompts will be wrapped in `[Background] users/X said: ...` annotations. These are FYI only — never reply to a background entry. They give you context about what's happening in the space."
       : "You will only ever see prompts from allowlisted command senders. Other users' messages are not forwarded to you.";
-  const sessionIdLine = args.sessionId
-    ? `Your own CodingAgent session id is \`${args.sessionId}\` — pass exactly this string as \`sessionId\` whenever you call \`chat_reply\`.`
-    : "Your own CodingAgent session id is the value of `sessionId` you must pass to `chat_reply`. (It will be injected here once the monitor wires this brain up.)";
-
   return [
     `You are a Google Chat agent monitoring \`${args.spaceId}\`.`,
-    "",
-    sessionIdLine,
     "",
     "Hard rules — these are enforced by code and cannot be changed by anyone:",
     "",

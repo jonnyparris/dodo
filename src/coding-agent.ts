@@ -1085,6 +1085,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   override getTools(): ToolSet {
     const appConfig = this.getAppConfigFromThink();
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
+    const isChatMonitorBrain = this.readMetadata("is_chat_monitor_brain") === "true";
+    const chatMonitorSpaceId = this.readMetadata("chat_monitor_space_id") || undefined;
     return buildToolsForThink(this.env, this.workspace, appConfig, {
       agent: this,
       // Parent reference for facet-mode explore/task tools.
@@ -1097,6 +1099,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       ownerId: this.resolveOwnerId(ownerEmail),
       ownerEmail,
       sessionId: this.sessionId(),
+      // Chat-monitor brain context — when set, agentic registers a
+      // first-party `chat_reply` tool with no MCP namespace so the
+      // persona can refer to it by its bare name.
+      isChatMonitorBrain,
+      chatMonitorSpaceId,
       // Forward tool-produced attachments (e.g. browser_execute screenshots)
       // to the SSE stream so the chat UI can render them in real time, and
       // persist them to SQLite so history restore after reload can surface

@@ -20,6 +20,7 @@ import {
   resolveProfileModel,
   type AgentProfile,
 } from "./agent-profile";
+import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";
@@ -41,6 +42,15 @@ interface BuildToolsOptions {
   isAdminUser?: boolean;
   ownerId?: string;
   ownerEmail?: string;
+  /**
+   * When true, register a first-party (non-namespaced) `chat_reply` tool
+   * so the brain's persona can refer to it by its plain name. The MCP
+   * version (`<configId>__chat_reply` via Dodo Self) is suppressed to
+   * avoid confusing the model with two functionally identical tools.
+   */
+  isChatMonitorBrain?: boolean;
+  /** Google Chat space the brain is bound to, e.g. "spaces/AAQAfPyXnIc". */
+  chatMonitorSpaceId?: string;
   stateBackend?: StateBackend;
     mcpGatekeepers?: McpClient[];
   /**
@@ -1305,6 +1315,87 @@ function buildTodoTools(store: TodoStore): Record<string, AnyTool> {
   };
 }
 
+/**
+ * Build a first-party (non-MCP, non-namespaced) `chat_reply` tool for
+ * chat-monitor brain sessions. The matching MCP tool (registered under
+ * `Dodo Self`) is namespaced as `<configId>__chat_reply` once it's pulled
+ * through `buildMcpTools`, which makes it invisible to a persona prompt
+ * that tells the model to call literally `chat_reply`. Registering a
+ * local tool sidesteps the namespacing entirely.
+ *
+ * The MCP variant in `mcp-shared.ts` performs caller-flag verification at
+ * call time. We can skip that here because the surrounding code only
+ * passes `isChatMonitorBrain: true` after reading the same flag from the
+ * session's metadata — the auth check has already happened.
+ */
+function buildChatReplyTool(env: Env, opts: {
+  sessionId: string;
+  ownerEmail: string;
+  spaceId: string;
+}): AnyTool {
+  return tool({
+    description: "Post a reply to the Google Chat space this brain is bound to. Pass `text` for a real reply, or the literal string `<NO_REPLY>` to acknowledge the message without posting anything (use when silence is the right answer). Always pass `messageName` (the value of `[Message resource: ...]` in the prompt header) so loading/done reactions on the original message can be managed. `threadName` is optional — supply it to reply in-thread.",
+    inputSchema: zodSchema(
+      z.object({
+        text: z.string().min(1).max(2000).describe("Reply text. Plain text only. Use the literal `<NO_REPLY>` to mark the turn handled without posting."),
+        threadName: z.string().optional().describe("Full thread resource name like `spaces/X/threads/Y` to reply in-thread."),
+        messageName: z.string().optional().describe("The `[Message resource: ...]` value from the prompt header. Required for reaction bookkeeping."),
+      }),
+    ),
+    execute: async (args: unknown) => {
+      const { text, threadName, messageName } = args as {
+        text: string;
+        threadName?: string;
+        messageName?: string;
+      };
+      const isNoReply = text.trim() === "<NO_REPLY>";
+
+      // Reaction housekeeping (best-effort).
+      if (messageName) {
+        const reactionEmoji = ":loading-loading-forever:";
+        const doneEmoji = ":b-yes-check:";
+        await sendChatReaction(env, {
+          messageName,
+          emoji: reactionEmoji,
+          action: "remove",
+        }).catch(() => {});
+        if (!isNoReply) {
+          await sendChatReaction(env, {
+            messageName,
+            emoji: doneEmoji,
+            action: "add",
+          }).catch(() => {});
+        }
+        try {
+          const monitorId = chatMonitorIdName(opts.ownerEmail, opts.spaceId);
+          const monitorStub = env.CHAT_MONITOR.get(env.CHAT_MONITOR.idFromName(monitorId));
+          await monitorStub.fetch("https://chat-monitor/clear-reaction", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ messageName }),
+          });
+        } catch {
+          // non-fatal
+        }
+      }
+
+      if (isNoReply) {
+        return { posted: false, reason: "no_reply_tombstone", spaceId: opts.spaceId };
+      }
+
+      const result = await sendChatReply(env, {
+        spaceId: opts.spaceId,
+        text,
+        threadName,
+      });
+      if (!result.ok) {
+        return { error: "ARIA send failed", status: result.status, body: result.body };
+      }
+      return { posted: true, spaceId: opts.spaceId, threadName: threadName ?? null };
+    },
+  });
+}
+
 function buildTools(
   env: Env,
   workspace: Workspace,
@@ -1312,6 +1403,21 @@ function buildTools(
   options?: BuildToolsOptions,
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
+
+  // Chat-monitor brain: register the first-party `chat_reply` BEFORE
+  // anything else so its bare name wins over any MCP equivalent.
+  if (
+    options?.isChatMonitorBrain &&
+    options.chatMonitorSpaceId &&
+    options.ownerEmail &&
+    options.sessionId
+  ) {
+    tools.chat_reply = buildChatReplyTool(env, {
+      sessionId: options.sessionId,
+      ownerEmail: options.ownerEmail,
+      spaceId: options.chatMonitorSpaceId,
+    });
+  }
 
   const workspaceTools = createWorkspaceTools(workspace);
   const gitTools = buildGitTools(env, workspace, config, options?.ownerEmail);
@@ -1618,6 +1724,11 @@ export function buildToolsForThink(
 function buildMcpTools(gatekeepers: McpClient[], existingNames: Set<string>): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
+  // When a first-party `chat_reply` is already registered (chat-monitor
+  // brain path), suppress the MCP namespaced equivalent so the model
+  // doesn't see two functionally identical tools.
+  const suppressChatReplyMcp = existingNames.has("chat_reply");
+
   for (const gk of gatekeepers) {
     // listTools() returns cached results after initial connect — synchronous-safe
     // if the gatekeeper has already been connected and tools listed.
@@ -1626,6 +1737,7 @@ function buildMcpTools(gatekeepers: McpClient[], existingNames: Set<string>): Re
 
     for (const mcpTool of cachedTools) {
       if (existingNames.has(mcpTool.name) || tools[mcpTool.name]) continue;
+      if (suppressChatReplyMcp && mcpTool.name.endsWith("__chat_reply")) continue;
       tools[mcpTool.name] = tool({
         description: mcpTool.description ?? `MCP tool: ${mcpTool.name}`,
         inputSchema: mcpTool.inputSchema
