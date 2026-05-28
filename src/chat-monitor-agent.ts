@@ -1264,6 +1264,20 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       }
     }
 
+    // Self-heal probe — if an existing brain session is missing from the
+    // UserControl session index (orphaned by a past schema reset or a
+    // creation-time race), this re-registers it so it shows up in the UI.
+    // Cheap on the happy path: one /check GET against the UC DO. Runs
+    // once per tick regardless of whether new messages will be forwarded.
+    if (row.brain_session_id) {
+      await this.ensureBrainSession(row).catch((err) => {
+        log("warn", "brain session self-heal probe failed (non-fatal)", {
+          sessionId: row.brain_session_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
     const commandSenders = parseCommandSenders(row.command_senders_json);
     const allowlistActive = commandSenders.length > 0;
     const contextOn = row.context_mode === "recent";
@@ -1326,19 +1340,16 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           continue;
         }
 
-        // We need a brain session. ensureBrainSession is idempotent: it
-        // returns the existing id immediately on the happy path, and
-        // re-registers the session in UserControl if the row is missing
-        // (self-heal for orphaned brain sessions).
+        // We need a brain session. The per-tick self-heal probe above
+        // already covers the "exists but missing from UserControl" case,
+        // so this branch only fires the very first time a forwarded
+        // message arrives.
         if (!brainSessionId) {
           brainSessionId = await this.ensureBrainSession(row);
           this.ctx.storage.sql.exec(
             "UPDATE monitor_state SET brain_session_id = ? WHERE 1=1",
             brainSessionId,
           );
-        } else {
-          // Best-effort self-heal probe — does not change brainSessionId.
-          await this.ensureBrainSession(row);
         }
 
         await this.forwardToBrain(brainSessionId, row.owner_email, row.space_id, msg, kind === "command");
