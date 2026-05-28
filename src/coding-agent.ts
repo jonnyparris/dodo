@@ -6443,10 +6443,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     log("info", "owner identity drift", { storedEmail: stored ?? null, incomingEmail: normalisedIncoming });
     await this.clearAllMcpConnections();
     this.writeMetadata("owner_email", normalisedIncoming);
-    // Owner changed, fingerprint/timestamp are now meaningless — force a
-    // fresh connect.
-    this.mcpConnectedAt = 0;
-    this.mcpEnabledConfigsFingerprint = null;
+    // clearAllMcpConnections() already zeroes mcpConnectedAt /
+    // mcpEnabledConfigsFingerprint; forceReconnect bypasses the cache
+    // anyway. Owner changed = the previous connect state is irrelevant.
     await this.connectMcpServers({ forceReconnect: true });
   }
 
@@ -6641,6 +6640,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // TTL fast-path: skip the reconnect storm if we have a recent
       // successful connect with the same enabled set. mcpGatekeepers stays
       // populated, so getTools() keeps seeing the same tool list.
+      //
+      // We still refresh OAuth tools from the hub on every call — that's a
+      // single peer-DO RPC, much cheaper than the gatekeeper reconnect, and
+      // it's the only way session DOs see newly-OAuth-connected servers
+      // without waiting for the full TTL window. OAuth server adds/removes
+      // happen on the hub DO via the Agents SDK and don't touch the
+      // mcp-configs fingerprint we just computed.
       if (
         !forceReconnect &&
         this.mcpGatekeepers.length > 0 &&
@@ -6651,6 +6657,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           CodingAgent.MCP_REFRESH_TTL_MS,
         )
       ) {
+        await this.loadOAuthToolsFromHub(ownerEmail);
         return;
       }
 
