@@ -154,9 +154,11 @@
     "WORKER_URL": "http://localhost:8787",
     "DODO_VERSION": "0.4.0",
     // Worker script name used when querying Workers Observability for our
-    // own logs (admin self-diagnose). The CLOUDFLARE_API_TOKEN +
-    // CLOUDFLARE_ACCOUNT_ID secrets are required for those queries to land
-    // — without them the cloudflare-logs helpers return an empty result.
-    "DODO_WORKER_NAME": "dodo"
+    // own logs (admin self-diagnose). Paired with CLOUDFLARE_ACCOUNT_ID
+    // (var, below) and CLOUDFLARE_API_TOKEN (secret, set via
+    // `wrangler secret put`) — without all three the cloudflare-logs
+    // helpers return an empty result.
+    "DODO_WORKER_NAME": "dodo",
+    "CLOUDFLARE_ACCOUNT_ID": "4b430e167a301330d13a9bb42f3986a2"
   }
 }
