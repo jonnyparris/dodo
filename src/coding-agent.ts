@@ -4945,7 +4945,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   private async maybeNudgeChatMonitorBrain(): Promise<void> {
     if (this.readMetadata("is_chat_monitor_brain") !== "true") return;
-    if (this._toolCallNames.has("chat_reply")) {
+    // MCP-mediated tools are namespaced by the gatekeeper as
+    // `${configId}__${toolName}` (see HttpMcpClient.listTools). So
+    // chat_reply appears as e.g. `82ed5670-...-cdd__chat_reply` in the
+    // _toolCallNames set. Match by suffix to cover any future mcp-config
+    // id shuffling. Built-in (non-MCP) tools would appear unprefixed,
+    // so check both shapes.
+    const calledChatReply = Array.from(this._toolCallNames).some((n) =>
+      n === "chat_reply" || n.endsWith("__chat_reply"),
+    );
+    if (calledChatReply) {
       // Replied successfully — reset retry counter for the next turn.
       this.writeMetadata("brain_nudge_count", "0");
       return;
