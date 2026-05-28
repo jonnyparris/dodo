@@ -45,12 +45,12 @@ describe("createMonitorSchema", () => {
     expect(result.success).toBe(false);
   });
 
-  it("rejects polling below the 10s floor", () => {
+  it("rejects polling below the 1s floor", () => {
     const result = createMonitorSchema.safeParse({
       ownerEmail: "ruskin@cloudflare.com",
       spaceId: "spaces/AAAA",
       persona: "x",
-      pollIntervalSeconds: 5,
+      pollIntervalSeconds: 0,
     });
     expect(result.success).toBe(false);
   });
