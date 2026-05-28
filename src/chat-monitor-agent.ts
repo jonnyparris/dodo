@@ -60,8 +60,15 @@ const MAX_MESSAGES_PER_TICK = 5;
 /** How long a brain prompt may run before runTick treats it as hung and
  *  aborts it. gemma-4 has been observed to chew on complex multi-tool
  *  queries indefinitely; this cap keeps the monitor from spinning
- *  forever on a stuck brain. */
-const BRAIN_PROMPT_TIMEOUT_SECONDS = 180;
+ *  forever on a stuck brain.
+ *
+ *  Sized for the legitimate worst case: DO cold start + ~7 MCP server
+ *  connects + large system prompt assembly + Workers AI queue + tool-
+ *  using inference. 3 min was too short — we observed apologies firing
+ *  while the brain was still legitimately initialising. 10 min should
+ *  be ample for a real query while still bounded enough to surface
+ *  genuinely stuck prompts. */
+const BRAIN_PROMPT_TIMEOUT_SECONDS = 600;
 /** URLs we'll accept as the cf-portal MCP server when resolving the
  *  owner's refresh-token config. Codemode variant is excluded so the
  *  individual chat_get_messages tool is exposed. */
@@ -954,8 +961,8 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     await sendChatReply(this.env, {
       spaceId: row.space_id,
       text:
-        "Sorry — I got stuck on that one. The query timed out after " +
-        `${Math.floor(ageSec / 60)} min and I had to give up. ` +
+        "Sorry — that query took too long (over " +
+        `${Math.floor(ageSec / 60)} min) and I had to give up. ` +
         "Try rephrasing or breaking it into smaller pieces.",
     }).catch((err) => {
       log("warn", "watchdog apology to chat failed (non-fatal)", {
