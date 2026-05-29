@@ -875,7 +875,13 @@ export class UserControl extends DurableObject<Env> {
             ? await this.refreshMcpAccessToken(id, ownerEmail)
             : await this.getMcpAccessToken(id, ownerEmail);
           if (!accessToken) return Response.json({ error: "no token" }, { status: 404 });
-          return Response.json({ accessToken });
+          // Surface the stored expiry so callers (e.g. ChatMonitorAgent)
+          // can cache the token and only re-fetch near expiry instead of
+          // hitting this endpoint on every poll. Absent/zero means
+          // "unknown" — callers should fall back to a conservative TTL.
+          const expiresAtRaw = await this.getSecret(`mcp:${id}:expires_at`, ownerEmail);
+          const expiresAt = Number(expiresAtRaw ?? "0");
+          return Response.json({ accessToken, expiresAt });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           return Response.json({ error: message }, { status: 502 });

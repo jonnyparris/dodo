@@ -73,6 +73,24 @@ const DONE_EMOJI = ":b-yes-check:";
  *  be ample for a real query while still bounded enough to surface
  *  genuinely stuck prompts. */
 const BRAIN_PROMPT_TIMEOUT_SECONDS = 600;
+/** Re-fetch the cf-portal access token this many seconds before its
+ *  stated expiry. Mirrors UserControl's own safety margin so the monitor
+ *  and UC agree on when a token is "about to expire". */
+const TOKEN_REFRESH_SAFETY_MARGIN_SECONDS = 60;
+/** When UserControl doesn't report a token expiry (older deploy), cache
+ *  the token for this long before re-fetching. Conservative: a transient
+ *  502 on the token endpoint then only stalls reads for at most this
+ *  window, and a stale token is caught by the auth-retry path anyway. */
+const TOKEN_FALLBACK_TTL_SECONDS = 120;
+/** How often the per-tick brain self-heal probe actually runs. The probe
+ *  re-registers orphaned brain sessions in the UI and re-asserts the
+ *  brain flag; it is not latency-critical, so we throttle it instead of
+ *  paying a UC + CodingAgent DO hop on every poll. */
+const SELFHEAL_MIN_INTERVAL_SECONDS = 300;
+/** How long a fetched owner config is reused before re-reading from
+ *  UserControl. Keeps the prompt-forward path off a UC hop on every
+ *  command message. */
+const OWNER_CONFIG_TTL_SECONDS = 60;
 /** URLs we'll accept as the cf-portal MCP server when resolving the
  *  owner's refresh-token config. Codemode variant is excluded so the
  *  individual chat_get_messages tool is exposed. */
@@ -152,6 +170,23 @@ interface MonitorRow {
   /** Unix seconds of the most recent /prompt POST to the brain. Used by
    *  the runTick watchdog to abort hung brain prompts. */
   last_brain_forward_ts: number | null;
+  /** Cached resolved name of the cf-portal `chat_get_messages` tool, so
+   *  we don't enumerate cf-portal's full tool surface via listTools()
+   *  on every poll. Cleared (→ re-listed) if a call ever reports the
+   *  tool is unknown. */
+  chat_tool_name: string | null;
+  /** Unix seconds of the most recent brain self-heal probe. Throttles
+   *  the per-tick orphaned-session re-register so it isn't a hop on
+   *  every poll. */
+  last_selfheal_ts: number | null;
+}
+
+/** Owner gateway/model config forwarded as headers on the brain prompt. */
+interface OwnerConfig {
+  aiGatewayBaseURL?: string;
+  activeGateway?: string;
+  model?: string;
+  opencodeBaseURL?: string;
 }
 
 interface ChatMessage {
@@ -432,6 +467,18 @@ export function buildBrainGoalText(args: {
 
 export class ChatMonitorAgent extends DurableObject<Env> {
   private migrated = false;
+  /** In-memory cache of the cf-portal access token. Deliberately NEVER
+   *  persisted to storage — bearer tokens stay off disk; UserControl is
+   *  the encrypted source of truth. Lost on DO eviction, repopulated
+   *  with a single UC hop. At a few-second poll cadence the DO stays
+   *  warm, so the common tick reuses this. */
+  private tokenCache: { value: string; expiresAt: number } | null = null;
+  /** In-memory cache of the picked cf-portal MCP config (id + url +
+   *  auth metadata). Rarely changes; cleared on the auth-retry path and
+   *  on DO eviction. */
+  private cfgCache: McpClientConfig | null = null;
+  /** In-memory cache of the owner's gateway/model config. */
+  private ownerConfigCache: { value: OwnerConfig; fetchedAt: number } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -468,6 +515,10 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     // can chew on complex tool-using queries indefinitely without
     // returning) and abort them.
     addCol("ALTER TABLE monitor_state ADD COLUMN last_brain_forward_ts INTEGER");
+    // Cached resolved cf-portal chat tool name — skips listTools() per tick.
+    addCol("ALTER TABLE monitor_state ADD COLUMN chat_tool_name TEXT");
+    // Throttle anchor for the per-tick brain self-heal probe.
+    addCol("ALTER TABLE monitor_state ADD COLUMN last_selfheal_ts INTEGER");
 
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS replied_messages (
@@ -1140,11 +1191,18 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     spaceId: string,
     msg: ChatMessage,
     asCommand: boolean,
+    sideEffects?: Promise<unknown>[],
   ): Promise<void> {
     // Best-effort: add a loading reaction so the human knows the message
-    // was received and is being processed.
+    // was received and is being processed. We kick this off WITHOUT
+    // awaiting it here — an ARIA round-trip in front of the prompt POST
+    // just delays the brain starting. The promise is handed to the
+    // caller's `sideEffects` array and drained at the end of the tick;
+    // if no array is supplied (legacy callers/tests) we fall back to
+    // awaiting inline.
     if (asCommand) {
-      await sendChatReaction(this.env, {
+      this.recordPendingReaction(msg.name);
+      const reactionPromise = sendChatReaction(this.env, {
         messageName: msg.name,
         emoji: LOADING_EMOJI,
         action: "add",
@@ -1154,7 +1212,8 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           error: err instanceof Error ? err.message : String(err),
         });
       });
-      this.recordPendingReaction(msg.name);
+      if (sideEffects) sideEffects.push(reactionPromise);
+      else await reactionPromise;
     }
 
     const agentStub = await getAgentByName(this.env.CODING_AGENT as never, sessionId);
@@ -1173,7 +1232,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         msg.text,
       ].join("\n");
 
-      const ownerConfig = await this.readOwnerConfig(ownerEmail);
+      const ownerConfig = await this.getOwnerConfig(ownerEmail);
       const res = await fetcher(
         new Request("https://coding-agent/prompt", {
           method: "POST",
@@ -1217,14 +1276,23 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     });
   }
 
+  /** Cached read of the owner's app config. The underlying values change
+   *  rarely (gateway / model picks), so reusing them for
+   *  OWNER_CONFIG_TTL_SECONDS keeps a UC DO hop off the prompt-forward
+   *  critical path on back-to-back commands. */
+  private async getOwnerConfig(ownerEmail: string): Promise<OwnerConfig | null> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (this.ownerConfigCache && nowSec - this.ownerConfigCache.fetchedAt < OWNER_CONFIG_TTL_SECONDS) {
+      return this.ownerConfigCache.value;
+    }
+    const cfg = await this.readOwnerConfig(ownerEmail);
+    if (cfg) this.ownerConfigCache = { value: cfg, fetchedAt: nowSec };
+    return cfg;
+  }
+
   /** Read the owner's app config so we can forward the right model /
    *  gateway headers with the prompt POST. Best-effort. */
-  private async readOwnerConfig(ownerEmail: string): Promise<{
-    aiGatewayBaseURL?: string;
-    activeGateway?: string;
-    model?: string;
-    opencodeBaseURL?: string;
-  } | null> {
+  private async readOwnerConfig(ownerEmail: string): Promise<OwnerConfig | null> {
     try {
       const stub = getUserControlStub(this.env, ownerEmail);
       const res = await stub.fetch("https://user-control/config", {
@@ -1300,15 +1368,27 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     // Self-heal probe — if an existing brain session is missing from the
     // UserControl session index (orphaned by a past schema reset or a
     // creation-time race), this re-registers it so it shows up in the UI.
-    // Cheap on the happy path: one /check GET against the UC DO. Runs
-    // once per tick regardless of whether new messages will be forwarded.
+    // It costs a /check GET against the UC DO plus a flag PUT against the
+    // CodingAgent DO. That's pure overhead on a silent space, so throttle
+    // it to SELFHEAL_MIN_INTERVAL_SECONDS rather than paying it on every
+    // poll. Orphaned-session recovery is a slow-path safety net, not a
+    // latency-critical operation; the fresh-create path below still spins
+    // up a brain immediately on the first forwarded message.
     if (row.brain_session_id) {
-      await this.ensureBrainSession(row).catch((err) => {
-        log("warn", "brain session self-heal probe failed (non-fatal)", {
-          sessionId: row.brain_session_id,
-          error: err instanceof Error ? err.message : String(err),
+      const nowSec = Math.floor(Date.now() / 1000);
+      const lastSelfheal = row.last_selfheal_ts ?? 0;
+      if (nowSec - lastSelfheal > SELFHEAL_MIN_INTERVAL_SECONDS) {
+        this.ctx.storage.sql.exec(
+          "UPDATE monitor_state SET last_selfheal_ts = ? WHERE 1=1",
+          nowSec,
+        );
+        await this.ensureBrainSession(row).catch((err) => {
+          log("warn", "brain session self-heal probe failed (non-fatal)", {
+            sessionId: row.brain_session_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
-      });
+      }
     }
 
     const commandSenders = parseCommandSenders(row.command_senders_json);
@@ -1328,6 +1408,14 @@ export class ChatMonitorAgent extends DurableObject<Env> {
 
     // Lazily spawn the brain session on first message we'd send to it.
     let brainSessionId: string | null = row.brain_session_id;
+
+    // Best-effort side effects (loading reactions) kicked off during
+    // forwarding. We don't await them inline — they'd otherwise sit on
+    // the critical path before the brain prompt is even POSTed — but we
+    // DO await them at the end of the tick so the DO doesn't return
+    // before they complete (unawaited promises aren't guaranteed to run
+    // to completion after an alarm handler returns).
+    const sideEffects: Promise<unknown>[] = [];
 
     for (const msg of limited) {
       try {
@@ -1385,7 +1473,7 @@ export class ChatMonitorAgent extends DurableObject<Env> {
           );
         }
 
-        await this.forwardToBrain(brainSessionId, row.owner_email, row.space_id, msg, kind === "command");
+        await this.forwardToBrain(brainSessionId, row.owner_email, row.space_id, msg, kind === "command", sideEffects);
         await this.appendForwardLog({
           messageName: msg.name,
           senderResource: msg.senderResource,
@@ -1402,6 +1490,12 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         const message = err instanceof Error ? err.message : String(err);
         errors.push(`${msg.name}: ${message}`);
       }
+    }
+
+    // Drain best-effort side effects (loading reactions) before returning
+    // so they complete within the tick rather than being cut off.
+    if (sideEffects.length > 0) {
+      await Promise.allSettled(sideEffects);
     }
 
     // Advance cursor to the newest message we saw, even if we skipped it.
@@ -1425,8 +1519,30 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     spaceId: string,
     afterIso: string | null,
   ): Promise<ChatMessage[]> {
-    const stub = getUserControlStub(this.env, ownerEmail);
+    const cfg = await this.getCfPortalConfig(ownerEmail);
+    try {
+      return await this.fetchMessagesOnce(ownerEmail, spaceId, cfg, false);
+    } catch (err) {
+      // A stale cached token (401), a connect blip, or a dropped config
+      // surfaces here. Drop the in-memory caches and retry exactly once
+      // with a force-refreshed token + freshly-picked config before
+      // surfacing the error. This is the common path when the cached
+      // token expired between ticks.
+      this.tokenCache = null;
+      this.cfgCache = null;
+      const msg = err instanceof Error ? err.message : String(err);
+      log("warn", "chat fetch failed; retrying once with forced token refresh", {
+        error: msg.slice(0, 200),
+      });
+      const freshCfg = await this.getCfPortalConfig(ownerEmail);
+      return await this.fetchMessagesOnce(ownerEmail, spaceId, freshCfg, true);
+    }
+  }
 
+  /** Resolve (and cache) the cf-portal MCP config for this owner. */
+  private async getCfPortalConfig(ownerEmail: string): Promise<McpClientConfig> {
+    if (this.cfgCache) return this.cfgCache;
+    const stub = getUserControlStub(this.env, ownerEmail);
     const cfgRes = await stub.fetch("https://user-control/mcp-configs", {
       headers: { "x-owner-email": ownerEmail },
     });
@@ -1437,27 +1553,85 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       throw new Error(`cf-portal MCP config not found for ${ownerEmail}. Run /dodo-dcr-oauth first.`);
     }
     if (!cfg.url) throw new Error("cf-portal config has no url");
+    this.cfgCache = cfg;
+    return cfg;
+  }
 
+  /** Return a cf-portal access token, reusing the in-memory cache unless
+   *  forced or within the refresh safety margin of expiry. */
+  private async getAccessToken(ownerEmail: string, configId: string, force: boolean): Promise<string> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (
+      !force &&
+      this.tokenCache &&
+      this.tokenCache.expiresAt - nowSec > TOKEN_REFRESH_SAFETY_MARGIN_SECONDS
+    ) {
+      return this.tokenCache.value;
+    }
+    const stub = getUserControlStub(this.env, ownerEmail);
     const tokenRes = await stub.fetch(
-      `https://user-control/mcp-configs/${encodeURIComponent(cfg.id)}/access-token`,
+      `https://user-control/mcp-configs/${encodeURIComponent(configId)}/access-token${force ? "?force=1" : ""}`,
       { headers: { "x-owner-email": ownerEmail } },
     );
     if (!tokenRes.ok) {
-      throw new Error(`cf-portal access-token fetch failed (${tokenRes.status}) for config ${cfg.id}.`);
+      throw new Error(`cf-portal access-token fetch failed (${tokenRes.status}) for config ${configId}.`);
     }
-    const { accessToken } = (await tokenRes.json()) as { accessToken?: string };
-    if (!accessToken) throw new Error("cf-portal returned no access token");
+    const body = (await tokenRes.json()) as { accessToken?: string; expiresAt?: number };
+    if (!body.accessToken) throw new Error("cf-portal returned no access token");
+    const expiresAt =
+      typeof body.expiresAt === "number" && body.expiresAt > 0
+        ? body.expiresAt
+        : nowSec + TOKEN_FALLBACK_TTL_SECONDS;
+    this.tokenCache = { value: body.accessToken, expiresAt };
+    return body.accessToken;
+  }
 
+  /** Read the cached cf-portal chat tool name, if resolved. */
+  private readChatToolName(): string | null {
+    this.ensureMigrations();
+    const rows = Array.from(
+      this.ctx.storage.sql.exec("SELECT chat_tool_name FROM monitor_state LIMIT 1"),
+    );
+    if (rows.length === 0) return null;
+    const v = (rows[0] as unknown as Record<string, unknown>).chat_tool_name;
+    return typeof v === "string" && v.length > 0 ? v : null;
+  }
+
+  private writeChatToolName(name: string | null): void {
+    this.ensureMigrations();
+    this.ctx.storage.sql.exec("UPDATE monitor_state SET chat_tool_name = ? WHERE 1=1", name);
+  }
+
+  /** Single read attempt against cf-portal with a given token freshness. */
+  private async fetchMessagesOnce(
+    ownerEmail: string,
+    spaceId: string,
+    cfg: McpClientConfig,
+    force: boolean,
+  ): Promise<ChatMessage[]> {
+    const accessToken = await this.getAccessToken(ownerEmail, cfg.id, force);
     const client = new HttpMcpClient({ ...cfg, headers: { Authorization: `Bearer ${accessToken}` } }, 0);
     try {
       await client.connect();
-      const tools = await client.listTools();
-      const chatTool = findChatGetMessagesTool(tools);
-      if (!chatTool) {
-        throw new Error(
-          `chat_get_messages tool not found on cf-portal; available: ${tools.slice(0, 5).map((t) => t.name).join(", ")}`,
-        );
+
+      // Resolve the tool name from cache; only enumerate cf-portal's full
+      // tool surface (listTools) when we don't have it. cf-portal proxies
+      // a large tool set, so listTools is the dominant per-tick cost — at
+      // a few-second cadence we'd otherwise pay it ~20×/min for a value
+      // that never changes.
+      let toolName = this.readChatToolName();
+      if (!toolName) {
+        const tools = await client.listTools();
+        const chatTool = findChatGetMessagesTool(tools);
+        if (!chatTool) {
+          throw new Error(
+            `chat_get_messages tool not found on cf-portal; available: ${tools.slice(0, 5).map((t) => t.name).join(", ")}`,
+          );
+        }
+        toolName = chatTool.name;
+        this.writeChatToolName(toolName);
       }
+
       // Pull newest-first and filter locally. Empirically the cf-portal
       // tool's `after` parameter doesn't reliably narrow results when
       // newestFirst=false (returns 0 even when newer messages exist).
@@ -1469,9 +1643,14 @@ export class ChatMonitorAgent extends DurableObject<Env> {
         maxResults: 25,
         newestFirst: true,
       };
-      const result = await client.callTool(chatTool.name, callArgs);
+      const result = await client.callTool(toolName, callArgs);
       if (result.isError) {
         const text = result.content.map((c) => c.text ?? "").join("\n");
+        // A cached tool name that no longer resolves — drop it so the
+        // retry (or next tick) re-lists and re-caches.
+        if (/not\s*found|unknown tool|no such tool/i.test(text)) {
+          this.writeChatToolName(null);
+        }
         throw new Error(`chat_get_messages error: ${text.slice(0, 500)}`);
       }
       return parseChatGetMessagesResult(result.content);
