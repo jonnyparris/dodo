@@ -48,6 +48,24 @@ const DEFAULT_CLOUDFLARE_REMOTE_MCP_CATALOG: McpCatalogEntry[] = [
     auth_type: "oauth",
     knownHosts: ["browser.mcp.cloudflare.com"],
   },
+  {
+    id: "web-search",
+    name: "Web Search",
+    description:
+      "Search the public web for URLs matching a query, powered by Cloudflare Web Search. Returns titles and catalog metadata — not page content; fetch a result URL yourself to read it.",
+    // Staging endpoint. Same *.mcp.cloudflare.com OAuth family as the
+    // Browser Rendering MCP above (which works from Dodo), unlike cf-portal
+    // on portal.mcp.cfdata.org (loopback-only redirect, excluded below).
+    // The companion `web_search` Worker binding (env.WEBSEARCH) was tried and
+    // reverted — the control plane silently drops the binding so it never
+    // materialises at runtime. This MCP is the working path until the binding
+    // GAs. See commit reverting "add Cloudflare Web Search binding".
+    url: "https://websearch-staging.mcp.cloudflare.com/mcp",
+    setupGuide:
+      "Connect with OAuth. Staging: your Cloudflare account must be enabled for Web Search by the Web Search team before queries succeed.",
+    auth_type: "oauth",
+    knownHosts: ["websearch-staging.mcp.cloudflare.com"],
+  },
   // NOTE: cf-portal (https://portal.mcp.cfdata.org/mcp) was tested and is
   // intentionally NOT in this catalog. Its OAuth authorize endpoint
   // (cf-mcp.cloudflareaccess.com) only accepts redirect URIs pointing at

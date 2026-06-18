@@ -23,6 +23,13 @@ describe("MCP_CATALOG", () => {
     expect(entry?.knownHosts).toContain("browser.mcp.cloudflare.com");
   });
 
+  it("includes web-search as an OAuth catalog entry", () => {
+    const entry = MCP_CATALOG.find((e) => e.id === "web-search");
+    expect(entry).toBeDefined();
+    expect(entry?.auth_type).toBe("oauth");
+    expect(entry?.knownHosts).toContain("websearch-staging.mcp.cloudflare.com");
+  });
+
   it("does NOT include github as an OAuth catalog entry — GitHub's MCP server doesn't support DCR", () => {
     // Documented in mcp-catalog.ts. api.githubcopilot.com returns
     // "Incompatible auth server: does not support dynamic client
