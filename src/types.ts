@@ -4,6 +4,60 @@ import type { CodingAgent } from "./coding-agent";
 import type { SharedIndex } from "./shared-index";
 import type { UserControl } from "./user-control";
 
+/**
+ * Cloudflare Web Search binding (`env.WEBSEARCH`).
+ *
+ * Discovery-only: `search()` returns URLs plus a small amount of catalog
+ * metadata (title, description, summary, thumbnail, favicon). It never
+ * returns page bodies, snippets, or excerpts — to read a result, fetch the
+ * URL yourself with the global `fetch()` API (at which point the
+ * destination's own access controls, including Pay-per-Crawl, apply).
+ *
+ * Hand-written here rather than pulled from `@cloudflare/workers-types`
+ * because the runtime type hadn't shipped to the installed types package
+ * when this binding was wired in. The shape matches the public Web Search
+ * v1 contract, which is designed to survive the whitelabel→Cloudflare-index
+ * cutover unchanged. See:
+ *   https://wiki.cfdata.org/spaces/~gmassadas/pages/1406852834
+ */
+export interface WebSearchOptions {
+  /** The search query. */
+  query: string;
+  /** Max results to return. Default 10, max 50. Actual count may be lower. */
+  limit?: number;
+}
+
+export interface WebSearchResult {
+  /** Canonical URL of the matched page. */
+  url: string;
+  /** Page title. */
+  title: string;
+  /** Page-level description. May be absent. */
+  description?: string;
+  /** Summary of the page contents. May be absent. */
+  summary?: string;
+  /** Optional preview image. */
+  thumbnailUrl?: string;
+  /** Optional favicon for UI hints. */
+  faviconUrl?: string;
+}
+
+export interface WebSearchResponse {
+  results: WebSearchResult[];
+  metadata: {
+    /** The query that was executed. */
+    query: string;
+    /** Request id for support / debugging. */
+    requestId: string;
+    /** Backend latency in milliseconds. */
+    latencyMs: number;
+  };
+}
+
+export interface WebSearch {
+  search(options: WebSearchOptions): Promise<WebSearchResponse>;
+}
+
 export interface Env {
   AI: Ai;
   AI_GATEWAY_BASE_URL: string;
@@ -30,6 +84,13 @@ export interface Env {
   LOADER?: WorkerLoader;
   OPENCODE_BASE_URL: string;
   OUTBOUND?: Fetcher;
+  /**
+   * Cloudflare Web Search binding. Zero-config (one shared web corpus),
+   * declared in wrangler.jsonc as `"websearch": { "binding": "WEBSEARCH" }`.
+   * Optional so the `web_search` tool is env-gated — absent in tests and any
+   * deploy that doesn't declare it. See the WebSearch interface above.
+   */
+  WEBSEARCH?: WebSearch;
   WORKER_URL: string;
   WORKSPACE_BUCKET?: R2Bucket;
   /**

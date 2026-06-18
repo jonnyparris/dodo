@@ -117,6 +117,13 @@
   "ai": {
     "binding": "AI"
   },
+  // Cloudflare Web Search — zero-config discovery binding (one shared web
+  // corpus, so a single object, not an array). Exposed to the coding agent
+  // as the `web_search` tool (src/agentic.ts, env-gated on this binding).
+  // Returns URLs + catalog metadata only, never page bodies.
+  "websearch": {
+    "binding": "WEBSEARCH"
+  },
   "secrets": {
     "required": ["ADMIN_EMAIL"]
   },

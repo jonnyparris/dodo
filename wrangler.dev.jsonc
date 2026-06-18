@@ -51,6 +51,15 @@
   "browser": {
     "binding": "BROWSER"
   },
+  // Cloudflare Web Search — mirrors wrangler.jsonc. `remote: true` so local
+  // `wrangler dev` proxies to the deployed Web Search service (there is no
+  // local implementation of the binding). Requires the dev account to have
+  // Web Search access; if it breaks `npm run dev`, drop this block — the
+  // `web_search` tool is env-gated and simply won't register without it.
+  "websearch": {
+    "binding": "WEBSEARCH",
+    "remote": true
+  },
   "triggers": {
     "crons": ["0 */6 * * *"]
   },
