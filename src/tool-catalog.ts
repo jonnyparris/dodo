@@ -127,17 +127,6 @@ const ORCHESTRATOR_TOOLS: ToolCatalogEntry[] = [
     alwaysOn: false,
     caveat: "Requires browser bindings, session browser config, and admin owner.",
   },
-  // Web Search — Cloudflare Web Search binding. Gated on the WEBSEARCH
-  // binding being declared in wrangler.jsonc. Discovery-only (URLs + metadata).
-  {
-    name: "web_search",
-    description:
-      "Search the public web for URLs matching a query — returns titles and catalog metadata, not page content.",
-    category: "discovery",
-    alwaysOn: false,
-    caveat:
-      "Requires the WEBSEARCH binding (Cloudflare Web Search). Fetch a result URL yourself to read its content.",
-  },
   // Git — only the hot-path quartet is top-level. Everything else is
   // reachable inside codemode via the `git.*` provider namespace; flagged
   // with CODEMODE_GIT_CAVEAT so the UI dims them and the drift test can

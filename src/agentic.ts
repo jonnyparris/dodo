@@ -254,7 +254,6 @@ export const KNOWN_CONDITIONAL_TOOL_NAMES = [
   "codemode",       // requires env.LOADER
   "browser_search", // requires browser bindings + admin + session config
   "browser_execute",
-  "web_search",     // requires the WEBSEARCH binding (Cloudflare Web Search)
 ] as const;
 
 export function capCodemodeResult(result: unknown, maxBytes: number): unknown {
@@ -1397,57 +1396,6 @@ function buildChatReplyTool(env: Env, opts: {
   });
 }
 
-/**
- * Web Search tool — wraps the Cloudflare Web Search binding (`env.WEBSEARCH`).
- *
- * Discovery-only by design: returns URLs plus catalog metadata (title,
- * description, summary, thumbnail, favicon), never page bodies. The
- * description steers the model to fetch a URL itself when it needs content,
- * which composes cleanly with a follow-up `fetch`/codemode step and keeps
- * Web Search a good citizen of Pay-per-Crawl.
- */
-function buildWebSearchTool(env: Env): AnyTool {
-  return tool({
-    description: [
-      "Search the public web for URLs matching a query, using Cloudflare Web Search.",
-      "",
-      "Returns a list of results with `url`, `title`, and optional `description`/`summary`/",
-      "`thumbnailUrl`/`faviconUrl` — discovery metadata only, NOT page content. To read a",
-      "result's body, fetch its URL yourself (e.g. via a codemode `fetch()` step); the",
-      "destination's own access controls then apply.",
-      "",
-      "Use this for real-time lookups the workspace can't answer: recent news, current docs,",
-      "release notes, library versions, etc. Answer from titles/descriptions when that's",
-      "enough; fetch a URL when you need the actual content.",
-    ].join("\n"),
-    inputSchema: zodSchema(
-      z.object({
-        query: z.string().min(1).describe("The search query."),
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .max(50)
-          .optional()
-          .describe("Max results to return. Default 10, max 50."),
-      }),
-    ),
-    execute: async ({ query, limit }: { query: string; limit?: number }) => {
-      if (!env.WEBSEARCH) {
-        return { error: "Web Search binding (WEBSEARCH) is not configured." };
-      }
-      try {
-        const { results, metadata } = await env.WEBSEARCH.search({ query, limit });
-        return { results, metadata };
-      } catch (error) {
-        return {
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-    },
-  });
-}
-
 function buildTools(
   env: Env,
   workspace: Workspace,
@@ -1728,15 +1676,6 @@ function buildTools(
       onAttachments: options?.onToolAttachments,
     });
     Object.assign(tools, browserTools);
-  }
-
-  // Web Search tool — Cloudflare Web Search binding (`env.WEBSEARCH`).
-  // Gated solely on the binding being present (declared in wrangler.jsonc as
-  // `websearch`). Unlike browser, it isn't admin- or session-gated: it's a
-  // zero-config discovery primitive billed to Dodo's own account, so any
-  // session can use it when the binding is wired.
-  if (env.WEBSEARCH) {
-    tools.web_search = buildWebSearchTool(env);
   }
 
   return tools;
