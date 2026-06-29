@@ -40,6 +40,66 @@ function isRoutableByOpencodeGateway(id: string): boolean {
   return true;
 }
 
+/** Shape of a model entry from the Cloudflare AI models search API
+ *  (`GET /accounts/{id}/ai/models/search`). Only the fields we consume. */
+interface WorkersAiCatalogModel {
+  name?: string;
+  properties?: Array<{ property_id?: string; value?: unknown }>;
+}
+
+/**
+ * Map one Cloudflare AI catalogue entry to our `{ id, name, cost*, context }`
+ * model shape. Returns null for entries we don't want to surface in the chat
+ * model picker:
+ *   - missing/invalid `name` (the `@cf/...` id),
+ *   - LoRA adapters (`lora: true`) — these aren't usable as a standalone chat
+ *     model id, so listing them would just produce broken selections.
+ *
+ * `name`/`id` is the catalogue `name` (e.g. `@cf/openai/gpt-oss-120b`). The
+ * wire-format `workers-ai/` prefix is applied later in resolveWireModelId.
+ */
+export function mapWorkersAiCatalogModel(
+  m: WorkersAiCatalogModel,
+): { id: string; name: string; costInput: number | null; costOutput: number | null; contextWindow: number | null } | null {
+  const id = typeof m.name === "string" ? m.name : "";
+  if (!id.startsWith("@cf/")) return null;
+
+  const props = new Map<string, unknown>();
+  for (const p of m.properties ?? []) {
+    if (p && typeof p.property_id === "string") props.set(p.property_id, p.value);
+  }
+
+  if (props.get("lora") === "true" || props.get("lora") === true) return null;
+
+  const ctxRaw = props.get("context_window");
+  const contextWindow = typeof ctxRaw === "string" && /^\d+$/.test(ctxRaw)
+    ? parseInt(ctxRaw, 10)
+    : typeof ctxRaw === "number"
+      ? ctxRaw
+      : null;
+
+  let costInput: number | null = null;
+  let costOutput: number | null = null;
+  const price = props.get("price");
+  if (Array.isArray(price)) {
+    for (const entry of price) {
+      if (!entry || typeof entry !== "object") continue;
+      const unit = String((entry as { unit?: unknown }).unit ?? "").toLowerCase();
+      const value = (entry as { price?: unknown }).price;
+      const num = typeof value === "number" ? value : typeof value === "string" ? parseFloat(value) : NaN;
+      if (!Number.isFinite(num)) continue;
+      if (unit.includes("input")) costInput = num;
+      else if (unit.includes("output")) costOutput = num;
+    }
+  }
+
+  // Display name: drop the `@cf/` prefix and tag the provider so the picker
+  // reads e.g. "openai/gpt-oss-120b (Workers AI)".
+  const name = `${id.slice("@cf/".length)} (Workers AI)`;
+
+  return { id, name, costInput, costOutput, contextWindow };
+}
+
 /**
  * SharedIndex DO — global singleton (`idFromName("global")`).
  *
@@ -188,6 +248,7 @@ export class SharedIndex extends DurableObject<Env> {
         const refresh = url.searchParams.get("refresh") === "1";
         if (refresh) {
           this.ctx.storage.sql.exec("DELETE FROM models_cache");
+          this.ctx.storage.sql.exec("DELETE FROM workers_ai_models_cache");
         }
         // `gateway` query param filters the list for the active gateway.
         // "opencode" → only providers the opencode gateway can actually route.
@@ -202,7 +263,17 @@ export class SharedIndex extends DurableObject<Env> {
           ? models.filter((m) => isRoutableByOpencodeGateway(m.id))
           : models;
         const ids = new Set(filteredBase.map((m) => m.id));
-        const extras = WORKERS_AI_MODELS.filter((m) => !ids.has(m.id));
+        // Append the live Workers AI catalogue (falls back to the hardcoded
+        // WORKERS_AI_MODELS when the API is unavailable). Union the hardcoded
+        // list in too so curated favourites survive any catalogue naming drift.
+        const liveWorkersAi = await this.getWorkersAiModels();
+        const seen = new Set<string>();
+        const extras: Array<{ id: string; name: string; costInput: number | null; costOutput: number | null; contextWindow: number | null }> = [];
+        for (const m of [...liveWorkersAi, ...WORKERS_AI_MODELS]) {
+          if (ids.has(m.id) || seen.has(m.id)) continue;
+          seen.add(m.id);
+          extras.push(m);
+        }
         return Response.json({ models: [...filteredBase, ...extras] });
       }
 
@@ -681,6 +752,21 @@ export class SharedIndex extends DurableObject<Env> {
       )
     `);
 
+    // Live Workers AI text-generation catalogue, fetched from the Cloudflare
+    // AI models API and cached here so the model picker autocompletes every
+    // @cf/* model available on the account — not just the hardcoded handful in
+    // WORKERS_AI_MODELS. Same shape as models_cache.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS workers_ai_models_cache (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        cost_input REAL,
+        cost_output REAL,
+        context_window INTEGER,
+        fetched_at INTEGER NOT NULL
+      )
+    `);
+
     // Phase 2 tables — created now so schema is stable
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS session_shares (
@@ -1020,6 +1106,68 @@ export class SharedIndex extends DurableObject<Env> {
     } catch {
       return FALLBACK_MODELS;
     }
+  }
+
+  /**
+   * Live Workers AI text-generation catalogue for the account, fetched from
+   * the Cloudflare AI models API and cached for 24h. Lets the model picker
+   * autocomplete every `@cf/*` chat model available on the account instead of
+   * just the hardcoded `WORKERS_AI_MODELS` handful.
+   *
+   * Best-effort: when the API token/account aren't configured, the fetch
+   * fails, or it returns nothing usable, we fall back to a stale cache (if
+   * any) and then to the hardcoded `WORKERS_AI_MODELS`. Never throws.
+   */
+  private async getWorkersAiModels(): Promise<Array<{ id: string; name: string; costInput: number | null; costOutput: number | null; contextWindow: number | null }>> {
+    const CACHE_TTL = 86400;
+    const now = nowEpoch();
+
+    const cached = Array.from(this.ctx.storage.sql.exec(
+      "SELECT id, name, cost_input, cost_output, context_window FROM workers_ai_models_cache WHERE fetched_at > ?",
+      now - CACHE_TTL,
+    ));
+    if (cached.length > 0) return cached.map((row) => this.mapModelRow(row));
+
+    const accountId = this.env.CLOUDFLARE_ACCOUNT_ID;
+    const token = this.env.CLOUDFLARE_API_TOKEN;
+    if (!accountId || !token) return WORKERS_AI_MODELS;
+
+    try {
+      const res = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search?task=Text+Generation&per_page=100`,
+        { headers: { Authorization: `Bearer ${token}`, "User-Agent": "dodo-agent" } },
+      );
+      if (!res.ok) return this.staleWorkersAiOrFallback();
+      const body = (await res.json()) as { success?: boolean; result?: WorkersAiCatalogModel[] };
+      if (!body.success || !Array.isArray(body.result)) return this.staleWorkersAiOrFallback();
+
+      const models = body.result
+        .map((m) => mapWorkersAiCatalogModel(m))
+        .filter((m): m is NonNullable<typeof m> => m !== null);
+      if (models.length === 0) return this.staleWorkersAiOrFallback();
+
+      this.ctx.storage.sql.exec("DELETE FROM workers_ai_models_cache");
+      for (const m of models) {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO workers_ai_models_cache (id, name, cost_input, cost_output, context_window, fetched_at) VALUES (?, ?, ?, ?, ?, ?)",
+          m.id, m.name, m.costInput, m.costOutput, m.contextWindow, now,
+        );
+      }
+      return models;
+    } catch {
+      return this.staleWorkersAiOrFallback();
+    }
+  }
+
+  /** Return whatever is in the Workers AI cache regardless of TTL, else the
+   *  hardcoded list. Used when a live refresh fails so we never regress to
+   *  fewer models than before. */
+  private staleWorkersAiOrFallback(): Array<{ id: string; name: string; costInput: number | null; costOutput: number | null; contextWindow: number | null }> {
+    const stale = Array.from(this.ctx.storage.sql.exec(
+      "SELECT id, name, cost_input, cost_output, context_window FROM workers_ai_models_cache",
+    ));
+    if (stale.length > 0) return stale.map((row) => this.mapModelRow(row));
+    return WORKERS_AI_MODELS;
   }
 
   private async enrichModelCosts(modelIds: string[]): Promise<void> {
