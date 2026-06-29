@@ -23,6 +23,7 @@ import {
 import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
 import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import { createShellTool } from "./tools/shell";
+import { sanitizeToolJsonSchema } from "./tool-schema";
 import { runTypecheck } from "./typecheck";
 import type { AppConfig, Env, TodoStore } from "./types";
 
@@ -1740,9 +1741,10 @@ function buildMcpTools(gatekeepers: McpClient[], existingNames: Set<string>): Re
       if (suppressChatReplyMcp && mcpTool.name.endsWith("__chat_reply")) continue;
       tools[mcpTool.name] = tool({
         description: mcpTool.description ?? `MCP tool: ${mcpTool.name}`,
-        inputSchema: mcpTool.inputSchema
-          ? jsonSchema(mcpTool.inputSchema as Record<string, unknown>)
-          : jsonSchema({ type: "object", properties: {} }),
+        // Sanitise the third-party schema: a single tool with an invalid
+        // draft-2020-12 schema makes strict providers (Workers AI glm-*)
+        // 400 the entire request. See src/tool-schema.ts.
+        inputSchema: jsonSchema(sanitizeToolJsonSchema(mcpTool.inputSchema)),
         execute: async (args: unknown) => {
           const result = await gk.callTool(mcpTool.name, args);
           if (result.isError) {
@@ -1806,9 +1808,9 @@ function buildOAuthMcpTools(
 
     tools[prefixedName] = tool({
       description: info.description ?? `OAuth MCP tool: ${info.name}`,
-      inputSchema: info.inputSchema
-        ? jsonSchema(info.inputSchema)
-        : jsonSchema({ type: "object", properties: {} }),
+      // Sanitise the third-party schema before forwarding to the provider —
+      // see buildMcpTools above and src/tool-schema.ts.
+      inputSchema: jsonSchema(sanitizeToolJsonSchema(info.inputSchema)),
       execute: async (args: unknown) => {
         try {
           return await executor(info.serverId, info.name, args);
