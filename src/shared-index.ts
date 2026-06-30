@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { resolveAdminEmail } from "./auth";
-import { FALLBACK_MODELS, WORKERS_AI_MODELS } from "./model-catalog";
+import { DEFAULT_REPLICATE_IMAGE_MODEL, FALLBACK_MODELS, WORKERS_AI_MODELS } from "./model-catalog";
 import { hashShareToken } from "./share";
 import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import type { AllowlistEntry, Env, SeedRecord } from "./types";
@@ -98,6 +98,29 @@ export function mapWorkersAiCatalogModel(
   const name = `${id.slice("@cf/".length)} (Workers AI)`;
 
   return { id, name, costInput, costOutput, contextWindow };
+}
+
+/** Shape of a model entry inside a Replicate collection
+ *  (`GET /v1/collections/{slug}`). Only the fields we consume. */
+interface ReplicateCollectionModel {
+  owner?: string;
+  name?: string;
+  description?: string;
+}
+
+/** Map a Replicate collection model to `{ id: "owner/name", label }`. Returns
+ *  null when owner/name are missing. Label is a short `owner/name — desc`. */
+export function mapReplicateCollectionModel(
+  m: ReplicateCollectionModel,
+): { id: string; label: string } | null {
+  const owner = typeof m.owner === "string" ? m.owner.trim() : "";
+  const name = typeof m.name === "string" ? m.name.trim() : "";
+  if (!owner || !name) return null;
+  const id = `${owner}/${name}`;
+  const desc = typeof m.description === "string" ? m.description.trim() : "";
+  const shortDesc = desc.length > 70 ? `${desc.slice(0, 70).trimEnd()}…` : desc;
+  const label = shortDesc ? `${id} — ${shortDesc}` : id;
+  return { id, label };
 }
 
 /**
@@ -275,6 +298,14 @@ export class SharedIndex extends DurableObject<Env> {
           extras.push(m);
         }
         return Response.json({ models: [...filteredBase, ...extras] });
+      }
+
+      // Replicate image-model catalogue for the "Image model" picker.
+      if (request.method === "GET" && url.pathname === "/replicate-models") {
+        if (url.searchParams.get("refresh") === "1") {
+          this.ctx.storage.sql.exec("DELETE FROM replicate_models_cache");
+        }
+        return Response.json({ models: await this.getReplicateImageModels() });
       }
 
       // ─── Session shares ───
@@ -767,6 +798,17 @@ export class SharedIndex extends DurableObject<Env> {
       )
     `);
 
+    // Replicate image models (text-to-image + image-editing collections),
+    // fetched from the Replicate API and cached so the "Image model" Settings
+    // field autocompletes. id is "owner/name"; label is a short description.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS replicate_models_cache (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        fetched_at INTEGER NOT NULL
+      )
+    `);
+
     // Phase 2 tables — created now so schema is stable
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS session_shares (
@@ -1168,6 +1210,81 @@ export class SharedIndex extends DurableObject<Env> {
     ));
     if (stale.length > 0) return stale.map((row) => this.mapModelRow(row));
     return WORKERS_AI_MODELS;
+  }
+
+  /**
+   * Replicate image models for the "Image model" picker — the union of the
+   * curated `text-to-image` and `image-editing` collections, cached 24h. The
+   * configured default is always included so the field never autocompletes to
+   * an empty/missing default.
+   *
+   * Best-effort: falls back to a small curated list when the token is unset,
+   * the fetch fails, or the collections come back empty. Never throws.
+   */
+  private async getReplicateImageModels(): Promise<Array<{ id: string; label: string }>> {
+    const CACHE_TTL = 86400;
+    const now = nowEpoch();
+
+    const cached = Array.from(this.ctx.storage.sql.exec(
+      "SELECT id, label FROM replicate_models_cache WHERE fetched_at > ?",
+      now - CACHE_TTL,
+    ));
+    if (cached.length > 0) return cached.map((row) => ({ id: String(row.id), label: String(row.label) }));
+
+    const token = this.env.REPLICATE_API_TOKEN;
+    const defaultModel = this.env.DEFAULT_REPLICATE_IMAGE_MODEL || DEFAULT_REPLICATE_IMAGE_MODEL;
+    if (!token) return this.staleReplicateOrFallback(defaultModel);
+
+    try {
+      const collections = ["text-to-image", "image-editing"];
+      const results = await Promise.all(
+        collections.map(async (slug) => {
+          const res = await fetch(`https://api.replicate.com/v1/collections/${slug}`, {
+            headers: { Authorization: `Bearer ${token}`, "User-Agent": "dodo-agent" },
+          });
+          if (!res.ok) return [] as ReplicateCollectionModel[];
+          const body = (await res.json()) as { models?: ReplicateCollectionModel[] };
+          return Array.isArray(body.models) ? body.models : [];
+        }),
+      );
+
+      const byId = new Map<string, string>();
+      // Ensure the configured default is always offered, even if a collection
+      // hasn't been curated to include it yet.
+      byId.set(defaultModel, defaultModel);
+      for (const model of results.flat()) {
+        const mapped = mapReplicateCollectionModel(model);
+        if (mapped && !byId.has(mapped.id)) byId.set(mapped.id, mapped.label);
+      }
+      if (byId.size === 0) return this.staleReplicateOrFallback(defaultModel);
+
+      const models = Array.from(byId, ([id, label]) => ({ id, label }));
+      this.ctx.storage.sql.exec("DELETE FROM replicate_models_cache");
+      for (const m of models) {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO replicate_models_cache (id, label, fetched_at) VALUES (?, ?, ?)",
+          m.id, m.label, now,
+        );
+      }
+      return models;
+    } catch {
+      return this.staleReplicateOrFallback(defaultModel);
+    }
+  }
+
+  /** Stale Replicate cache regardless of TTL, else a small curated fallback
+   *  that always includes the configured default model. */
+  private staleReplicateOrFallback(defaultModel: string): Array<{ id: string; label: string }> {
+    const stale = Array.from(this.ctx.storage.sql.exec("SELECT id, label FROM replicate_models_cache"));
+    if (stale.length > 0) return stale.map((row) => ({ id: String(row.id), label: String(row.label) }));
+    const curated = [
+      { id: defaultModel, label: defaultModel },
+      { id: "google/nano-banana", label: "google/nano-banana" },
+      { id: "black-forest-labs/flux-kontext-pro", label: "black-forest-labs/flux-kontext-pro" },
+      { id: "black-forest-labs/flux-1.1-pro", label: "black-forest-labs/flux-1.1-pro" },
+    ];
+    const seen = new Set<string>();
+    return curated.filter((m) => (seen.has(m.id) ? false : (seen.add(m.id), true)));
   }
 
   private async enrichModelCosts(modelIds: string[]): Promise<void> {

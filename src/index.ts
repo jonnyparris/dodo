@@ -1240,6 +1240,7 @@ app.get("/api/tool-catalog", async (c) => {
 // ─── Models (global via SharedIndex) ───
 
 app.get("/api/models", async (c) => proxyToSharedIndex(c.env, `/models${new URL(c.req.raw.url).search}`));
+app.get("/api/replicate-models", async (c) => proxyToSharedIndex(c.env, `/replicate-models${new URL(c.req.raw.url).search}`));
 
 // ─── Status (per-user) ───
 

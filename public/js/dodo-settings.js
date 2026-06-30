@@ -179,6 +179,19 @@ async function loadModels(){
   }catch{}
 }
 
+// Populate the "Image model" datalist from the live Replicate image-model
+// collections (text-to-image + image-editing). Suggestions only — the field
+// still accepts any owner/name a user types.
+async function loadReplicateModels(){
+  try{
+    const dl=$("image-model-list");
+    if(!dl)return;
+    const{models}=await api("/api/replicate-models");
+    dl.innerHTML="";
+    (models||[]).forEach(m=>{const o=document.createElement("option");o.value=m.id;o.textContent=m.label||m.id;dl.appendChild(o)});
+  }catch{}
+}
+
 // --- Browser Rendering Config ---
 
 async function loadBrowserConfig(){

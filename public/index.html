@@ -721,7 +721,8 @@
             <label for="cfg-gateway-url" class="field-label">Gateway URL</label>
             <input id="cfg-gateway-url" placeholder="https://..."/>
             <label for="cfg-image-model" class="field-label">Image model <span class="field-label-sm">(Replicate — generation &amp; editing)</span></label>
-            <input id="cfg-image-model" placeholder="google/nano-banana-2"/>
+            <input id="cfg-image-model" list="image-model-list" placeholder="google/nano-banana-2"/>
+            <datalist id="image-model-list"></datalist>
             <label for="cfg-git-author-name" class="field-label">Git Author Name</label>
             <input id="cfg-git-author-name" placeholder="Dodo"/>
             <label for="cfg-git-author-email" class="field-label">Git Author Email</label>
