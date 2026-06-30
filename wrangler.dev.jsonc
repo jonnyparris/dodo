@@ -65,6 +65,7 @@
     "DEFAULT_MODEL": "anthropic/claude-sonnet-4",
     // Default model used when a new session is created with activeGateway=ai-gateway.
     "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
+    "DEFAULT_REPLICATE_IMAGE_MODEL": "google/nano-banana-2",
     "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
     // AI Gateway unified API: include /{account_id}/{gateway_id}/compat
     "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1/your-account-id/your-gateway/compat",

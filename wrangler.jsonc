@@ -125,6 +125,10 @@
     // Default model used when a new session is created with activeGateway=ai-gateway.
     // Workers AI models (`@cf/…`) are only routable via AI Gateway.
     "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
+    // Default Replicate image model for /generate and image editing. Per-user
+    // overridable via the replicateImageModel config field. Requires the
+    // REPLICATE_API_TOKEN secret to be set.
+    "DEFAULT_REPLICATE_IMAGE_MODEL": "google/nano-banana-2",
     // Default model for the `explore` / `task` subagents.
     //
     // Initially set to Kimi K2.6 based on the main-model comparison, but

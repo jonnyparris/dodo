@@ -66,6 +66,14 @@ export interface Env {
   /** Worker script name used when querying observability for this worker. Wrangler var. */
   DODO_WORKER_NAME?: string;
 
+  /** Replicate API token for image generation + editing. Wrangler secret:
+   *  `wrangler secret put REPLICATE_API_TOKEN`. When unset, the image path
+   *  returns a clear "not configured" error. */
+  REPLICATE_API_TOKEN?: string;
+  /** Default Replicate image model id (owner/name). Wrangler var. Falls back
+   *  to `google/nano-banana-2` in code when unset. */
+  DEFAULT_REPLICATE_IMAGE_MODEL?: string;
+
   // Per-user secrets (deprecated as env vars — now in UserControl encrypted_secrets)
   // Kept temporarily for migration and fallback
   GITHUB_TOKEN?: string;
@@ -131,6 +139,11 @@ export interface AppConfig {
   exploreModel?: string;
   /** Same as exploreModel but for the generic `task` subagent. */
   taskModel?: string;
+  /**
+   * Replicate model id (owner/name) used for image generation + editing.
+   * Default `google/nano-banana-2`. Configurable per-user from Settings.
+   */
+  replicateImageModel?: string;
   /**
    * Where explore subagent work runs.
    *
@@ -201,6 +214,8 @@ export interface UpdateConfigRequest {
   exploreModel?: string;
   /** Pass empty string to clear. Must be a valid model ID if set. */
   taskModel?: string;
+  /** Replicate image model id (owner/name). Pass empty string to reset to default. */
+  replicateImageModel?: string;
   /** Override explore-subagent dispatch mode. See AppConfig.exploreMode. */
   exploreMode?: "inprocess" | "facet";
   /** Override task-subagent dispatch mode. See AppConfig.taskMode. */

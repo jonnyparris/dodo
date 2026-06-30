@@ -311,15 +311,63 @@ function _appendAttachmentImages(container, attachments){
     if(a.url.startsWith("data:")&&!a.url.startsWith("data:image/"))return;
     if(existing.has(a.url))return;
     existing.add(a.url);
+    const fig=document.createElement("div");fig.className="msg-attachment-item";
     const img=document.createElement("img");
     img.src=a.url;
     img.alt=`Attachment ${i+1} of ${attachments.length}`;
     img.loading="lazy";
     img.onclick=()=>window.open(a.url,"_blank","noopener,noreferrer");
     img.style.cursor="zoom-in";
-    wrap.appendChild(img);
+    fig.appendChild(img);
+    fig.appendChild(_makeEditImageButton(a.url));
+    wrap.appendChild(fig);
   });
   if(wrap.childElementCount>0)container.appendChild(wrap);
+}
+
+// Build an "Edit" affordance for an image. Clicking it prompts for edit
+// instructions and runs the image through the configured Replicate model.
+function _makeEditImageButton(url){
+  const btn=document.createElement("button");
+  btn.type="button";
+  btn.className="img-edit-btn";
+  btn.textContent="Edit";
+  btn.title="Edit this image with Replicate";
+  btn.setAttribute("aria-label","Edit this image with Replicate");
+  btn.onclick=(e)=>{e.stopPropagation();editImageFromUrl(url)};
+  return btn;
+}
+
+// Fetch image bytes (same-origin served path OR data: URL), base64-encode, and
+// POST to /edit-image with the user's edit instructions.
+async function editImageFromUrl(url){
+  if(!currentSession)return toast("Open a session first","warning");
+  if(isProcessing)return toast("Wait for the current response before editing","warning");
+  let img;
+  try{img=await _imageUrlToBase64(url)}
+  catch{return toast("Couldn't read that image to edit","error")}
+  if(!img)return toast("Unsupported image type for editing","warning");
+  const prompt=await appPrompt("How should this image be edited?",{placeholder:"e.g. make the background a sunset, add a hat…",confirmText:"Edit"});
+  if(!prompt)return;
+  setProcessing(true);showThinking();
+  const result=await jsonSafe(`/session/${currentSession}/edit-image`,{content:prompt,images:[img]});
+  if(!result){setProcessing(false);hideThinking()}
+}
+
+// Resolve any image URL to {data(base64), mediaType}. Handles data: URLs and
+// same-origin served paths (Access cookie travels automatically).
+async function _imageUrlToBase64(url){
+  const res=await fetch(url,{credentials:"same-origin"});
+  if(!res.ok)throw new Error(`fetch ${res.status}`);
+  const blob=await res.blob();
+  const mediaType=(blob.type||"").split(";")[0];
+  if(!/^image\/(png|jpeg|gif|webp|svg\+xml)$/.test(mediaType))return null;
+  const dataUrl=await new Promise((resolve,reject)=>{
+    const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(blob);
+  });
+  const base64=String(dataUrl).split(",")[1];
+  if(!base64)return null;
+  return{data:base64,mediaType};
 }
 
 function renderMessage(msg){
@@ -666,7 +714,12 @@ function renderImagePreviews(){
     const btn=document.createElement("button");btn.className="remove-btn";btn.textContent="\u00d7";
     btn.setAttribute("aria-label",img.name?`Remove ${img.name}`:`Remove attachment ${i+1}`);
     btn.onclick=()=>removeImage(i);
-    wrap.appendChild(imgEl);wrap.appendChild(btn);bar.appendChild(wrap);
+    // Edit-with-Replicate affordance on the staged upload itself, so the
+    // "upload then ask for edits" flow doesn't require sending first.
+    const edit=document.createElement("button");edit.type="button";edit.className="img-edit-btn";edit.textContent="Edit";
+    edit.title="Edit this image with Replicate";edit.setAttribute("aria-label","Edit this image with Replicate");
+    edit.onclick=()=>editImageFromUrl(img.dataUrl);
+    wrap.appendChild(imgEl);wrap.appendChild(btn);wrap.appendChild(edit);bar.appendChild(wrap);
   });
 }
 

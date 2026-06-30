@@ -2550,6 +2550,7 @@ app.post("/session/:id/prompt", async (c) => {
     "x-dodo-ai-base-url": config.aiGatewayBaseURL,
     "x-dodo-gateway": config.activeGateway,
     "x-dodo-model": config.model,
+    "x-dodo-image-model": config.replicateImageModel ?? "",
     "x-dodo-opencode-base-url": config.opencodeBaseURL,
     "x-author-email": email,
     "x-owner-email": ownerEmail,
@@ -2561,13 +2562,33 @@ app.post("/session/:id/generate", async (c) => {
   if (denied) return denied;
   const email = c.get("userEmail");
   // Hourly cap bounds burst traffic, daily cap bounds long-horizon cost
-  // exposure — FLUX is pay-per-call so we want both ceilings.
+  // exposure — image generation is pay-per-call so we want both ceilings.
   const hourly = promptLimiter.check(`generate-hr:${email}`, 30, 60 * 60 * 1000);
   if (!hourly.allowed) return rateLimitedResponse(hourly, "generate", email);
   const daily = promptLimiter.check(`generate-day:${email}`, 100, 24 * 60 * 60 * 1000);
   if (!daily.allowed) return rateLimitedResponse(daily, "generate", email);
   const ownerEmail = c.get("sessionOwnerEmail") || email;
+  const config = await readConfig(c.env, ownerEmail);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/generate", {
+    "x-dodo-image-model": config.replicateImageModel ?? "",
+    "x-author-email": email,
+    "x-owner-email": ownerEmail,
+  });
+});
+
+app.post("/session/:id/edit-image", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  // Same pay-per-call caps as /generate (shared budget keys).
+  const hourly = promptLimiter.check(`generate-hr:${email}`, 30, 60 * 60 * 1000);
+  if (!hourly.allowed) return rateLimitedResponse(hourly, "generate", email);
+  const daily = promptLimiter.check(`generate-day:${email}`, 100, 24 * 60 * 60 * 1000);
+  if (!daily.allowed) return rateLimitedResponse(daily, "generate", email);
+  const ownerEmail = c.get("sessionOwnerEmail") || email;
+  const config = await readConfig(c.env, ownerEmail);
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/edit-image", {
+    "x-dodo-image-model": config.replicateImageModel ?? "",
     "x-author-email": email,
     "x-owner-email": ownerEmail,
   });

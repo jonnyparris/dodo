@@ -51,3 +51,14 @@ export const FLUX_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell";
 export const FLUX_IMAGE_MEDIA_TYPE = "image/jpeg";
 /** FLUX-1-schnell API limit per the model schema (developers.cloudflare.com/workers-ai/models/flux-1-schnell). */
 export const FLUX_MAX_PROMPT_LENGTH = 2048;
+
+/** Default Replicate image model — Google's nano-banana-2 (Gemini 3.1 Flash
+ *  Image): fast text-to-image plus conversational editing / multi-image
+ *  fusion. Overridable per-user via `replicateImageModel` config. */
+export const DEFAULT_REPLICATE_IMAGE_MODEL = "google/nano-banana-2";
+/** Prompt ceiling for the Replicate image path. Generous vs FLUX — nano-banana
+ *  handles long instruction prompts — but bounded to avoid abuse. */
+export const REPLICATE_MAX_PROMPT_LENGTH = 5000;
+/** Max input images accepted per edit request. nano-banana-2 supports up to 14
+ *  reference images. */
+export const REPLICATE_MAX_EDIT_IMAGES = 14;

@@ -1,27 +1,28 @@
 import { DurableObject } from "cloudflare:workers";
 import { getAgentByName } from "agents";
 import { parseCronExpression } from "cron-schedule";
-import { RateLimiter } from "./rate-limit";
-import { SourceSessionMissingError } from "./sessions";
 import { z } from "zod";
 import {
-  bytesToBase64,
   base64ToBytes,
+  bytesToBase64,
   decryptSecret,
   derivePDK,
   deriveSDK,
   encryptSecret,
   generateDEK,
   generateSalt,
-  unwrapDEK,
-  wrapDEK,
   PBKDF2_DEFAULT_ITERATIONS,
   PBKDF2_LEGACY_ITERATIONS,
+  unwrapDEK,
+  wrapDEK,
 } from "./crypto";
-import { HttpMcpClient, type McpClientConfig } from "./mcp-client";
 import { log } from "./logger";
-import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
+import { HttpMcpClient, type McpClientConfig } from "./mcp-client";
+import { DEFAULT_REPLICATE_IMAGE_MODEL } from "./model-catalog";
 import { sendRunNotification } from "./notify";
+import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
+import { RateLimiter } from "./rate-limit";
+import { SourceSessionMissingError } from "./sessions";
 import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import type {
   AppConfig,
@@ -69,6 +70,8 @@ const updateConfigSchema = z
     exploreModel: z.string().max(200).optional(),
     /** Default model for the `task` subagent. Pass empty string to clear and fall back to heuristic. */
     taskModel: z.string().max(200).optional(),
+    /** Replicate image model id (owner/name). Pass empty string to reset to default. */
+    replicateImageModel: z.string().max(200).optional(),
     /** Explore-subagent dispatch mode. Pass empty string to clear (→ "inprocess"). */
     exploreMode: z.enum(["inprocess", "facet"]).optional(),
     /** Task-subagent dispatch mode. Pass empty string to clear (→ "inprocess"). */
@@ -1797,6 +1800,8 @@ export class UserControl extends DurableObject<Env> {
       // Kimi is the best-value fit per the 2026-04-24 model comparison.
       exploreModel: get("exploreModel") ?? this.env.DEFAULT_EXPLORE_MODEL,
       taskModel: get("taskModel") ?? this.env.DEFAULT_TASK_MODEL,
+      // Replicate image model — env default, then the hardcoded nano-banana-2.
+      replicateImageModel: get("replicateImageModel") ?? this.env.DEFAULT_REPLICATE_IMAGE_MODEL ?? DEFAULT_REPLICATE_IMAGE_MODEL,
       // Schema (UpdateConfigRequest) enforces the enum on write, but we
       // re-validate on read so a poisoned row (e.g. from a pre-schema
       // deployment or a direct SQL edit) still resolves to a valid mode

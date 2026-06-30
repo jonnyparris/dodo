@@ -372,6 +372,29 @@ async function showConfirm(message,onConfirm,{confirmText='Confirm',danger=false
   if(ok&&onConfirm)await onConfirm();
 }
 
+// Text-input modal — same shape/focus-trap as appConfirm but with a textarea.
+// Resolves to the trimmed string, or null if cancelled / left empty.
+function appPrompt(message,{placeholder='',confirmText='OK',cancelText='Cancel'}={}){
+  return new Promise(resolve=>{
+    const overlay=document.createElement('div');overlay.className='confirm-overlay';
+    overlay.setAttribute('role','dialog');
+    overlay.setAttribute('aria-modal','true');
+    overlay.setAttribute('aria-labelledby','prompt-message');
+    overlay.innerHTML=`<div class="confirm-card"><p id="prompt-message">${esc(message)}</p><textarea id="prompt-input" rows="3" class="form-input-mono" placeholder="${esc(placeholder)}" style="width:100%;resize:vertical"></textarea><div class="confirm-actions"><button class="ghost" id="prompt-cancel">${esc(cancelText)}</button><button class="primary" id="prompt-ok">${esc(confirmText)}</button></div></div>`;
+    document.body.appendChild(overlay);
+    const input=overlay.querySelector('#prompt-input');
+    const finish=(value)=>{releaseFocus(overlay);overlay.remove();resolve(value)};
+    const submit=()=>{const v=input.value.trim();finish(v||null)};
+    overlay.querySelector('#prompt-ok').onclick=submit;
+    overlay.querySelector('#prompt-cancel').onclick=()=>finish(null);
+    overlay.addEventListener('click',(e)=>{if(e.target===overlay)finish(null)});
+    // Cmd/Ctrl+Enter submits; Escape is handled by the focus trap's closer.
+    input.addEventListener('keydown',(e)=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){e.preventDefault();submit()}});
+    trapFocus(overlay);
+    input.focus();
+  });
+}
+
 // === Modal focus management (WCAG 2.4.3, 2.1.2) ===
 // Tracks the element that had focus before a modal opened so we can restore
 // it when the modal closes. Also installs a Tab-key handler that traps focus

@@ -5,38 +5,44 @@ import { type AgentNamespace, type Connection, type ConnectionContext, getAgentB
 import { type FileUIPart, generateText, type LanguageModel, type ModelMessage, streamText, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
-import { flushTurnToArtifacts, ARTIFACTS_TOKEN_TTL_SECONDS, type ArtifactsFsCache, buildArtifactsCloneUrl, listArtifactsTree, readArtifactsFile, refreshArtifactsFs } from "./artifacts";
+import { ARTIFACTS_TOKEN_TTL_SECONDS, type ArtifactsFsCache, buildArtifactsCloneUrl, flushTurnToArtifacts, listArtifactsTree, readArtifactsFile, refreshArtifactsFs } from "./artifacts";
 import type { ArtifactsRepo } from "./artifacts-types";
 import type { AttachmentRef } from "./attachments";
 import { rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
 import { listBuiltinSkills } from "./builtin-skills";
+import { pickCutoff, shouldCompact } from "./compaction-policy";
 import { bytesToBase64Chunked } from "./crypto";
 import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
+import { shouldRunFinalSummary, stripHarnessNotices } from "./final-summary-policy";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
+import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
 import { log } from "./logger";
+import { detectSameToolRepetition } from "./loop-detection";
 import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
+import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import { dispatchNotification } from "./notify";
+import { nextRetry } from "./overflow-retry";
+import { pruneOversizedToolResults } from "./own-loop-prune";
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
+import { assembleSystemPrompt } from "./prompt-composer";
+import { type ReplicateImageInput, ReplicateNotConfiguredError, runReplicateImage } from "./replicate";
 import { AgentConnectionTransport } from "./rpc";
-import { extractGeneratePrompt, FALLBACK_MODELS, FLUX_IMAGE_MEDIA_TYPE, FLUX_IMAGE_MODEL, FLUX_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
-import {
-  type GoalState,
-  type GoalStatus,
-  renderGoalSystemPromptSection,
-} from "./session-goal";
-import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
 import {
   createSessionControlPlane,
   type MetadataKv,
   type SessionControlPlane,
 } from "./session-control-plane";
 import {
+  type GoalState,
+  type GoalStatus,
+  renderGoalSystemPromptSection,
+} from "./session-goal";
+import {
   createSessionLifecycle,
   type SessionLifecycle,
 } from "./session-lifecycle";
-import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 import {
   createPersonalSkillClient,
   mergeSkills,
@@ -70,13 +76,8 @@ import {
   normaliseWatchdogConfig,
   type WatchdogConfig,
 } from "./watchdog";
-import { shouldCompact, pickCutoff } from "./compaction-policy";
-import { shouldRunFinalSummary, stripHarnessNotices } from "./final-summary-policy";
-import { detectSameToolRepetition } from "./loop-detection";
-import { pruneOversizedToolResults } from "./own-loop-prune";
-import { nextRetry } from "./overflow-retry";
-import { assembleSystemPrompt } from "./prompt-composer";
 import { evaluateSession } from "./watchdog-policy";
+import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 
 /**
  * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
@@ -258,9 +259,14 @@ const sendMessageSchema = z.object({
   content: z.string().trim().min(1),
   images: z.array(imageAttachmentSchema).max(MAX_IMAGES_PER_MESSAGE).optional(),
 }).strict();
-/** /generate schema — FLUX-1-schnell rejects >2048 chars, so enforce at the edge. */
+/** /generate schema — text-to-image via Replicate. */
 const generateImageSchema = z.object({
-  content: z.string().trim().min(1).max(FLUX_MAX_PROMPT_LENGTH),
+  content: z.string().trim().min(1).max(REPLICATE_MAX_PROMPT_LENGTH),
+}).strict();
+/** /edit-image schema — prompt + one or more input images, edited via Replicate. */
+const editImageSchema = z.object({
+  content: z.string().trim().min(1).max(REPLICATE_MAX_PROMPT_LENGTH),
+  images: z.array(imageAttachmentSchema).min(1).max(REPLICATE_MAX_EDIT_IMAGES),
 }).strict();
 const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
 const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
@@ -3272,6 +3278,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         return await this.handleGenerate(request);
       }
 
+      if (request.method === "POST" && url.pathname === "/edit-image") {
+        return await this.handleEditImage(request);
+      }
+
       if (request.method === "POST" && url.pathname === "/abort") {
         return await this.handleAbort();
       }
@@ -4631,24 +4641,59 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     });
   }
 
+  /** Edit one or more images via Replicate. Same lifecycle/persistence as
+   *  generation, but carries the input images through to the model. */
+  private async handleEditImage(request: Request): Promise<Response> {
+    const input = editImageSchema.parse(await request.json());
+    const sessionId = this.requireSessionId(request);
+    const authorEmail = request.headers.get("x-author-email");
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.ensureMetadata(sessionId, ownerEmail);
+    this.ensureThinkConfig(request);
+    return this.runImageGeneration({
+      prompt: input.content,
+      sessionId,
+      authorEmail,
+      ownerEmail,
+      images: input.images,
+    });
+  }
+
   /** Shared image-generation core. Invoked by `handleGenerate` (dedicated
    *  endpoint) and by `handleMessage`/`handlePrompt` when they detect a
    *  `/generate` slash command in the chat content. Returns a Response so
    *  callers can bubble errors and status codes without double-wrapping. */
+  /** Resolve the Replicate image model from the session's Think config,
+   *  falling back to the env default then the hardcoded nano-banana-2. */
+  private resolveImageModel(): string {
+    const fromConfig = this.getConfig()?.replicateImageModel?.trim();
+    return fromConfig || this.env.DEFAULT_REPLICATE_IMAGE_MODEL || DEFAULT_REPLICATE_IMAGE_MODEL;
+  }
+
+  /**
+   * Image generation + editing via Replicate (default `google/nano-banana-2`).
+   * When `images` is non-empty the call edits those images; otherwise it's
+   * text-to-image. Shared by `handleGenerate` (no images), the inline
+   * `/generate` slash, and `handleEditImage` (with images).
+   */
   private async runImageGeneration(opts: {
     prompt: string;
     sessionId: string;
     authorEmail: string | null;
     ownerEmail: string | null;
+    images?: ReplicateImageInput[];
   }): Promise<Response> {
-    if (opts.prompt.length > FLUX_MAX_PROMPT_LENGTH) {
-      return Response.json({ error: `Prompt exceeds ${FLUX_MAX_PROMPT_LENGTH} characters` }, { status: 400 });
+    if (opts.prompt.length > REPLICATE_MAX_PROMPT_LENGTH) {
+      return Response.json({ error: `Prompt exceeds ${REPLICATE_MAX_PROMPT_LENGTH} characters` }, { status: 400 });
     }
 
     const thinkSessionId = this.getCurrentSessionId();
     if (!thinkSessionId) {
       return Response.json({ error: "No Think session" }, { status: 500 });
     }
+
+    const isEdit = !!(opts.images && opts.images.length > 0);
+    const model = this.resolveImageModel();
 
     // Start a synchronous prompt via lifecycle. image-gen's policy rejects
     // when busy (matches the pre-refactor 409 behaviour) and uses
@@ -4671,18 +4716,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // 1. Persist user prompt message
       const userMsgId = this.persistGenerateUserMessage(thinkSessionId, opts.prompt, opts.authorEmail);
 
-      // 2. Generate image via Workers AI. Pass a random seed so repeat
-      //    invocations of the same prompt don't collapse to identical output.
-      const raw = await this.env.AI.run(FLUX_IMAGE_MODEL, {
+      // 2. Generate / edit the image via Replicate.
+      const result = await runReplicateImage({
+        env: this.env,
+        model,
         prompt: opts.prompt,
-        seed: Math.floor(Math.random() * 1_000_000),
+        images: opts.images,
       });
-      // Defensive parsing — type assertions would silently break if the
-      // Workers AI response shape ever drifts (it already has for FLUX.2).
-      if (!raw || typeof raw !== "object" || typeof (raw as { image?: unknown }).image !== "string" || !(raw as { image: string }).image) {
-        throw new Error("FLUX returned unexpected response shape");
-      }
-      const imageData = (raw as { image: string }).image;
+      const imageData = result.imageBase64;
 
       // 3. Persist assistant message with the generated image
       const assistantResult = await this.persistGeneratedImageMessage({
@@ -4690,6 +4731,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         sessionId: opts.sessionId,
         prompt: opts.prompt,
         imageData,
+        mediaType: result.mediaType,
+        model,
+        provider: "Replicate",
+        captionPrefix: isEdit ? "✏️" : "🎨",
         ownerEmail: opts.ownerEmail ?? undefined,
       });
 
@@ -4709,7 +4754,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       await this.finishPrompt(promptId, { error: message, status: "failed" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
       this.emitEvent({ data: this.listPrompts(), type: "prompt" });
-      return Response.json({ error: message }, { status: 502 });
+      // Missing-token is a configuration error (400), not an upstream failure (502).
+      const status = error instanceof ReplicateNotConfiguredError ? 400 : 502;
+      return Response.json({ error: message }, { status });
     }
   }
 
@@ -4744,7 +4791,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return userMsgId;
   }
 
-  /** Upload the FLUX-generated image to R2 and persist it as an assistant
+  /** Upload the generated/edited image to R2 and persist it as an assistant
    *  message. If R2 is unavailable the message falls back to an inline data
    *  URL so the user still sees the image rather than a silent stub — this
    *  matches the design contract in `src/attachments.ts`. */
@@ -4753,10 +4800,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     sessionId: string;
     prompt: string;
     imageData: string;
+    /** Media type of the produced image (e.g. image/jpeg). */
+    mediaType: string;
+    /** Model id recorded on the message metadata. */
+    model: string;
+    /** Provider label recorded on the message metadata. */
+    provider: string;
+    /** Emoji prefix for the caption (🎨 generate, ✏️ edit). */
+    captionPrefix: string;
     ownerEmail: string | undefined;
   }): Promise<{ messageId: string; record: ChatMessageRecord }> {
     const assistantMsgId = crypto.randomUUID();
-    const mediaType = FLUX_IMAGE_MEDIA_TYPE;
+    const mediaType = opts.mediaType;
 
     const attachmentRef = await uploadAttachment(this.env, {
       sessionId: opts.sessionId,
@@ -4768,10 +4823,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     });
 
     // Short, non-verbose caption — the image carries the meaning. Truncate the
-    // prompt so a 2000-char prompt doesn't dominate the bubble.
+    // prompt so a long prompt doesn't dominate the bubble.
     const preview = opts.prompt.length > 80 ? `${opts.prompt.slice(0, 80).trimEnd()}…` : opts.prompt;
     const assistantParts: UIMessage["parts"] = [
-      { type: "text", text: `🎨 ${preview}` },
+      { type: "text", text: `${opts.captionPrefix} ${preview}` },
     ];
     // Prefer the R2-backed URL; fall back to an inline data URL when R2 is
     // unavailable so the UI still renders something useful in local dev.
@@ -4791,8 +4846,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     this.insertMessageMetadata({
       messageId: assistantMsgId,
       authorEmail: null,
-      model: FLUX_IMAGE_MODEL,
-      provider: "Workers AI",
+      model: opts.model,
+      provider: opts.provider,
       tokenInput: 0,
       tokenOutput: 0,
     });
@@ -4814,8 +4869,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const record = uiMessageToChatRecord(assistantMsg, {
       messageId: assistantMsgId,
       authorEmail: null,
-      model: FLUX_IMAGE_MODEL,
-      provider: "Workers AI",
+      model: opts.model,
+      provider: opts.provider,
       tokenInput: 0,
       tokenOutput: 0,
       createdAt: nowEpoch(),
@@ -5187,11 +5242,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private ensureThinkConfig(request: Request): void {
     const incomingModel = request.headers.get("x-dodo-model") ?? this.env.DEFAULT_MODEL;
     const incomingGateway = request.headers.get("x-dodo-gateway") === "ai-gateway" ? "ai-gateway" as const : "opencode" as const;
+    const incomingImageModel = request.headers.get("x-dodo-image-model") ?? undefined;
     const existing = this.getConfig();
 
     if (existing) {
-      // Check if model or gateway changed — if so, reconfigure
-      if (existing.model === incomingModel && existing.activeGateway === incomingGateway) {
+      // Check if model/gateway/image-model changed — if so, reconfigure
+      const imageModelChanged = incomingImageModel !== undefined && incomingImageModel !== existing.replicateImageModel;
+      if (existing.model === incomingModel && existing.activeGateway === incomingGateway && !imageModelChanged) {
         return; // No change
       }
       this.configure({
@@ -5200,6 +5257,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         activeGateway: incomingGateway,
         opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? existing.opencodeBaseURL,
         aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? existing.aiGatewayBaseURL,
+        replicateImageModel: incomingImageModel ?? existing.replicateImageModel,
       });
       return;
     }
@@ -5216,6 +5274,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       model: incomingModel,
       opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? this.env.OPENCODE_BASE_URL,
       aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? this.env.AI_GATEWAY_BASE_URL,
+      replicateImageModel: incomingImageModel ?? this.env.DEFAULT_REPLICATE_IMAGE_MODEL ?? DEFAULT_REPLICATE_IMAGE_MODEL,
     };
     this.configure(config);
   }

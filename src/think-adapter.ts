@@ -7,26 +7,23 @@
 
 // ─── Re-exports from @cloudflare/think ───
 
-export { Think } from "@cloudflare/think";
 export type {
   ChatMessageOptions,
   FiberCompleteContext,
   FiberRecoveryContext,
-  StreamCallback,
   StreamableResult,
+  StreamCallback,
 } from "@cloudflare/think";
-
-export { createWorkspaceTools } from "@cloudflare/think/tools/workspace";
-export {
-  createReadTool,
-  createListTool,
+export { Think } from "@cloudflare/think";
+export { truncateToolOutput } from "@cloudflare/think/session";
+export { createExecuteTool } from "@cloudflare/think/tools/execute";
+export { 
+  createEditTool,
   createFindTool,
   createGrepTool,
-  createWriteTool,
-  createEditTool,
-} from "@cloudflare/think/tools/workspace";
-export { createExecuteTool } from "@cloudflare/think/tools/execute";
-export { truncateToolOutput } from "@cloudflare/think/session";
+  createListTool,
+  createReadTool,createWorkspaceTools, 
+  createWriteTool,} from "@cloudflare/think/tools/workspace";
 
 // ─── Re-exports from AI SDK (used alongside Think) ───
 
@@ -57,6 +54,8 @@ export interface DodoConfig {
   exploreModel?: string;
   /** Default model for the `task` subagent. See AppConfig for details. */
   taskModel?: string;
+  /** Replicate image model id (owner/name) for image generation + editing. */
+  replicateImageModel?: string;
   /** Explore-subagent dispatch mode (inprocess | facet). See AppConfig. */
   exploreMode?: "inprocess" | "facet";
   /** Task-subagent dispatch mode (inprocess | facet). See AppConfig. */

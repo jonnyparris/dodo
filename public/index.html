@@ -501,8 +501,13 @@
     .image-preview-item{position:relative;display:inline-block}
     .image-preview-item img{height:48px;max-width:80px;border-radius:var(--radius);object-fit:cover;border:1px solid var(--line)}
     .image-preview-item .remove-btn{position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;background:var(--text);color:var(--base);border:none;font-size:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1}
-    .msg-attachment{margin-top:6px}
+    .msg-attachment{margin-top:6px;display:flex;flex-wrap:wrap;gap:8px}
     .msg-attachment img{max-width:300px;max-height:200px;border-radius:var(--radius);cursor:pointer;border:1px solid var(--line)}
+    .msg-attachment-item{position:relative;display:inline-block}
+    /* Edit-with-Replicate affordance, shown on hover over generated/uploaded images */
+    .img-edit-btn{position:absolute;bottom:6px;right:6px;padding:2px 8px;font-size:11px;line-height:1.4;border-radius:var(--radius);border:1px solid var(--line);background:rgba(0,0,0,.6);color:#fff;cursor:pointer;opacity:0;transition:opacity .12s}
+    .msg-attachment-item:hover .img-edit-btn,.img-edit-btn:focus-visible{opacity:1}
+    .image-preview-item .img-edit-btn{position:absolute;bottom:-6px;right:-6px;opacity:1;padding:1px 6px;font-size:10px}
 
     /* === Session header actions — 3 icon buttons + overflow kebab at all widths === */
     .header-actions{display:flex;gap:6px;justify-content:flex-end;flex-shrink:0}
@@ -715,6 +720,8 @@
             </select>
             <label for="cfg-gateway-url" class="field-label">Gateway URL</label>
             <input id="cfg-gateway-url" placeholder="https://..."/>
+            <label for="cfg-image-model" class="field-label">Image model <span class="field-label-sm">(Replicate — generation &amp; editing)</span></label>
+            <input id="cfg-image-model" placeholder="google/nano-banana-2"/>
             <label for="cfg-git-author-name" class="field-label">Git Author Name</label>
             <input id="cfg-git-author-name" placeholder="Dodo"/>
             <label for="cfg-git-author-email" class="field-label">Git Author Email</label>
