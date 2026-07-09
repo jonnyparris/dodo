@@ -144,7 +144,7 @@ export interface StartIntent {
   content: string;
   authorEmail?: string | null;
   /** Optional image attachments (user-prompt only today). */
-  images?: Array<{ data: string; mediaType: string }>;
+  images?: Array<{ data: string; mediaType: string; name?: string }>;
   /** Override the title derivation; used by snapshot-import paths. */
   titleHint?: string;
 }
@@ -221,7 +221,7 @@ export interface FiberPromptPayload {
   content: string;
   authorEmail?: string;
   title: string;
-  images?: Array<{ data: string; mediaType: string }>;
+  images?: Array<{ data: string; mediaType: string; name?: string }>;
 }
 
 // ─── Module-private helpers ─────────────────────────────────────────────

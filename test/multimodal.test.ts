@@ -108,12 +108,40 @@ describe("Multimodal image support", () => {
       const res = await fetchJson(`/session/${sessionId}/message`, {
         body: JSON.stringify({
           content: "Bad type",
-          images: [{ data: TINY_PNG_BASE64, mediaType: "application/pdf" }],
+          images: [{ data: TINY_PNG_BASE64, mediaType: "application/zip" }],
         }),
         headers: { "content-type": "application/json" },
         method: "POST",
       });
       expect(res.status).toBe(400);
+    });
+
+    it("accepts a PDF attachment", async () => {
+      // %PDF-1.4 header, base64. PDFs travel through the same pipeline as
+      // images but are handed to the model as file parts.
+      const pdfBase64 = btoa("%PDF-1.4\n%%EOF\n");
+      const res = await fetchJson(`/session/${sessionId}/message`, {
+        body: JSON.stringify({
+          content: "Summarise this PDF",
+          images: [{ data: pdfBase64, mediaType: "application/pdf", name: "doc.pdf" }],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it("accepts a text document attachment", async () => {
+      const txtBase64 = btoa("# Notes\nHello from a markdown file.");
+      const res = await fetchJson(`/session/${sessionId}/message`, {
+        body: JSON.stringify({
+          content: "Use this doc as context",
+          images: [{ data: txtBase64, mediaType: "text/markdown", name: "notes.md" }],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(res.status).toBe(200);
     });
 
     it("rejects images with empty data", async () => {

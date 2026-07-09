@@ -240,6 +240,39 @@ export function estimateMessagesTokens(messages: ModelMessage[]): number {
 const MAX_IMAGES_PER_MESSAGE = 5;
 const MAX_IMAGE_BASE64_LENGTH = 4_000_000; // ~3MB decoded per image
 const ALLOWED_IMAGE_MEDIA_TYPES = /^image\/(png|jpeg|gif|webp|svg\+xml)$/;
+// Document attachments (PDFs + text docs) travel through the same base64
+// pipeline as images. PDFs are handed to the model as `file` parts (Claude /
+// Gemini read them natively); text docs are decoded and inlined as text so
+// every model — not just the ones with native file support — sees them.
+const ALLOWED_PDF_MEDIA_TYPES = /^application\/pdf$/;
+const ALLOWED_TEXT_MEDIA_TYPES = /^(text\/(plain|markdown|csv|html)|application\/json)$/;
+// Decoded text inlined per document is capped so a single big paste can't blow
+// the model's context window. ~200k chars ≈ 50k tokens.
+const MAX_INLINED_DOC_CHARS = 200_000;
+export const isImageMediaType = (m: string): boolean => ALLOWED_IMAGE_MEDIA_TYPES.test(m);
+export const isPdfMediaType = (m: string): boolean => ALLOWED_PDF_MEDIA_TYPES.test(m);
+export const isTextDocMediaType = (m: string): boolean => ALLOWED_TEXT_MEDIA_TYPES.test(m);
+export const isAllowedAttachmentMediaType = (m: string): boolean =>
+  isImageMediaType(m) || isPdfMediaType(m) || isTextDocMediaType(m);
+/**
+ * Decode base64 attachment bytes to UTF-8 text for inlining. Never throws:
+ * returns null on malformed base64 so a bad doc drops rather than failing the
+ * whole message. Truncates to MAX_INLINED_DOC_CHARS with a marker.
+ */
+export function decodeBase64Doc(base64: string): { text: string; truncated: boolean } | null {
+  let binary: string;
+  try {
+    binary = atob(base64);
+  } catch {
+    return null;
+  }
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  const decoded = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  if (decoded.length > MAX_INLINED_DOC_CHARS) {
+    return { text: decoded.slice(0, MAX_INLINED_DOC_CHARS), truncated: true };
+  }
+  return { text: decoded, truncated: false };
+}
 // Sampled base64 validation — avoids running a regex across a multi-MB string, which
 // is expensive in the DO isolate. Base64 must have length divisible by 4; the head/tail
 // sampling catches most corruption without the full scan. convertToLanguageModelV3DataContent
@@ -255,9 +288,16 @@ const imageAttachmentSchema = z.object({
   data: z.string().min(1).max(MAX_IMAGE_BASE64_LENGTH).refine(isLikelyBase64, "Invalid base64"),
   mediaType: z.string().regex(ALLOWED_IMAGE_MEDIA_TYPES),
 }).strict();
+// Prompt attachments accept images, PDFs, and text docs. `name` is optional and
+// used for the inlined-doc header / transcript chip; it's ignored for images.
+const promptAttachmentSchema = z.object({
+  data: z.string().min(1).max(MAX_IMAGE_BASE64_LENGTH).refine(isLikelyBase64, "Invalid base64"),
+  mediaType: z.string().refine(isAllowedAttachmentMediaType, "Unsupported attachment type"),
+  name: z.string().max(256).optional(),
+}).strict();
 const sendMessageSchema = z.object({
   content: z.string().trim().min(1),
-  images: z.array(imageAttachmentSchema).max(MAX_IMAGES_PER_MESSAGE).optional(),
+  images: z.array(promptAttachmentSchema).max(MAX_IMAGES_PER_MESSAGE).optional(),
 }).strict();
 /** /generate schema — text-to-image via Replicate. */
 const generateImageSchema = z.object({
@@ -4957,7 +4997,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * if the DO is evicted mid-chat, recovery replays from the top and
    * skips already-completed work.
    */
-  async runFiberPrompt(payload: { promptId: string; content: string; images?: Array<{ data: string; mediaType: string }>; authorEmail?: string; title: string }): Promise<void> {
+  async runFiberPrompt(payload: { promptId: string; content: string; images?: Array<{ data: string; mediaType: string; name?: string }>; authorEmail?: string; title: string }): Promise<void> {
     const { promptId, content, images, authorEmail, title } = payload;
 
     // If the prompt was aborted (or otherwise finished) before the fiber
@@ -5447,29 +5487,62 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   private async runThinkChat(
     userContent: string,
-    options?: { authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string }> },
+    options?: { authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }> },
   ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string }> {
     // Connect MCP servers before Think calls getTools()
     await this.connectMcpServers();
 
     // Insert user message metadata
     const userMsgId = crypto.randomUUID();
+    // Text-doc attachments are decoded and inlined into a single trailing text
+    // part so every model sees them; collect them here and append after the
+    // loop so image/pdf file parts stay grouped with the user's own text.
+    const inlinedDocs: string[] = [];
     const parts: UIMessage["parts"] = [{ type: "text", text: userContent }];
     if (options?.images?.length) {
-      for (const img of options.images) {
-        // Sanitize SVG uploads here — user-uploaded SVGs stay inline as
-        // `data:` URLs (we don't write them to R2), so this is the only
-        // place the sanitizer runs for them. `<img>`-loaded SVG is inert
-        // in browsers, but click-to-zoom navigates to the data URL which
-        // could execute scripts in older browsers or non-Chromium engines.
-        // Returns null for malformed/oversized SVGs — silently drop the
-        // bad part rather than fail the whole message.
-        const sanitized = sanitizeUserImage(img.data, img.mediaType);
-        if (sanitized === null) {
+      for (const att of options.images) {
+        if (isTextDocMediaType(att.mediaType)) {
+          // Text docs: decode base64 → UTF-8 and inline as text. Robust across
+          // all models (no native file support required) and visible in the
+          // transcript. Malformed base64 / oversized docs drop silently.
+          const decoded = decodeBase64Doc(att.data);
+          if (decoded === null) {
+            log("warn", "decodeBase64Doc rejected attachment", {
+              sessionId: this.sessionId(),
+              mediaType: att.mediaType,
+              bytes: att.data.length,
+            });
+            continue;
+          }
+          const label = att.name?.trim() || "attachment";
+          const truncNote = decoded.truncated
+            ? `\n[truncated — showing first ${MAX_INLINED_DOC_CHARS} characters]`
+            : "";
+          inlinedDocs.push(
+            `--- Attached document: ${label} (${att.mediaType}) ---\n${decoded.text}${truncNote}\n--- End of ${label} ---`,
+          );
+          continue;
+        }
+        let url: string | null;
+        if (isImageMediaType(att.mediaType)) {
+          // Sanitize SVG uploads here — user-uploaded SVGs stay inline as
+          // `data:` URLs (we don't write them to R2), so this is the only
+          // place the sanitizer runs for them. `<img>`-loaded SVG is inert
+          // in browsers, but click-to-zoom navigates to the data URL which
+          // could execute scripts in older browsers or non-Chromium engines.
+          // Returns null for malformed/oversized SVGs — silently drop the
+          // bad part rather than fail the whole message.
+          url = sanitizeUserImage(att.data, att.mediaType);
+        } else {
+          // PDFs (and any future binary file type): pass the raw base64
+          // through untouched. The model reads them as file parts.
+          url = att.data;
+        }
+        if (url === null) {
           log("warn", "sanitizeUserImage rejected attachment", {
             sessionId: this.sessionId(),
-            mediaType: img.mediaType,
-            bytes: img.data.length,
+            mediaType: att.mediaType,
+            bytes: att.data.length,
           });
           continue;
         }
@@ -5479,11 +5552,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         // handles the raw string as inline base64 data.
         const filePart = {
           type: "file",
-          mediaType: img.mediaType,
-          url: sanitized,
+          mediaType: att.mediaType,
+          url,
+          ...(att.name ? { filename: att.name } : {}),
         } satisfies FileUIPart;
         parts.push(filePart);
       }
+    }
+    if (inlinedDocs.length) {
+      parts.push({ type: "text", text: `\n\n${inlinedDocs.join("\n\n")}` });
     }
     const userMsg: UIMessage = {
       id: userMsgId,

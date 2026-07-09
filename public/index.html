@@ -508,6 +508,12 @@
     .img-edit-btn{position:absolute;bottom:6px;right:6px;padding:2px 8px;font-size:11px;line-height:1.4;border-radius:var(--radius);border:1px solid var(--line);background:rgba(0,0,0,.6);color:#fff;cursor:pointer;opacity:0;transition:opacity .12s}
     .msg-attachment-item:hover .img-edit-btn,.img-edit-btn:focus-visible{opacity:1}
     .image-preview-item .img-edit-btn{position:absolute;bottom:-6px;right:-6px;opacity:1;padding:1px 6px;font-size:10px}
+    /* Document attachment chips (PDFs, text docs) — staged preview + in-transcript */
+    .doc-chip{display:inline-flex;align-items:center;gap:6px;max-width:220px;padding:6px 10px;border-radius:var(--radius);border:1px solid var(--line);background:var(--control);color:var(--text-default);font-size:12px;text-decoration:none;line-height:1.3}
+    .doc-chip i{font-size:16px;flex-shrink:0}
+    .doc-chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    a.doc-chip:hover{border-color:var(--text);cursor:pointer}
+    .image-preview-item.doc-preview-item{display:inline-flex}
 
     /* === Session header actions — 3 icon buttons + overflow kebab at all widths === */
     .header-actions{display:flex;gap:6px;justify-content:flex-end;flex-shrink:0}
@@ -810,9 +816,9 @@
         <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash command suggestions" hidden></div>
         <textarea id="msg-input" rows="1" placeholder="Ask Dodo to build something..." onkeydown="handleInputKeydown(event)" oninput="autoResizeInput(this);sendTypingStart();updateSlashMenu()" onpaste="handleImagePaste(event)" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)" onblur="setTimeout(hideSlashMenu,150)" aria-label="Message input" aria-autocomplete="list" aria-controls="slash-menu"></textarea>
         <div class="input-actions">
-          <label for="image-file-input" class="visually-hidden">Attach image files</label>
-          <input type="file" id="image-file-input" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml" multiple style="display:none" onchange="handleFileSelect(this)"/>
-          <button class="ghost" onclick="$('image-file-input').click()" title="Attach image" aria-label="Attach image"><i class="ph ph-paperclip" aria-hidden="true"></i></button>
+          <label for="image-file-input" class="visually-hidden">Attach image, PDF, or text files</label>
+          <input type="file" id="image-file-input" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml,application/pdf,text/plain,text/markdown,text/csv,text/html,application/json,.md,.markdown,.txt,.text,.log,.csv,.tsv,.json,.jsonc,.yaml,.yml,.toml,.ini,.cfg,.conf,.env,.xml,.html,.htm,.css,.js,.jsx,.ts,.tsx,.mjs,.cjs,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.h,.cpp,.hpp,.cc,.cs,.php,.sh,.bash,.zsh,.sql,.graphql,.gql,.vue,.svelte,.tf,.hcl,.proto,.lua,.pl,.dart,.scala,.r" multiple style="display:none" onchange="handleFileSelect(this)"/>
+          <button class="ghost" onclick="$('image-file-input').click()" title="Attach image, PDF, or text file" aria-label="Attach image, PDF, or text file"><i class="ph ph-paperclip" aria-hidden="true"></i></button>
           <button class="sending" id="send-btn" onclick="handleSendBtn()" aria-label="Send message"><i class="ph ph-paper-plane-right" aria-hidden="true"></i></button>
         </div>
       </div>

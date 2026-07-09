@@ -49,13 +49,29 @@ describe("uiMessageToChatRecord — multimodal", () => {
     expect(record.attachments![1].mediaType).toBe("image/jpeg");
   });
 
-  it("ignores non-image file parts", () => {
+  it("surfaces PDF file parts as downloadable attachments", () => {
     const msg: UIMessage = {
       id: "msg-4",
       role: "user",
       parts: [
         { type: "text", text: "Check this" },
-        { type: "file", mediaType: "application/pdf", url: "data:application/pdf;base64,xyz" } as UIMessage["parts"][number],
+        { type: "file", mediaType: "application/pdf", filename: "spec.pdf", url: "JVBERi0xLjQ=" } as UIMessage["parts"][number],
+      ],
+    };
+    const record = uiMessageToChatRecord(msg);
+    expect(record.content).toBe("Check this");
+    expect(record.attachments).toEqual([
+      { mediaType: "application/pdf", url: "data:application/pdf;base64,JVBERi0xLjQ=", name: "spec.pdf" },
+    ]);
+  });
+
+  it("ignores unsupported binary file parts", () => {
+    const msg: UIMessage = {
+      id: "msg-4b",
+      role: "user",
+      parts: [
+        { type: "text", text: "Check this" },
+        { type: "file", mediaType: "application/zip", url: "data:application/zip;base64,UEsDBA==" } as UIMessage["parts"][number],
       ],
     };
     const record = uiMessageToChatRecord(msg);
@@ -115,16 +131,17 @@ describe("uiMessageToChatRecord — multimodal", () => {
 
   it("drops file parts with media types outside the allowlist", () => {
     // Defensive: even if something slips past the ingest schema (migrated data,
-    // direct DB edits), uiMessageToChatRecord must not surface non-image or
-    // non-allowlisted types as renderable attachments.
+    // direct DB edits), uiMessageToChatRecord must not surface types we don't
+    // render as either an inline image or a doc chip. PDFs and images are the
+    // only renderable file parts; everything else is dropped.
     const msg: UIMessage = {
       id: "msg-bad-mime",
       role: "user",
       parts: [
         { type: "text", text: "Check" },
-        // application/pdf is a file but not one we'll render as an image.
-        { type: "file", mediaType: "application/pdf", url: "data:application/pdf;base64,JVBERi0=" } as UIMessage["parts"][number],
-        // image/bmp isn't in the allowlist either.
+        // application/zip is a file but not one we render.
+        { type: "file", mediaType: "application/zip", url: "data:application/zip;base64,UEsDBA==" } as UIMessage["parts"][number],
+        // image/bmp isn't in the image allowlist either.
         { type: "file", mediaType: "image/bmp", url: "data:image/bmp;base64,Qk0=" } as UIMessage["parts"][number],
       ],
     };

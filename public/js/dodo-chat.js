@@ -308,18 +308,30 @@ function _appendAttachmentImages(container, attachments){
   const wrap=document.createElement("div");wrap.className="msg-attachment";
   attachments.forEach((a,i)=>{
     if(!a||typeof a.url!=="string")return;
-    if(a.url.startsWith("data:")&&!a.url.startsWith("data:image/"))return;
     if(existing.has(a.url))return;
     existing.add(a.url);
+    const mt=(a.mediaType||"");
+    const isImage=mt.startsWith("image/")||a.url.startsWith("data:image/");
     const fig=document.createElement("div");fig.className="msg-attachment-item";
-    const img=document.createElement("img");
-    img.src=a.url;
-    img.alt=`Attachment ${i+1} of ${attachments.length}`;
-    img.loading="lazy";
-    img.onclick=()=>window.open(a.url,"_blank","noopener,noreferrer");
-    img.style.cursor="zoom-in";
-    fig.appendChild(img);
-    fig.appendChild(_makeEditImageButton(a.url));
+    if(isImage){
+      const img=document.createElement("img");
+      img.src=a.url;
+      img.alt=`Attachment ${i+1} of ${attachments.length}`;
+      img.loading="lazy";
+      img.onclick=()=>window.open(a.url,"_blank","noopener,noreferrer");
+      img.style.cursor="zoom-in";
+      fig.appendChild(img);
+      fig.appendChild(_makeEditImageButton(a.url));
+    }else{
+      // Non-image (PDF) attachment → open/download chip.
+      const link=document.createElement("a");
+      link.href=a.url;link.target="_blank";link.rel="noopener noreferrer";link.className="doc-chip";
+      if(a.name)link.download=a.name;
+      const icon=document.createElement("i");icon.className="ph ph-file-pdf";icon.setAttribute("aria-hidden","true");
+      const label=document.createElement("span");label.textContent=a.name||"Attached document";
+      link.appendChild(icon);link.appendChild(label);
+      fig.appendChild(link);
+    }
     wrap.appendChild(fig);
   });
   if(wrap.childElementCount>0)container.appendChild(wrap);
@@ -543,11 +555,11 @@ async function sendMessage(){
   const content=$("msg-input").value.trim();
   const images=getPendingImages();
   if(!content&&!images)return;
-  if(!content)return toast("Add a text message with your images","warning");
-  // Block sending images while a prompt is running — the queued-prompt path
+  if(!content)return toast("Add a text message with your attachments","warning");
+  // Block sending attachments while a prompt is running — the queued-prompt path
   // can't carry attachments end-to-end, and silently dropping them is worse
   // than asking the user to wait.
-  if(isProcessing&&images)return toast("Wait for the current response before sending images","warning");
+  if(isProcessing&&images)return toast("Wait for the current response before sending attachments","warning");
   sendTypingStop();
   if(!currentSession){const d=await jsonSafe("/session",{});if(!d)return;currentSession=d.id;await selectSession(d.id)}
   $("msg-input").value="";$("msg-input").style.height='auto';clearPendingImages();
@@ -652,15 +664,38 @@ function sendTypingStop(){
   }
 }
 
-// --- Image attachments ---
-// Limits kept in sync with `imageAttachmentSchema` in src/coding-agent.ts.
-// Backend caps base64 length at 4_000_000 chars (~3MB decoded per image, 5 per message);
-// 3MB raw here is a conservative frontend bound that stays under the backend limit
-// after base64 encoding (3MB * 4/3 ≈ 4MB).
+// --- Prompt attachments (images, PDFs, text docs) ---
+// Limits kept in sync with `promptAttachmentSchema` in src/coding-agent.ts.
+// Backend caps base64 length at 4_000_000 chars (~3MB decoded, 5 per message);
+// 3MB raw here is a conservative frontend bound that stays under the backend
+// limit after base64 encoding (3MB * 4/3 ≈ 4MB). Images render inline; PDFs are
+// sent as model file parts; text docs are decoded server-side and inlined into
+// the prompt so every model — not just ones with native file support — sees them.
 const _pendingImages=[];
-const MAX_IMAGE_SIZE=3*1024*1024; // 3MB raw — pairs with ~4MB base64 on the backend
-const MAX_IMAGES=5;
+const MAX_ATTACHMENT_SIZE=3*1024*1024; // 3MB raw — pairs with ~4MB base64 on the backend
+const MAX_IMAGES=5; // combined images + docs per message
 const ALLOWED_IMAGE_TYPES=new Set(["image/png","image/jpeg","image/gif","image/webp","image/svg+xml"]);
+// Browser-reported MIME types the backend accepts for docs.
+const ALLOWED_DOC_TYPES=new Set(["application/pdf","text/plain","text/markdown","text/csv","text/html","application/json"]);
+// Browsers report inconsistent (or empty, or plain wrong — a .ts file often
+// reports video/mp2t) MIME types for code/text files, so classify by extension
+// and normalise to a media type the backend schema accepts.
+const DOC_EXT_MEDIA={md:"text/markdown",markdown:"text/markdown",csv:"text/csv",tsv:"text/plain",json:"application/json",jsonc:"application/json",pdf:"application/pdf",html:"text/html",htm:"text/html",txt:"text/plain",text:"text/plain",log:"text/plain",yaml:"text/plain",yml:"text/plain",toml:"text/plain",ini:"text/plain",cfg:"text/plain",conf:"text/plain",env:"text/plain",xml:"text/plain",css:"text/plain",js:"text/plain",jsx:"text/plain",ts:"text/plain",tsx:"text/plain",mjs:"text/plain",cjs:"text/plain",py:"text/plain",rb:"text/plain",go:"text/plain",rs:"text/plain",java:"text/plain",kt:"text/plain",swift:"text/plain",c:"text/plain",h:"text/plain",cpp:"text/plain",hpp:"text/plain",cc:"text/plain",cs:"text/plain",php:"text/plain",sh:"text/plain",bash:"text/plain",zsh:"text/plain",sql:"text/plain",graphql:"text/plain",gql:"text/plain",vue:"text/plain",svelte:"text/plain",tf:"text/plain",hcl:"text/plain",proto:"text/plain",lua:"text/plain",pl:"text/plain",dart:"text/plain",scala:"text/plain",r:"text/plain"};
+const KNOWN_TEXT_NAMES=new Set(["dockerfile","makefile","readme","license","changelog",".gitignore",".env"]);
+
+// Classify a File into {mediaType, kind:'image'|'pdf'|'doc'} or null if unsupported.
+function classifyAttachment(file){
+  const t=(file.type||"").split(";")[0].trim().toLowerCase();
+  if(ALLOWED_IMAGE_TYPES.has(t))return{mediaType:t,kind:"image"};
+  const name=(file.name||"").toLowerCase();
+  const dot=name.lastIndexOf(".");
+  const ext=dot>=0?name.slice(dot+1):"";
+  let mt=DOC_EXT_MEDIA[ext];
+  if(!mt&&!ext&&KNOWN_TEXT_NAMES.has(name))mt="text/plain";
+  if(!mt&&ALLOWED_DOC_TYPES.has(t))mt=t;
+  if(mt)return{mediaType:mt,kind:mt==="application/pdf"?"pdf":"doc"};
+  return null;
+}
 
 function handleImagePaste(event){
   const items=event.clipboardData?.items;
@@ -669,7 +704,7 @@ function handleImagePaste(event){
     if(ALLOWED_IMAGE_TYPES.has(item.type)){
       event.preventDefault();
       const file=item.getAsFile();
-      if(file)addImageFile(file);
+      if(file)addAttachmentFile(file);
       return;
     }
   }
@@ -677,24 +712,25 @@ function handleImagePaste(event){
 
 function handleFileSelect(input){
   for(const file of input.files){
-    if(ALLOWED_IMAGE_TYPES.has(file.type))addImageFile(file);
-    else toast(`${file.type} not supported. Use PNG, JPEG, GIF, WebP, or SVG.`,"warning");
+    if(classifyAttachment(file))addAttachmentFile(file);
+    else toast(`${file.type||file.name} not supported. Use images, PDFs, or text/code files.`,"warning");
   }
   input.value="";
 }
 
-function addImageFile(file){
-  if(_pendingImages.length>=MAX_IMAGES)return toast(`Maximum ${MAX_IMAGES} images per message`,"warning");
-  if(file.size>MAX_IMAGE_SIZE)return toast("Image too large (max 3MB)","warning");
+function addAttachmentFile(file){
+  const cls=classifyAttachment(file);
+  if(!cls)return toast(`${file.type||file.name} not supported`,"warning");
+  if(_pendingImages.length>=MAX_IMAGES)return toast(`Maximum ${MAX_IMAGES} attachments per message`,"warning");
+  if(file.size>MAX_ATTACHMENT_SIZE)return toast("File too large (max 3MB)","warning");
   const reader=new FileReader();
   reader.onload=()=>{
-    const dataUrl=reader.result;
+    const dataUrl=String(reader.result);
     const base64=dataUrl.split(",")[1];
-    const mediaType=file.type;
-    _pendingImages.push({data:base64,mediaType,dataUrl,name:file.name||""});
+    _pendingImages.push({data:base64,mediaType:cls.mediaType,dataUrl,name:file.name||"",kind:cls.kind});
     renderImagePreviews();
   };
-  reader.onerror=()=>toast("Failed to read image file","warning");
+  reader.onerror=()=>toast("Failed to read file","warning");
   reader.readAsDataURL(file);
 }
 
@@ -707,25 +743,35 @@ function renderImagePreviews(){
   const bar=$("image-preview-bar");
   bar.replaceChildren();
   const total=_pendingImages.length;
-  _pendingImages.forEach((img,i)=>{
+  _pendingImages.forEach((att,i)=>{
     const wrap=document.createElement("div");wrap.className="image-preview-item";
-    const imgEl=document.createElement("img");imgEl.src=img.dataUrl;
-    imgEl.alt=img.name?`Attachment: ${img.name}`:`Attachment ${i+1} of ${total}`;
     const btn=document.createElement("button");btn.className="remove-btn";btn.textContent="\u00d7";
-    btn.setAttribute("aria-label",img.name?`Remove ${img.name}`:`Remove attachment ${i+1}`);
+    btn.setAttribute("aria-label",att.name?`Remove ${att.name}`:`Remove attachment ${i+1}`);
     btn.onclick=()=>removeImage(i);
-    // Edit-with-Replicate affordance on the staged upload itself, so the
-    // "upload then ask for edits" flow doesn't require sending first.
-    const edit=document.createElement("button");edit.type="button";edit.className="img-edit-btn";edit.textContent="Edit";
-    edit.title="Edit this image with Replicate";edit.setAttribute("aria-label","Edit this image with Replicate");
-    edit.onclick=()=>editImageFromUrl(img.dataUrl);
-    wrap.appendChild(imgEl);wrap.appendChild(btn);wrap.appendChild(edit);bar.appendChild(wrap);
+    if(att.kind==="image"){
+      const imgEl=document.createElement("img");imgEl.src=att.dataUrl;
+      imgEl.alt=att.name?`Attachment: ${att.name}`:`Attachment ${i+1} of ${total}`;
+      // Edit-with-Replicate affordance on the staged upload itself, so the
+      // "upload then ask for edits" flow doesn't require sending first.
+      const edit=document.createElement("button");edit.type="button";edit.className="img-edit-btn";edit.textContent="Edit";
+      edit.title="Edit this image with Replicate";edit.setAttribute("aria-label","Edit this image with Replicate");
+      edit.onclick=()=>editImageFromUrl(att.dataUrl);
+      wrap.appendChild(imgEl);wrap.appendChild(btn);wrap.appendChild(edit);
+    }else{
+      wrap.classList.add("doc-preview-item");
+      const chip=document.createElement("span");chip.className="doc-chip";
+      const icon=document.createElement("i");icon.className=att.kind==="pdf"?"ph ph-file-pdf":"ph ph-file-text";icon.setAttribute("aria-hidden","true");
+      const label=document.createElement("span");label.textContent=att.name||(att.kind==="pdf"?"document.pdf":"document");
+      chip.appendChild(icon);chip.appendChild(label);
+      wrap.appendChild(chip);wrap.appendChild(btn);
+    }
+    bar.appendChild(wrap);
   });
 }
 
 function getPendingImages(){
   if(!_pendingImages.length)return undefined;
-  return _pendingImages.map(({data,mediaType})=>({data,mediaType}));
+  return _pendingImages.map(({data,mediaType,name})=>name?{data,mediaType,name}:{data,mediaType});
 }
 
 function clearPendingImages(){

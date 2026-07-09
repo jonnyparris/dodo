@@ -129,6 +129,13 @@ const SAFE_IMAGE_MEDIA_TYPES = new Set([
 ]);
 
 /**
+ * Non-image file parts we surface to the transcript as a downloadable chip
+ * (rather than an inline preview). Text docs never reach here — they're
+ * inlined into the message text — so this is currently just PDFs.
+ */
+const SAFE_DOC_MEDIA_TYPES = new Set(["application/pdf"]);
+
+/**
  * Walk a tool result's `output` value looking for image content parts. The
  * AI SDK's `ToolResultOutput` variant `{type: "content", value: [...]}` can
  * carry `{type: "image-data", data, mediaType}` or `{type: "media", data,
@@ -192,7 +199,7 @@ export function uiMessageToChatRecord(
   // an R2 object or — in legacy messages or local-dev fallbacks — a data URL
   // or raw base64. `toClientUrl()` normalises all three shapes to something
   // the browser can load.
-  const attachments: Array<{ mediaType: string; url: string }> = [];
+  const attachments: Array<{ mediaType: string; url: string; name?: string }> = [];
   if (msg.parts) {
     content = msg.parts
       .filter((p): p is { type: "text"; text: string } => p.type === "text")
@@ -204,13 +211,15 @@ export function uiMessageToChatRecord(
         const mediaType = (p as { mediaType?: string }).mediaType;
         // Defensive: re-check mediaType here even though the schema gated it on
         // ingest. Protects against malformed stored messages or future callers
-        // that bypass the HTTP layer.
-        if (!mediaType || !SAFE_IMAGE_MEDIA_TYPES.has(mediaType)) continue;
+        // that bypass the HTTP layer. Images render inline; PDFs render as a
+        // downloadable chip.
+        if (!mediaType || !(SAFE_IMAGE_MEDIA_TYPES.has(mediaType) || SAFE_DOC_MEDIA_TYPES.has(mediaType))) continue;
         const rawUrl = (p as { url?: string }).url;
         if (typeof rawUrl !== "string" || rawUrl.length === 0) continue;
         const url = toClientUrl(rawUrl, mediaType);
         if (!url) continue;
-        attachments.push({ mediaType, url });
+        const name = (p as { filename?: string }).filename;
+        attachments.push({ mediaType, url, ...(name ? { name } : {}) });
         continue;
       }
       // Tool parts — Think encodes these as `type: "tool-<name>"` with an
