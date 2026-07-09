@@ -108,6 +108,26 @@ describe("attachments — SVG media type", () => {
     expect(_internals.MIME_TO_EXT["image/svg+xml"]).toBe("svg");
     expect(_internals.EXT_TO_MIME.svg).toBe("image/svg+xml");
   });
+
+  it("maps document media types so uploadAttachment accepts them", () => {
+    // uploadAttachment refuses any media type absent from MIME_TO_EXT, so the
+    // download-chip feature depends on these entries existing.
+    expect(_internals.MIME_TO_EXT["application/pdf"]).toBe("pdf");
+    expect(_internals.MIME_TO_EXT["text/plain"]).toBe("txt");
+    expect(_internals.MIME_TO_EXT["text/markdown"]).toBe("md");
+    expect(_internals.MIME_TO_EXT["text/csv"]).toBe("csv");
+    expect(_internals.MIME_TO_EXT["text/html"]).toBe("html");
+    expect(_internals.MIME_TO_EXT["application/json"]).toBe("json");
+  });
+
+  it("maps document extensions back so fetchAttachment can serve them", () => {
+    expect(_internals.EXT_TO_MIME.pdf).toBe("application/pdf");
+    expect(_internals.EXT_TO_MIME.txt).toBe("text/plain");
+    expect(_internals.EXT_TO_MIME.md).toBe("text/markdown");
+    expect(_internals.EXT_TO_MIME.csv).toBe("text/csv");
+    expect(_internals.EXT_TO_MIME.html).toBe("text/html");
+    expect(_internals.EXT_TO_MIME.json).toBe("application/json");
+  });
 });
 
 describe("attachments — sanitizeSvg", () => {

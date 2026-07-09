@@ -129,11 +129,28 @@ const SAFE_IMAGE_MEDIA_TYPES = new Set([
 ]);
 
 /**
- * Non-image file parts we surface to the transcript as a downloadable chip
- * (rather than an inline preview). Text docs never reach here — they're
- * inlined into the message text — so this is currently just PDFs.
+ * Non-image doc media types we surface to the transcript as a downloadable
+ * chip (rather than an inline preview). Docs are also stored in the
+ * message_attachments side-table and merged in `listThinkMessages`, so this
+ * set gates the (rarer) `file`-part path only.
  */
-const SAFE_DOC_MEDIA_TYPES = new Set(["application/pdf"]);
+const SAFE_DOC_MEDIA_TYPES = new Set([
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "text/html",
+  "application/json",
+]);
+
+/**
+ * Prefix of the sentinel that `runThinkChat` wraps inlined document text in
+ * (`--- Attached document: … ---`). The inlined text is a real message part
+ * so every model reads it, but it must NOT leak into the `content` string the
+ * UI renders — the transcript shows a download chip instead. Matched against
+ * the trimmed start of a text part.
+ */
+const INLINED_DOC_SENTINEL_PREFIX = "--- Attached document: ";
 
 /**
  * Walk a tool result's `output` value looking for image content parts. The
@@ -203,6 +220,10 @@ export function uiMessageToChatRecord(
   if (msg.parts) {
     content = msg.parts
       .filter((p): p is { type: "text"; text: string } => p.type === "text")
+      // Exclude inlined-document text (PDF-as-Markdown, decoded text docs).
+      // The model still receives it — it's a real part in the stored message —
+      // but the UI shows a download chip instead of the full dump.
+      .filter((p) => !p.text.trimStart().startsWith(INLINED_DOC_SENTINEL_PREFIX))
       .map((p) => p.text)
       .join("");
     for (const p of msg.parts) {

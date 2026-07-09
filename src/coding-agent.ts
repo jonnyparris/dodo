@@ -3634,12 +3634,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         url TEXT NOT NULL,
         size INTEGER NOT NULL DEFAULT 0,
         source TEXT NOT NULL,
+        name TEXT,
         created_at INTEGER NOT NULL
       )
     `);
     this.ctx.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_message_attachments_msg ON message_attachments(message_id)",
     );
+    // Migration: add `name` to DOs created before the column existed. SQLite
+    // throws "duplicate column" if it's already there — swallow that so the
+    // migration is idempotent on every boot.
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE message_attachments ADD COLUMN name TEXT");
+    } catch {
+      // column already exists — expected on all but the first boot after deploy
+    }
 
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS prompts (
@@ -5421,15 +5430,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     url: string;
     size: number;
     source: "user" | "assistant" | "tool";
+    /** Original filename, surfaced as the download-chip label for docs. */
+    name?: string | null;
   }): void {
     this.ctx.storage.sql.exec(
-      "INSERT INTO message_attachments (message_id, tool_call_id, media_type, url, size, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO message_attachments (message_id, tool_call_id, media_type, url, size, source, name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       input.messageId,
       input.toolCallId ?? null,
       input.mediaType,
       input.url,
       input.size,
       input.source,
+      input.name ?? null,
       nowEpoch(),
     );
   }
@@ -5451,8 +5463,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /** List attachment refs for one or more messages, ordered by creation time. */
-  private listMessageAttachments(messageIds: string[]): Map<string, Array<{ mediaType: string; url: string; size: number; source: "user" | "assistant" | "tool" }>> {
-    const result = new Map<string, Array<{ mediaType: string; url: string; size: number; source: "user" | "assistant" | "tool" }>>();
+  private listMessageAttachments(messageIds: string[]): Map<string, Array<{ mediaType: string; url: string; size: number; source: "user" | "assistant" | "tool"; name?: string }>> {
+    const result = new Map<string, Array<{ mediaType: string; url: string; size: number; source: "user" | "assistant" | "tool"; name?: string }>>();
     if (messageIds.length === 0) return result;
     const placeholders = messageIds.map(() => "?").join(",");
     // Surface `source` so the UI can distinguish user uploads from
@@ -5461,7 +5473,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // NOT NULL (defensive — should not happen in practice). (audit
     // follow-up: previously dead column.)
     const rows = Array.from(this.ctx.storage.sql.exec(
-      `SELECT message_id, media_type, url, size, source FROM message_attachments WHERE message_id IN (${placeholders}) ORDER BY id ASC`,
+      `SELECT message_id, media_type, url, size, source, name FROM message_attachments WHERE message_id IN (${placeholders}) ORDER BY id ASC`,
       ...messageIds,
     ));
     for (const row of rows) {
@@ -5470,11 +5482,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       const rawSource = row.source === null || row.source === undefined ? "tool" : String(row.source);
       const source: "user" | "assistant" | "tool" =
         rawSource === "user" || rawSource === "assistant" || rawSource === "tool" ? rawSource : "tool";
+      const name = row.name === null || row.name === undefined ? undefined : String(row.name);
       list.push({
         mediaType: String(row.media_type),
         url: String(row.url),
         size: Number(row.size ?? 0),
         source,
+        ...(name ? { name } : {}),
       });
       result.set(id, list);
     }
@@ -5563,6 +5577,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // part so every model sees them; collect them here and append after the
     // loop so image/pdf file parts stay grouped with the user's own text.
     const inlinedDocs: string[] = [];
+    // Docs (PDF + text) are inlined for the model but also persisted to R2 so
+    // the transcript can render a download chip instead of dumping the text.
+    // Collect the original bytes + label here; upload after the message id and
+    // metadata are settled.
+    const docAttachments: Array<{ data: string; mediaType: string; name: string }> = [];
     const parts: UIMessage["parts"] = [{ type: "text", text: userContent }];
     if (options?.images?.length) {
       for (const att of options.images) {
@@ -5586,6 +5605,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           inlinedDocs.push(
             `--- Attached document: ${label} (${att.mediaType}) ---\n${decoded.text}${truncNote}\n--- End of ${label} ---`,
           );
+          docAttachments.push({ data: att.data, mediaType: att.mediaType, name: label });
           continue;
         }
         // PDFs: convert to Markdown server-side via Workers AI `toMarkdown`
@@ -5612,6 +5632,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             });
             continue;
           }
+          // Persist the original PDF for the download chip even if OCR fails —
+          // a bad OCR pass doesn't make the file itself un-downloadable.
+          docAttachments.push({ data: att.data, mediaType: att.mediaType, name: label });
           let markdown: string | null = null;
           try {
             const res = await this.env.AI.toMarkdown({
@@ -5696,6 +5719,42 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       authorEmail: options?.authorEmail,
     });
 
+    // Persist docs to R2 + the side-table so the transcript shows a download
+    // chip. Kept off the UIMessage parts (unlike images) so the doc bytes are
+    // never replayed to the model as a `file` part — the model reads the
+    // inlined text instead. Best-effort: a failed upload (e.g. no R2 binding
+    // in local dev) just means no chip; the inlined text still reaches the
+    // model. Collect client-facing refs to attach to the emitted user record.
+    const docChipAttachments: Array<{ mediaType: string; url: string; size: number; name?: string }> = [];
+    for (const doc of docAttachments) {
+      try {
+        const ref = await uploadAttachment(this.env, {
+          sessionId: this.sessionId(),
+          messageId: userMsgId,
+          mediaType: doc.mediaType,
+          data: doc.data,
+          source: "user",
+          ownerEmail: options?.authorEmail,
+        });
+        if (!ref) continue;
+        this.insertMessageAttachment({
+          messageId: userMsgId,
+          mediaType: ref.mediaType,
+          url: ref.url,
+          size: ref.size,
+          source: "user",
+          name: doc.name,
+        });
+        docChipAttachments.push({ mediaType: ref.mediaType, url: ref.url, size: ref.size, name: doc.name });
+      } catch (e) {
+        log("warn", "doc attachment upload failed", {
+          sessionId: this.sessionId(),
+          name: doc.name,
+          error: String(e),
+        });
+      }
+    }
+
     // Emit user message event in Dodo format
     const userRecord = uiMessageToChatRecord(userMsg, {
       messageId: userMsgId,
@@ -5706,6 +5765,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       tokenOutput: 0,
       createdAt: nowEpoch(),
     });
+    if (docChipAttachments.length > 0) {
+      const rewritten = rewriteAttachmentsForClient(docChipAttachments) ?? docChipAttachments;
+      userRecord.attachments = [...(userRecord.attachments ?? []), ...rewritten];
+    }
     this.emitEvent({ data: userRecord, type: "message" });
 
     // Track assistant response metadata

@@ -6,8 +6,11 @@ import {
   isPdfMediaType,
   isTextDocMediaType,
 } from "../src/coding-agent";
+import { uiMessageToChatRecord } from "../src/think-adapter";
 
 const b64 = (s: string): string => btoa(unescape(encodeURIComponent(s)));
+
+type UIMsg = Parameters<typeof uiMessageToChatRecord>[0];
 
 describe("doc attachments — media type classification", () => {
   it("recognises image types", () => {
@@ -70,5 +73,46 @@ describe("doc attachments — decodeBase64Doc", () => {
     expect(out).not.toBeNull();
     expect(out?.text).toBe("");
     expect(out?.truncated).toBe(false);
+  });
+});
+
+describe("doc attachments — inlined-doc text is hidden from the UI content", () => {
+  const inlined = (label: string, body: string): string =>
+    `--- Attached document: ${label} (application/pdf, converted to Markdown) ---\n${body}\n--- End of ${label} ---`;
+
+  it("keeps the user's prompt text but drops the inlined doc dump", () => {
+    const msg = {
+      id: "m1",
+      role: "user",
+      parts: [
+        { type: "text", text: "summarise this" },
+        { type: "text", text: `\n\n${inlined("citacao.pdf", "PAGE ONE giant OCR dump")}` },
+      ],
+    } as UIMsg;
+    const rec = uiMessageToChatRecord(msg);
+    expect(rec.content).toBe("summarise this");
+    expect(rec.content).not.toContain("Attached document");
+    expect(rec.content).not.toContain("OCR dump");
+  });
+
+  it("drops a leading inlined doc even with no other text", () => {
+    const msg = {
+      id: "m2",
+      role: "user",
+      parts: [{ type: "text", text: inlined("notes.md", "secret body") }],
+    } as UIMsg;
+    const rec = uiMessageToChatRecord(msg);
+    expect(rec.content).toBe("");
+    expect(rec.content).not.toContain("secret body");
+  });
+
+  it("leaves ordinary assistant/user text untouched", () => {
+    const msg = {
+      id: "m3",
+      role: "assistant",
+      parts: [{ type: "text", text: "here is a normal reply about documents" }],
+    } as UIMsg;
+    const rec = uiMessageToChatRecord(msg);
+    expect(rec.content).toBe("here is a normal reply about documents");
   });
 });

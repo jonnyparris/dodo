@@ -32,6 +32,16 @@ const MIME_TO_EXT: Record<string, string> = {
   "image/gif": "gif",
   "image/webp": "webp",
   "image/svg+xml": "svg",
+  // Document attachments — stored so the transcript can offer a download
+  // chip instead of dumping the inlined text. PDFs render inline in a tab;
+  // text docs are served as attachments (see fetchAttachment) to neutralise
+  // any text/html payload.
+  "application/pdf": "pdf",
+  "text/plain": "txt",
+  "text/markdown": "md",
+  "text/csv": "csv",
+  "text/html": "html",
+  "application/json": "json",
 };
 
 const EXT_TO_MIME: Record<string, string> = {
@@ -41,7 +51,20 @@ const EXT_TO_MIME: Record<string, string> = {
   gif: "image/gif",
   webp: "image/webp",
   svg: "image/svg+xml",
+  pdf: "application/pdf",
+  txt: "text/plain",
+  md: "text/markdown",
+  csv: "text/csv",
+  html: "text/html",
+  json: "application/json",
 };
+
+/** True for media types that are neither images nor PDFs — served as a
+ * forced download with a neutralised content type so a stored text/html doc
+ * can't execute when opened directly. */
+function isDownloadOnlyDoc(mediaType: string): boolean {
+  return !mediaType.startsWith("image/") && mediaType !== "application/pdf";
+}
 
 /**
  * Minimal SVG sanitizer — strips script-execution vectors before an SVG is
@@ -349,6 +372,13 @@ export async function fetchAttachment(
     // Prevents content-sniffing an SVG as HTML when opened directly.
     "x-content-type-options": "nosniff",
   };
+  // Text/code docs (incl. text/html) are served as a neutralised download so
+  // opening the chip can never execute a stored HTML/script payload. PDFs and
+  // images keep their real content type so they render inline in a tab.
+  if (isDownloadOnlyDoc(mediaType)) {
+    headers["content-type"] = "text/plain; charset=utf-8";
+    headers["content-disposition"] = "attachment";
+  }
   if (isSvgMediaType(mediaType)) {
     // Defence in depth: even if an SVG slipped past the sanitizer, the CSP
     // stops inline scripts, external refs, and plugin/iframe embeds when
