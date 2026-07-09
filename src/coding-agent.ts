@@ -241,9 +241,12 @@ const MAX_IMAGES_PER_MESSAGE = 5;
 const MAX_IMAGE_BASE64_LENGTH = 4_000_000; // ~3MB decoded per image
 const ALLOWED_IMAGE_MEDIA_TYPES = /^image\/(png|jpeg|gif|webp|svg\+xml)$/;
 // Document attachments (PDFs + text docs) travel through the same base64
-// pipeline as images. PDFs are handed to the model as `file` parts (Claude /
-// Gemini read them natively); text docs are decoded and inlined as text so
-// every model — not just the ones with native file support — sees them.
+// pipeline as images, but neither is sent to the model as a `file` part:
+// PDFs are converted to Markdown server-side via Workers AI `toMarkdown` and
+// text docs are decoded, then both are inlined as text so every model — not
+// just ones with native document support — sees them. Only images reach the
+// model as `file` parts. (Historically PDFs were sent as `file` parts, which
+// the OpenAI-compat gateways reject; see stripUnsupportedFileParts.)
 const ALLOWED_PDF_MEDIA_TYPES = /^application\/pdf$/;
 const ALLOWED_TEXT_MEDIA_TYPES = /^(text\/(plain|markdown|csv|html)|application\/json)$/;
 // Decoded text inlined per document is capped so a single big paste can't blow
@@ -254,6 +257,52 @@ export const isPdfMediaType = (m: string): boolean => ALLOWED_PDF_MEDIA_TYPES.te
 export const isTextDocMediaType = (m: string): boolean => ALLOWED_TEXT_MEDIA_TYPES.test(m);
 export const isAllowedAttachmentMediaType = (m: string): boolean =>
   isImageMediaType(m) || isPdfMediaType(m) || isTextDocMediaType(m);
+
+/**
+ * Strip unsupported `file` content parts from conversation history.
+ *
+ * Only images are ever sent to the model as `file` parts. PDFs and text docs
+ * are inlined as text at ingest (see runThinkChat). But sessions created
+ * before PDFs were inlined persisted the PDF as a `file` part in Think's
+ * message store. On every subsequent turn `assembleContext` replays it, the
+ * `@ai-sdk/openai-compatible` provider serializes it as an OpenAI
+ * `file`/`file_data` content part, and gateways without native document
+ * support reject the entire request — Workers AI returns HTTP 501, the
+ * ai-gateway OpenAI-compat endpoint returns HTTP 400 "Bad Request". That
+ * permanently wedges the session: even a plain-text follow-up fails because
+ * the poisoned historical message is replayed every turn.
+ *
+ * This guard drops any `file` part whose media type is not a supported image,
+ * so a single legacy (or malformed) message can't brick a session. Image
+ * parts are preserved for vision models. A message left with no parts gets a
+ * short placeholder so we never emit empty content (some providers reject it).
+ *
+ * Pure and exported for direct unit testing — `assembleContext` calls it on
+ * the output of `super.assembleContext()`.
+ */
+export function stripUnsupportedFileParts(
+  messages: ModelMessage[],
+): { messages: ModelMessage[]; stripped: number } {
+  let stripped = 0;
+  const cleaned = messages.map((msg) => {
+    if (!Array.isArray(msg.content)) return msg;
+    const kept = msg.content.filter((part) => {
+      const p = part as { type?: string; mediaType?: string; mimeType?: string };
+      if (p.type !== "file") return true;
+      const mediaType = p.mediaType ?? p.mimeType ?? "";
+      if (isImageMediaType(mediaType)) return true;
+      stripped++;
+      return false;
+    });
+    if (kept.length === msg.content.length) return msg;
+    const content =
+      kept.length > 0
+        ? kept
+        : [{ type: "text" as const, text: "[unsupported document attachment removed from context]" }];
+    return { ...msg, content } as ModelMessage;
+  });
+  return { messages: cleaned, stripped };
+}
 /**
  * Decode base64 attachment bytes to UTF-8 text for inlining. Never throws:
  * returns null on malformed base64 so a bad doc drops rather than failing the
@@ -2457,6 +2506,22 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   override async assembleContext(): Promise<ModelMessage[]> {
     let messages = await super.assembleContext();
+
+    // ─── Strip unsupported file parts (poison-pill guard) ───
+    // Runs first so all downstream token estimation and shaping operate on the
+    // cleaned messages. Un-wedges sessions poisoned by a legacy PDF `file`
+    // part that gateways reject (HTTP 501 / 400 "Bad Request"). See
+    // stripUnsupportedFileParts for the full rationale.
+    {
+      const { messages: cleaned, stripped } = stripUnsupportedFileParts(messages);
+      if (stripped > 0) {
+        messages = cleaned;
+        log("info", "assembleContext: stripped unsupported file parts from history", {
+          sessionId: this.sessionId(),
+          strippedFileParts: stripped,
+        });
+      }
+    }
 
     // ─── Inject compaction summary if missing ───
     // Think's getHistory() is supposed to inject the compaction summary as a
