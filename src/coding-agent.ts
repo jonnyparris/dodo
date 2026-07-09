@@ -5523,21 +5523,79 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           );
           continue;
         }
-        let url: string | null;
-        if (isImageMediaType(att.mediaType)) {
-          // Sanitize SVG uploads here — user-uploaded SVGs stay inline as
-          // `data:` URLs (we don't write them to R2), so this is the only
-          // place the sanitizer runs for them. `<img>`-loaded SVG is inert
-          // in browsers, but click-to-zoom navigates to the data URL which
-          // could execute scripts in older browsers or non-Chromium engines.
-          // Returns null for malformed/oversized SVGs — silently drop the
-          // bad part rather than fail the whole message.
-          url = sanitizeUserImage(att.data, att.mediaType);
-        } else {
-          // PDFs (and any future binary file type): pass the raw base64
-          // through untouched. The model reads them as file parts.
-          url = att.data;
+        // PDFs: convert to Markdown server-side via Workers AI `toMarkdown`
+        // and inline as text (same path as text docs). The AI SDK's
+        // openai-compatible provider serializes a PDF file part as an OpenAI
+        // `file`/`file_data` content part, which the Workers AI OpenAI-compat
+        // endpoint does not implement — it returns HTTP 501 "Not Implemented".
+        // Converting to Markdown makes PDFs readable by every model (including
+        // scanned PDFs, via toMarkdown's OCR), not just models with native
+        // document support, and reuses the proven text-inlining path.
+        if (isPdfMediaType(att.mediaType)) {
+          const label = att.name?.trim() || "document.pdf";
+          let bytes: Uint8Array<ArrayBuffer>;
+          try {
+            // Allocate over a concrete ArrayBuffer (not the ArrayBufferLike
+            // that Uint8Array.from infers) so the Blob constructor accepts it.
+            const binary = atob(att.data);
+            bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          } catch {
+            log("warn", "pdf attachment base64 decode failed", {
+              sessionId: this.sessionId(),
+              name: label,
+            });
+            continue;
+          }
+          let markdown: string | null = null;
+          try {
+            const res = await this.env.AI.toMarkdown({
+              name: label,
+              blob: new Blob([bytes], { type: "application/pdf" }),
+            });
+            if (res.format === "error") {
+              log("warn", "toMarkdown failed for pdf attachment", {
+                sessionId: this.sessionId(),
+                name: label,
+                error: res.error,
+              });
+            } else {
+              markdown = res.data;
+            }
+          } catch (e) {
+            log("warn", "toMarkdown threw for pdf attachment", {
+              sessionId: this.sessionId(),
+              name: label,
+              error: String(e),
+            });
+          }
+          if (markdown === null) {
+            inlinedDocs.push(
+              `--- Attached document: ${label} (application/pdf) ---\n[PDF could not be read — conversion failed]\n--- End of ${label} ---`,
+            );
+            continue;
+          }
+          let truncated = false;
+          if (markdown.length > MAX_INLINED_DOC_CHARS) {
+            markdown = markdown.slice(0, MAX_INLINED_DOC_CHARS);
+            truncated = true;
+          }
+          const truncNote = truncated
+            ? `\n[truncated — showing first ${MAX_INLINED_DOC_CHARS} characters]`
+            : "";
+          inlinedDocs.push(
+            `--- Attached document: ${label} (application/pdf, converted to Markdown) ---\n${markdown}${truncNote}\n--- End of ${label} ---`,
+          );
+          continue;
         }
+        // Images: sanitize SVG uploads here — user-uploaded SVGs stay inline
+        // as `data:` URLs (we don't write them to R2), so this is the only
+        // place the sanitizer runs for them. `<img>`-loaded SVG is inert in
+        // browsers, but click-to-zoom navigates to the data URL which could
+        // execute scripts in older browsers or non-Chromium engines. Returns
+        // null for malformed/oversized SVGs — silently drop the bad part
+        // rather than fail the whole message.
+        const url = sanitizeUserImage(att.data, att.mediaType);
         if (url === null) {
           log("warn", "sanitizeUserImage rejected attachment", {
             sessionId: this.sessionId(),
