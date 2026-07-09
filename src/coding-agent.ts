@@ -5801,31 +5801,39 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
     await this.chat(userMsg, callback, { signal: options?.signal });
 
-    // Flush workspace changes to Artifacts. Never blocks the turn —
-    // we attach a then-handler to update the read-side cache flag,
-    // and a catch to swallow any rejection so an unhandled-rejection
-    // warning never reaches Workers logs.
-    const artifactsCtx = await this.getOrCreateArtifactsContext().catch(() => null);
-    if (artifactsCtx) {
-      flushTurnToArtifacts({
-        workspace: this.workspace,
-        remote: artifactsCtx.remote,
-        tokenSecret: artifactsCtx.tokenSecret,
-        message: `dodo: turn ${new Date().toISOString()}`,
-        author: options?.authorEmail
-          ? { name: options.authorEmail, email: options.authorEmail }
-          : { name: "Dodo", email: "dodo@workers.dev" },
-      })
-        .then((pushed) => {
+    // Flush workspace changes to Artifacts. Never blocks the turn.
+    //
+    // This is fully fire-and-forget, INCLUDING acquiring the artifacts
+    // context. getOrCreateArtifactsContext() is a call into the ARTIFACTS
+    // binding, and if that binding hangs, awaiting it here wedges turn
+    // finalization: no assistant token metadata is persisted, runThinkChat
+    // never returns, lifecycle.finish() never clears activePromptId, and the
+    // terminal state/prompt events that stop the client spinner never fire —
+    // so the session appears permanently stuck even though the LLM already
+    // produced its answer. Keep the whole flush off the hot path; a slow or
+    // dead ARTIFACTS binding must only cost us the (best-effort) flush.
+    void this.getOrCreateArtifactsContext()
+      .then((artifactsCtx) => {
+        if (!artifactsCtx) return;
+        return flushTurnToArtifacts({
+          workspace: this.workspace,
+          remote: artifactsCtx.remote,
+          tokenSecret: artifactsCtx.tokenSecret,
+          message: `dodo: turn ${new Date().toISOString()}`,
+          author: options?.authorEmail
+            ? { name: options.authorEmail, email: options.authorEmail }
+            : { name: "Dodo", email: "dodo@workers.dev" },
+        }).then((pushed) => {
           // On a successful push, lift the first-flush gate and mark
           // any existing read-side cache stale.
           if (pushed) this.markArtifactsFsDirty();
-        })
-        .catch(() => {
-          // flushTurnToArtifacts catches its own errors and returns
-          // false, but belt-and-braces in case it ever throws.
         });
-    }
+      })
+      .catch(() => {
+        // getOrCreateArtifactsContext / flushTurnToArtifacts both swallow
+        // their own errors, but belt-and-braces so a rejection here can
+        // never surface as an unhandled-rejection warning.
+      });
 
     // If the stream contained an error chunk that Think silently dropped,
     // throw it so the caller (runFiberPrompt) can surface it properly.
