@@ -26,6 +26,9 @@ const ATTACHMENT_URL_SCHEME = "dodo-attachment://";
 const ATTACHMENT_KEY_PREFIX = "attachments/";
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10MB per attachment
 
+/** Max characters returned per `read_attachment` call. */
+export const MAX_READ_ATTACHMENT_CHARS = 50_000;
+
 const MIME_TO_EXT: Record<string, string> = {
   "image/png": "png",
   "image/jpeg": "jpg",

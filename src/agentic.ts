@@ -3,6 +3,7 @@ import { jsonSchema, tool, zodSchema } from "ai";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import type { AttachmentRef } from "./attachments";
+import { MAX_READ_ATTACHMENT_CHARS } from "./attachments";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { createPullRequest } from "./github-api";
 import { normalizePath } from "./paths";
@@ -79,6 +80,12 @@ interface BuildToolsOptions {
    * `todo_add` / `todo_update` / `todo_list` / `todo_clear` tools.
    */
   todoStore?: TodoStore;
+  /**
+   * Read a slice of a large attached document that was too big to inline.
+   * Backs the `read_attachment` tool. Provided by CodingAgent as
+   * `this.readSessionDocument`.
+   */
+  readAttachment?: (input: { id: string; offset?: number; limit?: number }) => Promise<unknown>;
   /**
    * Parent CodingAgent reference — used when `config.exploreMode` or
    * `config.taskMode` is `"facet"` so the explore / task tools can
@@ -1651,6 +1658,24 @@ function buildTools(
   // model stay oriented across long multi-step tasks and compactions.
   if (options?.todoStore) {
     Object.assign(tools, buildTodoTools(options.todoStore));
+  }
+
+  // read_attachment — lazy-load slices of large attached documents (PDFs/text)
+  // that were too big to inline. The stub in the prompt tells the model the
+  // doc id and how to call this tool.
+  if (options?.readAttachment) {
+    tools.read_attachment = tool({
+      description:
+        "Read a slice of a large attached document (PDF/text) that was too big to inline. " +
+        "Such docs appear in the prompt as a stub containing a `doc id`. Page through with " +
+        "character offset/limit; the result reports nextOffset and hasMore.",
+      inputSchema: zodSchema(z.object({
+        id: z.string().min(1),
+        offset: z.number().int().min(0).default(0),
+        limit: z.number().int().min(1).max(MAX_READ_ATTACHMENT_CHARS).default(20000),
+      })),
+      execute: async ({ id, offset, limit }) => options.readAttachment!({ id, offset, limit }),
+    });
   }
 
   // Goal status tool — only present when the parent agent exposes the

@@ -8,7 +8,7 @@ import { buildProvider, buildToolsForThink } from "./agentic";
 import { ARTIFACTS_TOKEN_TTL_SECONDS, type ArtifactsFsCache, buildArtifactsCloneUrl, flushTurnToArtifacts, listArtifactsTree, readArtifactsFile, refreshArtifactsFs } from "./artifacts";
 import type { ArtifactsRepo } from "./artifacts-types";
 import type { AttachmentRef } from "./attachments";
-import { rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
+import { attachmentUrlToKey, MAX_READ_ATTACHMENT_CHARS, rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
 import { listBuiltinSkills } from "./builtin-skills";
 import { pickCutoff, shouldCompact } from "./compaction-policy";
@@ -252,6 +252,13 @@ const ALLOWED_TEXT_MEDIA_TYPES = /^(text\/(plain|markdown|csv|html)|application\
 // Decoded text inlined per document is capped so a single big paste can't blow
 // the model's context window. ~200k chars ≈ 50k tokens.
 const MAX_INLINED_DOC_CHARS = 200_000;
+// Lazy attachment read: small docs inline as before; large docs (or when the
+// per-turn budget is spent) become a ~40-token stub and the model pulls slices
+// via the `read_attachment` tool. See the plan in
+// memory/workload/plans/2026-07-11-dodo-lazy-attachment-read.md.
+const INLINE_DOC_THRESHOLD = 8_000;      // ≤ this inlines (chars)
+const MAX_TURN_INLINE_CHARS = 24_000;    // per-turn inline budget (chars)
+const MAX_STORED_DOC_CHARS = 2_000_000;  // cap on stored readable text (~500k tok)
 export const isImageMediaType = (m: string): boolean => ALLOWED_IMAGE_MEDIA_TYPES.test(m);
 export const isPdfMediaType = (m: string): boolean => ALLOWED_PDF_MEDIA_TYPES.test(m);
 export const isTextDocMediaType = (m: string): boolean => ALLOWED_TEXT_MEDIA_TYPES.test(m);
@@ -1230,6 +1237,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       stateBackend: this.stateBackend,
       mcpGatekeepers: this.mcpGatekeepers,
       todoStore: this.todoStore(),
+      readAttachment: (i: { id: string; offset?: number; limit?: number }) => this.readSessionDocument(i),
     });
   }
 
@@ -3650,6 +3658,25 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // column already exists — expected on all but the first boot after deploy
     }
 
+    // Lazy attachment reads: large docs (PDFs/text) are stored to R2 as
+    // readable text and tracked here. The model sees only a ~40-token stub
+    // in the prompt and pulls slices on demand via `read_attachment`.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS session_documents (
+        doc_id       TEXT PRIMARY KEY,
+        message_id   TEXT NOT NULL,
+        label        TEXT NOT NULL,
+        media_type   TEXT NOT NULL,
+        r2_url       TEXT NOT NULL,
+        total_chars  INTEGER NOT NULL,
+        est_tokens   INTEGER NOT NULL,
+        created_at   INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_session_documents_msg ON session_documents(message_id)",
+    );
+
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS prompts (
         id TEXT PRIMARY KEY,
@@ -5446,6 +5473,93 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     );
   }
 
+  /** Generate a short doc id for the `session_documents` table. */
+  private mintDocId(): string {
+    return "doc_" + crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+  }
+
+  /** Insert a row into `session_documents` for a lazy-loaded attachment. */
+  private insertSessionDocument(input: {
+    docId: string;
+    messageId: string;
+    label: string;
+    mediaType: string;
+    r2Url: string;
+    totalChars: number;
+    estTokens: number;
+  }): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO session_documents (doc_id, message_id, label, media_type, r2_url, total_chars, est_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      input.docId,
+      input.messageId,
+      input.label,
+      input.mediaType,
+      input.r2Url,
+      input.totalChars,
+      input.estTokens,
+      nowEpoch(),
+    );
+  }
+
+  /**
+   * Read a slice of a large attached document that was too big to inline.
+   * Called by the `read_attachment` tool via `getTools` → `buildToolsForThink`.
+   */
+  private async readSessionDocument(input: {
+    id: string;
+    offset?: number;
+    limit?: number;
+  }): Promise<{
+    id: string;
+    label: string;
+    mediaType: string;
+    offset: number;
+    returnedChars: number;
+    totalChars: number;
+    nextOffset: number;
+    hasMore: boolean;
+    text: string;
+  } | { error: string }> {
+    const offset = Math.max(0, Math.floor(input.offset ?? 0));
+    const limit = Math.min(MAX_READ_ATTACHMENT_CHARS, Math.max(1, Math.floor(input.limit ?? 20_000)));
+
+    const rows = Array.from(this.ctx.storage.sql.exec(
+      "SELECT label, media_type, r2_url, total_chars FROM session_documents WHERE doc_id = ?",
+      input.id,
+    ));
+    if (rows.length === 0) {
+      return { error: `No attached document with id '${input.id}'. It may be from a different or forked session.` };
+    }
+    const row = rows[0];
+    const label = String(row.label);
+    const mediaType = String(row.media_type);
+    const r2Url = String(row.r2_url);
+    const totalChars = Number(row.total_chars);
+
+    const key = attachmentUrlToKey(r2Url);
+    if (!key || !this.env.WORKSPACE_BUCKET) {
+      return { error: "Document storage unavailable." };
+    }
+    const obj = await this.env.WORKSPACE_BUCKET.get(key);
+    if (!obj) {
+      return { error: "Document expired or missing." };
+    }
+    const full = await obj.text();
+    const slice = full.slice(offset, offset + limit);
+    const nextOffset = offset + slice.length;
+    return {
+      id: input.id,
+      label,
+      mediaType,
+      offset,
+      returnedChars: slice.length,
+      totalChars,
+      nextOffset,
+      hasMore: nextOffset < full.length,
+      text: slice,
+    };
+  }
+
   /**
    * Rebind attachments originally stored under a tool_call_id to the actual
    * assistant message id, now that the stream has finished and we know it.
@@ -5583,12 +5697,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // metadata are settled.
     const docAttachments: Array<{ data: string; mediaType: string; name: string }> = [];
     const parts: UIMessage["parts"] = [{ type: "text", text: userContent }];
+    // Per-turn budget for inlined doc text. Once spent, later docs stub even
+    // if individually small.
+    let turnInlineChars = 0;
     if (options?.images?.length) {
       for (const att of options.images) {
         if (isTextDocMediaType(att.mediaType)) {
-          // Text docs: decode base64 → UTF-8 and inline as text. Robust across
-          // all models (no native file support required) and visible in the
-          // transcript. Malformed base64 / oversized docs drop silently.
+          // Text docs: decode base64 → UTF-8. Robust across all models (no
+          // native file support required) and visible in the transcript.
+          // Malformed base64 drops silently.
           const decoded = decodeBase64Doc(att.data);
           if (decoded === null) {
             log("warn", "decodeBase64Doc rejected attachment", {
@@ -5599,13 +5716,58 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             continue;
           }
           const label = att.name?.trim() || "attachment";
-          const truncNote = decoded.truncated
-            ? `\n[truncated — showing first ${MAX_INLINED_DOC_CHARS} characters]`
-            : "";
-          inlinedDocs.push(
-            `--- Attached document: ${label} (${att.mediaType}) ---\n${decoded.text}${truncNote}\n--- End of ${label} ---`,
-          );
           docAttachments.push({ data: att.data, mediaType: att.mediaType, name: label });
+          // Inline-or-stub: small docs inline as before; large docs (or when
+          // the per-turn budget is spent) become a stub + R2-stored readable
+          // text the model pulls via `read_attachment`.
+          const readableText = decoded.text;
+          const storedTrunc = readableText.length > MAX_STORED_DOC_CHARS;
+          const stored = storedTrunc ? readableText.slice(0, MAX_STORED_DOC_CHARS) : readableText;
+          const small = stored.length <= INLINE_DOC_THRESHOLD;
+          const budgetLeft = turnInlineChars < MAX_TURN_INLINE_CHARS;
+
+          if (small && budgetLeft) {
+            const note = decoded.truncated || storedTrunc
+              ? `\n[truncated — showing first ${stored.length} characters]`
+              : "";
+            inlinedDocs.push(
+              `--- Attached document: ${label} (${att.mediaType}) ---\n${stored}${note}\n--- End of ${label} ---`,
+            );
+            turnInlineChars += stored.length;
+          } else {
+            // STUB path — upload readable text to R2 and inline only a stub.
+            const b64 = bytesToBase64Chunked(new TextEncoder().encode(stored));
+            const ref = await uploadAttachment(this.env, {
+              sessionId: this.sessionId(), messageId: userMsgId,
+              mediaType: "text/markdown", data: b64, source: "user",
+              ownerEmail: options?.authorEmail,
+            });
+            if (!ref) {
+              // R2 unavailable → fall back to today's inline+truncate
+              const fb = stored.slice(0, MAX_INLINED_DOC_CHARS);
+              const note = stored.length > MAX_INLINED_DOC_CHARS
+                ? `\n[truncated — showing first ${MAX_INLINED_DOC_CHARS} characters]`
+                : "";
+              inlinedDocs.push(
+                `--- Attached document: ${label} (${att.mediaType}) ---\n${fb}${note}\n--- End of ${label} ---`,
+              );
+              turnInlineChars += fb.length;
+            } else {
+              const docId = this.mintDocId();
+              const estTokens = Math.ceil(stored.length / 4);
+              this.insertSessionDocument({
+                docId, messageId: userMsgId, label, mediaType: att.mediaType,
+                r2Url: ref.url, totalChars: stored.length, estTokens,
+              });
+              const truncNote = storedTrunc ? " · stored copy truncated" : "";
+              inlinedDocs.push(
+                `--- Attached document: ${label} (${att.mediaType}) ---\n` +
+                `[doc id: ${docId} · ~${estTokens} tokens · ${stored.length} chars${truncNote} · not loaded]\n` +
+                `Read it with read_attachment(id="${docId}", offset=0, limit=20000).\n` +
+                `--- End of ${label} ---`,
+              );
+            }
+          }
           continue;
         }
         // PDFs: convert to Markdown server-side via Workers AI `toMarkdown`
@@ -5663,17 +5825,58 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             );
             continue;
           }
-          let truncated = false;
-          if (markdown.length > MAX_INLINED_DOC_CHARS) {
-            markdown = markdown.slice(0, MAX_INLINED_DOC_CHARS);
-            truncated = true;
+          // Inline-or-stub for the converted Markdown.
+          const readableText = markdown;
+          const storedTrunc = readableText.length > MAX_STORED_DOC_CHARS;
+          const stored = storedTrunc ? readableText.slice(0, MAX_STORED_DOC_CHARS) : readableText;
+          const small = stored.length <= INLINE_DOC_THRESHOLD;
+          const budgetLeft = turnInlineChars < MAX_TURN_INLINE_CHARS;
+
+          if (small && budgetLeft) {
+            let truncated = stored.length < readableText.length;
+            if (stored.length > MAX_INLINED_DOC_CHARS) {
+              truncated = true;
+            }
+            const fb = stored.slice(0, MAX_INLINED_DOC_CHARS);
+            const note = truncated
+              ? `\n[truncated — showing first ${fb.length} characters]`
+              : "";
+            inlinedDocs.push(
+              `--- Attached document: ${label} (application/pdf, converted to Markdown) ---\n${fb}${note}\n--- End of ${label} ---`,
+            );
+            turnInlineChars += fb.length;
+          } else {
+            const b64 = bytesToBase64Chunked(new TextEncoder().encode(stored));
+            const ref = await uploadAttachment(this.env, {
+              sessionId: this.sessionId(), messageId: userMsgId,
+              mediaType: "text/markdown", data: b64, source: "user",
+              ownerEmail: options?.authorEmail,
+            });
+            if (!ref) {
+              const fb = stored.slice(0, MAX_INLINED_DOC_CHARS);
+              const note = stored.length > MAX_INLINED_DOC_CHARS
+                ? `\n[truncated — showing first ${MAX_INLINED_DOC_CHARS} characters]`
+                : "";
+              inlinedDocs.push(
+                `--- Attached document: ${label} (application/pdf, converted to Markdown) ---\n${fb}${note}\n--- End of ${label} ---`,
+              );
+              turnInlineChars += fb.length;
+            } else {
+              const docId = this.mintDocId();
+              const estTokens = Math.ceil(stored.length / 4);
+              this.insertSessionDocument({
+                docId, messageId: userMsgId, label, mediaType: "application/pdf",
+                r2Url: ref.url, totalChars: stored.length, estTokens,
+              });
+              const truncNote = storedTrunc ? " · stored copy truncated" : "";
+              inlinedDocs.push(
+                `--- Attached document: ${label} (application/pdf) ---\n` +
+                `[doc id: ${docId} · ~${estTokens} tokens · ${stored.length} chars · converted to Markdown${truncNote} · not loaded]\n` +
+                `Read it with read_attachment(id="${docId}", offset=0, limit=20000).\n` +
+                `--- End of ${label} ---`,
+              );
+            }
           }
-          const truncNote = truncated
-            ? `\n[truncated — showing first ${MAX_INLINED_DOC_CHARS} characters]`
-            : "";
-          inlinedDocs.push(
-            `--- Attached document: ${label} (application/pdf, converted to Markdown) ---\n${markdown}${truncNote}\n--- End of ${label} ---`,
-          );
           continue;
         }
         // Images: sanitize SVG uploads here — user-uploaded SVGs stay inline
@@ -7600,6 +7803,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // recreations on the same DO key.
     this.ctx.storage.sql.exec("DELETE FROM message_metadata");
     this.ctx.storage.sql.exec("DELETE FROM message_attachments");
+    this.ctx.storage.sql.exec("DELETE FROM session_documents");
     this.ctx.storage.sql.exec("DELETE FROM prompts");
     this.ctx.storage.sql.exec("DELETE FROM prompt_queue");
     this.ctx.storage.sql.exec("DELETE FROM cron_jobs");
