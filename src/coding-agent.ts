@@ -5908,6 +5908,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           inlinedDocs.push(
             `[Image uploaded: ${att.name ?? att.mediaType} — this model cannot process images]`,
           );
+          continue;
         }
         // Pass raw base64 in the url field — the AI SDK's downloadAssets step
         // tries new URL(data) which throws for raw base64 (not a valid URL),
