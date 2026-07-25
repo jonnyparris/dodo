@@ -20,7 +20,7 @@ import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
 import { log } from "./logger";
 import { detectSameToolRepetition } from "./loop-detection";
 import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
-import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
+import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import { dispatchNotification } from "./notify";
 import { nextRetry } from "./overflow-retry";
 import { pruneOversizedToolResults } from "./own-loop-prune";
@@ -289,7 +289,9 @@ export const isAllowedAttachmentMediaType = (m: string): boolean =>
  */
 export function stripUnsupportedFileParts(
   messages: ModelMessage[],
+  modelId?: string,
 ): { messages: ModelMessage[]; stripped: number } {
+  const visionOk = modelId ? modelSupportsVision(modelId) : true;
   let stripped = 0;
   const cleaned = messages.map((msg) => {
     if (!Array.isArray(msg.content)) return msg;
@@ -297,7 +299,11 @@ export function stripUnsupportedFileParts(
       const p = part as { type?: string; mediaType?: string; mimeType?: string };
       if (p.type !== "file") return true;
       const mediaType = p.mediaType ?? p.mimeType ?? "";
-      if (isImageMediaType(mediaType)) return true;
+      if (isImageMediaType(mediaType)) {
+        if (visionOk) return true;
+        stripped++;
+        return false;
+      }
       stripped++;
       return false;
     });
@@ -305,7 +311,7 @@ export function stripUnsupportedFileParts(
     const content =
       kept.length > 0
         ? kept
-        : [{ type: "text" as const, text: "[unsupported document attachment removed from context]" }];
+        : [{ type: "text" as const, text: "[attachment removed from context — this model cannot process file attachments]" }];
     return { ...msg, content } as ModelMessage;
   });
   return { messages: cleaned, stripped };
@@ -2521,7 +2527,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // part that gateways reject (HTTP 501 / 400 "Bad Request"). See
     // stripUnsupportedFileParts for the full rationale.
     {
-      const { messages: cleaned, stripped } = stripUnsupportedFileParts(messages);
+      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
+      const { messages: cleaned, stripped } = stripUnsupportedFileParts(messages, modelId);
       if (stripped > 0) {
         messages = cleaned;
         log("info", "assembleContext: stripped unsupported file parts from history", {
@@ -5701,6 +5708,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // if individually small.
     let turnInlineChars = 0;
     if (options?.images?.length) {
+      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
+      const visionOk = modelSupportsVision(modelId);
       for (const att of options.images) {
         if (isTextDocMediaType(att.mediaType)) {
           // Text docs: decode base64 → UTF-8. Robust across all models (no
@@ -5894,6 +5903,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             bytes: att.data.length,
           });
           continue;
+        }
+        if (!visionOk) {
+          inlinedDocs.push(
+            `[Image uploaded: ${att.name ?? att.mediaType} — this model cannot process images]`,
+          );
         }
         // Pass raw base64 in the url field — the AI SDK's downloadAssets step
         // tries new URL(data) which throws for raw base64 (not a valid URL),

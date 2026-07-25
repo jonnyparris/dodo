@@ -62,3 +62,19 @@ export const REPLICATE_MAX_PROMPT_LENGTH = 5000;
 /** Max input images accepted per edit request. nano-banana-2 supports up to 14
  *  reference images. */
 export const REPLICATE_MAX_EDIT_IMAGES = 14;
+
+/** Model ID prefixes that support image/vision input. Used to decide whether
+ *  to pass image `file` parts to the model or replace them with a text note.
+ *  When in doubt, return false — a text note is always safe; an image part
+ *  sent to a non-vision model causes the model to hallucinate or reject the
+ *  request. */
+const VISION_CAPABLE_MODEL_PATTERNS = [
+  /^openai\//,
+  /^anthropic\//,
+  /^google\//,
+  /^@cf\/meta\/llama-4-/,
+];
+
+export function modelSupportsVision(modelId: string): boolean {
+  return VISION_CAPABLE_MODEL_PATTERNS.some((p) => p.test(modelId));
+}
