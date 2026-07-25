@@ -666,13 +666,13 @@ function sendTypingStop(){
 
 // --- Prompt attachments (images, PDFs, text docs) ---
 // Limits kept in sync with `promptAttachmentSchema` in src/coding-agent.ts.
-// Backend caps base64 length at 4_000_000 chars (~3MB decoded, 5 per message);
-// 3MB raw here is a conservative frontend bound that stays under the backend
-// limit after base64 encoding (3MB * 4/3 ≈ 4MB). Images render inline; PDFs are
+// Backend caps base64 length at 10_000_000 chars (~7.5MB decoded, 5 per message);
+// 7MB raw here is a conservative frontend bound that stays under the backend
+// limit after base64 encoding (7MB * 4/3 ≈ 9.8MB). Images render inline; PDFs are
 // sent as model file parts; text docs are decoded server-side and inlined into
 // the prompt so every model — not just ones with native file support — sees them.
 const _pendingImages=[];
-const MAX_ATTACHMENT_SIZE=3*1024*1024; // 3MB raw — pairs with ~4MB base64 on the backend
+const MAX_ATTACHMENT_SIZE=7*1024*1024; // 7MB raw — pairs with ~10MB base64 on the backend
 const MAX_IMAGES=5; // combined images + docs per message
 const ALLOWED_IMAGE_TYPES=new Set(["image/png","image/jpeg","image/gif","image/webp","image/svg+xml"]);
 // Browser-reported MIME types the backend accepts for docs.
@@ -722,7 +722,7 @@ function addAttachmentFile(file){
   const cls=classifyAttachment(file);
   if(!cls)return toast(`${file.type||file.name} not supported`,"warning");
   if(_pendingImages.length>=MAX_IMAGES)return toast(`Maximum ${MAX_IMAGES} attachments per message`,"warning");
-  if(file.size>MAX_ATTACHMENT_SIZE)return toast("File too large (max 3MB)","warning");
+  if(file.size>MAX_ATTACHMENT_SIZE)return toast("File too large (max 7MB)","warning");
   const reader=new FileReader();
   reader.onload=()=>{
     const dataUrl=String(reader.result);

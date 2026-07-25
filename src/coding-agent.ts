@@ -235,10 +235,10 @@ export function estimateMessagesTokens(messages: ModelMessage[]): number {
 /**
  * Image attachment limits — keep in sync with `public/js/dodo-chat.js`.
  * Base64 encodes 3 bytes → 4 chars, so MAX_IMAGE_BASE64_LENGTH ≈ MAX_IMAGE_BYTES * 4/3.
- * Kept tight to protect the DO isolate: 5 images × 4MB base64 = 20MB peak payload.
+ * Kept tight to protect the DO isolate: 5 images × 10MB base64 = 50MB peak payload.
  */
 const MAX_IMAGES_PER_MESSAGE = 5;
-const MAX_IMAGE_BASE64_LENGTH = 4_000_000; // ~3MB decoded per image
+const MAX_IMAGE_BASE64_LENGTH = 10_000_000; // ~7.5MB decoded per image
 const ALLOWED_IMAGE_MEDIA_TYPES = /^image\/(png|jpeg|gif|webp|svg\+xml)$/;
 // Document attachments (PDFs + text docs) travel through the same base64
 // pipeline as images, but neither is sent to the model as a `file` part:
@@ -4679,6 +4679,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Replicate image editing instead of sending to the text LLM (which would
     // either reject the image or hallucinate). This lets users on non-vision
     // models edit images via "add dreadlocks" + upload without /generate.
+    // When no new images are attached but the last assistant message has an
+    // image, reuse it for follow-up editing (e.g. "make it blue" after a
+    // previous edit).
     if (input.images?.length) {
       this.ensureThinkConfig(request);
       const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
@@ -4693,6 +4696,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             authorEmail,
             ownerEmail,
             images: replicateImages,
+          });
+        }
+      }
+    } else {
+      this.ensureThinkConfig(request);
+      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
+      if (!modelSupportsVision(modelId)) {
+        const lastImage = await this.fetchLastAssistantImage();
+        if (lastImage) {
+          return this.runImageGeneration({
+            prompt: input.content,
+            sessionId,
+            authorEmail,
+            ownerEmail,
+            images: [lastImage],
           });
         }
       }
@@ -4779,7 +4797,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     }
 
     // When images are attached and the chat model can't see them, route to
-    // Replicate image editing instead of the text LLM.
+    // Replicate image editing instead of the text LLM. When no new images
+    // are attached but the last assistant message has an image, reuse it
+    // for follow-up editing.
     if (input.images?.length) {
       const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
       if (!modelSupportsVision(modelId)) {
@@ -4793,6 +4813,20 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             authorEmail,
             ownerEmail,
             images: replicateImages,
+          });
+        }
+      }
+    } else {
+      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
+      if (!modelSupportsVision(modelId)) {
+        const lastImage = await this.fetchLastAssistantImage();
+        if (lastImage) {
+          return this.runImageGeneration({
+            prompt: input.content,
+            sessionId,
+            authorEmail,
+            ownerEmail,
+            images: [lastImage],
           });
         }
       }
@@ -5657,6 +5691,32 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       result.set(id, list);
     }
     return result;
+  }
+
+  /** Fetch the most recent assistant-generated image from R2 as base64.
+   *  Used for follow-up image editing: when a user sends a text prompt with no
+   *  new images on a non-vision model, the last edited image is reused as
+   *  input for the next Replicate edit. Returns null if no image found or
+   *  R2 unavailable. */
+  private async fetchLastAssistantImage(): Promise<{ data: string; mediaType: string } | null> {
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) return null;
+    const row = (Array.from(this.ctx.storage.sql.exec(
+      `SELECT ma.url, ma.media_type FROM message_attachments ma
+       JOIN message_metadata mm ON ma.message_id = mm.message_id
+       WHERE ma.source = 'assistant' AND ma.media_type LIKE 'image/%'
+       ORDER BY ma.id DESC LIMIT 1`,
+    ))[0] as SqlRow | null);
+    if (!row) return null;
+    const url = String(row.url);
+    const mediaType = String(row.media_type);
+    const key = attachmentUrlToKey(url);
+    if (!key || !this.env.WORKSPACE_BUCKET) return null;
+    const obj = await this.env.WORKSPACE_BUCKET.get(key);
+    if (!obj) return null;
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    const base64 = bytesToBase64Chunked(bytes);
+    return { data: base64, mediaType };
   }
 
   /** Read metadata for a Think message. */
