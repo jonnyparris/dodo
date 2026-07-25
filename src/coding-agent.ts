@@ -4675,6 +4675,29 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
     }
 
+    // When images are attached and the chat model can't see them, route to
+    // Replicate image editing instead of sending to the text LLM (which would
+    // either reject the image or hallucinate). This lets users on non-vision
+    // models edit images via "add dreadlocks" + upload without /generate.
+    if (input.images?.length) {
+      this.ensureThinkConfig(request);
+      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
+      if (!modelSupportsVision(modelId)) {
+        const replicateImages = input.images
+          .filter((att) => isImageMediaType(att.mediaType))
+          .map((att) => ({ data: att.data, mediaType: att.mediaType }));
+        if (replicateImages.length > 0) {
+          return this.runImageGeneration({
+            prompt: input.content,
+            sessionId,
+            authorEmail,
+            ownerEmail,
+            images: replicateImages,
+          });
+        }
+      }
+    }
+
     // handleMessage is synchronous — callers (MCP, external integrations) expect the
     // assistant response in the HTTP reply. Queuing would lose the response. Keep 409.
     // This is the only path that doesn't go through SessionLifecycle (sync semantics
@@ -4753,6 +4776,26 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         authorEmail,
         ownerEmail,
       });
+    }
+
+    // When images are attached and the chat model can't see them, route to
+    // Replicate image editing instead of the text LLM.
+    if (input.images?.length) {
+      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
+      if (!modelSupportsVision(modelId)) {
+        const replicateImages = input.images
+          .filter((att) => isImageMediaType(att.mediaType))
+          .map((att) => ({ data: att.data, mediaType: att.mediaType }));
+        if (replicateImages.length > 0) {
+          return this.runImageGeneration({
+            prompt: input.content,
+            sessionId,
+            authorEmail,
+            ownerEmail,
+            images: replicateImages,
+          });
+        }
+      }
     }
 
     const r = await this.lifecycle.start({
