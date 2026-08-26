@@ -9,6 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 // outputSchema, which is why their MCP server's tools never appeared
 // despite a working connect/initialize.)
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker-provider.js";
+import { log } from "./logger";
 
 // ─── Auth header normalisation ───
 
@@ -140,9 +141,10 @@ export class HttpMcpClient implements McpClient {
     const norm = normaliseAuthHeaders(headers);
     headers = norm.headers;
     if (norm.normalised) {
-      console.info(
-        `[mcp] prepended "Bearer " to Authorization header for "${this.config.name}" (${this.config.id}) — stored value was missing an auth scheme`,
-      );
+      log("info", "prepended Bearer auth scheme to MCP Authorization header", {
+        mcpId: this.config.id,
+        mcpName: this.config.name,
+      });
     }
     // Propagate MCP recursion depth to outbound MCP servers
     if (this.mcpDepth > 0) {

@@ -763,7 +763,11 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
         await sourceCtx.repo.fork(`dodo-${newId}`, { defaultBranchOnly: false });
       }
     } catch (err) {
-      console.warn("[fork_session] Artifacts fork failed (files still copied via snapshot):", err);
+      log("warn", "fork_session artifacts fork failed", {
+        sessionId,
+        newId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
     return textResult({ sessionId: newId, sourceSessionId: sessionId, forkedAt: new Date().toISOString() });
   });

@@ -2999,7 +2999,9 @@ export class UserControl extends DurableObject<Env> {
       const sharedIndex = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
       await sharedIndex.fetch(`https://shared-index/mcp-token-index/${encodeURIComponent(token)}`, { method: "DELETE" });
     } catch (err) {
-      console.warn("[user-control] Failed to delete token from SharedIndex:", err);
+      log("warn", "failed to delete token from SharedIndex", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
     return true;
   }

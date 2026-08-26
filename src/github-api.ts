@@ -493,7 +493,20 @@ export async function triggerVerifyWorkflow(input: {
 
   if (!triggerRes.ok) {
     const errorText = await triggerRes.text();
-    console.warn(`[verify-gate] workflow_dispatch failed ${triggerRes.status}:`, errorText.slice(0, 500));
+    let message = "";
+    try {
+      const parsed = JSON.parse(errorText) as { message?: unknown };
+      if (typeof parsed.message === "string") message = parsed.message;
+    } catch {
+      // Non-JSON error body — omit rather than forward raw text to the log sink.
+    }
+    log("warn", "verify-gate workflow_dispatch failed", {
+      runId: run.id,
+      repo: run.repoUrl,
+      branch: run.branch,
+      status: triggerRes.status,
+      error: message,
+    });
     return null;
   }
 
@@ -520,7 +533,11 @@ export async function triggerVerifyWorkflow(input: {
     }
   }
 
-  console.warn("[verify-gate] workflow dispatched but run id not found within 5s");
+  log("warn", "verify-gate workflow dispatched but run id not found", {
+    runId: run.id,
+    repo: run.repoUrl,
+    branch: run.branch,
+  });
   return null;
 }
 
@@ -564,7 +581,12 @@ export async function pollVerifyWorkflow(input: {
   const url = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/actions/runs/${encodeURIComponent(run.verifyWorkflowRunId)}`;
   const res = await fetch(url, { headers: ghHeaders(token) });
   if (!res.ok) {
-    console.warn(`[verify-gate] poll failed ${res.status}`);
+    log("warn", "verify-gate poll failed", {
+      runId: run.id,
+      workflowRunId: run.verifyWorkflowRunId,
+      repo: run.repoUrl,
+      status: res.status,
+    });
     return null;
   }
 

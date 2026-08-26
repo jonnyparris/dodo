@@ -2928,7 +2928,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       }
     } else if (existing.length > 1) {
       // Multiple sessions — use most recent, delete extras
-      console.warn(`CodingAgent: found ${existing.length} Think sessions, expected 1. Using most recent.`);
+      log("warn", "multiple think sessions found, using most recent", {
+        sessionId: this.sessionId(),
+        count: existing.length,
+      });
       const sorted = [...existing].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
       // Switch to the most recent
       this.switchSession(sorted[0].id);
@@ -6157,7 +6160,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             // returns an error. Think's applyChunkToParts silently drops these.
             // Capture so we can throw after the stream ends.
             streamError = chunk.errorText ?? chunk.error ?? "Unknown LLM error";
-            console.error("[runThinkChat] stream error chunk:", streamError);
+            log("error", "stream error chunk", { sessionId: this.sessionId(), error: streamError });
           }
           // Token usage is captured via onChatMessage() override — see _lastUsage.
         } catch {
@@ -6178,7 +6181,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         }
       },
       onError: (error: string) => {
-        console.error("Think chat error:", error);
+        log("error", "think chat error", { sessionId: this.sessionId(), error });
         streamError = error;
       },
     };
@@ -6305,7 +6308,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     try {
       await this.maybeCompactContext();
     } catch (err) {
-      console.warn("[compaction] Post-chat compaction failed:", err instanceof Error ? err.message : err);
+      log("warn", "post-chat compaction failed", {
+        sessionId: this.sessionId(),
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
 
     return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
@@ -6654,10 +6660,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         iterative: !!previousSummary,
       });
     } catch (error) {
-      console.warn(
-        "[compaction:ERROR] Failed to generate summary:",
-        error instanceof Error ? `${error.message}\n${error.stack}` : error,
-      );
+      log("warn", "failed to generate compaction summary", {
+        sessionId: this.sessionId(),
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
     }
   }
 
@@ -6963,7 +6970,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       this._artifactsTokenSecret = tokenSecret;
       return { repo, remote, tokenSecret };
     } catch (err) {
-      console.warn("[artifacts] failed to get/create repo:", err);
+      log("warn", "failed to get/create artifacts repo", {
+        sessionId: this.sessionId(),
+        error: err instanceof Error ? err.message : String(err),
+      });
       return null;
     }
   }
@@ -7458,10 +7468,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           // We also record the failure on `mcpStatus` so the UI can surface it
           // instead of leaving the user to guess why tools never appeared.
           const message = error instanceof Error ? error.message : String(error);
-          console.warn(
-            `MCP connect failed for "${config.name}" (${config.id}):`,
-            message,
-          );
+          log("warn", "mcp connect failed", {
+            sessionId: this.sessionId(),
+            mcpId: config.id,
+            mcpName: config.name,
+            error: message,
+          });
           this.mcpStatus.set(config.id, {
             name: config.name,
             url: config.url,
@@ -7485,7 +7497,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       // fingerprint/timestamp in place so the next call retries.
       this.mcpConnectedAt = 0;
       this.mcpEnabledConfigsFingerprint = null;
-      console.warn("connectMcpServers failed:", error instanceof Error ? error.message : error);
+      log("warn", "connectMcpServers failed", {
+        sessionId: this.sessionId(),
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -7547,7 +7562,10 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
     } catch (error) {
       // Log but don't throw — sync failure shouldn't break prompt completion
-      console.error("syncSessionIndex failed:", error instanceof Error ? error.message : error);
+      log("warn", "syncSessionIndex failed", {
+        sessionId: this.sessionId(),
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
