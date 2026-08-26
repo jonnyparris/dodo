@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { canonicalizeEmail, resolveAdminEmail } from "./auth";
 import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
+import { log } from "./logger";
 import type { Env } from "./types";
 
 /**
@@ -20,7 +21,7 @@ export function mcpUserEmail(env: Env, userEmail?: string, label = "mcp"): strin
   if (canonical) return canonical;
   const email = resolveAdminEmail(env);
   if (!email) throw new Error("ADMIN_EMAIL must be configured for MCP access. Set it as a secret or in wrangler.jsonc vars.");
-  console.warn(`[${label}] Operation attributed to admin via service-mode fallback (no userEmail threaded).`);
+  log("warn", "mcp operation attributed to admin via service-mode fallback", { label });
   return email;
 }
 
@@ -89,7 +90,12 @@ export function registerChatReplyTool(server: McpServer, env: Env, userEmail: st
           emoji: reactionEmoji,
           action: "remove",
         }).catch((err) => {
-          console.warn("[chat_reply] failed to remove loading reaction (non-fatal):", err instanceof Error ? err.message : String(err));
+          log("warn", "chat_reply failed to remove loading reaction", {
+            sessionId,
+            spaceId: flag.spaceId,
+            messageName,
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
 
         // Add the done reaction only when we actually posted a reply.
@@ -99,7 +105,12 @@ export function registerChatReplyTool(server: McpServer, env: Env, userEmail: st
             emoji: doneEmoji,
             action: "add",
           }).catch((err) => {
-            console.warn("[chat_reply] failed to add done reaction (non-fatal):", err instanceof Error ? err.message : String(err));
+            log("warn", "chat_reply failed to add done reaction", {
+              sessionId,
+              spaceId: flag.spaceId,
+              messageName,
+              error: err instanceof Error ? err.message : String(err),
+            });
           });
         }
 
@@ -113,7 +124,12 @@ export function registerChatReplyTool(server: McpServer, env: Env, userEmail: st
             body: JSON.stringify({ messageName }),
           });
         } catch (err) {
-          console.warn("[chat_reply] failed to notify monitor of reaction clear (non-fatal):", err instanceof Error ? err.message : String(err));
+          log("warn", "chat_reply failed to notify monitor of reaction clear", {
+            sessionId,
+            spaceId: flag.spaceId,
+            messageName,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }
 

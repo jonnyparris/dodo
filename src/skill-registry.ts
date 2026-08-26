@@ -27,6 +27,7 @@
  */
 
 import type { Workspace } from "@cloudflare/shell";
+import { log } from "./logger";
 
 // ─── Types ───
 
@@ -221,9 +222,10 @@ export function normalizeFrontmatter(
   if (options.dirName && options.dirName !== name) {
     // Loose match — log a warning but don't throw. OpenCode is strict here;
     // we're more forgiving so imported third-party skills don't fail.
-    console.warn(
-      `SKILL.md name "${name}" doesn't match directory "${options.dirName}" — proceeding anyway`,
-    );
+    log("warn", "skill name mismatch with directory", {
+      name,
+      dirName: options.dirName,
+    });
   }
 
   const descRaw = frontmatter.description;
@@ -434,7 +436,10 @@ async function loadWorkspaceSkill(
       rawFrontmatter: input.rawFrontmatter,
     };
   } catch (error) {
-    console.warn(`skill-load-failed dir=${dir}:`, error instanceof Error ? error.message : error);
+    log("warn", "skill-load-failed", {
+      dir,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return null;
   }
 }

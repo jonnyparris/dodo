@@ -26,6 +26,7 @@ import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
 import { createShellTool } from "./tools/shell";
 import { sanitizeToolJsonSchema } from "./tool-schema";
 import { runTypecheck } from "./typecheck";
+import { log } from "./logger";
 import type { AppConfig, Env, TodoStore } from "./types";
 
 /** Options passed through from the coding agent into tool factories. */
@@ -1817,7 +1818,10 @@ function buildOAuthMcpTools(
 
   for (const info of oauthTools) {
     if (!info.name || !info.serverId) {
-      console.warn("[oauth-mcp] Skipping tool with missing name or serverId:", info);
+      log("warn", "oauth-mcp skipping tool with missing name or serverId", {
+        serverId: info.serverId,
+        name: info.name,
+      });
       continue;
     }
 
@@ -1827,7 +1831,11 @@ function buildOAuthMcpTools(
     const prefixedName = fullName.length > 64 ? fullName.slice(0, 64) : fullName;
 
     if (existingNames.has(prefixedName) || tools[prefixedName]) {
-      console.warn("[oauth-mcp] Skipping duplicate tool name:", { prefixedName, serverId: info.serverId, original: info.name });
+      log("warn", "oauth-mcp skipping duplicate tool name", {
+        prefixedName,
+        serverId: info.serverId,
+        original: info.name,
+      });
       continue;
     }
 
