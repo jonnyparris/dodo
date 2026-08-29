@@ -14,11 +14,25 @@ import { listBuiltinSkills } from "./builtin-skills";
 import { pickCutoff, shouldCompact } from "./compaction-policy";
 import { bytesToBase64Chunked } from "./crypto";
 import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
-import { shouldRunFinalSummary, stripHarnessNotices } from "./final-summary-policy";
+import { type OwnLoopExitReason, STUCK_EXIT_REASONS, shouldRunFinalSummary, stripHarnessNotices } from "./final-summary-policy";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
 import { log } from "./logger";
-import { detectSameToolRepetition } from "./loop-detection";
+import {
+  buildPhaseDigest,
+  decidePostStep,
+  decideStepGate,
+  LOOP_LIMITS,
+  type StepGate,
+  shouldAutoContinue,
+  shouldHardStopBeforeCall,
+  shouldPruneResults,
+  shouldTagStepLimit,
+  shouldTriggerCompaction,
+  trackNoTextStep,
+  trackTextIteration,
+  trackToolCall,
+} from "./loop-policy";
 import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
 import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import { dispatchNotification } from "./notify";
@@ -1294,48 +1308,28 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
 
-    // ─── Loop state ───
-    const recentToolCalls: string[] = []; // "toolName:argsJSON" for doom-loop detection
+    // ─── Loop state (shared across the primary loop and continuation phases) ───
+    // Decisions live in src/loop-policy.ts; this scope only applies effects.
+    const recentToolCalls: string[] = []; // "toolName:argsJSON" for loop detection
     const recentTextPrefixes: string[] = []; // first ~80 chars of text per iteration for repetition detection
     let cumulativeInputTokens = 0;
     let cumulativeOutputTokens = 0;
     let step = 0;
     let warnInjected = false;
     let wrapUpInjected = false;
+    let sameToolNudgeInjected = false;
     let compactionTriggered = false;
-    let consecutiveNoTextSteps = 0; // Track iterations where the model produces tool calls but no text
-    let exitReason: "natural" | "step-limit" | "budget-limit" | "doom-loop" | "no-text-loop" | "text-loop" | "abort" = "natural";
+    let consecutiveNoTextSteps = 0; // Iterations where the model produces tool calls but no text
+    let exitReason: OwnLoopExitReason = "natural";
     // Running total of plain text emitted across iterations. Used after the
     // loop to decide whether a forced final-summary turn is needed (only
     // when the loop ended on a stuck signal and the model never wrote
     // a real conclusion).
     let turnText = "";
 
-    // ─── Budget thresholds (% of tokenBudget) ───
-    const WARN_THRESHOLD = 0.70;
-    const WRAP_UP_THRESHOLD = 0.85;
-    const HARD_STOP_THRESHOLD = 0.95;
-
-    // ─── Doom loop detection ───
-    const DOOM_LOOP_THRESHOLD = 3;
-    const NO_TEXT_LOOP_THRESHOLD = 15;
-    const NO_TEXT_GRACE_STEPS = 10; // Skip no-text detection for the first N steps (exploration phase)
     // OpenAI/Google/DeepSeek models work silently (tool calls without text narration).
     // The no-text detector is only useful for Anthropic models where silence means stuck.
     const noTextDetectionEnabled = modelId.startsWith("anthropic/");
-    // ─── Same-tool repetition (softer than doom-loop) ───
-    // The doom-loop detector requires *identical* tool+args calls. This
-    // catches the looser pattern of "same tool name, different args, N
-    // times in a row" which is how a model gets stuck speculatively
-    // calling codemode / explore / grep without ever wrapping up.
-    // Provider-agnostic — applies to every orchestrator. Nudge first,
-    // then hard-break if the model ignores the nudge.
-    const SAME_TOOL_NUDGE_THRESHOLD = 6;
-    const SAME_TOOL_HARD_BREAK_THRESHOLD = 10;
-    let sameToolNudgeInjected = false;
-
-    // ─── Mid-loop compaction threshold ───
-    const MID_LOOP_COMPACTION_THRESHOLD = 0.50; // Compact when >50% of budget used
 
     const self = this;
 
@@ -1383,6 +1377,26 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           return text.length > 500 ? `${text.slice(0, 500)}…[truncated, see phase summary for progress]` : text;
         })();
 
+        // ─── Compaction helper ───
+        // Shared by the loop-entry guard, mid-loop compaction, pre-step
+        // compaction, and overflow recovery. Forces Think-level compaction,
+        // refreshes persisted history, and re-assembles the local messages
+        // array so it picks up the compaction summary. Returns whether the
+        // pass actually summarised anything — distinguishes "attempted and
+        // summarised" from "attempted but no-op'd because there's nothing
+        // in Think's persisted history yet" (see PR #74).
+        const compactAndReassemble = async (): Promise<"summarised" | "noop"> => {
+          const compactionsBefore = self.getCompactionCount();
+          await self.maybeCompactContext({ force: true });
+          const compactionsAfter = self.getCompactionCount();
+          const thinkSessionId = self.getCurrentSessionId();
+          if (thinkSessionId) {
+            self.messages = self.sessions.getHistory(thinkSessionId);
+          }
+          messages = await self.assembleContext();
+          return compactionsAfter > compactionsBefore ? "summarised" : "noop";
+        };
+
         // ─── Loop-entry oversized-prompt guard (issue #34, bug 3) ───
         // When the user prompt itself is large (detailed dispatch prompts, long
         // pasted logs, etc.) the first streamText() call can exceed the budget
@@ -1395,23 +1409,16 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         // fire again unnecessarily, and re-assemble.
         const entryInputTokens = estimateMessagesTokens(messages);
         const entryUsage = entryInputTokens / tokenBudget;
-        if (entryUsage >= MID_LOOP_COMPACTION_THRESHOLD) {
+        if (entryUsage >= LOOP_LIMITS.MID_LOOP_COMPACTION_THRESHOLD) {
           compactionTriggered = true;
           try {
-            const compactionsBefore = self.getCompactionCount();
-            await self.maybeCompactContext({ force: true });
-            const compactionsAfter = self.getCompactionCount();
-            const thinkSessionId = self.getCurrentSessionId();
-            if (thinkSessionId) {
-              self.messages = self.sessions.getHistory(thinkSessionId);
-            }
-            messages = await self.assembleContext();
+            const outcome = await compactAndReassemble();
             log("info", "own-loop: loop-entry compaction attempted", {
               sessionId,
               entryInputTokens,
               tokenBudget,
               entryUsage: `${Math.round(entryUsage * 100)}%`,
-              outcome: compactionsAfter > compactionsBefore ? "summarised" : "noop",
+              outcome,
             });
           } catch (err) {
             log("warn", "own-loop: loop-entry compaction failed", {
@@ -1421,621 +1428,379 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           }
         }
 
-        while (step < maxSteps) {
-          if (signal?.aborted) { exitReason = "abort"; break; }
+        // ─── Unified phase runner ───
+        // The primary loop and every continuation phase run through this
+        // one generator. Before this refactor the continuation loop was a
+        // hand-copied subset: it silently missed the same-tool repetition
+        // checks, the cost runaway backstop, projected-token budget gating,
+        // mid-loop compaction, tool-result pruning, and overflow recovery.
+        // One loop, one set of decisions (src/loop-policy.ts) — the runner
+        // only applies effects.
+        const runPhase = async function* (phaseNum: number) {
+          const label = phaseNum === 0 ? "own-loop" : `own-loop: phase ${phaseNum}`;
+          step = 0;
+          while (step < maxSteps) {
+            if (signal?.aborted) { exitReason = "abort"; return; }
 
-          // ─── Newline separator between iterations ───
-          // After a tool call, the model starts a new text response. Without
-          // a separator, the new text gets concatenated directly to the previous
-          // text, creating an unreadable wall of text (e.g. "Let me explore...Let me explore...").
-          // Yield a synthetic text-delta chunk so the separator flows through
-          // Think's callback and gets appended to fullText and the SSE stream.
-          if (step > 0) {
-            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
-          }
-
-          // ─── Between-step injections ───
-          const injections: ModelMessage[] = [];
-
-          // Doom loop detection: check if the last N tool calls are identical
-          const DOOM_LOOP_HARD_BREAK = DOOM_LOOP_THRESHOLD + 2; // 5 identical calls → hard break
-          if (recentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
-            const lastN = recentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
-            const allSame = lastN.every(c => c === lastN[0]);
-            if (allSame) {
-              const toolName = lastN[0].split(":")[0];
-
-              // Hard break after DOOM_LOOP_HARD_BREAK identical calls
-              if (recentToolCalls.length >= DOOM_LOOP_HARD_BREAK) {
-                const hardN = recentToolCalls.slice(-DOOM_LOOP_HARD_BREAK);
-                if (hardN.every(c => c === hardN[0])) {
-                  log("warn", "doom loop hard break — identical tool calls", {
-                    sessionId,
-                    toolName,
-                    step,
-                    repeats: DOOM_LOOP_HARD_BREAK,
-                  });
-                  yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Stopped: repeated ${toolName} calls detected]\n\n` };
-                  exitReason = "doom-loop";
-                  break;
-                }
-              }
-
-              injections.push({
-                role: "system" as const,
-                content: `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach — use a different tool, different arguments, or explain what's blocking you.]`,
-              });
-              log("warn", "doom loop detected", {
-                sessionId,
-                toolName,
-                step,
-                repeats: DOOM_LOOP_THRESHOLD,
-              });
+            // ─── Newline separator between iterations ───
+            // After a tool call, the model starts a new text response. Without
+            // a separator, the new text gets concatenated directly to the previous
+            // text, creating an unreadable wall of text (e.g. "Let me explore...Let me explore...").
+            if (step > 0) {
+              yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
             }
-          }
 
-          // ─── Same-tool repetition detection (looser than doom-loop) ───
-          // Catches the pattern where a model speculatively calls the same
-          // tool over and over with *different* args, never producing a
-          // text answer. Doom-loop misses this because each call's args
-          // differ. The harness intervenes in two stages:
-          //   1. Nudge at SAME_TOOL_NUDGE_THRESHOLD (default 6) — inject
-          //      a system message asking the model whether it's done.
-          //   2. Hard-break at SAME_TOOL_HARD_BREAK_THRESHOLD (default 10) —
-          //      if the model ignored the nudge and kept calling the same
-          //      tool, we exit cleanly with a wrap-up message.
-          // Provider-agnostic — applies to every orchestrator regardless
-          // of whether silent tool-calling is normal for the provider.
-          // First observed on Gemma 4 26B running 18 consecutive codemode
-          // calls without ever writing a conclusion.
-          const hardBreakTool = detectSameToolRepetition(
-            recentToolCalls,
-            SAME_TOOL_HARD_BREAK_THRESHOLD,
-          );
-          if (hardBreakTool) {
-            log("warn", "same-tool repetition hard break", {
-              sessionId,
-              toolName: hardBreakTool,
-              step,
-              repeats: SAME_TOOL_HARD_BREAK_THRESHOLD,
-            });
-            yield {
-              type: "text-delta",
-              id: crypto.randomUUID(),
-              delta: `\n\n[Stopped: ${hardBreakTool} called ${SAME_TOOL_HARD_BREAK_THRESHOLD} times in a row without producing a text answer — write your conclusion from what you have so far.]\n\n`,
-            };
-            exitReason = "doom-loop";
-            break;
-          }
-          const nudgeTool = detectSameToolRepetition(
-            recentToolCalls,
-            SAME_TOOL_NUDGE_THRESHOLD,
-          );
-          if (nudgeTool && !sameToolNudgeInjected) {
-            sameToolNudgeInjected = true;
-            injections.push({
-              role: "system" as const,
-              content: `[STOP-CHECK] You've called \`${nudgeTool}\` ${SAME_TOOL_NUDGE_THRESHOLD} times in a row. Do you have enough information to answer the user? If yes: write your conclusion as plain text and do NOT call any more tools. If no: switch to a different tool or explain what's missing. Do not call \`${nudgeTool}\` again unless you have a concrete new question that requires it.`,
-            });
-            log("info", "same-tool repetition nudge injected", {
-              sessionId,
-              toolName: nudgeTool,
-              step,
-              repeats: SAME_TOOL_NUDGE_THRESHOLD,
-            });
-          }
-
-          // ─── Cost runaway backstop ───
-          // Per-call context pressure (below) is the primary stop signal,
-          // but a model stuck in a non-doom-loop loop (tools succeeding,
-          // results changing, but no real progress) could still burn
-          // unbounded tokens. Cap absolute cumulative input at 5× the
-          // context budget. For a 200k-context model that's 1M tokens —
-          // generous for real work, low enough to catch obvious runaway.
-          const COST_RUNAWAY_FACTOR = 5;
-          if (cumulativeInputTokens >= tokenBudget * COST_RUNAWAY_FACTOR) {
-            log("warn", "own-loop: cost runaway backstop", {
-              sessionId,
-              step,
+            // ─── Pre-step gate: loops, runaway, budget tiers → stop or inject ───
+            // Projected next-call size (messages only; system prompt and tool
+            // defs ride on top). Cumulative input is telemetry — it no longer
+            // gates injections (PR #77), except via the runaway backstop.
+            const projectedNextCallTokens = estimateMessagesTokens(messages);
+            const gate: StepGate = decideStepGate({
+              recentToolCalls,
               cumulativeInputTokens,
               tokenBudget,
-              factor: COST_RUNAWAY_FACTOR,
-            });
-            yield {
-              type: "text-delta",
-              id: crypto.randomUUID(),
-              delta: `\n\n[Stopped: cumulative input tokens exceeded ${COST_RUNAWAY_FACTOR}× the context budget — likely loop]\n\n`,
-            };
-            exitReason = "budget-limit";
-            break;
-          }
-
-          // ─── Budget-aware injections (context pressure, not cumulative cost) ───
-          //
-          // The thresholds below tell the model when it's running out of
-          // **context window space**, not when it's spent a lot of tokens.
-          // These are different: cumulative input grows by ~system-prompt
-          // size every step regardless of how much real history the model
-          // is carrying, so gating on cumulative tells the model to bail
-          // when its actual context window has plenty of room.
-          //
-          // We estimate the size of the message array we'd send NEXT to
-          // streamText (system prompt + tools are added by the SDK on top;
-          // this only measures the messages-array portion). That's the
-          // signal that matches what the wrap-up text actually says
-          // ("nearly exhausted... do not read new files").
-          //
-          // `cumulativeInputTokens` is kept for telemetry — logged on every
-          // step-complete line — but no longer gates injections. We
-          // discovered the previous coupling by deploying #75 + #76 and
-          // watching Gemma get told to stop at step 8 of a session where
-          // projected context was at 10%. See PR #77.
-          const projectedNextCallTokens = estimateMessagesTokens(messages);
-          const budgetUsage = projectedNextCallTokens / tokenBudget;
-
-          if (budgetUsage >= HARD_STOP_THRESHOLD) {
-            log("warn", "own-loop: hard stop — projected context budget exhausted", {
-              sessionId,
-              step,
               projectedNextCallTokens,
-              cumulativeInputTokens,
-              tokenBudget,
-              usage: `${Math.round(budgetUsage * 100)}%`,
+              warnInjected,
+              wrapUpInjected,
+              sameToolNudgeInjected,
             });
-            exitReason = "budget-limit";
-            break;
-          }
-
-          if (budgetUsage >= WRAP_UP_THRESHOLD && !wrapUpInjected) {
-            injections.push({
-              role: "system" as const,
-              content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop. Do not read new files or start new tasks. Complete your current thought and wrap up.",
-            });
-            wrapUpInjected = true;
-            log("info", "own-loop: wrap-up injection", {
-              sessionId,
-              step,
-              projectedNextCallTokens,
-              cumulativeInputTokens,
-              tokenBudget,
-              usage: `${Math.round(budgetUsage * 100)}%`,
-            });
-          } else if (budgetUsage >= WARN_THRESHOLD && !warnInjected) {
-            injections.push({
-              role: "system" as const,
-              content: "[CONTEXT BUDGET WARNING] You are using most of your context budget. Focus on completing the current task. Avoid reading new files unless essential. Prefer targeted edits over full file reads.",
-            });
-            warnInjected = true;
-            log("info", "own-loop: budget warning injection", {
-              sessionId,
-              step,
-              projectedNextCallTokens,
-              cumulativeInputTokens,
-              tokenBudget,
-              usage: `${Math.round(budgetUsage * 100)}%`,
-            });
-          }
-
-          // ─── Mid-loop compaction ───
-          // If context usage is above threshold and we haven't compacted yet this turn,
-          // trigger Think's compaction system to summarize older messages.
-          // After compaction, re-assemble the local messages array so it
-          // picks up the compacted history (with the summary injected).
-          //
-          // No `step >= N` guard: a large prompt + aggressive exploration can burn
-          // through the budget in steps 0-2. The `!compactionTriggered` flag already
-          // prevents compaction from firing more than once per turn, so gating on
-          // step count only delays a necessary safety net. See issue #34.
-          if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
-            compactionTriggered = true;
-            try {
-              // force=true so maybeCompactContext() bypasses the
-              // `lastInputTokens === 0` early-return guard. The mid-loop
-              // trigger fires on the FIRST user turn (before any assistant
-              // message is persisted), so lastInputTokens is always 0 here
-              // and the guard would silently no-op without `force`. The
-              // own-loop has already proved compaction is warranted by
-              // measuring cumulativeInputTokens directly — don't make
-              // maybeCompactContext re-decide.
-              const compactionsBefore = self.getCompactionCount();
-              await self.maybeCompactContext({ force: true });
-              const compactionsAfter = self.getCompactionCount();
-              // Refresh messages from storage and re-assemble with compaction summary.
-              const thinkSessionId = self.getCurrentSessionId();
-              if (thinkSessionId) {
-                self.messages = self.sessions.getHistory(thinkSessionId);
+            if (gate.action === "stop") {
+              if (gate.reason === "doom-loop" && !gate.notice) {
+                // Projected hard stop — no notice today, log-only.
               }
-              messages = await self.assembleContext();
-              // Log the outcome truthfully — distinguishes "we attempted and
-              // it summarised something" from "we attempted but it no-op'd
-              // because there's nothing in Think's persisted history yet."
-              // Without the distinction, debugging compaction issues is a
-              // wild goose chase (we hit that twice already — see PR #74).
-              log("info", "own-loop: mid-loop compaction attempted", {
-                sessionId,
-                step,
-                cumulativeInputTokens,
-                tokenBudget,
-                outcome: compactionsAfter > compactionsBefore ? "summarised" : "noop",
-              });
-            } catch (err) {
-              log("warn", "own-loop: mid-loop compaction failed", {
-                sessionId,
-                step,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          }
-
-          // Build final messages with injections appended
-          let finalMessages = injections.length > 0
-            ? [...messages, ...injections]
-            : messages;
-
-          // ─── Pre-step budget check (issue #34, bug 2) ───
-          // cumulativeInputTokens is only updated AFTER streamText() completes,
-          // so the budget-aware injections above (warn / wrap-up / hard-stop) see
-          // counters that trail the just-finished step. If a single step burns
-          // through the budget, the next step's pre-call injection won't fire in
-          // time. Estimate the input size directly from the outgoing messages and
-          // force compaction before making the LLM call if we're already past the
-          // compaction threshold.
-          const projectedInputTokens = estimateMessagesTokens(finalMessages);
-          const projectedUsage = projectedInputTokens / tokenBudget;
-
-          if (projectedUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
-            compactionTriggered = true;
-            try {
-              const compactionsBefore = self.getCompactionCount();
-              await self.maybeCompactContext({ force: true });
-              const compactionsAfter = self.getCompactionCount();
-              const thinkSessionId = self.getCurrentSessionId();
-              if (thinkSessionId) {
-                self.messages = self.sessions.getHistory(thinkSessionId);
+              if (gate.notice) {
+                yield { type: "text-delta", id: crypto.randomUUID(), delta: gate.notice };
               }
-              messages = await self.assembleContext();
-              finalMessages = injections.length > 0
-                ? [...messages, ...injections]
-                : messages;
-              log("info", "own-loop: pre-step compaction attempted", {
-                sessionId,
-                step,
-                projectedInputTokens,
-                tokenBudget,
-                projectedUsage: `${Math.round(projectedUsage * 100)}%`,
-                outcome: compactionsAfter > compactionsBefore ? "summarised" : "noop",
-              });
-            } catch (err) {
-              log("warn", "own-loop: pre-step compaction failed", {
-                sessionId,
-                step,
-                error: err instanceof Error ? err.message : String(err),
-              });
+              exitReason = gate.reason;
+              return;
             }
-          }
+            warnInjected = warnInjected || !!gate.warnFired;
+            wrapUpInjected = wrapUpInjected || !!gate.wrapUpFired;
+            sameToolNudgeInjected = sameToolNudgeInjected || !!gate.sameToolNudgeFired;
 
-          // ─── In-memory tool-result prune (harness safety net) ───
-          // Think-level compaction operates on persisted session history.
-          // On the very first user turn that's just `[user]`, so compaction
-          // had nothing to summarise and left `finalMessages` untouched.
-          // For weak orchestrators that fan out many tool calls inside a
-          // single turn, this is the failure mode that ends sessions
-          // prematurely with "context budget exhausted".
-          //
-          // This is a no-LLM, no-storage fallback: walk `finalMessages`
-          // and shorten the largest tool-result payloads (oldest first,
-          // preserving the most recent two) until projected tokens are
-          // back under the mid-loop threshold. Preserves the tool-call
-          // envelope (toolName, toolCallId) so the model's chain of
-          // pending tool calls still resolves.
-          //
-          // **Trigger condition.** Two signals can independently warrant
-          // a prune:
-          //  1. `projectedInputTokens` — what we're about to send to
-          //     streamText on this iteration. Useful when the current
-          //     iteration's payload is already huge.
-          //  2. `cumulativeInputTokens` — what we've sent across ALL
-          //     iterations of this turn so far. Useful when the cumulative
-          //     climb is the problem even though any single iteration
-          //     looks small.
-          //
-          // Without #2 the prune never fires for the typical Gemma
-          // failure: each per-step call sends ~19k tokens (system prompt
-          // + tool defs dominate) so the per-iteration projection stays
-          // small, but the running total burns through the budget. We
-          // saw this empirically: 8 successful steps, cumulative 158k
-          // (77%), zero prune log lines.
-          const projectedAfterCompactionTokens = estimateMessagesTokens(finalMessages);
-          const projectedTrigger =
-            projectedAfterCompactionTokens / tokenBudget >= MID_LOOP_COMPACTION_THRESHOLD;
-          const cumulativeTrigger =
-            cumulativeInputTokens / tokenBudget >= MID_LOOP_COMPACTION_THRESHOLD;
-          if (projectedTrigger || cumulativeTrigger) {
-            const pruneResult = pruneOversizedToolResults(finalMessages, {
-              targetTokens: Math.floor(tokenBudget * MID_LOOP_COMPACTION_THRESHOLD),
-              estimate: estimateMessagesTokens,
-            });
-            if (pruneResult.pruned) {
-              log("info", "own-loop: in-memory tool-result prune", {
-                sessionId,
-                step,
-                partsPruned: pruneResult.partsPruned,
-                bytesRemoved: pruneResult.bytesRemoved,
-                tokensBefore: pruneResult.tokensBefore,
-                tokensAfter: pruneResult.tokensAfter,
-                trigger: cumulativeTrigger ? "cumulative" : "projected",
-              });
-            }
-          }
+            // Build final messages with injections appended
+            let finalMessages = gate.injections.length > 0
+              ? [...messages, ...gate.injections]
+              : messages;
 
-          // Hard stop if even after compaction + prune we're projected above the budget.
-          // Without this, streamText() is guaranteed to throw a context-overflow
-          // error — better to exit cleanly with a wrap-up message.
-          const projectedAfterPruneTokens = estimateMessagesTokens(finalMessages);
-          const projectedAfterUsage = projectedAfterPruneTokens / tokenBudget;
-          if (projectedAfterUsage >= HARD_STOP_THRESHOLD) {
-            log("warn", "own-loop: pre-step hard stop — projected tokens exceed budget", {
-              sessionId,
-              step,
-              projectedInputTokens: projectedAfterPruneTokens,
-              tokenBudget,
-              projectedUsage: `${Math.round(projectedAfterUsage * 100)}%`,
-            });
-            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Stopped: context budget exhausted before next step]\n\n" };
-            exitReason = "budget-limit";
-            break;
-          }
-
-          // ─── Single-step LLM call with overflow recovery (Tactic 5) ───
-          // Note: Prompt cache retention (Tactic 7) requires the native @ai-sdk/anthropic
-          // provider. Dodo uses @ai-sdk/openai-compatible which doesn't support
-          // Anthropic-specific providerOptions. Cache control will be enabled when/if
-          // we switch to the native Anthropic provider.
-          let result;
-          // Declared outside try so post-step bookkeeping can access them
-          let iterationText = "";
-          let chunkCount = 0;
-          let hasErrorChunk = false;
-          let errorText = "";
-          try {
-            result = streamText({
-              model,
-              system,
-              messages: finalMessages,
-              tools,
-              abortSignal: signal,
-            });
-
-            // Forward all chunks from this iteration to the caller.
-            // Capture text emitted this iteration for repetition detection.
-            for await (const chunk of result.toUIMessageStream()) {
-              yield chunk;
-              chunkCount++;
-              const c = chunk as { type?: string; delta?: string; errorText?: string; error?: string };
-              if (c.type === "text-delta" && c.delta) {
-                iterationText += c.delta;
-                turnText += c.delta;
-              } else if (c.type === "error") {
-                hasErrorChunk = true;
-                errorText = c.errorText ?? c.error ?? "unknown";
-              }
-            }
-
-            // Log diagnostic info when the stream produced no content
-            if (!iterationText && chunkCount === 0) {
-              log("warn", "own-loop: LLM stream produced zero chunks", {
-                sessionId,
-                step,
-                model: modelId,
-              });
-            } else if (hasErrorChunk) {
-              log("warn", "own-loop: LLM stream contained error chunk", {
-                sessionId,
-                step,
-                model: modelId,
-                errorText: errorText.slice(0, 500),
-                chunkCount,
-              });
-              if (!iterationText && errorText) {
-                throw new Error(errorText);
-              }
-            }
-          } catch (err) {
-            // ─── Overflow recovery ───
-            // Detect context overflow errors and trigger emergency compaction.
-            // Only attempt once per onChatMessage() invocation to prevent infinite loops.
-            const errMsg = err instanceof Error ? err.message : String(err);
-            const decision = nextRetry({
-              previousAttempts: self._overflowRecoveryAttempted ? 1 : 0,
-              maxAttempts: 1,
-              error: { message: errMsg },
-            });
-
-            if (decision.kind === "retry-with-truncation") {
-              self._overflowRecoveryAttempted = true;
-              log("warn", "own-loop: context overflow detected, attempting emergency compaction", {
-                sessionId,
-                step,
-                error: errMsg.slice(0, 200),
-              });
-
+            // ─── Mid-loop compaction ───
+            // If context usage is above threshold and we haven't compacted yet
+            // this turn, trigger Think's compaction system to summarize older
+            // messages. No `step >= N` guard: a large prompt + aggressive
+            // exploration can burn through the budget in steps 0-2 (issue #34).
+            if (shouldTriggerCompaction(projectedNextCallTokens, tokenBudget, compactionTriggered)) {
+              compactionTriggered = true;
               try {
-                await self.maybeCompactContext({ force: true });
-                // Refresh messages from storage so we get the compaction summary.
-                const thinkSid = self.getCurrentSessionId();
-                if (thinkSid) {
-                  self.messages = self.sessions.getHistory(thinkSid);
-                }
-                // Re-assemble context after compaction to pick up the summary.
-                // This replaces the stale accumulated messages with freshly
-                // compacted ones.
-                messages = await self.assembleContext();
-                step++;
-                continue;
-              } catch (compactionErr) {
-                log("warn", "own-loop: emergency compaction failed, propagating original error", {
+                const outcome = await compactAndReassemble();
+                log("info", `${label}: mid-loop compaction attempted`, {
                   sessionId,
-                  error: compactionErr instanceof Error ? compactionErr.message : String(compactionErr),
+                  step,
+                  cumulativeInputTokens,
+                  tokenBudget,
+                  outcome,
+                });
+              } catch (err) {
+                log("warn", `${label}: mid-loop compaction failed`, {
+                  sessionId,
+                  step,
+                  error: err instanceof Error ? err.message : String(err),
                 });
               }
             }
-            // Re-throw if not an overflow or recovery failed
-            throw err;
-          }
 
-          // ─── Post-step bookkeeping ───
-          // Reset overflow recovery flag on successful step
-          self._overflowRecoveryAttempted = false;
-
-          const usage = await (result as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
-          cumulativeInputTokens += usage?.inputTokens ?? 0;
-          cumulativeOutputTokens += usage?.outputTokens ?? 0;
-
-          // ─── Accumulate response messages for the next iteration ───
-          // streamText() returns response messages (assistant + tool results)
-          // that must be appended to the messages array so the model sees its
-          // own tool call results on subsequent iterations. Without this, each
-          // iteration would only see the original user message (because
-          // this.messages is not updated until Think's chat() finishes).
-          const response = await (result as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
-          if (response?.messages?.length) {
-            messages = [...messages, ...response.messages];
-          }
-
-          // Track tool calls for doom loop detection
-          const steps = await (result as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
-          const lastStep = steps?.[steps.length - 1];
-          if (lastStep?.toolCalls?.length) {
-            for (const tc of lastStep.toolCalls) {
-              recentToolCalls.push(`${tc.toolName}:${JSON.stringify(tc.input)}`);
+            // ─── Pre-step compaction (issue #34, bug 2) ───
+            // cumulativeInputTokens trails the just-finished step, so the
+            // injections above can fire late. If the outgoing messages are
+            // already past the compaction threshold, compact before calling.
+            let projectedInputTokens = estimateMessagesTokens(finalMessages);
+            if (shouldTriggerCompaction(projectedInputTokens, tokenBudget, compactionTriggered)) {
+              compactionTriggered = true;
+              try {
+                const outcome = await compactAndReassemble();
+                finalMessages = gate.injections.length > 0
+                  ? [...messages, ...gate.injections]
+                  : messages;
+                log("info", `${label}: pre-step compaction attempted`, {
+                  sessionId,
+                  step,
+                  projectedInputTokens,
+                  tokenBudget,
+                  projectedUsage: `${Math.round((projectedInputTokens / tokenBudget) * 100)}%`,
+                  outcome,
+                });
+              } catch (err) {
+                log("warn", `${label}: pre-step compaction failed`, {
+                  sessionId,
+                  step,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
             }
-            // Keep enough history to feed all the loop detectors that
-            // read from this buffer: the doom-loop check needs the last
-            // DOOM_LOOP_THRESHOLD * 2 entries; the same-tool hard-break
-            // check needs the last SAME_TOOL_HARD_BREAK_THRESHOLD. Pick
-            // the larger so neither detector starves.
-            const recentToolCallsRetention = Math.max(
-              DOOM_LOOP_THRESHOLD * 2,
-              SAME_TOOL_HARD_BREAK_THRESHOLD,
-            );
-            if (recentToolCalls.length > recentToolCallsRetention) {
-              recentToolCalls.splice(0, recentToolCalls.length - recentToolCallsRetention);
-            }
-          }
 
-          // ─── Text repetition detection ───
-          // Catches loops where the model emits similar text each iteration
-          // but varies tool arguments (evading the tool-call doom loop detector).
-          // Compare the first ~80 chars of text from each iteration.
-          const textPrefix = iterationText.trim().slice(0, 80);
-          if (textPrefix.length > 10) {
-            recentTextPrefixes.push(textPrefix);
-            if (recentTextPrefixes.length > DOOM_LOOP_THRESHOLD * 2) {
-              recentTextPrefixes.splice(0, recentTextPrefixes.length - DOOM_LOOP_THRESHOLD * 2);
+            // ─── In-memory tool-result prune (harness safety net) ───
+            // Think-level compaction operates on persisted history, which is
+            // nearly empty on the first user turn. This is the no-LLM,
+            // no-storage fallback: shorten the largest tool-result payloads
+            // (oldest first, preserving the most recent two) until projected
+            // tokens are back under the mid-loop threshold. Two signals
+            // warrant it independently: the outgoing payload is large, or
+            // the cumulative spend is large even though each step looks
+            // small (the classic silent-grind failure).
+            const projectedAfterCompactionTokens = estimateMessagesTokens(finalMessages);
+            if (shouldPruneResults(projectedAfterCompactionTokens, cumulativeInputTokens, tokenBudget)) {
+              const pruneResult = pruneOversizedToolResults(finalMessages, {
+                targetTokens: Math.floor(tokenBudget * LOOP_LIMITS.MID_LOOP_COMPACTION_THRESHOLD),
+                estimate: estimateMessagesTokens,
+              });
+              if (pruneResult.pruned) {
+                log("info", `${label}: in-memory tool-result prune`, {
+                  sessionId,
+                  step,
+                  partsPruned: pruneResult.partsPruned,
+                  bytesRemoved: pruneResult.bytesRemoved,
+                  tokensBefore: pruneResult.tokensBefore,
+                  tokensAfter: pruneResult.tokensAfter,
+                  trigger: (cumulativeInputTokens / tokenBudget) >= LOOP_LIMITS.MID_LOOP_COMPACTION_THRESHOLD ? "cumulative" : "projected",
+                });
+              }
             }
-            if (recentTextPrefixes.length >= DOOM_LOOP_THRESHOLD) {
-              const lastN = recentTextPrefixes.slice(-DOOM_LOOP_THRESHOLD);
-              const allSame = lastN.every(t => t === lastN[0]);
-              if (allSame) {
-                log("warn", "text repetition loop detected — breaking", {
+
+            // ─── Hard stop if compaction + prune weren't enough ───
+            // Without this, streamText() is guaranteed to throw a
+            // context-overflow error — better to exit cleanly.
+            const projectedAfterPruneTokens = estimateMessagesTokens(finalMessages);
+            if (shouldHardStopBeforeCall(projectedAfterPruneTokens, tokenBudget)) {
+              log("warn", `${label}: pre-step hard stop — projected tokens exceed budget`, {
+                sessionId,
+                step,
+                projectedInputTokens: projectedAfterPruneTokens,
+                tokenBudget,
+                projectedUsage: `${Math.round((projectedAfterPruneTokens / tokenBudget) * 100)}%`,
+              });
+              yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Stopped: context budget exhausted before next step]\n\n" };
+              exitReason = "budget-limit";
+              return;
+            }
+
+            // ─── Single-step LLM call with overflow recovery ───
+            // Note: Prompt cache retention requires the native @ai-sdk/anthropic
+            // provider. Dodo uses @ai-sdk/openai-compatible which doesn't support
+            // Anthropic-specific providerOptions.
+            let result;
+            // Declared outside try so post-step bookkeeping can access them
+            let iterationText = "";
+            let chunkCount = 0;
+            let hasErrorChunk = false;
+            let errorText = "";
+            try {
+              result = streamText({
+                model,
+                system,
+                messages: finalMessages,
+                tools,
+                abortSignal: signal,
+              });
+
+              // Forward all chunks from this iteration to the caller.
+              // Capture text emitted this iteration for repetition detection.
+              for await (const chunk of result.toUIMessageStream()) {
+                yield chunk;
+                chunkCount++;
+                const c = chunk as { type?: string; delta?: string; errorText?: string; error?: string };
+                if (c.type === "text-delta" && c.delta) {
+                  iterationText += c.delta;
+                  turnText += c.delta;
+                } else if (c.type === "error") {
+                  hasErrorChunk = true;
+                  errorText = c.errorText ?? c.error ?? "unknown";
+                }
+              }
+
+              // Log diagnostic info when the stream produced no content
+              if (!iterationText && chunkCount === 0) {
+                log("warn", `${label}: LLM stream produced zero chunks`, {
+                  sessionId,
+                  step,
+                  model: modelId,
+                });
+              } else if (hasErrorChunk) {
+                log("warn", `${label}: LLM stream contained error chunk`, {
+                  sessionId,
+                  step,
+                  model: modelId,
+                  errorText: errorText.slice(0, 500),
+                  chunkCount,
+                });
+                if (!iterationText && errorText) {
+                  throw new Error(errorText);
+                }
+              }
+            } catch (err) {
+              // ─── Overflow recovery ───
+              // Detect context overflow errors and trigger emergency compaction.
+              // Only attempt once per onChatMessage() invocation to prevent
+              // infinite loops.
+              const errMsg = err instanceof Error ? err.message : String(err);
+              const decision = nextRetry({
+                previousAttempts: self._overflowRecoveryAttempted ? 1 : 0,
+                maxAttempts: 1,
+                error: { message: errMsg },
+              });
+
+              if (decision.kind === "retry-with-truncation") {
+                self._overflowRecoveryAttempted = true;
+                log("warn", `${label}: context overflow detected, attempting emergency compaction`, {
+                  sessionId,
+                  step,
+                  error: errMsg.slice(0, 200),
+                });
+
+                try {
+                  await compactAndReassemble();
+                  step++;
+                  continue;
+                } catch (compactionErr) {
+                  log("warn", `${label}: emergency compaction failed, propagating original error`, {
+                    sessionId,
+                    error: compactionErr instanceof Error ? compactionErr.message : String(compactionErr),
+                  });
+                }
+              }
+              // Re-throw if not an overflow or recovery failed
+              throw err;
+            }
+
+            // ─── Post-step bookkeeping ───
+            // Reset overflow recovery flag on successful step
+            self._overflowRecoveryAttempted = false;
+
+            const usage = await (result as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
+            cumulativeInputTokens += usage?.inputTokens ?? 0;
+            cumulativeOutputTokens += usage?.outputTokens ?? 0;
+
+            // ─── Accumulate response messages for the next iteration ───
+            // streamText() returns response messages (assistant + tool results)
+            // that must be appended so the model sees its own tool call
+            // results on subsequent iterations (this.messages is not updated
+            // until Think's chat() finishes).
+            const response = await (result as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
+            if (response?.messages?.length) {
+              messages = [...messages, ...response.messages];
+            }
+
+            // Track tool calls for loop detection
+            const steps = await (result as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
+            const lastStep = steps?.[steps.length - 1];
+            const madeToolCalls = !!lastStep?.toolCalls?.length;
+            if (lastStep?.toolCalls?.length) {
+              for (const tc of lastStep.toolCalls) {
+                trackToolCall(recentToolCalls, tc.toolName, tc.input);
+              }
+            }
+
+            // ─── Text repetition + no-text watchdog ───
+            // Text repetition catches loops where the model emits similar text
+            // each iteration but varies tool arguments. The no-text watchdog
+            // catches diverse tool calls with no narration (Anthropic only —
+            // OpenAI/Google/DeepSeek work silently by design).
+            const { prefix: textPrefix, tracked } = trackTextIteration(recentTextPrefixes, iterationText);
+            consecutiveNoTextSteps = trackNoTextStep(consecutiveNoTextSteps, noTextDetectionEnabled, tracked, madeToolCalls);
+
+            const post = decidePostStep({
+              recentTextPrefixes,
+              consecutiveNoTextSteps,
+              noTextDetectionEnabled,
+              step,
+              madeToolCalls,
+            });
+            if (post.action === "stop") {
+              if (post.reason === "text-loop") {
+                log("warn", `${label}: text repetition loop detected — breaking`, {
                   sessionId,
                   step,
                   repeatedText: textPrefix.slice(0, 60),
-                  repeats: DOOM_LOOP_THRESHOLD,
+                  repeats: LOOP_LIMITS.DOOM_LOOP_THRESHOLD,
                 });
-                exitReason = "text-loop";
-                break;
+              } else {
+                log("warn", `${label}: no-text tool-call loop detected — breaking`, {
+                  sessionId,
+                  step,
+                  consecutiveNoTextSteps,
+                  recentTools: recentToolCalls.slice(-LOOP_LIMITS.NO_TEXT_LOOP_THRESHOLD),
+                });
               }
+              if (post.notice) {
+                yield { type: "text-delta", id: crypto.randomUUID(), delta: post.notice };
+              }
+              exitReason = post.reason;
+              return;
             }
+
+            // Check finish reason — if the model didn't make a tool call, it's done
+            const finishReason = await (result as unknown as { finishReason: PromiseLike<string> }).finishReason;
+
+            log("info", `${label}: step complete`, {
+              sessionId,
+              step,
+              finishReason,
+              inputTokens: usage?.inputTokens ?? 0,
+              cumulativeInputTokens,
+              budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
+              toolCalls: lastStep?.toolCalls?.map((tc) => tc.toolName) ?? [],
+              consecutiveNoTextSteps,
+            });
+
+            if (finishReason !== "tool-calls") return;
+
+            step++;
           }
 
-          // ─── No-text tool-call loop detection ───
-          // Catches loops where the model makes diverse tool calls (evading the
-          // identical-call detector) and produces no meaningful text (evading the
-          // text-repetition detector). If the model makes tool calls without any
-          // text for too many consecutive iterations, it's stuck exploring.
-          if (noTextDetectionEnabled && textPrefix.length <= 10 && lastStep?.toolCalls?.length) {
-            consecutiveNoTextSteps++;
-            if (step >= NO_TEXT_GRACE_STEPS && consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
-              log("warn", "no-text tool-call loop detected — breaking", {
-                sessionId,
-                step,
-                consecutiveNoTextSteps,
-                recentTools: recentToolCalls.slice(-NO_TEXT_LOOP_THRESHOLD),
-              });
-              // Inject a final message asking the model to summarize
-              yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Loop detected — summarizing progress so far]\n\n" };
-              exitReason = "no-text-loop";
-              break;
-            }
-          } else {
-            consecutiveNoTextSteps = 0;
+          // Tag step-limit exit (while condition failed)
+          if (shouldTagStepLimit(step, maxSteps, exitReason)) {
+            exitReason = "step-limit";
           }
+        };
 
-          // Check finish reason — if the model didn't make a tool call, it's done
-          const finishReason = await (result as unknown as { finishReason: PromiseLike<string> }).finishReason;
+        // ─── Phase 0: the original turn ───
+        exitReason = "natural";
+        yield* runPhase(0);
 
-          log("info", "own-loop: step complete", {
-            sessionId,
-            step,
-            finishReason,
-            inputTokens: usage?.inputTokens ?? 0,
-            cumulativeInputTokens,
-            budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
-            toolCalls: lastStep?.toolCalls?.map(tc => tc.toolName) ?? [],
-            consecutiveNoTextSteps,
-          });
-
-          if (finishReason !== "tool-calls") break;
-
-          step++;
-        }
-
-        // Tag step-limit exit (while condition failed)
-        if (step >= maxSteps && exitReason === "natural") {
-          exitReason = "step-limit";
-        }
+        // Use totals across all phases for _lastUsage
+        let totalInputTokens = cumulativeInputTokens;
+        let totalOutputTokens = cumulativeOutputTokens;
 
         // ─── Final-summary turn (after a stuck-loop exit) ───
         //
         // When the loop exits on a stuck signal (doom-loop, no-text-loop,
-        // text-loop, or budget hard-stop without auto-continuation),
-        // the model often left only the harness's own
+        // text-loop), the model often left only the harness's own
         // "[Stopped: ...]" delta in the user-visible response — no real
-        // conclusion. The auto-continuation block below SKIPS those exits
-        // by design (they mean the model is stuck and shouldn't be
-        // restarted). But it leaves users with a stop notice and no
-        // answer.
-        //
-        // Run one more single-turn streamText with NO tools and a
-        // strict 'write your conclusion now' system message. The model
+        // conclusion. Run one more single-turn streamText with NO tools and
+        // a strict 'write your conclusion now' system message. The model
         // has no choice but to emit text. Bounded by a short timeout
         // so this can't itself loop.
         //
-        // Guards:
+        // Guards (inside shouldRunFinalSummary):
         //   - skipped on abort (the user asked to stop)
         //   - skipped on `natural` exit (the model already wrapped up)
         //   - skipped when the turn already produced substantive text
         //     (>=200 chars of non-stop-notice content)
-        //   - skipped on cost-runaway exits where there's no point
-        //     spending more tokens
         const FINAL_SUMMARY_MIN_EXISTING_TEXT = 200;
         const FINAL_SUMMARY_TIMEOUT_MS = 30_000;
         const FINAL_SUMMARY_MAX_OUTPUT_TOKENS = 800;
 
-        const turnTextWithoutHarnessNotices = stripHarnessNotices(turnText);
-        const runFinalSummary = shouldRunFinalSummary({
-          exitReason,
-          signalAborted: !!signal?.aborted,
-          turnText,
-          minExistingTextChars: FINAL_SUMMARY_MIN_EXISTING_TEXT,
-        });
+        const runFinalSummaryTurn = async function* () {
+          const runFinalSummary = shouldRunFinalSummary({
+            exitReason,
+            signalAborted: !!signal?.aborted,
+            turnText,
+            minExistingTextChars: FINAL_SUMMARY_MIN_EXISTING_TEXT,
+          });
+          if (!runFinalSummary) return;
 
-        if (runFinalSummary) {
           log("info", "own-loop: final-summary turn starting", {
             sessionId,
             exitReason,
-            existingTextChars: turnTextWithoutHarnessNotices.length,
+            existingTextChars: stripHarnessNotices(turnText).length,
             step,
           });
 
@@ -2112,20 +1877,21 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             clearTimeout(timeoutHandle);
             signal?.removeEventListener("abort", onOuterAbort);
           }
-        }
+        };
+
+        yield* runFinalSummaryTurn();
 
         // ─── Multi-phase auto-continuation ───
-        // When the loop ends due to resource limits (step or budget), truncate
+        // When a loop ends due to resource limits (step or budget), rebuild
         // context in-memory and start a new phase. Repeats up to MAX_PHASES
-        // times. Does NOT trigger on loop detection exits (doom loop, text
-        // repetition, no-text loop) — those indicate the model is stuck.
+        // times. Does NOT trigger on loop-detection exits (doom loop, text
+        // repetition, no-text loop) — those indicate the model is stuck;
+        // stuck exits get a final-summary turn instead (above, and after
+        // each phase below — previously only the primary exit got one).
         const MAX_CONTINUATION_PHASES = 5;
-        let totalInputTokens = cumulativeInputTokens;
-        let totalOutputTokens = cumulativeOutputTokens;
 
         for (let phase = 1; phase <= MAX_CONTINUATION_PHASES; phase++) {
-          const shouldAutoContinue = (exitReason === "step-limit" || exitReason === "budget-limit");
-          if (!shouldAutoContinue || signal?.aborted) break;
+          if (!shouldAutoContinue(exitReason) || signal?.aborted) break;
 
           const phaseNum = phase + 1; // phase 1 = original, phase 2+ = continuations
           log("info", `own-loop: auto-continuation phase ${phaseNum}`, {
@@ -2139,126 +1905,23 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
           try {
             // ─── In-memory context truncation ───
-            // Keep more recent messages (12) so the model retains context
-            // from the current phase. Also extract text output from dropped
-            // messages to preserve the model's findings and plan.
-            const keepRecent = 12;
-            if (messages.length > keepRecent + 2) {
-              // Replace the original (potentially huge) user prompt at index 0
-              // with a compact synthetic system message that carries only the
-              // goal digest. See issue #34 — re-sending the full prompt on
-              // every phase duplicated input-token cost N times for N phases.
-              const firstMsg: ModelMessage = originalPromptDigest
-                ? {
-                    role: "system" as const,
-                    content: `[Original task]\n${originalPromptDigest}`,
-                  }
-                : messages[0];
-              const recentMsgs = messages.slice(-keepRecent);
-              const droppedMsgs = messages.slice(1, -keepRecent);
-
-              const droppedCount = droppedMsgs.length;
-              const droppedToolNames = new Set<string>();
-              const discoveredFiles = new Set<string>();
-              const assistantTexts: string[] = [];
-              // Compact record of each dropped tool call: `name(sanitized-args)`.
-              // Previously we only preserved distinct tool *names* plus any
-              // `input.path`, which meant after compaction the model lost
-              // specifics like 'git_clone was called with {url, depth: 30,
-              // dir: /dodo}' and just saw 'git_clone was used'. It then
-              // re-cloned. This cost us ~200k tokens across phases in the
-              // repeatable session-6d85ea02 / 1243c636 failure. Capping each
-              // entry at 160 chars and the whole list at 2 KB keeps the
-              // digest small even for 30+ tool calls.
-              const toolCallDigest: string[] = [];
-              const MAX_TOOL_CALL_ENTRY_CHARS = 160;
-              const MAX_TOOL_CALL_DIGEST_CHARS = 2_000;
-
-              for (const msg of droppedMsgs) {
-                if (typeof msg.content === "object" && Array.isArray(msg.content)) {
-                  for (const part of msg.content) {
-                    if (part && typeof part === "object" && "type" in part) {
-                      if (part.type === "tool-call" && "toolName" in part) {
-                        const toolName = String(part.toolName);
-                        droppedToolNames.add(toolName);
-                        if ("input" in part && part.input && typeof part.input === "object") {
-                          const input = part.input as Record<string, unknown>;
-                          if (typeof input.path === "string" && input.path.length > 1) {
-                            discoveredFiles.add(input.path);
-                          }
-                          // Sanitize + cap the input for the tool-call digest.
-                          // Strip long string fields (content / code / old_string /
-                          // new_string) before serializing so a single write
-                          // doesn't eat the whole budget.
-                          const sanitized: Record<string, unknown> = {};
-                          for (const [k, v] of Object.entries(input)) {
-                            if (typeof v === "string" && v.length > 80) {
-                              sanitized[k] = `<${v.length}-char ${k}>`;
-                            } else {
-                              sanitized[k] = v;
-                            }
-                          }
-                          let entry = `${toolName}(${JSON.stringify(sanitized)})`;
-                          if (entry.length > MAX_TOOL_CALL_ENTRY_CHARS) {
-                            entry = entry.slice(0, MAX_TOOL_CALL_ENTRY_CHARS - 3) + "...";
-                          }
-                          toolCallDigest.push(entry);
-                        } else {
-                          toolCallDigest.push(`${toolName}()`);
-                        }
-                      }
-                      // Extract the model's text output (findings, plans, decisions)
-                      if (part.type === "text" && "text" in part && typeof part.text === "string") {
-                        const text = part.text.trim();
-                        if (text.length > 20) assistantTexts.push(text);
-                      }
-                    }
-                  }
-                }
-              }
-
-              // Tail-trim tool-call digest so the most recent calls survive.
-              // Older calls are less relevant — the model has likely acted on them.
-              let toolCallList = toolCallDigest.join("\n");
-              if (toolCallList.length > MAX_TOOL_CALL_DIGEST_CHARS) {
-                let bytes = 0;
-                const kept: string[] = [];
-                for (let i = toolCallDigest.length - 1; i >= 0; i--) {
-                  const entry = toolCallDigest[i];
-                  if (bytes + entry.length + 1 > MAX_TOOL_CALL_DIGEST_CHARS) break;
-                  kept.unshift(entry);
-                  bytes += entry.length + 1;
-                }
-                toolCallList = `[...older tool calls elided...]\n${kept.join("\n")}`;
-              }
-
-              // Build a summary that preserves the model's key findings
-              const toolsSummary = [...droppedToolNames].join(", ") || "none";
-              const filesList = discoveredFiles.size > 0
-                ? "\n\nFiles discovered in previous phases:\n" + [...discoveredFiles].join("\n")
-                : "";
-              const callsList = toolCallList.length > 0
-                ? "\n\nTool calls already made in previous phases (DO NOT repeat these):\n" + toolCallList
-                : "";
-              const findingsDigest = assistantTexts.length > 0
-                ? "\n\nKey findings from previous phases:\n" + assistantTexts.join("\n").slice(-1500)
-                : "";
-
-              const summaryInjection: ModelMessage = {
-                role: "system" as const,
-                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${toolsSummary}. The task is not yet complete. Do NOT re-explore files you already found and do NOT repeat tool calls already made — use the file paths, tool-call history, and findings below to continue making edits.${callsList}${filesList}${findingsDigest}]`,
-              };
-
-              messages = [firstMsg, summaryInjection, ...recentMsgs];
+            // Keep the most recent messages so the model retains context
+            // from the current phase, replace the (potentially huge) original
+            // prompt with a short digest, and summarise everything dropped —
+            // tool calls, discovered files, findings — so the next phase
+            // continues instead of re-exploring (issue #34).
+            const digest = buildPhaseDigest(messages, 12, originalPromptDigest);
+            if (digest) {
+              messages = digest.messages;
               log("info", `own-loop: phase ${phaseNum} context truncation`, {
                 sessionId,
-                originalCount: messages.length + droppedCount,
-                keptCount: messages.length,
-                droppedTools: [...droppedToolNames],
-                droppedToolCalls: toolCallDigest.length,
-                discoveredFiles: discoveredFiles.size,
-                findingsLength: findingsDigest.length,
-                toolCallDigestLength: toolCallList.length,
+                originalCount: digest.messages.length + digest.droppedCount,
+                keptCount: digest.messages.length,
+                droppedTools: digest.droppedToolNames,
+                droppedToolCalls: digest.droppedToolCalls,
+                discoveredFiles: digest.discoveredFiles.length,
+                findingsLength: digest.findingsLength,
+                toolCallDigestLength: digest.toolCallDigestLength,
               });
             }
 
@@ -2267,6 +1930,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             cumulativeOutputTokens = 0;
             warnInjected = false;
             wrapUpInjected = false;
+            sameToolNudgeInjected = false;
             compactionTriggered = false;
             consecutiveNoTextSteps = 0;
             recentToolCalls.length = 0;
@@ -2281,169 +1945,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             messages = [...messages, continuationInjection];
 
             // Run the next phase
-            step = 0;
-            while (step < maxSteps) {
-              if (signal?.aborted) { exitReason = "abort"; break; }
-
-              if (step > 0) {
-                yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
-              }
-
-              const phaseInjections: ModelMessage[] = [];
-              const phaseBudgetUsage = cumulativeInputTokens / tokenBudget;
-
-              if (phaseBudgetUsage >= HARD_STOP_THRESHOLD) {
-                log("warn", `own-loop: phase ${phase + 1} hard stop`, { sessionId, step });
-                exitReason = "budget-limit";
-                break;
-              }
-              if (phaseBudgetUsage >= WRAP_UP_THRESHOLD && !wrapUpInjected) {
-                phaseInjections.push({
-                  role: "system" as const,
-                  content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop. Do not read new files or start new tasks. Complete your current thought and wrap up.",
-                });
-                wrapUpInjected = true;
-              } else if (phaseBudgetUsage >= WARN_THRESHOLD && !warnInjected) {
-                phaseInjections.push({
-                  role: "system" as const,
-                  content: "[CONTEXT BUDGET WARNING] You are using most of your context budget. Focus on completing the current task. Avoid reading new files unless essential. Prefer targeted edits over full file reads.",
-                });
-                warnInjected = true;
-              }
-
-              // Doom loop detection (two-tier: soft warning then hard break)
-              if (recentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
-                const lastN = recentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
-                if (lastN.every(c => c === lastN[0])) {
-                  const toolName = lastN[0].split(":")[0];
-                  const DOOM_LOOP_HARD_BREAK = DOOM_LOOP_THRESHOLD + 2;
-
-                  if (recentToolCalls.length >= DOOM_LOOP_HARD_BREAK) {
-                    const hardN = recentToolCalls.slice(-DOOM_LOOP_HARD_BREAK);
-                    if (hardN.every(c => c === hardN[0])) {
-                      log("warn", `own-loop: phase ${phase + 1} doom loop hard break`, { sessionId, step, toolName });
-                      yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Stopped: repeated ${toolName} calls detected]\n\n` };
-                      exitReason = "doom-loop";
-                      break;
-                    }
-                  }
-
-                  phaseInjections.push({
-                    role: "system" as const,
-                    content: `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach.]`,
-                  });
-                }
-              }
-
-              const finalMessages = phaseInjections.length > 0
-                ? [...messages, ...phaseInjections]
-                : messages;
-
-              let phResult;
-              let phText = "";
-              try {
-                phResult = streamText({
-                  model,
-                  system,
-                  messages: finalMessages,
-                  tools,
-                  abortSignal: signal,
-                });
-
-                for await (const chunk of phResult.toUIMessageStream()) {
-                  yield chunk;
-                  const c = chunk as { type?: string; delta?: string };
-                  if (c.type === "text-delta" && c.delta) {
-                    phText += c.delta;
-                  }
-                }
-              } catch (err) {
-                const errMsg = err instanceof Error ? err.message : String(err);
-                const isOverflow = /context.*(length|limit|overflow|window|too long|exceed)/i.test(errMsg)
-                  || /max.*token/i.test(errMsg)
-                  || /request too large/i.test(errMsg);
-                if (isOverflow) {
-                  log("warn", `own-loop: phase ${phase + 1} overflow — stopping`, { sessionId });
-                  exitReason = "budget-limit";
-                  break;
-                }
-                throw err;
-              }
-
-              const phUsage = await (phResult as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
-              cumulativeInputTokens += phUsage?.inputTokens ?? 0;
-              cumulativeOutputTokens += phUsage?.outputTokens ?? 0;
-
-              const phResponse = await (phResult as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
-              if (phResponse?.messages?.length) {
-                messages = [...messages, ...phResponse.messages];
-              }
-
-              // Track tool calls for loop detection
-              const phSteps = await (phResult as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
-              const phLastStep = phSteps?.[phSteps.length - 1];
-              if (phLastStep?.toolCalls?.length) {
-                for (const tc of phLastStep.toolCalls) {
-                  recentToolCalls.push(`${tc.toolName}:${JSON.stringify(tc.input)}`);
-                }
-                if (recentToolCalls.length > DOOM_LOOP_THRESHOLD * 2) {
-                  recentToolCalls.splice(0, recentToolCalls.length - DOOM_LOOP_THRESHOLD * 2);
-                }
-              }
-
-              // Text repetition detection
-              const phTextPrefix = phText.trim().slice(0, 80);
-              if (phTextPrefix.length > 10) {
-                recentTextPrefixes.push(phTextPrefix);
-                if (recentTextPrefixes.length > DOOM_LOOP_THRESHOLD * 2) {
-                  recentTextPrefixes.splice(0, recentTextPrefixes.length - DOOM_LOOP_THRESHOLD * 2);
-                }
-                if (recentTextPrefixes.length >= DOOM_LOOP_THRESHOLD) {
-                  const lastN = recentTextPrefixes.slice(-DOOM_LOOP_THRESHOLD);
-                  if (lastN.every(t => t === lastN[0])) {
-                    log("warn", `own-loop: phase ${phase + 1} text repetition loop`, { sessionId, step });
-                    exitReason = "text-loop";
-                    break;
-                  }
-                }
-              }
-
-              // No-text loop detection (only for Anthropic; OpenAI/Google work silently)
-              if (noTextDetectionEnabled && phTextPrefix.length <= 10 && phLastStep?.toolCalls?.length) {
-                consecutiveNoTextSteps++;
-                if (step >= NO_TEXT_GRACE_STEPS && consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
-                  log("warn", `own-loop: phase ${phaseNum} no-text loop`, { sessionId, step });
-                  yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Loop detected — summarizing progress so far]\n\n" };
-                  exitReason = "no-text-loop";
-                  break;
-                }
-              } else {
-                consecutiveNoTextSteps = 0;
-              }
-
-              const phFinishReason = await (phResult as unknown as { finishReason: PromiseLike<string> }).finishReason;
-
-              log("info", `own-loop: phase ${phase + 1} step complete`, {
-                sessionId,
-                step,
-                finishReason: phFinishReason,
-                budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
-                toolCalls: phLastStep?.toolCalls?.map(tc => tc.toolName) ?? [],
-              });
-
-              if (phFinishReason !== "tool-calls") break;
-              step++;
-            }
-
-            // Tag step-limit exit
-            if (step >= maxSteps && exitReason === "natural") {
-              exitReason = "step-limit";
-            }
-
-            // Accumulate phase tokens into total
-            totalInputTokens += cumulativeInputTokens;
-            totalOutputTokens += cumulativeOutputTokens;
+            yield* runPhase(phaseNum);
           } catch (err) {
+            // Accumulate phase tokens into total
             totalInputTokens += cumulativeInputTokens;
             totalOutputTokens += cumulativeOutputTokens;
             log("warn", `own-loop: auto-continuation phase ${phase} failed`, {
@@ -2451,6 +1955,18 @@ export class CodingAgent extends Think<Env, DodoConfig> {
               error: err instanceof Error ? err.message : String(err),
             });
             yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Auto-continuation failed — send 'continue' to resume manually]\n\n" };
+            break;
+          }
+
+          // Accumulate phase tokens into total
+          totalInputTokens += cumulativeInputTokens;
+          totalOutputTokens += cumulativeOutputTokens;
+
+          // A phase that exits stuck gets the same conclusion turn the
+          // primary exit always had — previously phases left the user
+          // with only the harness stop notice.
+          if (STUCK_EXIT_REASONS.has(exitReason)) {
+            yield* runFinalSummaryTurn();
             break;
           }
         }
