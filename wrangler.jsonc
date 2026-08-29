@@ -2,6 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "dodo",
   "main": "src/index.ts",
+  "routes": [{ "pattern": "dodo.jonnyparris.club", "custom_domain": true }],
   "compatibility_date": "2026-03-10",
   "compatibility_flags": ["nodejs_compat", "experimental"],
   // Allow `*.wasm` imports to resolve to `WebAssembly.Module` at deploy

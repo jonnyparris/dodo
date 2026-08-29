@@ -115,6 +115,16 @@ export async function verifyAccess(request: Request, env: Env): Promise<AccessId
     throw new AuthError("Invalid or expired Access token", 401);
   }
 
+  // Service tokens (non_identity policies) carry no email claim — map them
+  // to the admin so Browser Run sessions can exercise the full UI/API.
+  const isServiceToken =
+    typeof payload.common_name === "string" ||
+    (typeof payload.sub === "string" && payload.sub.endsWith(".access"));
+  if (isServiceToken) {
+    const admin = resolveAdminEmail(env);
+    if (admin) return { email: admin, source: "service-token" };
+  }
+
   const rawEmail = (typeof payload.email === "string" ? payload.email : null) ??
     request.headers.get("Cf-Access-Authenticated-User-Email");
   return {
