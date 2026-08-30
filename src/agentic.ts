@@ -1,32 +1,32 @@
-import type { StateBackend } from "@cloudflare/shell";
+import type { WorkspaceRuntimeClient } from "@cloudflare/computer";
+import type { StateBackend, Workspace } from "@cloudflare/shell";
 import { jsonSchema, tool, zodSchema } from "ai";
 import { z } from "zod";
-import type { Workspace } from "@cloudflare/shell";
+import {
+  type AgentProfile,
+  EXPLORE_PROFILE,
+  resolveProfileModel,
+  TASK_PROFILE,
+} from "./agent-profile";
 import type { AttachmentRef } from "./attachments";
 import { MAX_READ_ATTACHMENT_CHARS } from "./attachments";
+import { createBrowserTools } from "./browser/tools";
+import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { createPullRequest } from "./github-api";
-import { normalizePath } from "./paths";
-import { createBrowserTools } from "./browser/tools";
+import { log } from "./logger";
 import type { McpClient } from "./mcp-client";
+import { normalizePath } from "./paths";
 import { getKnownRepo, listKnownRepos, parseRemoteSpec } from "./repos";
 import {
   buildProviderForModel,
   capToolOutputs,
   runSubagentForProfile,
 } from "./subagent-runner";
-import {
-  EXPLORE_PROFILE,
-  TASK_PROFILE,
-  resolveProfileModel,
-  type AgentProfile,
-} from "./agent-profile";
-import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
-import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
-import { createShellTool } from "./tools/shell";
+import { createExecuteTool, createWorkspaceTools } from "./think-adapter";
 import { sanitizeToolJsonSchema } from "./tool-schema";
+import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";
-import { log } from "./logger";
 import type { AppConfig, Env, TodoStore } from "./types";
 
 /** Options passed through from the coding agent into tool factories. */
@@ -87,6 +87,12 @@ interface BuildToolsOptions {
    * `this.readSessionDocument`.
    */
   readAttachment?: (input: { id: string; offset?: number; limit?: number }) => Promise<unknown>;
+  /**
+   * Computer workspace runtime for the `shell` tool. When provided,
+   * commands are executed via `ws.runtime.exec()` instead of the legacy
+   * busybox wasm emulator.
+   */
+  shellRuntime?: WorkspaceRuntimeClient;
   /**
    * Parent CodingAgent reference — used when `config.exploreMode` or
    * `config.taskMode` is `"facet"` so the explore / task tools can
@@ -1562,11 +1568,12 @@ function buildTools(
     },
   });
 
-  // Shell tool — busybox-in-a-worker with /workspace mounted. Pure-code,
-  // no env binding required (busybox.wasm + initramfs.wasm bundle into the
-  // Worker via wrangler's CompiledWasm rule). Lives alongside codemode:
-  // codemode for JS/API-shaped work, shell for pipelines and file ops.
-  tools.shell = createShellTool(workspace);
+  // Shell tool — computer workspace runtime with /workspace mounted.
+  // When shellRuntime is provided, commands execute via ws.runtime.exec();
+  // otherwise the tool is omitted (should not happen in production).
+  if (options?.shellRuntime) {
+    tools.shell = createShellTool(options.shellRuntime);
+  }
 
   // Git tools — only the hot-path subset is exposed at the top level.
   // See KNOWN_TOP_LEVEL_GIT_TOOLS / KNOWN_CODEMODE_GIT_TOOLS module-scope

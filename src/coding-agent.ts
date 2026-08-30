@@ -1,5 +1,8 @@
 import { DynamicWorkerExecutor, type ExecuteResult, resolveProvider } from "@cloudflare/codemode";
-import { createWorkspaceStateBackend, Workspace } from "@cloudflare/shell";
+import type { WorkspaceRuntimeClient } from "@cloudflare/computer";
+import { withWorkspace } from "@cloudflare/computer";
+import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
+import { createMemoryStateBackend, createWorkspaceStateBackend, Workspace } from "@cloudflare/shell";
 import { stateTools } from "@cloudflare/shell/workers";
 import { type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type WSMessage } from "agents";
 import { type FileUIPart, generateText, type LanguageModel, type ModelMessage, streamText, type ToolSet } from "ai";
@@ -43,6 +46,7 @@ import { PresenceTracker } from "./presence";
 import { assembleSystemPrompt } from "./prompt-composer";
 import { type ReplicateImageInput, ReplicateNotConfiguredError, runReplicateImage } from "./replicate";
 import { AgentConnectionTransport } from "./rpc";
+import { ComputerFileSystem } from "./runtime/computer/computer-fs";
 import {
   createSessionControlPlane,
   type MetadataKv,
@@ -632,7 +636,22 @@ class FacetNotFoundError extends Error {
   }
 }
 
-export class CodingAgent extends Think<Env, DodoConfig> {
+const CodingAgentBase = withWorkspace(Think<Env, DodoConfig>, (self) => {
+  const s = self as any;
+  return {
+    storage: s.ctx.storage as any,
+    backends: [
+      new WorkerShellBackend({
+        loader: s.env.LOADER,
+        workspace: { binding: "WorkspaceServiceProxy", id: s.ctx.id.toString() },
+        ctx: s.ctx,
+      }),
+    ],
+    sessionId: s.ctx.id.toString(),
+  };
+});
+
+export class CodingAgent extends CodingAgentBase {
   initialState: SessionState = {
     activePromptId: null,
     activeStreamCount: 0,
@@ -770,6 +789,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private _toolCallNames: Set<string> = new Set();
   private readonly presence = new PresenceTracker();
   readonly stateBackend;
+  readonly computerStateBackend;
   private readonly transports = new Map<string, AgentConnectionTransport>();
   readonly workspace: Workspace;
   /**
@@ -787,15 +807,32 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   private readonly lifecycle: SessionLifecycle;
 
+  /** Access the computer Workspace instance created by the withWorkspace mixin. */
+  private get computerWorkspace(): any {
+    const sym = Object.getOwnPropertySymbols(this).find((s) => s.description === "workspace");
+    return sym ? (this as any)[sym] : undefined;
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.initializeSchema();
+
+    // Keep the existing @cloudflare/shell Workspace for file tools
+    // (read, write, edit, grep, etc.) — unchanged contract.
     this.workspace = new Workspace({
       name: () => this.sessionId() || "session-pending",
       r2: env.WORKSPACE_BUCKET,
       sql: ctx.storage.sql,
     });
+
+    // stateBackend — old workspace, for file-tool endpoints (write,
+    // search, replace) so they stay in sync with each other.
     this.stateBackend = createWorkspaceStateBackend(this.workspace);
+
+    // computerStateBackend — computer workspace fs, wired into codemode
+    // so sandboxed JS sees the same filesystem as shell commands.
+    const computerFs = new ComputerFileSystem(this.computerWorkspace.fs);
+    this.computerStateBackend = createMemoryStateBackend({ fs: computerFs });
 
     // ─── Typed stores + SessionLifecycle wiring (ADR-0001) ───
     //
@@ -1018,6 +1055,64 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
       return;
     }
+  }
+
+  /** Guard so ensureSessionCompat runs at most once per DO instance. */
+  private _sessionCompatChecked = false;
+
+  /**
+   * Session compatibility: on first workspace access, if the computer
+   * workspace is empty and the legacy R2-backed workspace has files,
+   * copy them once into the computer workspace. Guarded by a metadata
+   * marker so the copy is idempotent across DO evictions.
+   */
+  async ensureSessionCompat(): Promise<void> {
+    if (this._sessionCompatChecked) return;
+    this._sessionCompatChecked = true;
+
+    const markerKey = `computer_compat_copied_${this.sessionId()}`;
+    if (this.readMetadata(markerKey) === "true") return;
+
+    // Check if computer workspace already has files
+    try {
+      const computerEntries = await this.computerWorkspace.fs.readdir("/");
+      if (computerEntries.length > 0) return;
+    } catch {
+      // not ready or empty — proceed to copy check
+    }
+
+    // Check if legacy workspace has files
+    const oldPaths = await this.workspace._getAllPaths();
+    if (oldPaths.length === 0) return;
+
+    log("info", "session-compat-copy-start", {
+      sessionId: this.sessionId(),
+      count: oldPaths.length,
+    });
+
+    for (const path of oldPaths) {
+      try {
+        const st = await this.workspace.stat(path);
+        if (st?.type === "file") {
+          const bytes = await this.workspace.readFileBytes(path);
+          await this.computerWorkspace.fs.writeFile(path, bytes);
+        } else if (st?.type === "directory") {
+          await this.computerWorkspace.fs.mkdir(path, { recursive: true });
+        }
+      } catch (e) {
+        log("warn", "session-compat-copy-error", {
+          sessionId: this.sessionId(),
+          path,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+
+    this.writeMetadata(markerKey, "true");
+    log("info", "session-compat-copy-done", {
+      sessionId: this.sessionId(),
+      count: oldPaths.length,
+    });
   }
 
   /**
@@ -1254,7 +1349,8 @@ export class CodingAgent extends Think<Env, DodoConfig> {
           type: "tool_attachments",
         });
       },
-      stateBackend: this.stateBackend,
+      stateBackend: this.computerStateBackend,
+      shellRuntime: this.computerWorkspace.runtime as WorkspaceRuntimeClient,
       mcpGatekeepers: this.mcpGatekeepers,
       todoStore: this.todoStore(),
       readAttachment: (i: { id: string; offset?: number; limit?: number }) => this.readSessionDocument(i),
@@ -1293,6 +1389,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Refresh the admin-managed global prompt prefix from SharedIndex.
     // TTL-cached on the DO so this is a no-op for most turns.
     await this.warmGlobalPrompt();
+
+    // One-time copy of legacy R2 workspace files into the computer workspace.
+    await this.ensureSessionCompat();
 
     const baseTools = this.getTools();
     const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
@@ -2470,6 +2569,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (incomingEmail) {
       await this.reconcileOwnerIdentity(incomingEmail);
     }
+
+    // One-time copy of legacy R2 workspace files into the computer workspace.
+    await this.ensureSessionCompat();
 
     try {
       if (request.method === "GET" && url.pathname === "/ws") {
