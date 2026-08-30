@@ -113,7 +113,7 @@ const BUILTIN_SKILLS: Array<Pick<Skill, "name" | "description" | "body">> = [
       "Dodo strips base64 screenshot payloads from `browser_execute`'s tool output text before the model sees it (see `src/browser/tools.ts:extractScreenshotsInPlace`). The screenshot becomes an *attachment* on the assistant message, not a wall of base64 in the tool log. That's the good news.",
       "",
       "The hard limits, from `src/coding-agent.ts`:",
-      "- **Per image: `MAX_IMAGE_BASE64_LENGTH = 4_000_000`** (~3MB decoded). Larger images are rejected.",
+      "- **Per image: `MAX_IMAGE_BASE64_LENGTH = 10_000_000`** (~7.5MB decoded). Larger images are rejected.",
       "- **Per message: `MAX_IMAGES_PER_MESSAGE = 5`**. The sixth screenshot in one turn is dropped.",
       "",
       "PNG is lossless and uncompressed. A 1440×900 PNG with `deviceScaleFactor:2` (the recommended default for crisp screenshots) easily exceeds 3MB. **For full-page screenshots, use JPEG quality 75 unless you specifically need lossless** — the page can be tall and a `captureBeyondViewport: true` PNG of a content-heavy site routinely blows the cap.",
