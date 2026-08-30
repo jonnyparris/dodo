@@ -2321,16 +2321,39 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Create an MCP config, storing headers as encrypted secrets.
    * The mcp_configs table stores only header key names (not values).
+   *
+   * Upserts on (auth_type, url): re-adding an integration that already exists
+   * updates it in place instead of stacking a duplicate row. Mirrors
+   * upsertRefreshTokenMcp, which is idempotent on url for the same reason.
+   * Configs without a url can't be deduped and always insert.
    */
   private async createMcpConfigEncrypted(input: { name: string; type: string; auth_type: "oauth" | "static_headers"; url?: string; headers?: Record<string, string>; enabled: boolean }, ownerEmail: string): Promise<McpClientConfig & { headerKeys?: string[] }> {
-    const id = crypto.randomUUID();
     const now = nowEpoch();
     const headerKeys = input.headers ? Object.keys(input.headers) : [];
 
-    this.ctx.storage.sql.exec(
-      "INSERT INTO mcp_configs (id, name, type, auth_type, url, headers_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      id, input.name, input.type, input.auth_type, input.url ?? null, headerKeys.length > 0 ? JSON.stringify(headerKeys) : null, input.enabled ? 1 : 0, now, now,
-    );
+    const existing = input.url
+      ? Array.from(this.ctx.storage.sql.exec(
+          "SELECT id FROM mcp_configs WHERE auth_type = ? AND url = ?",
+          input.auth_type,
+          input.url,
+        ))[0] as SqlRow | undefined
+      : undefined;
+    const id = existing ? String(existing.id) : crypto.randomUUID();
+
+    if (existing) {
+      // Replace header secrets along with the row — stale encrypted values
+      // would otherwise outlive the headerKeys that reference them.
+      this.deleteMcpConfigSecrets(id);
+      this.ctx.storage.sql.exec(
+        "UPDATE mcp_configs SET name = ?, type = ?, headers_json = ?, enabled = ?, updated_at = ? WHERE id = ?",
+        input.name, input.type, headerKeys.length > 0 ? JSON.stringify(headerKeys) : null, input.enabled ? 1 : 0, now, id,
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO mcp_configs (id, name, type, auth_type, url, headers_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        id, input.name, input.type, input.auth_type, input.url ?? null, headerKeys.length > 0 ? JSON.stringify(headerKeys) : null, input.enabled ? 1 : 0, now, now,
+      );
+    }
 
     // Store each header value as an encrypted secret
     if (input.headers && ownerEmail && this.hasKeyEnvelope()) {
