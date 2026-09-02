@@ -261,6 +261,7 @@ export class TaskAgent extends Agent<Env> {
 
     try {
       const result = await runSubagentForProfile(TASK_PROFILE, {
+        sessionAffinity: parentSessionId,
         prompt: userMessage,
         model: modelId,
         config,

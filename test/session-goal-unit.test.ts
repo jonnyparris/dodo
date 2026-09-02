@@ -50,10 +50,13 @@ describe("renderGoalSystemPromptSection", () => {
     expect(renderGoalSystemPromptSection(state({ status: "active", text: null }))).toBeNull();
   });
 
-  it("includes goal text and turn count when active", () => {
+  it("includes goal text and turn budget when active", () => {
     const section = renderGoalSystemPromptSection(state({ turnsUsed: 3, maxTurns: 10 }));
     expect(section).toContain("Investigate logs and fix one bug.");
-    expect(section).toContain("Turn 4 of 10");
+    // No per-turn counter — it would invalidate the prompt cache every
+    // turn. Only the static budget is rendered.
+    expect(section).toContain("Turn budget: 10.");
+    expect(section).not.toContain("Turn 4 of");
     expect(section).toContain("active");
   });
 

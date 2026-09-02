@@ -340,7 +340,12 @@ function resolveGatewayForModel(
   return mainGateway;
 }
 
-export function buildProviderForModel(modelId: string, config: AppConfig, env: Env) {
+export function buildProviderForModel(
+  modelId: string,
+  config: AppConfig,
+  env: Env,
+  sessionAffinity?: string,
+) {
   const effectiveGateway = resolveGatewayForModel(modelId, config.activeGateway);
   const isOpencode = effectiveGateway === "opencode";
   const baseURL = isOpencode
@@ -352,6 +357,10 @@ export function buildProviderForModel(modelId: string, config: AppConfig, env: E
     : {
         "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
         "x-api-key": env.AI_GATEWAY_KEY ?? "",
+        // Workers AI prefix caching is per-replica. Without a stable
+        // affinity key, consecutive steps of one conversation land on
+        // different replicas and re-pay full prefill every step.
+        ...(sessionAffinity ? { "x-session-affinity": sessionAffinity } : {}),
       };
 
   const provider = createOpenAICompatible({
@@ -432,6 +441,11 @@ export function resolveSubagentModel(
 export interface SubagentRunInput {
   /** The natural-language prompt the subagent's model sees. */
   prompt: string;
+  /**
+   * Stable conversation key for Workers AI prefix-cache affinity
+   * (x-session-affinity). Pass the parent session id from facets.
+   */
+  sessionAffinity?: string;
   /** Resolved model id to invoke (see `resolveProfileModel`). */
   model: string;
   /** Per-session config — supplies provider, gateway, base URLs. */
@@ -525,6 +539,7 @@ export function runSubagentForProfile(
     prepareStep: input.prepareStep,
     env: input.env,
     signal: input.signal,
+    sessionAffinity: input.sessionAffinity,
     resultSchemaName: input.resultSchemaName ?? profile.defaultResultSchemaName,
   });
 }
@@ -544,6 +559,7 @@ export async function runSubagent(input: SubagentInvocation): Promise<SubagentRe
 interface SubagentExecuteInput {
   profile: AgentProfile;
   prompt: string;
+  sessionAffinity?: string;
   model: string;
   config: AppConfig;
   toolset: ToolSet;
@@ -555,7 +571,7 @@ interface SubagentExecuteInput {
 }
 
 async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentResult> {
-  const provider = buildProviderForModel(input.model, input.config, input.env);
+  const provider = buildProviderForModel(input.model, input.config, input.env, input.sessionAffinity);
   const model = provider.chatModel(input.model);
 
   const messages = [{ role: "user" as const, content: input.prompt }];

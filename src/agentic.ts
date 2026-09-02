@@ -347,8 +347,8 @@ function getByPath(value: unknown, path: string): unknown {
   return current;
 }
 
-export function buildProvider(config: AppConfig, env: Env) {
-  return buildProviderForModel(config.model, config, env);
+export function buildProvider(config: AppConfig, env: Env, sessionAffinity?: string) {
+  return buildProviderForModel(config.model, config, env, sessionAffinity);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1774,7 +1774,9 @@ function buildMcpTools(gatekeepers: McpClient[], existingNames: Set<string>): Re
       if (existingNames.has(mcpTool.name) || tools[mcpTool.name]) continue;
       if (suppressChatReplyMcp && mcpTool.name.endsWith("__chat_reply")) continue;
       tools[mcpTool.name] = tool({
-        description: mcpTool.description ?? `MCP tool: ${mcpTool.name}`,
+        // Cap third-party descriptions: some servers ship multi-KB
+        // instructions blocks that ride on every request of every turn.
+        description: capToolDescription(mcpTool.description ?? `MCP tool: ${mcpTool.name}`),
         // Sanitise the third-party schema: a single tool with an invalid
         // draft-2020-12 schema makes strict providers (Workers AI glm-*)
         // 400 the entire request. See src/tool-schema.ts.
@@ -1796,6 +1798,14 @@ function buildMcpTools(gatekeepers: McpClient[], existingNames: Set<string>): Re
   }
 
   return tools;
+}
+
+/** Hard cap on third-party MCP tool descriptions. See buildMcpTools. */
+const MCP_TOOL_DESCRIPTION_CAP = 400;
+
+function capToolDescription(description: string): string {
+  if (description.length <= MCP_TOOL_DESCRIPTION_CAP) return description;
+  return `${description.slice(0, MCP_TOOL_DESCRIPTION_CAP)}… [truncated]`;
 }
 
 function slugifyToolNamespace(name: string): string {
@@ -1848,7 +1858,7 @@ function buildOAuthMcpTools(
     }
 
     tools[prefixedName] = tool({
-      description: info.description ?? `OAuth MCP tool: ${info.name}`,
+      description: capToolDescription(info.description ?? `OAuth MCP tool: ${info.name}`),
       // Sanitise the third-party schema before forwarding to the provider —
       // see buildMcpTools above and src/tool-schema.ts.
       inputSchema: jsonSchema(sanitizeToolJsonSchema(info.inputSchema)),
