@@ -2,7 +2,7 @@
 // @cloudflare/computer's WorkerShellBackend.
 //
 // Each call routes to `ws.runtime.exec()` which runs the command in a
-// fresh dynamic Worker with the workspace mounted at `/workspace`.
+// fresh dynamic Worker with the session workspace as the filesystem.
 // The shell state (cwd, env exports) does not persist between calls —
 // each command is independent.
 //
@@ -49,7 +49,7 @@ const SHELL_INPUT = z.object({
     .string()
     .optional()
     .describe(
-      "Working directory for the shell. Defaults to `/workspace`. Must start with `/`.",
+      "Working directory for the shell. Defaults to `/` (the workspace root). Must start with `/`.",
     ),
   env: z
     .record(z.string(), z.string())
@@ -124,7 +124,7 @@ export async function runShellBatch(
   runtime: WorkspaceRuntimeClient,
   input: z.infer<typeof SHELL_INPUT>,
 ): Promise<ShellResult> {
-  const cwd = input.cwd ?? "/workspace";
+  const cwd = input.cwd ?? "/";
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const envObj: Record<string, string> = {
     HOME: "/",
@@ -166,19 +166,18 @@ export function createShellTool(runtime: WorkspaceRuntimeClient) {
     description: [
       "Run shell commands against the session workspace.",
       "",
-      "Each call boots a fresh sandbox with the workspace mounted at `/workspace` (read+write). File changes flush back to the Workspace on close. Use for file-shaped work that's awkward in `codemode`:",
+      "Each call boots a fresh sandbox with the session workspace as the filesystem (read+write) — the SAME tree the `write`/`read`/`edit` tools use. Use for file-shaped work that's awkward in `codemode`:",
       "",
-      "- pipelines: `cat /workspace/foo | wc -l`, `find /workspace -name '*.ts' | head`, `grep -r TODO /workspace/src | head -20`",
-      "- redirection: `echo bar > /workspace/notes.txt`, `cmd 2>&1 | tee /workspace/log`",
-      "- archive ops: `tar tzf /workspace/release.tgz | head`",
+      "- pipelines: `cat /foo | wc -l`, `find /src -name '*.ts' | head`, `grep -r TODO /src | head -20`",
+      "- redirection: `echo bar > /notes.txt`, `cmd 2>&1 | tee /log`",
+      "- archive ops: `tar tzf /release.tgz | head`",
       "",
-      "**Path translation — read carefully.** The `write`/`read`/`edit` tools use workspace paths starting with `/`. `shell` mounts the workspace at `/workspace`. So a file created by `write({ path: \"/foo.txt\" })` is visible to shell as `/workspace/foo.txt`. **Do NOT pass `/workspace/foo` to `write` — that creates a nested file.** Just `/foo`.",
+      "**Paths are workspace paths, identical to the file tools.** `write({ path: \"/foo.txt\" })` creates the same file shell sees at `/foo.txt`. No `/workspace` prefix — that directory does not exist.",
       "",
       "What's available inside the shell:",
       "",
-      "- `sh` (hush), all standard coreutils applets: `cat`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `find`, `grep`, `sed`, `awk`, `head`, `tail`, `wc`, `sort`, `uniq`, `tr`, `cut`, `xargs`, `tar`, `gzip`. Run `busybox --list` from the shell to see the full set.",
-      "- `/workspace` — your session workspace, read+write. Default cwd. Use absolute paths under it (`/workspace/...`).",
-      "- `/tmp` — in-memory scratch space, wiped when the call returns.",
+      "- `sh` (hush), all standard coreutils applets: `cat`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `find`, `grep`, `sed`, `awk`, `head`, `tail`, `wc`, `sort`, `uniq`, `tr`, `cut`, `xargs`, `tar`, `gzip`.",
+      "- `/` — your session workspace, read+write. Default cwd.",
       "- `/dev/null`, `/dev/zero`, `/dev/urandom`.",
       "",
       "What's NOT available (yet):",
@@ -192,7 +191,7 @@ export function createShellTool(runtime: WorkspaceRuntimeClient) {
       "Typical use:",
       "",
       "```",
-      "shell({ commands: [\"ls -la /workspace\", \"grep -rn 'TODO' /workspace/src | head -20\"] })",
+      "shell({ commands: [\"ls -la /\", \"grep -rn 'TODO' /src | head -20\"] })",
       "```",
     ].join("\n"),
     inputSchema: zodSchema(SHELL_INPUT),
