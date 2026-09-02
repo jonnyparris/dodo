@@ -1,0 +1,111 @@
+{
+  /**
+   * Preview deployment config — deploys to a separate `dodo-preview` worker
+   * on `dodo-preview.jonnyparris.club` so branches can be validated before
+   * merging to main and redeploying prod.
+   *
+   * Usage: npx wrangler deploy --config wrangler.preview.jsonc
+   * (driven by .github/workflows/dodo-preview.yml)
+   *
+   * IMPORTANT: Keep everything in sync with wrangler.jsonc except name,
+   * routes, the OUTBOUND service target, and the preview-specific vars.
+   * If you add a new DO class or binding in wrangler.jsonc, add it here too.
+   */
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dodo-preview",
+  "main": "src/index.ts",
+  "routes": [{ "pattern": "dodo-preview.jonnyparris.club", "custom_domain": true }],
+  "compatibility_date": "2026-03-10",
+  "compatibility_flags": ["nodejs_compat", "experimental"],
+  // Allow `*.wasm` imports to resolve to `WebAssembly.Module` at deploy
+  // time. Required by `src/tools/shell.ts` which static-imports
+  // busybox.wasm + initramfs.wasm from vendor/wasm/busybox/. Wrangler
+  // forbids runtime `WebAssembly.compile`, so all our wasm modules must
+  // be imported this way.
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": false }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CODING_AGENT", "class_name": "CodingAgent" },
+      { "name": "USER_CONTROL", "class_name": "UserControl" },
+      { "name": "SHARED_INDEX", "class_name": "SharedIndex" },
+      { "name": "CHAT_MONITOR", "class_name": "ChatMonitorAgent" }
+    ]
+  },
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "services": [
+    {
+      "binding": "OUTBOUND",
+      "service": "dodo-preview",
+      "entrypoint": "AllowlistOutbound"
+    }
+  ],
+  // Collapsed migration — the preview worker is a fresh script, so it can't
+  // replay the historical v1→v7 chain (deleted classes like AppControl never
+  // existed here). Mirrors wrangler.dev.jsonc. Bump the tag when adding a
+  // new DO class.
+  "migrations": [
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["CodingAgent", "UserControl", "SharedIndex"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["ExploreAgent", "TaskAgent"]
+    },
+    {
+      "tag": "v7",
+      "new_sqlite_classes": ["ChatMonitorAgent"]
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" },
+    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-fork-snapshots" }
+  ],
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "default"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  },
+  "build": {
+    "command": "npm run build"
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "secrets": {
+    "required": ["ADMIN_EMAIL"]
+  },
+  "vars": {
+    "DEFAULT_MODEL": "anthropic/claude-sonnet-4",
+    "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
+    "DEFAULT_REPLICATE_IMAGE_MODEL": "google/nano-banana-2",
+    "DEFAULT_EXPLORE_MODEL": "anthropic/claude-haiku-4-5",
+    "DEFAULT_TASK_MODEL": "anthropic/claude-haiku-4-5",
+    "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
+    "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1/4b430e167a301330d13a9bb42f3986a2/jp-gw/compat",
+    "WORKER_URL": "https://dodo-preview.jonnyparris.club",
+    "DODO_VERSION": "0.4.0-preview",
+    "DODO_WORKER_NAME": "dodo-preview",
+    "CLOUDFLARE_ACCOUNT_ID": "4b430e167a301330d13a9bb42f3986a2"
+  }
+}

@@ -50,7 +50,7 @@ describe("Multimodal image support", () => {
     sendNotificationMock.mockReset();
 
     await fetchJson("/api/config", {
-      body: JSON.stringify({ activeGateway: "opencode", model: "claude-test" }),
+      body: JSON.stringify({ activeGateway: "opencode", model: "anthropic/claude-test" }),
       headers: { "content-type": "application/json" },
       method: "PUT",
     });
@@ -157,10 +157,10 @@ describe("Multimodal image support", () => {
     });
 
     it("rejects images whose base64 payload exceeds the length cap", async () => {
-      // MAX_IMAGE_BASE64_LENGTH = 4_000_000. One over and it should fail schema
+      // MAX_IMAGE_BASE64_LENGTH = 10_000_000. One over and it should fail schema
       // validation before the handler ever runs. Use divisible-by-4 so it
       // doesn't fail for the wrong reason.
-      const oversizedBase64 = "A".repeat(4_000_004);
+      const oversizedBase64 = "A".repeat(10_000_004);
       const res = await fetchJson(`/session/${sessionId}/message`, {
         body: JSON.stringify({
           content: "Too big",

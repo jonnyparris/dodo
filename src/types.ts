@@ -167,7 +167,7 @@ export interface AppConfig {
 
 export interface AccessIdentity {
   email: string | null;
-  source: "access" | "dev" | "share";
+  source: "access" | "dev" | "share" | "service-token";
 }
 
 export interface SessionState {

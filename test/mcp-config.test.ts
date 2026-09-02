@@ -49,7 +49,7 @@ describe("MCP Config CRUD", () => {
     try { await fetchJson("/api/mcp-configs"); } catch { /* absorb invalidation */ }
     try { await fetchJson("/api/mcp-configs"); } catch { /* retry */ }
     // Add test hostnames to the allowlist via direct DO access (write routes are admin-only)
-    const hosts = ["mcp.example.com", "mcp-v2.example.com", "minimal.example.com", "toggle.example.com"];
+    const hosts = ["mcp.example.com", "mcp-v2.example.com", "minimal.example.com", "toggle.example.com", "upsert.example.com"];
     for (const hostname of hosts) {
       await addAllowlistDirect(hostname);
     }
@@ -148,6 +148,49 @@ describe("MCP Config CRUD", () => {
 
     // Cleanup
     await fetchJson(`/api/mcp-configs/${created.id}`, { method: "DELETE" });
+  });
+
+  it("re-adding the same url upserts instead of duplicating", async () => {
+    // First add
+    const firstRes = await fetchJson("/api/mcp-configs", {
+      body: JSON.stringify({
+        name: "Upsert Config",
+        url: "https://upsert.example.com",
+        headers: { Authorization: "Bearer first" },
+        enabled: true,
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(firstRes.status).toBe(201);
+    const first = (await firstRes.json()) as { id: string };
+
+    // Second add with the same url — must reuse the existing row
+    const secondRes = await fetchJson("/api/mcp-configs", {
+      body: JSON.stringify({
+        name: "Upsert Config Renamed",
+        url: "https://upsert.example.com",
+        headers: { Authorization: "Bearer second" },
+        enabled: false,
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(secondRes.status).toBe(201);
+    const second = (await secondRes.json()) as { id: string; name: string; enabled: boolean };
+    expect(second.id).toBe(first.id);
+    expect(second.name).toBe("Upsert Config Renamed");
+    expect(second.enabled).toBe(false);
+
+    // Exactly one config for that url
+    const listRes = await fetchJson("/api/mcp-configs");
+    const listBody = (await listRes.json()) as { configs: Array<{ id: string; url: string }> };
+    const matches = listBody.configs.filter((c) => c.url === "https://upsert.example.com");
+    expect(matches).toHaveLength(1);
+    expect(matches[0].id).toBe(first.id);
+
+    // Cleanup
+    await fetchJson(`/api/mcp-configs/${first.id}`, { method: "DELETE" });
   });
 
   it("update config enabled flag", async () => {
