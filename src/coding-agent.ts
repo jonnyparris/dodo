@@ -860,6 +860,18 @@ export class CodingAgent extends CodingAgentBase {
     return this.#ensureWs().computerWs;
   }
 
+  /**
+   * RPC target for the shell worker's HOST binding. The exported
+   * WorkspaceServiceProxy class (see src/index.ts) calls this to hand the
+   * loaded shell worker a stub of this session's Workspace, so shell
+   * commands read/write the same VFS as the file tools.
+   */
+  async __getWorkspaceStub(): Promise<unknown> {
+    const ws = this.computerWorkspace;
+    await ws.ready();
+    return ws.stub();
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.initializeSchema();
