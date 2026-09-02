@@ -140,7 +140,11 @@ export class ComputerFileSystem implements FileSystem {
   }
 
   async glob(pattern: string): Promise<string[]> {
-    const entries = await this.fs.find("/", pattern);
+    // computer's find() matches its glob against paths RELATIVE to the
+    // start directory (and yields absolute paths), but shell's
+    // FileSystem.glob contract takes root-anchored patterns like
+    // "/src/**/*.ts". Strip the leading slash so both conventions meet.
+    const entries = await this.fs.find("/", pattern.replace(/^\//, ""));
     return entries.map((e: { path: string }) => e.path).sort();
   }
 

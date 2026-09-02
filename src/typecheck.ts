@@ -23,7 +23,7 @@
  * opaque DO crash.
  */
 
-import type { Workspace } from "@cloudflare/shell";
+import type { WorkspaceFsView } from "./runtime/computer/workspace-view";
 
 /** Hard caps before we refuse to typecheck. Tunable after we measure prod heap. */
 const MAX_FILES = 50;
@@ -118,7 +118,7 @@ const EXTRA_STRICT_OPTIONS: Readonly<Record<string, boolean>> = {
  *     model sees those as actionable.
  */
 export async function runTypecheck(
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   opts: TypecheckOptions = {},
 ): Promise<TypecheckResult> {
   const start = Date.now();
@@ -279,7 +279,7 @@ function joinPath(dir: string, leaf: string): string {
 
 const SKIP_DIR_RE = /(^|\/)(node_modules|dist|build|\.git|\.wrangler|coverage)(\/|$)/;
 
-async function listTsFiles(workspace: Workspace, rootDir: string): Promise<string[]> {
+async function listTsFiles(workspace: WorkspaceFsView, rootDir: string): Promise<string[]> {
   const out: string[] = [];
   // Prefer `glob` if it covers our pattern; fall back to a manual walk if
   // the implementation only supports literal patterns.
@@ -304,7 +304,7 @@ async function listTsFiles(workspace: Workspace, rootDir: string): Promise<strin
   }
 }
 
-async function walk(workspace: Workspace, dir: string, out: string[]): Promise<void> {
+async function walk(workspace: WorkspaceFsView, dir: string, out: string[]): Promise<void> {
   let entries: Array<{ name: string; type?: string; path?: string }> = [];
   try {
     entries = (await workspace.readDir(dir)) as typeof entries;
@@ -324,7 +324,7 @@ async function walk(workspace: Workspace, dir: string, out: string[]): Promise<v
 }
 
 async function loadFiles(
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   paths: string[],
 ): Promise<{ fileCount: number; byteCount: number; fileMap: Map<string, string> }> {
   const fileMap = new Map<string, string>();
@@ -338,7 +338,7 @@ async function loadFiles(
   return { fileCount: fileMap.size, byteCount, fileMap };
 }
 
-async function safeRead(workspace: Workspace, path: string): Promise<string | null> {
+async function safeRead(workspace: WorkspaceFsView, path: string): Promise<string | null> {
   try {
     const content = await workspace.readFile(path);
     return typeof content === "string" ? content : null;

@@ -1,10 +1,11 @@
 import { DynamicWorkerExecutor, type ExecuteResult, resolveProvider } from "@cloudflare/codemode";
 import type { WorkspaceRuntimeClient } from "@cloudflare/computer";
-import { withWorkspace } from "@cloudflare/computer";
+import { Workspace as WorkspaceComputer } from "@cloudflare/computer";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
-import { createMemoryStateBackend, createWorkspaceStateBackend, Workspace } from "@cloudflare/shell";
-import { stateTools } from "@cloudflare/shell/workers";
-import { type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type WSMessage } from "agents";
+
+import { createMemoryStateBackend, Workspace } from "@cloudflare/shell";
+import { stateToolsFromBackend } from "@cloudflare/shell/workers";
+import { type Agent, type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type SubAgentClass, type SubAgentStub, type WSMessage } from "agents";
 import { type FileUIPart, generateText, type LanguageModel, type ModelMessage, streamText, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
@@ -47,6 +48,7 @@ import { assembleSystemPrompt } from "./prompt-composer";
 import { type ReplicateImageInput, ReplicateNotConfiguredError, runReplicateImage } from "./replicate";
 import { AgentConnectionTransport } from "./rpc";
 import { ComputerFileSystem } from "./runtime/computer/computer-fs";
+import { WorkspaceFsView } from "./runtime/computer/workspace-view";
 import {
   createSessionControlPlane,
   type MetadataKv,
@@ -636,20 +638,7 @@ class FacetNotFoundError extends Error {
   }
 }
 
-const CodingAgentBase = withWorkspace(Think<Env, DodoConfig>, (self) => {
-  const s = self as any;
-  return {
-    storage: s.ctx.storage as any,
-    backends: [
-      new WorkerShellBackend({
-        loader: s.env.LOADER,
-        workspace: { binding: "WorkspaceServiceProxy", id: s.ctx.id.toString() },
-        ctx: s.ctx,
-      }),
-    ],
-    sessionId: s.ctx.id.toString(),
-  };
-});
+const CodingAgentBase = Think<Env, DodoConfig>;
 
 export class CodingAgent extends CodingAgentBase {
   initialState: SessionState = {
@@ -788,10 +777,69 @@ export class CodingAgent extends CodingAgentBase {
    *  brains nudge themselves if they didn't call chat_reply). */
   private _toolCallNames: Set<string> = new Set();
   private readonly presence = new PresenceTracker();
-  readonly stateBackend;
-  readonly computerStateBackend;
+  #wsChain: {
+    computerWs: WorkspaceComputer;
+    computerFs: ComputerFileSystem;
+    workspace: WorkspaceFsView;
+    stateBackend: ReturnType<typeof createMemoryStateBackend>;
+  } | null = null;
+
+  /**
+   * Construct the computer Workspace lazily — never in the constructor.
+   * The DO constructor runs under workerd's implicit
+   * blockConcurrencyWhile, so keeping its VFS schema transaction out of
+   * it keeps construction fast and avoids amplifying a known workerd
+   * facet-creation stall (see subAgentStallSafe). First access happens
+   * on the first workspace-touching entry point instead.
+   */
+  #ensureWs() {
+    if (!this.#wsChain) {
+      const computerWs = new WorkspaceComputer({
+        // Boundary cast: computer's DurableObjectStorageLike and
+        // workers-types' DurableObjectStorage disagree only on Row
+        // generic variance; the mixin did the same cast internally.
+        storage: this.ctx.storage as unknown as ConstructorParameters<typeof WorkspaceComputer>[0]["storage"],
+        backends: [
+          new WorkerShellBackend({
+            loader: this.env.LOADER,
+            // The CodingAgent DO's own binding name from wrangler.jsonc
+            // durable_objects.bindings. A binding that doesn't exist is a
+            // hard construction failure inside the DO pool and times out
+            // every test that boots a USER_CONTROL -> CodingAgent chain.
+            workspace: { binding: "CODING_AGENT", id: this.ctx.id.toString() },
+            ctx: this.ctx,
+          }),
+        ],
+        sessionId: this.ctx.id.toString(),
+      });
+      const computerFs = new ComputerFileSystem(computerWs.fs);
+      this.#wsChain = {
+        computerWs,
+        computerFs,
+        workspace: new WorkspaceFsView(computerFs),
+        stateBackend: createMemoryStateBackend({ fs: computerFs }),
+      };
+    }
+    return this.#wsChain;
+  }
+
+  get stateBackend() {
+    return this.#ensureWs().stateBackend;
+  }
   private readonly transports = new Map<string, AgentConnectionTransport>();
-  readonly workspace: Workspace;
+  /**
+   * The single workspace store: a computer-VFS FileSystem with a
+   * Workspace-shaped view over it. Every consumer — file tools, git,
+   * snapshots, facet RPCs, artifacts flush — reads and writes here.
+   * Legacy R2 is only ever touched by the one-time compat copy.
+   */
+  get computerFs(): ComputerFileSystem {
+    return this.#ensureWs().computerFs;
+  }
+
+  get workspace(): WorkspaceFsView {
+    return this.#ensureWs().workspace;
+  }
   /**
    * Typed stores wrapping the `metadata` k/v table. See ADR-0001.
    * Constructed before the lifecycle so it can take them as dependencies.
@@ -807,32 +855,22 @@ export class CodingAgent extends CodingAgentBase {
    */
   private readonly lifecycle: SessionLifecycle;
 
-  /** Access the computer Workspace instance created by the withWorkspace mixin. */
-  private get computerWorkspace(): any {
-    const sym = Object.getOwnPropertySymbols(this).find((s) => s.description === "workspace");
-    return sym ? (this as any)[sym] : undefined;
+  /** The computer Workspace instance backing the single store. */
+  private get computerWorkspace(): WorkspaceComputer {
+    return this.#ensureWs().computerWs;
   }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.initializeSchema();
 
-    // Keep the existing @cloudflare/shell Workspace for file tools
-    // (read, write, edit, grep, etc.) — unchanged contract.
-    this.workspace = new Workspace({
-      name: () => this.sessionId() || "session-pending",
-      r2: env.WORKSPACE_BUCKET,
-      sql: ctx.storage.sql,
-    });
-
-    // stateBackend — old workspace, for file-tool endpoints (write,
-    // search, replace) so they stay in sync with each other.
-    this.stateBackend = createWorkspaceStateBackend(this.workspace);
-
-    // computerStateBackend — computer workspace fs, wired into codemode
-    // so sandboxed JS sees the same filesystem as shell commands.
-    const computerFs = new ComputerFileSystem(this.computerWorkspace.fs);
-    this.computerStateBackend = createMemoryStateBackend({ fs: computerFs });
+    // ─── The ONE workspace store ───
+    //
+    // Nothing workspace-related is constructed here — see #ensureWs().
+    // The store chain (computer Workspace -> ComputerFileSystem ->
+    // WorkspaceFsView -> state backend) is built on first access, after
+    // the DO constructor has returned. R2 is only read by the one-time
+    // compat copy.
 
     // ─── Typed stores + SessionLifecycle wiring (ADR-0001) ───
     //
@@ -1062,42 +1100,86 @@ export class CodingAgent extends CodingAgentBase {
 
   /**
    * Session compatibility: on first workspace access, if the computer
-   * workspace is empty and the legacy R2-backed workspace has files,
-   * copy them once into the computer workspace. Guarded by a metadata
-   * marker so the copy is idempotent across DO evictions.
+   * workspace is empty and the legacy R2/SQL workspace has files, copy
+   * them once into the computer workspace. Guarded by a metadata marker
+   * so the copy is idempotent across DO evictions.
+   *
+   * The legacy Workspace is constructed inside this function as a
+   * read-only copy SOURCE and never used again — it must not become a
+   * second live store.
    */
   async ensureSessionCompat(): Promise<void> {
     if (this._sessionCompatChecked) return;
     this._sessionCompatChecked = true;
 
-    const markerKey = `computer_compat_copied_${this.sessionId()}`;
+    const markerKey = "computer_compat_copied";
     if (this.readMetadata(markerKey) === "true") return;
 
     // Check if computer workspace already has files
     try {
-      const computerEntries = await this.computerWorkspace.fs.readdir("/");
-      if (computerEntries.length > 0) return;
+      const computerEntries = await this.computerFs.readdir("/");
+      if (computerEntries.length > 0) {
+        this.writeMetadata(markerKey, "true");
+        return;
+      }
     } catch {
       // not ready or empty — proceed to copy check
     }
 
-    // Check if legacy workspace has files
-    const oldPaths = await this.workspace._getAllPaths();
-    if (oldPaths.length === 0) return;
+    // Throwaway legacy workspace: reads the shell-Workspace SQL tables
+    // (still resident in this DO's SQLite) plus the R2 spill bucket.
+    // Read-only — copied into the computer VFS, never written.
+    const legacy = new Workspace({
+      name: () => this.sessionId() || "session-pending",
+      r2: this.env.WORKSPACE_BUCKET,
+      sql: this.ctx.storage.sql,
+    });
+
+    let oldPaths: string[];
+    try {
+      oldPaths = await legacy._getAllPaths();
+    } catch (e) {
+      // No legacy tables (fresh session) — nothing to copy.
+      log("info", "session-compat-no-legacy", {
+        sessionId: this.sessionId(),
+        error: e instanceof Error ? e.message : String(e),
+      });
+      this.writeMetadata(markerKey, "true");
+      return;
+    }
+    if (oldPaths.length === 0) {
+      this.writeMetadata(markerKey, "true");
+      return;
+    }
 
     log("info", "session-compat-copy-start", {
       sessionId: this.sessionId(),
       count: oldPaths.length,
     });
 
+    // Dirs first so file writes never race their parents.
     for (const path of oldPaths) {
       try {
-        const st = await this.workspace.stat(path);
+        const st = await legacy.stat(path);
+        if (st?.type === "directory" && path !== "/") {
+          await this.computerFs.mkdir(path, { recursive: true });
+        }
+      } catch (e) {
+        log("warn", "session-compat-copy-error", {
+          sessionId: this.sessionId(),
+          path,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    for (const path of oldPaths) {
+      try {
+        const st = await legacy.stat(path);
         if (st?.type === "file") {
-          const bytes = await this.workspace.readFileBytes(path);
-          await this.computerWorkspace.fs.writeFile(path, bytes);
-        } else if (st?.type === "directory") {
-          await this.computerWorkspace.fs.mkdir(path, { recursive: true });
+          const bytes = await legacy.readFileBytes(path);
+          if (bytes !== null) {
+            await this.computerFs.writeFileBytes(path, bytes);
+          }
         }
       } catch (e) {
         log("warn", "session-compat-copy-error", {
@@ -1269,34 +1351,41 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   /**
+   * Cached workspace root summary. Refreshed asynchronously by
+   * `refreshWorkspaceSummary()` (called from onChatMessage before the
+   * prompt is composed) because the computer VFS has no synchronous
+   * read. `getWorkspaceSummary()` stays synchronous for getSystemPrompt.
+   */
+  private _workspaceSummary: string | null = null;
+
+  private async refreshWorkspaceSummary(): Promise<void> {
+    try {
+      const entries = await this.workspace.readDir("/");
+      if (!entries.length) {
+        this._workspaceSummary = null;
+        return;
+      }
+      const lines = entries.slice(0, 40).map((entry) => {
+        return entry.type === "directory" ? `${entry.name}/` : entry.name;
+      });
+      let result = "```\n" + lines.join("\n") + "\n```";
+      if (entries.length > 40) {
+        result += `\n(${entries.length} entries total, showing first 40)`;
+      }
+      this._workspaceSummary = result;
+    } catch {
+      // workspace may not be ready — no summary this turn
+      this._workspaceSummary = null;
+    }
+  }
+
+  /**
    * Build a bounded workspace summary — shallow root listing only.
    * Returns null if the workspace is empty. Capped at ~40 entries
    * to prevent bloating the system prompt on large repos.
    */
   private getWorkspaceSummary(): string | null {
-    try {
-      // Synchronous readDir not available — use the Think workspace's
-      // internal SQL to get a fast root listing without async.
-      const rows = Array.from(this.ctx.storage.sql.exec(
-        "SELECT path, type FROM workspace_entries WHERE parent = '/' ORDER BY type DESC, path ASC LIMIT 40",
-      ));
-      if (!rows.length) return null;
-
-      const lines = rows.map((r) => {
-        const name = String(r.path).split("/").filter(Boolean).pop() ?? String(r.path);
-        return r.type === "directory" ? `${name}/` : name;
-      });
-      const total = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) as cnt FROM workspace_entries WHERE parent = '/'"))[0] as SqlRow | null);
-      const count = Number(total?.cnt ?? lines.length);
-      let result = "```\n" + lines.join("\n") + "\n```";
-      if (count > 40) {
-        result += `\n(${count} entries total, showing first 40)`;
-      }
-      return result;
-    } catch {
-      // workspace_entries table may not exist or be empty — no summary
-      return null;
-    }
+    return this._workspaceSummary;
   }
 
   override getTools(): ToolSet {
@@ -1349,8 +1438,8 @@ export class CodingAgent extends CodingAgentBase {
           type: "tool_attachments",
         });
       },
-      stateBackend: this.computerStateBackend,
-      shellRuntime: this.computerWorkspace.runtime as WorkspaceRuntimeClient,
+      stateBackend: this.stateBackend,
+      shellRuntime: this.computerWorkspace.runtime as unknown as WorkspaceRuntimeClient,
       mcpGatekeepers: this.mcpGatekeepers,
       todoStore: this.todoStore(),
       readAttachment: (i: { id: string; offset?: number; limit?: number }) => this.readSessionDocument(i),
@@ -1392,6 +1481,9 @@ export class CodingAgent extends CodingAgentBase {
 
     // One-time copy of legacy R2 workspace files into the computer workspace.
     await this.ensureSessionCompat();
+
+    // Refresh the root listing served (synchronously) to getSystemPrompt.
+    await this.refreshWorkspaceSummary();
 
     const baseTools = this.getTools();
     const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
@@ -2448,8 +2540,15 @@ export class CodingAgent extends CodingAgentBase {
     return messages;
   }
 
+  /**
+   * Think's host bridge (extension Workers) calls readFile/writeFile/
+   * deleteFile/readDir on this. Think types it as shell's Workspace, which
+   * our WorkspaceFsView can't satisfy nominally (shell Workspace has
+   * private fields) — the runtime contract is those four methods, which
+   * the view provides over the computer VFS.
+   */
   override getWorkspace(): Workspace {
-    return this.workspace;
+    return this.workspace as unknown as Workspace;
   }
 
   override onStart(): void {
@@ -3580,7 +3679,7 @@ export class CodingAgent extends CodingAgentBase {
       timeout: 30000,
     });
 
-    const execution: ExecuteResult = await executor.execute(body.code, [resolveProvider(stateTools(this.workspace))]);
+    const execution: ExecuteResult = await executor.execute(body.code, [resolveProvider(stateToolsFromBackend(this.stateBackend))]);
 
     this.emitEvent({ data: execution, type: "execution" });
     return Response.json(execution, { status: execution.error ? 400 : 200 });
@@ -3588,14 +3687,14 @@ export class CodingAgent extends CodingAgentBase {
 
   private async handleGitInit(request: Request): Promise<Response> {
     const body = gitDirSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const result = await git.init({ defaultBranch: "main", dir: body.dir ? normalizePath(body.dir) : undefined });
     return Response.json(result);
   }
 
   private async handleGitClone(request: Request): Promise<Response> {
     const body = gitCloneSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     const token = await resolveRemoteToken({ dir, env: this.env, git, url: body.url, ownerEmail });
@@ -3614,7 +3713,7 @@ export class CodingAgent extends CodingAgentBase {
 
   private async handleGitAdd(request: Request): Promise<Response> {
     const body = z.object({ dir: z.string().optional(), filepath: z.string().min(1) }).strict().parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     try {
       return Response.json(await git.add({ dir: body.dir ? normalizePath(body.dir) : undefined, filepath: body.filepath }));
     } catch (error) {
@@ -3632,7 +3731,7 @@ export class CodingAgent extends CodingAgentBase {
     if (ownerEmail && !this.readMetadata("owner_email")) {
       this.writeMetadata("owner_email", ownerEmail);
     }
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     try {
       const dir = body.dir ? normalizePath(body.dir) : undefined;
       const statusEntries = await git.status({ dir });
@@ -3664,7 +3763,7 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   private async handleGitStatus(url: URL): Promise<Response> {
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = url.searchParams.get("dir");
     try {
       const entries = await git.status({ dir: dir ? normalizePath(dir) : undefined });
@@ -3679,7 +3778,7 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   private async handleGitLog(url: URL): Promise<Response> {
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = url.searchParams.get("dir");
     const depth = url.searchParams.get("depth");
     try {
@@ -3695,7 +3794,7 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   private async handleGitDiff(url: URL): Promise<Response> {
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = url.searchParams.get("dir");
     try {
       const entries = await git.diff({ dir: dir ? normalizePath(dir) : undefined });
@@ -3711,13 +3810,13 @@ export class CodingAgent extends CodingAgentBase {
 
   private async handleGitBranch(request: Request): Promise<Response> {
     const body = gitBranchSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     return Response.json(await git.branch({ delete: body.delete, dir: body.dir ? normalizePath(body.dir) : undefined, list: body.list, name: body.name }));
   }
 
   private async handleGitCheckout(request: Request): Promise<Response> {
     const body = gitCheckoutSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     return Response.json(
       await git.checkout({ branch: body.branch, dir: body.dir ? normalizePath(body.dir) : undefined, force: body.force, ref: body.ref }),
     );
@@ -3725,7 +3824,7 @@ export class CodingAgent extends CodingAgentBase {
 
   private async handleGitPull(request: Request): Promise<Response> {
     const body = z.object({ dir: z.string().optional(), ref: z.string().optional(), remote: z.string().optional() }).strict().parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote, ownerEmail });
@@ -3735,7 +3834,7 @@ export class CodingAgent extends CodingAgentBase {
 
   private async handleGitPush(request: Request): Promise<Response> {
     const body = z.object({ dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional(), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     try {
@@ -3793,7 +3892,7 @@ export class CodingAgent extends CodingAgentBase {
 
   private async handleGitVerifyBranch(request: Request): Promise<Response> {
     const body = z.object({ dir: z.string().optional(), ref: z.string().min(1), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     const verification = await verifyRemoteBranch({
@@ -3814,7 +3913,7 @@ export class CodingAgent extends CodingAgentBase {
 
   private async handleGitRemote(request: Request): Promise<Response> {
     const body = gitRemoteSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     return Response.json(
       await git.remote({ add: body.add, dir, list: body.list, remove: body.remove }),
@@ -3843,7 +3942,7 @@ export class CodingAgent extends CodingAgentBase {
       remoteName: z.string().optional(),
     }).strict().parse(await request.json());
 
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const remoteName = body.remoteName ?? "github";
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
@@ -4124,7 +4223,7 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   private async exportSnapshot(): Promise<SessionSnapshot | SnapshotV2> {
-    const paths = await this.workspace._getAllPaths();
+    const paths = await this.workspace.getAllPaths();
     const files: Array<{ content: string; path: string; encoding?: "base64" }> = [];
 
     for (const path of paths) {
@@ -7214,8 +7313,31 @@ export class CodingAgent extends CodingAgentBase {
    * `buildExploreTool` when `config.exploreMode === "facet"` and from
    * the HTTP surface (via facet transcript routes).
    */
+  /**
+   * Stall-safe facet spawn. workerd's experimental facet creation can
+   * stall when the isolate has been idle between DO activity: the
+   * creation event sits queued until another facet event arrives (this
+   * reproduces on main too, so it is not migration-specific). Issuing a
+   * second subAgent call after a short timeout delivers that nudge —
+   * both attempts then resolve — so spawns stay deterministic.
+   */
+  private async subAgentStallSafe<T extends Agent>(
+    cls: SubAgentClass<T>,
+    name: string,
+  ): Promise<SubAgentStub<T>> {
+    const first = this.subAgent(cls, name);
+    const winner = await Promise.race([
+      first,
+      new Promise<SubAgentStub<T>>((resolve) =>
+        setTimeout(() => resolve(this.subAgent(cls, name)), 2_000),
+      ),
+    ]);
+    void first.catch(() => {});
+    return winner;
+  }
+
   async runExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
-    const stub = await this.subAgent(ExploreAgent, name);
+    const stub = await this.subAgentStallSafe(ExploreAgent, name);
     const parentSessionId = opts.parentSessionId ?? this.sessionId();
     const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
 
@@ -7310,7 +7432,7 @@ export class CodingAgent extends CodingAgentBase {
    * owns that side of the lifecycle.
    */
   async runTaskFacet(name: string, opts: TaskInvokeOpts): Promise<TaskInvokeResult> {
-    const stub = await this.subAgent(TaskAgent, name);
+    const stub = await this.subAgentStallSafe(TaskAgent, name);
     const parentSessionId = opts.parentSessionId ?? this.sessionId();
     const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
 
@@ -7421,11 +7543,11 @@ export class CodingAgent extends CodingAgentBase {
     const facetType = row[0].facetType;
     try {
       if (facetType === "explore") {
-        const stub = await this.subAgent(ExploreAgent, facetName);
+        const stub = await this.subAgentStallSafe(ExploreAgent, facetName);
         const transcript = await stub.getTranscript();
         return { facetType, messages: transcript };
       } else {
-        const stub = await this.subAgent(TaskAgent, facetName);
+        const stub = await this.subAgentStallSafe(TaskAgent, facetName);
         const transcript = await stub.getTranscript();
         return { facetType, messages: transcript };
       }
@@ -7457,7 +7579,7 @@ export class CodingAgent extends CodingAgentBase {
       });
       this.completeFacetRun(runId, "(test-seeded)", { input: 0, output: 0 });
     }
-    const stub = await this.subAgent(TaskAgent, facetName);
+    const stub = await this.subAgentStallSafe(TaskAgent, facetName);
     return stub.writeScratchForTest(parentSessionId, path, content);
   }
 
@@ -7498,7 +7620,7 @@ export class CodingAgent extends CodingAgentBase {
     if (!this.facetExists(facetName, "task")) {
       throw new FacetNotFoundError(facetName);
     }
-    const stub = await this.subAgent(TaskAgent, facetName);
+    const stub = await this.subAgentStallSafe(TaskAgent, facetName);
     return stub.applyFromScratch(paths);
   }
 
@@ -7515,7 +7637,7 @@ export class CodingAgent extends CodingAgentBase {
    */
   async cleanupScratchFacet(payload: { facetName: string; parentSessionId: string }): Promise<void> {
     try {
-      const stub = await this.subAgent(TaskAgent, payload.facetName);
+      const stub = await this.subAgentStallSafe(TaskAgent, payload.facetName);
       await stub.cleanupScratch(payload.parentSessionId);
     } catch (err) {
       log("warn", "Scratch cleanup R2 sweep failed", { facetName: payload.facetName, err: err instanceof Error ? err.message : String(err) });

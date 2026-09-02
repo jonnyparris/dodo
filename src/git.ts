@@ -1,10 +1,9 @@
-import { WorkspaceFileSystem } from "@cloudflare/shell";
+import type { FileSystem } from "@cloudflare/shell";
 import { createGit } from "@cloudflare/shell/git";
-import type { Workspace } from "@cloudflare/shell";
+import { resolveProviderToken } from "./git-auth";
 import { isGitHubHost, isGitLabHost } from "./hosts";
 import { log } from "./logger";
 import { parseRemoteSpec } from "./repos";
-import { resolveProviderToken } from "./git-auth";
 import type { AppConfig, Env } from "./types";
 
 function hostFromUrl(url: string): string {
@@ -33,8 +32,13 @@ interface RemoteBranchVerification {
   remoteUrl?: string;
 }
 
-export function createWorkspaceGit(workspace: Workspace) {
-  return createGit(new WorkspaceFileSystem(workspace));
+/**
+ * Git ops over the session workspace's FileSystem. Callers pass the
+ * computer-backed store (`CodingAgent.computerFs`) so isomorphic-git
+ * reads and writes land in the same store as the file tools and shell.
+ */
+export function createWorkspaceGit(fs: FileSystem) {
+  return createGit(fs);
 }
 
 export async function resolveRemoteToken(input: {

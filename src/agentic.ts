@@ -1,5 +1,5 @@
 import type { WorkspaceRuntimeClient } from "@cloudflare/computer";
-import type { StateBackend, Workspace } from "@cloudflare/shell";
+import type { StateBackend } from "@cloudflare/shell";
 import { jsonSchema, tool, zodSchema } from "ai";
 import { z } from "zod";
 import {
@@ -18,6 +18,7 @@ import { log } from "./logger";
 import type { McpClient } from "./mcp-client";
 import { normalizePath } from "./paths";
 import { getKnownRepo, listKnownRepos, parseRemoteSpec } from "./repos";
+import type { WorkspaceFsView } from "./runtime/computer/workspace-view";
 import {
   buildProviderForModel,
   capToolOutputs,
@@ -365,11 +366,11 @@ const DEFAULT_CLONE_DEPTH = 20;
 
 function buildGitTools(
   env: Env,
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   ownerEmail?: string,
 ): Record<string, AnyTool> {
-  const git = createWorkspaceGit(workspace);
+  const git = createWorkspaceGit(workspace.fs);
   const knownRepoIds = listKnownRepos().map((repo) => repo.id) as [string, ...string[]];
 
   const dirSchema = zodSchema(z.object({ dir: z.string().optional().describe("Repo directory") }));
@@ -862,7 +863,7 @@ function buildSubagentTool(spec: {
  * context (~500-1000 tokens) instead of multiple raw file reads (~5-20k tokens).
  */
 function buildExploreTool(
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   env: Env,
   parentAgent?: BuildToolsOptions["parentAgent"],
@@ -1090,7 +1091,7 @@ function buildExploreTool(
  * in the main conversation.
  */
 function buildTaskTool(
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   env: Env,
   parentAgent?: BuildToolsOptions["parentAgent"],
@@ -1413,7 +1414,7 @@ function buildChatReplyTool(env: Env, opts: {
 
 function buildTools(
   env: Env,
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   options?: BuildToolsOptions,
 ): Record<string, AnyTool> {
@@ -1721,7 +1722,7 @@ function buildTools(
  */
 export function buildToolsForThink(
   env: Env,
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   options?: BuildToolsOptions & {
     agent?: { mcp?: unknown };
