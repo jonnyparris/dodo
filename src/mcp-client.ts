@@ -178,6 +178,20 @@ export class HttpMcpClient implements McpClient {
     this.cachedTools = null;
   }
 
+  /**
+   * Namespace prefix for this server's tools. Uses a slug of the config's
+   * display name (e.g. "you-search") rather than its UUID id — shorter in
+   * the tool list (the UUID cost ~36 tokens per tool) and the model can
+   * actually reason about which server a tool belongs to.
+   */
+  private namespacePrefix(): string {
+    const slug = (this.config.name || this.config.id)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    return slug || this.config.id;
+  }
+
   async listTools(): Promise<McpToolInfo[]> {
     if (this.cachedTools) return this.cachedTools;
     if (!this.client || !this.connected) {
@@ -185,7 +199,7 @@ export class HttpMcpClient implements McpClient {
     }
 
     const result = await this.client.listTools();
-    const prefix = this.config.id;
+    const prefix = this.namespacePrefix();
 
     this.cachedTools = result.tools.map((tool) => ({
       name: `${prefix}__${tool.name}`,
@@ -202,7 +216,7 @@ export class HttpMcpClient implements McpClient {
     }
 
     // Strip the namespace prefix to get the original tool name
-    const prefix = `${this.config.id}__`;
+    const prefix = `${this.namespacePrefix()}__`;
     const originalName = name.startsWith(prefix) ? name.slice(prefix.length) : name;
 
     const result = await this.client.callTool({

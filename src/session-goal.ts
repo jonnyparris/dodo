@@ -60,11 +60,15 @@ export function isTerminalStatus(status: GoalStatus): status is "done" | "blocke
  */
 export function renderGoalSystemPromptSection(state: GoalState): string | null {
   if (state.status === "none" || !state.text) return null;
+  // No per-turn counter here: a changing number in the system prompt
+  // invalidates the provider's prompt cache for the whole conversation
+  // every turn. Budget pressure is delivered via injected messages
+  // (loop-policy wrap-up warnings) instead.
   const lines = [
     "## Your goal",
     "",
     `Status: ${state.status}`,
-    `Turn ${state.turnsUsed + 1} of ${state.maxTurns}.`,
+    `Turn budget: ${state.maxTurns}.`,
     "",
     state.text.trim(),
     "",

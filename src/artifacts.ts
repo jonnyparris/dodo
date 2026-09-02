@@ -20,7 +20,7 @@ import git from "isomorphic-git";
 import http from "isomorphic-git/http/web";
 import { createWorkspaceGit } from "./git";
 import { log } from "./logger";
-import type { Workspace } from "@cloudflare/shell";
+import type { WorkspaceFsView } from "./runtime/computer/workspace-view";
 
 const ARTIFACTS_DIR = "/repo";
 const ARTIFACTS_DEFAULT_DEPTH = 50;
@@ -36,7 +36,7 @@ export const ARTIFACTS_TOKEN_TTL_SECONDS = 3600;
 // ── Flush ─────────────────────────────────────────────────────────────
 
 export interface FlushInput {
-  workspace: Workspace;
+  workspace: WorkspaceFsView;
   remote: string;
   tokenSecret: string;
   message: string;
@@ -49,7 +49,7 @@ export interface FlushInput {
  */
 export async function flushTurnToArtifacts(input: FlushInput): Promise<boolean> {
   try {
-    const git = createWorkspaceGit(input.workspace);
+    const git = createWorkspaceGit(input.workspace.fs);
 
     // Ensure the workspace is a git repo. isomorphic-git's init is idempotent.
     try {

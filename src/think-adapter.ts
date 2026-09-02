@@ -7,6 +7,12 @@
 
 // ─── Re-exports from @cloudflare/think ───
 
+import type { Workspace } from "@cloudflare/shell";
+import {
+  createWorkspaceTools as thinkCreateWorkspaceTools,
+} from "@cloudflare/think/tools/workspace";
+import type { WorkspaceFsView } from "./runtime/computer/workspace-view";
+
 export type {
   ChatMessageOptions,
   FiberCompleteContext,
@@ -17,13 +23,25 @@ export type {
 export { Think } from "@cloudflare/think";
 export { truncateToolOutput } from "@cloudflare/think/session";
 export { createExecuteTool } from "@cloudflare/think/tools/execute";
-export { 
+export {
   createEditTool,
   createFindTool,
   createGrepTool,
   createListTool,
-  createReadTool,createWorkspaceTools, 
-  createWriteTool,} from "@cloudflare/think/tools/workspace";
+  createReadTool,
+  createWriteTool,
+} from "@cloudflare/think/tools/workspace";
+
+/**
+ * think's workspace tools are typed against shell's Workspace class, which
+ * can't be satisfied structurally (private fields). The runtime contract is
+ * what think's ops actually call — readFile/stat/writeFile/mkdir/readDir/
+ * glob/rm — all provided by WorkspaceFsView. The cast lives here, at the
+ * think boundary, so the rest of Dodo stays typed against the view.
+ */
+export function createWorkspaceTools(workspace: WorkspaceFsView) {
+  return thinkCreateWorkspaceTools(workspace as unknown as Workspace);
+}
 
 // ─── Re-exports from AI SDK (used alongside Think) ───
 
@@ -93,7 +111,7 @@ export interface SnapshotV2 {
   }>;
 }
 
-// ─── Adapter functions ───
+// ─── Adapter functions ──────────────────────────────────────────────────
 
 import type { UIMessage } from "ai";
 import { attachmentUrlToHttpPath, isAttachmentUrl } from "./attachments";

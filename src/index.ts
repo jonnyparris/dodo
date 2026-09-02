@@ -2916,6 +2916,12 @@ app.get("/api/admin/account-permissions", adminGuard as never, async (c) => {
 
 export { AllowlistOutbound, ChatMonitorAgent, CodingAgent, ExploreAgent, SharedIndex, TaskAgent, UserControl };
 
+// Top-level export required by the worker-shell backend: it builds the
+// loaded shell worker's HOST binding via `ctx.exports.WorkspaceServiceProxy
+// ({ props: { binding, id } })` — a loopback service binding that only
+// exists if the class is exported from the worker entrypoint.
+export { WorkspaceServiceProxy } from "@cloudflare/computer";
+
 export default {
   fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {
     return Promise.resolve(app.fetch(request, env, executionContext));

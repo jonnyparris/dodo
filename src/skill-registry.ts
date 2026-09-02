@@ -26,8 +26,8 @@
  * filesystem.
  */
 
-import type { Workspace } from "@cloudflare/shell";
 import { log } from "./logger";
+import type { WorkspaceFsView } from "./runtime/computer/workspace-view";
 
 // ─── Types ───
 
@@ -366,7 +366,7 @@ export function renderSkillContent(skill: Skill): string {
  */
 const MAX_WORKSPACE_SKILLS = 50;
 
-export async function scanWorkspaceSkills(workspace: Workspace): Promise<Skill[]> {
+export async function scanWorkspaceSkills(workspace: WorkspaceFsView): Promise<Skill[]> {
   const out: Skill[] = [];
   for (const root of WORKSPACE_SKILL_DIRS) {
     const entries = await safeReadDir(workspace, `/${root}`);
@@ -403,7 +403,7 @@ export async function scanWorkspaceSkills(workspace: Workspace): Promise<Skill[]
 }
 
 async function loadWorkspaceSkill(
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   dir: string,
   dirName: string,
 ): Promise<Skill | null> {
@@ -445,7 +445,7 @@ async function loadWorkspaceSkill(
 }
 
 async function collectAssets(
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   base: string,
   prefix: string,
   out: string[],
@@ -469,7 +469,7 @@ async function collectAssets(
 }
 
 async function safeReadDir(
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   path: string,
 ): Promise<Array<{ name: string; type: string }> | null> {
   try {
@@ -480,7 +480,7 @@ async function safeReadDir(
   }
 }
 
-async function safeReadFile(workspace: Workspace, path: string): Promise<string | null> {
+async function safeReadFile(workspace: WorkspaceFsView, path: string): Promise<string | null> {
   try {
     const out = await workspace.readFile(path);
     return typeof out === "string" ? out : null;

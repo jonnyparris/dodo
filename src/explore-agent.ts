@@ -192,6 +192,7 @@ export class ExploreAgent extends Agent<Env> {
 
     try {
       const result = await runSubagentForProfile(EXPLORE_PROFILE, {
+        sessionAffinity: parentSessionId,
         prompt: userMessage,
         model: modelId,
         config,

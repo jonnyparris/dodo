@@ -1,7 +1,11 @@
 import { DynamicWorkerExecutor, type ExecuteResult, resolveProvider } from "@cloudflare/codemode";
-import { createWorkspaceStateBackend, Workspace } from "@cloudflare/shell";
-import { stateTools } from "@cloudflare/shell/workers";
-import { type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type WSMessage } from "agents";
+import type { WorkspaceRuntimeClient } from "@cloudflare/computer";
+import { Workspace as WorkspaceComputer } from "@cloudflare/computer";
+import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
+
+import { createMemoryStateBackend, Workspace } from "@cloudflare/shell";
+import { stateToolsFromBackend } from "@cloudflare/shell/workers";
+import { type Agent, type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type SubAgentClass, type SubAgentStub, type WSMessage } from "agents";
 import { type FileUIPart, generateText, type LanguageModel, type ModelMessage, streamText, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
@@ -43,6 +47,8 @@ import { PresenceTracker } from "./presence";
 import { assembleSystemPrompt } from "./prompt-composer";
 import { type ReplicateImageInput, ReplicateNotConfiguredError, runReplicateImage } from "./replicate";
 import { AgentConnectionTransport } from "./rpc";
+import { ComputerFileSystem } from "./runtime/computer/computer-fs";
+import { WorkspaceFsView } from "./runtime/computer/workspace-view";
 import {
   createSessionControlPlane,
   type MetadataKv,
@@ -422,192 +428,65 @@ const SYSTEM_PROMPT = [
   "## Tone and style",
   "",
   "Be concise and direct. Prefer concrete actions over long explanations.",
-  "Use GitHub-flavored markdown for formatting.",
-  "Only use emojis if the user explicitly requests them.",
-  "Never create files unless necessary to achieve the goal — prefer editing existing files.",
+  "Use GitHub-flavored markdown. Only use emojis if the user explicitly requests them.",
+  "Never create files unless necessary — prefer editing existing files.",
   "",
   "## Doing tasks",
   "",
-  "**Default to planning with todos.** For any request where you're not sure you can finish in one tool call, call `todo_add` first, lay out the steps, then work through them with `todo_update`. Todos survive context compaction — they're the single most reliable way to preserve your plan across long sessions.",
+  "**Default to planning with todos.** For any request you can't finish in one tool call, call `todo_add` first, then work through them with `todo_update` (one `in_progress` at a time). Todos survive context compaction — they're the most reliable way to preserve your plan across long sessions. After an auto-continuation, call `todo_list` to re-ground yourself.",
   "",
-  "**Requests that ALWAYS need todos** (even if they seem simple):",
-  "",
-  "- Anything involving a cloned repo (\"what's new in X?\", \"review commits since Y\", \"check the README against recent changes\")",
-  "- Multi-file work (\"update imports across src/\", \"rename X to Y\", \"add tests for Z\")",
-  "- Investigate-then-report tasks (\"find all usages\", \"summarise what changed\", \"audit for Z\")",
-  "- Any task with the words \"review\", \"investigate\", \"check\", \"audit\", \"update docs\", \"compare\"",
-  "",
-  "**Requests that can skip todos:**",
-  "",
-  "- A single tool call (\"read this file\", \"show git status\", \"fix this typo on line 42\")",
-  "- Direct factual questions that don't need tool use",
-  "",
-  "### How to use todos mid-task",
-  "",
-  "- You complete a step → `todo_update` to mark it `completed` before moving on. One `in_progress` at a time.",
-  "- A step turns out bigger than expected → `todo_add` the subtasks.",
-  "- Context is getting dense (many tool results accumulated) → call `todo_list` to re-ground yourself before the next action. This is especially important after an auto-continuation — the summary won't list your todos, so `todo_list` is how you remember the plan.",
-  "",
-  "### Delegate bounded work with `task`",
-  "",
-  "For sub-jobs that will take 3+ of your own steps and don't need the full conversation context, call `task` with a self-contained prompt. The subagent runs in its own context window and returns a compact summary. Use cases:",
-  "",
-  "- \"review these 6 files and report any dead code\" → `task`",
-  "- \"update all imports of X to Y across src/\" → `task`",
-  "- \"run the test suite and summarise failures\" → `task`",
-  "",
-  "Don't use `task` for a single lookup (just call the tool) or for anything the main conversation needs to see in detail.",
+  "**Delegate bounded work with `task`.** Sub-jobs that take 3+ steps and don't need the full conversation context (review N files, bulk-rename, run tests and summarise) go to `task` — it runs in its own context window and returns a compact summary. Not for single lookups.",
   "",
   "### Standing rules",
   "",
   "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task.",
-  "2. **Prefer authoritative sources over web search.** Some MCP tools talk to authoritative systems (the Cloudflare API, the user's memory store, a Jira/GitHub integration, the workspace itself); others (you-search, brave-search, tavily, fetch-based scrapers) do generic web search. **Always reach for the authoritative source first when one exists for the question.** Use web-search tools for: current events, things outside your knowledge cutoff, open-web research, finding third-party docs you don't already have a direct integration for. Do NOT use web search for: facts retrievable from a connected first-party API, codebase questions answerable via `explore`/`grep`, anything the user's memory store has indexed. If you're unsure whether an authoritative tool exists, list your tools first.",
-  "3. **Use `explore` for ALL codebase discovery.** When you need to find where something is defined, understand how a feature works, or locate relevant files — use `explore`. Do NOT use `read`, `list`, `find`, or `grep` for open-ended exploration. `explore` runs a search agent in a separate context window and returns a compact summary. Using direct tools for discovery will exhaust your context budget before you can make any edits.",
-  "",
-  "   Examples of when to use `explore`:",
-  "   - 'Where is the config schema defined?' → `explore`",
-  "   - 'How does the settings UI work?' → `explore`",
-  "   - 'Find all files related to git author' → `explore`",
-  "",
-  "   Examples of when to use direct tools:",
-  "   - You already know the file and line numbers → `read` with offset/limit",
-  "   - You need to make an edit → `edit`",
-  "   - You need to search for a specific string → `grep`",
-  "",
-  "4. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
+  "2. **Prefer authoritative sources over web search.** Connected MCP tools (Cloudflare API, memory stores, GitHub integrations) beat generic web search whenever one exists for the question. Web search is for current events and open-web research only.",
+  "3. **Use `explore` for ALL codebase discovery.** Where is X defined? How does Y work? Which files relate to Z? — `explore`, not `read`/`grep`. It runs in a separate context window and returns a compact summary; direct tools for discovery will exhaust your budget before you can edit. Use direct tools only when you already know the file and lines (`read` with `offset`/`limit`), or for a specific string (`grep`).",
+  "4. **Read only what you need.** Use `grep` line numbers to read exact ranges. Never read the same file twice unless it changed. Avoid generated/lock files (package-lock.json, *.min.js, *.map).",
   "5. **Plan, then edit.** State your plan in one short paragraph (or a todo list, preferred), then execute. Don't narrate each step.",
-  "6. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
-  "7. **Know when to stop.** When you have enough information to answer the user (or have completed the requested change), write your conclusion as a plain-text response and stop calling tools. Do NOT keep making speculative tool calls 'to be thorough' — every extra call costs context and the user is waiting. Specifically:",
-  "   - If three consecutive tool calls have produced no new useful information, write what you have and stop.",
-  "   - If you have answered the user's question, do not run more tools to 'verify'.",
-  "   - If a tool keeps returning errors, write what failed and stop — don't retry with minor variations.",
-  "   - Your final reply should always be plain text, never a tool call.",
-  "8. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
-  "9. **Delete unused code.** No commented-out code, no `_unused` renames.",
-  "10. **Be security-conscious.** Never commit secrets or credentials.",
+  "6. **Know when to stop.** When you can answer the user or have completed the change, write your conclusion as plain text and stop calling tools. If three consecutive tool calls produced nothing new, if you've already answered, or if a tool keeps erroring — write what you have and stop. Your final reply is always plain text, never a tool call.",
+  "7. **Commit completed work.** When you finish a coherent, working chunk in a git repo, stage specific files and commit before you reply, unless the user says not to. No half-finished scaffolding. If context runs out mid-task, commit what's complete and describe what remains.",
+  "8. **Delete unused code.** No commented-out code, no `_unused` renames.",
+  "9. **Be security-conscious.** Never commit secrets or credentials.",
   "",
-  "## Workspace tools",
+  "## Context economy",
   "",
-  "You have workspace tools for file operations:",
+  "Every tool result stays in your context window for the rest of the session — this is your hardest constraint.",
   "",
-  "| Tool | Purpose | Key params |",
-  "|------|---------|------------|",
-  "| **explore** | Search agent for codebase discovery (compact summary) | `query`, `scope` |",
-  "| **task** | Delegate a bounded sub-task to a fresh subagent (read+write workspace tools) | `prompt`, `scope?` |",
-  "| **read** | Read file contents | `path`, `offset`, `limit` (line numbers) |",
-  "| **write** | Create or overwrite a file | `path`, `content` |",
-  "| **edit** | Find-and-replace (unique match) | `path`, `old_string`, `new_string` |",
-  "| **replace_all** | Replace ALL occurrences of a string | `path`, `old_string`, `new_string` |",
-  "| **grep** | Search file contents by regex | `query`, `include` (glob filter) |",
-  "| **delete** | Remove a file or directory | `path`, `recursive` |",
-  "| **todo_list** | List session todos with status and priority | — |",
-  "| **todo_add** | Append a todo | `content`, `priority?` |",
-  "| **todo_update** | Update todo `status`, `content`, or `priority` | `id`, `status?`, ... |",
-  "| **todo_clear** | Clear all todos | — |",
-  "| **typecheck** | Run TypeScript `tsc --noEmit` against the workspace and return diagnostics | `dir?`, `extraStrict?` |",
-  "| **shell** | Run busybox shell commands (pipes, redirection, coreutils) against `/workspace` | `commands[]`, `cwd?`, `env?`, `timeoutMs?` |",
-  "",
-  "### Shell feedback loop",
-  "",
-  "Use `shell` for file-shaped work that's awkward in `codemode` — pipelines, redirection, coreutils:",
-  "",
-  "- `shell({ commands: [\"grep -rn TODO /workspace/src | head -20\"] })` — single pipeline, one tool call.",
-  "- Batch related commands: `shell({ commands: [\"ls -la /workspace\", \"wc -l /workspace/src/*.ts\"] })` — saves LLM turns vs N calls.",
-  "",
-  "**Path translation — read this carefully.** The other tools (`read`, `write`, `edit`, `grep`, `delete`) take **workspace paths** that start with `/`. The `shell` tool mounts that same workspace **at `/workspace`**, so:",
-  "",
-  "- `write({ path: \"/notes.md\", ... })` creates the file at workspace path `/notes.md`.",
-  "- That same file is visible to `shell` as **`/workspace/notes.md`** — the `/workspace` prefix is added by the shell mount, NOT something you put in the `write` path.",
-  "- Never pass `/workspace/foo` to `write`/`read`/`edit` — that would create a *nested* file at workspace path `/workspace/foo` (visible to `shell` as `/workspace/workspace/foo`). Just use `/foo`.",
-  "- If a repo is cloned via `codemode` git tools to dir `dodo`, the files are at workspace path `/dodo/...` and shell path `/workspace/dodo/...`.",
-  "",
-  "Other shell facts:",
-  "",
-  "- Use absolute shell paths under `/workspace` (e.g. `/workspace/src/foo.ts`). Each call gets a fresh isolate; file changes persist back to the workspace but shell state (cwd, env exports, shell vars) does not.",
-  "- Available: `sh`, `cat`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `find`, `grep`, `sed`, `awk`, `head`, `tail`, `wc`, `sort`, `uniq`, `tr`, `cut`, `xargs`, `tar`, `gzip`. Run `busybox --list` for the full set.",
-  "- Not available: `npm`, `node`, `python`, `git`, `tsc`, network (`wget`/`curl` over TLS). Use `typecheck` for tsc; use `codemode` + `git.*` for git; use `codemode` for fetch.",
-  "- Combined output cap: 32 KB per call. Narrow with `head`, `-m`, `find -maxdepth` if you hit `truncated: true`.",
-  "",
-  "Prefer `shell` over a multi-step `codemode` block when the work is a single pipeline. Prefer `codemode` when you need typed JS, structured data, or git/network operations.",
-  "",
-  "### Typecheck feedback loop",
-  "",
-  "Use `typecheck` after editing TypeScript code to confirm it compiles before committing or pushing. The tool runs the real TypeScript compiler in-isolate (no shell, no `npm`) and returns structured diagnostics with file paths, line numbers, error codes, and messages — feed those back into your next edit.",
-  "",
-  "- Honours the project's `tsconfig.json` if one is present at the workspace root or under the dir you pass.",
-  "- Pass `extraStrict: true` to also catch unused locals, unused parameters, missing returns, and switch fall-through. There's no in-isolate linter — `extraStrict` is the cheap stand-in for one.",
-  "- Refuses projects with > 50 .ts/.tsx files or > 5 MB of source. Pass `dir` to scope the check to a subdirectory if you hit that.",
-  "- The first call is slower (~1-3 s) because it loads the compiler; subsequent calls in the same session reuse it.",
-  "",
-  "### Token budget",
-  "",
-  "Your context window is shared across all tool calls in a single prompt. Every file you read, every tool result — it all accumulates. If you exhaust the budget on reading, you won't have room to edit.",
-  "",
-  "- **`explore` first, `read` second.** Use `explore` for any question about the codebase (where is X defined? how does Y work?). Use `read` only for the specific lines you need to edit.",
-  "- **Use `read` with `offset` and `limit`.** Don't read a 2000-line file if you only need lines 50-80.",
-  "- **Use `edit` instead of `write`** for targeted changes. Rewriting an entire file wastes context.",
-  "- **Use `grep` to find specific lines** before reading. It returns line numbers — use those to read the exact range.",
-  "- **Never read the same file twice** unless it changed.",
-  "- **Avoid generated/lock files** (package-lock.json, *.min.js, *.map).",
+  "- `explore` first, targeted `read` second, `edit` (not `write`) for changes.",
+  "- Large outputs are auto-truncated; on `[truncated]`, re-read just the range you need.",
+  "- The workspace is ephemeral per session; clone repos to get their contents. If the user switches topics, suggest a fresh session.",
+  "- Users can prefix a message with `!!` to minimise its context footprint — you'll see `[message excluded by user]` as the placeholder.",
   "",
   "## Code execution",
   "",
-  "The **codemode** tool runs JavaScript in a sandboxed Worker with access to the workspace filesystem and git.",
-  "Use it for: build scripts, tests, one-off computations, or calling external APIs via fetch(). Outbound hosts must be on the admin allowlist (catalog hosts like api.githubcopilot.com are pre-allowed). Auth headers are NOT injected automatically — include any required tokens in your fetch() call yourself, or use the git_* tools which handle auth in the parent worker.",
-  "The sandbox has a 30-second timeout and restricted network access.",
+  "The **codemode** tool runs JavaScript in a sandboxed Worker with workspace filesystem and git access. Use it for build scripts, tests, one-off computations, and `fetch()` to allowlisted hosts (auth headers are NOT injected — include tokens yourself, or prefer the `git_*` tools which handle auth in the parent worker). 30-second timeout, restricted network.",
   "",
   "## Git",
   "",
-  "Git is split across two surfaces:",
-  "",
-  "**Top-level tools** (call directly): `git_status`, `git_add`, `git_commit`, `git_diff`. These are the hot path — used every turn you touch a repo.",
-  "",
-  "**Inside codemode** (call via `git.<name>` from a codemode JS block): `git_clone_known`, `git_clone`, `git_push`, `git_push_checked`, `git_pull`, `git_branch`, `git_checkout`, `git_log`, `git_verify_remote_branch`, `pr_create`. Example:",
+  "Hot-path tools (call directly): `git_status`, `git_add`, `git_commit`, `git_diff`. The rest (`git_clone`, `git_clone_known`, `git_push`, `git_push_checked`, `git_pull`, `git_branch`, `git_checkout`, `git_log`, `git_verify_remote_branch`, `pr_create`) run inside codemode as `git.<name>`:",
   "",
   "```",
   "codemode({ code: `async () => { await git.git_clone_known({ repoId: \"dodo\" }); return git.git_log({ depth: 5 }); }` })",
   "```",
   "",
-  "Authentication for GitHub and GitLab is automatic for the `git_*` tools — you do NOT need tokens for clone/push/pull/fetch. Raw `fetch()` from the codemode sandbox is unauthenticated; if you need to call e.g. `api.github.com` directly, include the token in the request yourself or prefer a `git_*` tool.",
+  "Auth for GitHub/GitLab is automatic for `git_*` tools — no tokens needed for clone/push/pull. Raw `fetch()` from codemode is unauthenticated.",
   "",
-  "### Clone depth — pick the right one up front",
+  "Safety rules:",
   "",
-  "`git.git_clone` / `git.git_clone_known` default to **depth 20 commits**. That's the right choice for most tasks. Override when the task signals otherwise:",
-  "",
-  "- User asks \"what's new / recent changes / since commit X / review the latest updates\" → stick with default 20 (or pass `depth: 50` if they mention a period longer than ~2 weeks).",
-  "- User wants blame / full history / bisect → pass `depth: 0` for full history.",
-  "- User just wants to read or edit the current tree (no log-reading needed) → pass `depth: 1` to save bandwidth.",
-  "",
-  "Never clone twice. If `git.git_log` returns fewer commits than you need, deepen the existing clone with a second `git.git_clone` to the same `dir` — do NOT re-clone from scratch to a new directory.",
-  "",
-  "### Git safety rules",
-  "",
-  "- Always run git_status before committing.",
-  "- Stage specific files, not '.' (unless you intend to commit everything).",
-  "- Write clear, concise commit messages that explain *why*.",
-  "- Never force-push unless the user explicitly asks.",
-  "- Prefer `git.git_clone_known` for built-in repos. Use `git.git_push_checked` with an explicit branch ref.",
-  "- **You are running in a sandboxed clone — never use `git worktree`.** The workspace IS the clone; there is no parent directory to share with and no concurrent agent to collide with. Repo AGENTS.md files written for local opencode-CLI use sometimes mention worktrees — that guidance does not apply to you. Branch directly off `main` via codemode (`git.git_checkout`) and push the branch with `git.git_push_checked`.",
-  "- **Open the PR before you reply.** When the user asks for a PR: push the branch with `git.git_push_checked`, then call `git.pr_create` (both inside codemode) to open a draft PR/MR and quote the URL it returns. `pr_create` works for GitHub and GitLab, auto-detects the provider, and auto-fills the title and body from your latest commit. Don't make the user ask \"where's the PR?\" — that's a workflow failure. If `git.pr_create` fails (e.g. missing token), fall back to constructing `https://github.com/<owner>/<repo>/compare/<base>...<branch>?expand=1` and tell the user what's missing.",
-  "- **Diagnostic vs imperative phrasing.** If the user asks \"what should we update / what's changed / what do you think\" — that's a DIAGNOSTIC question. Propose changes but do NOT apply them or commit without explicit instruction (\"update it\", \"apply the fix\", \"yes please do\"). When in doubt, ask.",
+  "- Run `git_status` before committing. Stage specific files, not '.'.",
+  "- Commit messages explain *why*. Never force-push unless explicitly asked.",
+  "- Clones default to depth 20 — right for most tasks. `depth: 0` for full history/blame, `depth: 1` for tree-only work. Never clone twice; deepen the existing clone instead.",
+  "- **Never use `git worktree`.** You run in a sandboxed clone — the workspace IS the clone. Repo AGENTS.md files written for local CLI use sometimes mention worktrees; that guidance does not apply. Branch off `main` via `git.git_checkout` and push with `git.git_push_checked`.",
+  "- **Open the PR before you reply.** Push the branch, then call `git.pr_create` (in codemode) and quote the URL. If it fails, fall back to a `https://github.com/<owner>/<repo>/compare/<base>...<branch>?expand=1` link and say what's missing.",
+  "- **Diagnostic vs imperative.** \u201cWhat should we update / what's changed?\u201d is DIAGNOSTIC — propose, don't apply or commit without explicit instruction. When in doubt, ask.",
   "",
   "## Working with errors",
   "",
   "When something fails: state what failed, fix it, move on. Don't apologize repeatedly.",
-  "",
-  "## Context management",
-  "",
-  "**Every tool result stays in your context window.** This is the most important constraint.",
-  "",
-  "- Your context budget is limited. Plan efficiently — use `explore` for discovery, then targeted reads for edits.",
-  "- Large outputs are automatically truncated. If you see `[truncated]`, use `read` with `offset`/`limit` to get the specific portion you need.",
-  "- The workspace is ephemeral per session. Clone repos to get their contents.",
-  "- If the user switches topics, suggest a fresh session to keep context clean.",
-  "- Users can prefix a message with `!!` to minimize its context footprint. You'll see `[message excluded by user]` as a placeholder instead of the original content.",
 ].join("\n");
-
 /** Build a LanguageModel from DodoConfig (Think per-session config). */
-function buildProviderFromConfig(config: DodoConfig, env: Env): LanguageModel {
+function buildProviderFromConfig(config: DodoConfig, env: Env, sessionAffinity?: string): LanguageModel {
   const appConfig: AppConfig = {
     activeGateway: config.activeGateway,
     aiGatewayBaseURL: config.aiGatewayBaseURL,
@@ -616,7 +495,7 @@ function buildProviderFromConfig(config: DodoConfig, env: Env): LanguageModel {
     model: config.model,
     opencodeBaseURL: config.opencodeBaseURL,
   };
-  return buildProvider(appConfig, env).chatModel(config.model);
+  return buildProvider(appConfig, env, sessionAffinity).chatModel(config.model);
 }
 
 // normalizePath imported at top of file from ./paths
@@ -632,7 +511,9 @@ class FacetNotFoundError extends Error {
   }
 }
 
-export class CodingAgent extends Think<Env, DodoConfig> {
+const CodingAgentBase = Think<Env, DodoConfig>;
+
+export class CodingAgent extends CodingAgentBase {
   initialState: SessionState = {
     activePromptId: null,
     activeStreamCount: 0,
@@ -768,10 +649,72 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    *  Used by runFiberPrompt's post-completion check (chat-monitor
    *  brains nudge themselves if they didn't call chat_reply). */
   private _toolCallNames: Set<string> = new Set();
+  /** LLM calls made during the current turn — surfaced as message metadata. */
+  private _llmCallsThisTurn = 0;
   private readonly presence = new PresenceTracker();
-  readonly stateBackend;
+  #wsChain: {
+    computerWs: WorkspaceComputer;
+    computerFs: ComputerFileSystem;
+    workspace: WorkspaceFsView;
+    stateBackend: ReturnType<typeof createMemoryStateBackend>;
+  } | null = null;
+
+  /**
+   * Construct the computer Workspace lazily — never in the constructor.
+   * The DO constructor runs under workerd's implicit
+   * blockConcurrencyWhile, so keeping its VFS schema transaction out of
+   * it keeps construction fast and avoids amplifying a known workerd
+   * facet-creation stall (see subAgentStallSafe). First access happens
+   * on the first workspace-touching entry point instead.
+   */
+  #ensureWs() {
+    if (!this.#wsChain) {
+      const computerWs = new WorkspaceComputer({
+        // Boundary cast: computer's DurableObjectStorageLike and
+        // workers-types' DurableObjectStorage disagree only on Row
+        // generic variance; the mixin did the same cast internally.
+        storage: this.ctx.storage as unknown as ConstructorParameters<typeof WorkspaceComputer>[0]["storage"],
+        backends: [
+          new WorkerShellBackend({
+            loader: this.env.LOADER,
+            // The CodingAgent DO's own binding name from wrangler.jsonc
+            // durable_objects.bindings. A binding that doesn't exist is a
+            // hard construction failure inside the DO pool and times out
+            // every test that boots a USER_CONTROL -> CodingAgent chain.
+            workspace: { binding: "CODING_AGENT", id: this.ctx.id.toString() },
+            ctx: this.ctx,
+          }),
+        ],
+        sessionId: this.ctx.id.toString(),
+      });
+      const computerFs = new ComputerFileSystem(computerWs.fs);
+      this.#wsChain = {
+        computerWs,
+        computerFs,
+        workspace: new WorkspaceFsView(computerFs),
+        stateBackend: createMemoryStateBackend({ fs: computerFs }),
+      };
+    }
+    return this.#wsChain;
+  }
+
+  get stateBackend() {
+    return this.#ensureWs().stateBackend;
+  }
   private readonly transports = new Map<string, AgentConnectionTransport>();
-  readonly workspace: Workspace;
+  /**
+   * The single workspace store: a computer-VFS FileSystem with a
+   * Workspace-shaped view over it. Every consumer — file tools, git,
+   * snapshots, facet RPCs, artifacts flush — reads and writes here.
+   * Legacy R2 is only ever touched by the one-time compat copy.
+   */
+  get computerFs(): ComputerFileSystem {
+    return this.#ensureWs().computerFs;
+  }
+
+  get workspace(): WorkspaceFsView {
+    return this.#ensureWs().workspace;
+  }
   /**
    * Typed stores wrapping the `metadata` k/v table. See ADR-0001.
    * Constructed before the lifecycle so it can take them as dependencies.
@@ -787,15 +730,34 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   private readonly lifecycle: SessionLifecycle;
 
+  /** The computer Workspace instance backing the single store. */
+  private get computerWorkspace(): WorkspaceComputer {
+    return this.#ensureWs().computerWs;
+  }
+
+  /**
+   * RPC target for the shell worker's HOST binding. The exported
+   * WorkspaceServiceProxy class (see src/index.ts) calls this to hand the
+   * loaded shell worker a stub of this session's Workspace, so shell
+   * commands read/write the same VFS as the file tools.
+   */
+  async __getWorkspaceStub(): Promise<unknown> {
+    const ws = this.computerWorkspace;
+    await ws.ready();
+    return ws.stub();
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.initializeSchema();
-    this.workspace = new Workspace({
-      name: () => this.sessionId() || "session-pending",
-      r2: env.WORKSPACE_BUCKET,
-      sql: ctx.storage.sql,
-    });
-    this.stateBackend = createWorkspaceStateBackend(this.workspace);
+
+    // ─── The ONE workspace store ───
+    //
+    // Nothing workspace-related is constructed here — see #ensureWs().
+    // The store chain (computer Workspace -> ComputerFileSystem ->
+    // WorkspaceFsView -> state backend) is built on first access, after
+    // the DO constructor has returned. R2 is only read by the one-time
+    // compat copy.
 
     // ─── Typed stores + SessionLifecycle wiring (ADR-0001) ───
     //
@@ -885,7 +847,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (!config) {
       throw new Error("getModel(): no Think config — session not configured yet");
     }
-    return buildProviderFromConfig(config, this.env);
+    return buildProviderFromConfig(config, this.env, this.sessionId());
   }
 
   override getSystemPrompt(): string {
@@ -1018,6 +980,108 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
       return;
     }
+  }
+
+  /** Guard so ensureSessionCompat runs at most once per DO instance. */
+  private _sessionCompatChecked = false;
+
+  /**
+   * Session compatibility: on first workspace access, if the computer
+   * workspace is empty and the legacy R2/SQL workspace has files, copy
+   * them once into the computer workspace. Guarded by a metadata marker
+   * so the copy is idempotent across DO evictions.
+   *
+   * The legacy Workspace is constructed inside this function as a
+   * read-only copy SOURCE and never used again — it must not become a
+   * second live store.
+   */
+  async ensureSessionCompat(): Promise<void> {
+    if (this._sessionCompatChecked) return;
+    this._sessionCompatChecked = true;
+
+    const markerKey = "computer_compat_copied";
+    if (this.readMetadata(markerKey) === "true") return;
+
+    // Check if computer workspace already has files
+    try {
+      const computerEntries = await this.computerFs.readdir("/");
+      if (computerEntries.length > 0) {
+        this.writeMetadata(markerKey, "true");
+        return;
+      }
+    } catch {
+      // not ready or empty — proceed to copy check
+    }
+
+    // Throwaway legacy workspace: reads the shell-Workspace SQL tables
+    // (still resident in this DO's SQLite) plus the R2 spill bucket.
+    // Read-only — copied into the computer VFS, never written.
+    const legacy = new Workspace({
+      name: () => this.sessionId() || "session-pending",
+      r2: this.env.WORKSPACE_BUCKET,
+      sql: this.ctx.storage.sql,
+    });
+
+    let oldPaths: string[];
+    try {
+      oldPaths = await legacy._getAllPaths();
+    } catch (e) {
+      // No legacy tables (fresh session) — nothing to copy.
+      log("info", "session-compat-no-legacy", {
+        sessionId: this.sessionId(),
+        error: e instanceof Error ? e.message : String(e),
+      });
+      this.writeMetadata(markerKey, "true");
+      return;
+    }
+    if (oldPaths.length === 0) {
+      this.writeMetadata(markerKey, "true");
+      return;
+    }
+
+    log("info", "session-compat-copy-start", {
+      sessionId: this.sessionId(),
+      count: oldPaths.length,
+    });
+
+    // Dirs first so file writes never race their parents.
+    for (const path of oldPaths) {
+      try {
+        const st = await legacy.stat(path);
+        if (st?.type === "directory" && path !== "/") {
+          await this.computerFs.mkdir(path, { recursive: true });
+        }
+      } catch (e) {
+        log("warn", "session-compat-copy-error", {
+          sessionId: this.sessionId(),
+          path,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    for (const path of oldPaths) {
+      try {
+        const st = await legacy.stat(path);
+        if (st?.type === "file") {
+          const bytes = await legacy.readFileBytes(path);
+          if (bytes !== null) {
+            await this.computerFs.writeFileBytes(path, bytes);
+          }
+        }
+      } catch (e) {
+        log("warn", "session-compat-copy-error", {
+          sessionId: this.sessionId(),
+          path,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+
+    this.writeMetadata(markerKey, "true");
+    log("info", "session-compat-copy-done", {
+      sessionId: this.sessionId(),
+      count: oldPaths.length,
+    });
   }
 
   /**
@@ -1174,34 +1238,41 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   /**
+   * Cached workspace root summary. Refreshed asynchronously by
+   * `refreshWorkspaceSummary()` (called from onChatMessage before the
+   * prompt is composed) because the computer VFS has no synchronous
+   * read. `getWorkspaceSummary()` stays synchronous for getSystemPrompt.
+   */
+  private _workspaceSummary: string | null = null;
+
+  private async refreshWorkspaceSummary(): Promise<void> {
+    try {
+      const entries = await this.workspace.readDir("/");
+      if (!entries.length) {
+        this._workspaceSummary = null;
+        return;
+      }
+      const lines = entries.slice(0, 40).map((entry) => {
+        return entry.type === "directory" ? `${entry.name}/` : entry.name;
+      });
+      let result = "```\n" + lines.join("\n") + "\n```";
+      if (entries.length > 40) {
+        result += `\n(${entries.length} entries total, showing first 40)`;
+      }
+      this._workspaceSummary = result;
+    } catch {
+      // workspace may not be ready — no summary this turn
+      this._workspaceSummary = null;
+    }
+  }
+
+  /**
    * Build a bounded workspace summary — shallow root listing only.
    * Returns null if the workspace is empty. Capped at ~40 entries
    * to prevent bloating the system prompt on large repos.
    */
   private getWorkspaceSummary(): string | null {
-    try {
-      // Synchronous readDir not available — use the Think workspace's
-      // internal SQL to get a fast root listing without async.
-      const rows = Array.from(this.ctx.storage.sql.exec(
-        "SELECT path, type FROM workspace_entries WHERE parent = '/' ORDER BY type DESC, path ASC LIMIT 40",
-      ));
-      if (!rows.length) return null;
-
-      const lines = rows.map((r) => {
-        const name = String(r.path).split("/").filter(Boolean).pop() ?? String(r.path);
-        return r.type === "directory" ? `${name}/` : name;
-      });
-      const total = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) as cnt FROM workspace_entries WHERE parent = '/'"))[0] as SqlRow | null);
-      const count = Number(total?.cnt ?? lines.length);
-      let result = "```\n" + lines.join("\n") + "\n```";
-      if (count > 40) {
-        result += `\n(${count} entries total, showing first 40)`;
-      }
-      return result;
-    } catch {
-      // workspace_entries table may not exist or be empty — no summary
-      return null;
-    }
+    return this._workspaceSummary;
   }
 
   override getTools(): ToolSet {
@@ -1255,6 +1326,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
         });
       },
       stateBackend: this.stateBackend,
+      shellRuntime: this.computerWorkspace.runtime as unknown as WorkspaceRuntimeClient,
       mcpGatekeepers: this.mcpGatekeepers,
       todoStore: this.todoStore(),
       readAttachment: (i: { id: string; offset?: number; limit?: number }) => this.readSessionDocument(i),
@@ -1293,6 +1365,12 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Refresh the admin-managed global prompt prefix from SharedIndex.
     // TTL-cached on the DO so this is a no-op for most turns.
     await this.warmGlobalPrompt();
+
+    // One-time copy of legacy R2 workspace files into the computer workspace.
+    await this.ensureSessionCompat();
+
+    // Refresh the root listing served (synchronously) to getSystemPrompt.
+    await this.refreshWorkspaceSummary();
 
     const baseTools = this.getTools();
     const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
@@ -1593,6 +1671,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
             let hasErrorChunk = false;
             let errorText = "";
             try {
+              self._llmCallsThisTurn++;
               result = streamText({
                 model,
                 system,
@@ -2349,8 +2428,15 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     return messages;
   }
 
+  /**
+   * Think's host bridge (extension Workers) calls readFile/writeFile/
+   * deleteFile/readDir on this. Think types it as shell's Workspace, which
+   * our WorkspaceFsView can't satisfy nominally (shell Workspace has
+   * private fields) — the runtime contract is those four methods, which
+   * the view provides over the computer VFS.
+   */
   override getWorkspace(): Workspace {
-    return this.workspace;
+    return this.workspace as unknown as Workspace;
   }
 
   override onStart(): void {
@@ -2470,6 +2556,9 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (incomingEmail) {
       await this.reconcileOwnerIdentity(incomingEmail);
     }
+
+    // One-time copy of legacy R2 workspace files into the computer workspace.
+    await this.ensureSessionCompat();
 
     try {
       if (request.method === "GET" && url.pathname === "/ws") {
@@ -3478,7 +3567,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       timeout: 30000,
     });
 
-    const execution: ExecuteResult = await executor.execute(body.code, [resolveProvider(stateTools(this.workspace))]);
+    const execution: ExecuteResult = await executor.execute(body.code, [resolveProvider(stateToolsFromBackend(this.stateBackend))]);
 
     this.emitEvent({ data: execution, type: "execution" });
     return Response.json(execution, { status: execution.error ? 400 : 200 });
@@ -3486,14 +3575,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async handleGitInit(request: Request): Promise<Response> {
     const body = gitDirSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const result = await git.init({ defaultBranch: "main", dir: body.dir ? normalizePath(body.dir) : undefined });
     return Response.json(result);
   }
 
   private async handleGitClone(request: Request): Promise<Response> {
     const body = gitCloneSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     const token = await resolveRemoteToken({ dir, env: this.env, git, url: body.url, ownerEmail });
@@ -3512,7 +3601,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async handleGitAdd(request: Request): Promise<Response> {
     const body = z.object({ dir: z.string().optional(), filepath: z.string().min(1) }).strict().parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     try {
       return Response.json(await git.add({ dir: body.dir ? normalizePath(body.dir) : undefined, filepath: body.filepath }));
     } catch (error) {
@@ -3530,7 +3619,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (ownerEmail && !this.readMetadata("owner_email")) {
       this.writeMetadata("owner_email", ownerEmail);
     }
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     try {
       const dir = body.dir ? normalizePath(body.dir) : undefined;
       const statusEntries = await git.status({ dir });
@@ -3562,7 +3651,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private async handleGitStatus(url: URL): Promise<Response> {
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = url.searchParams.get("dir");
     try {
       const entries = await git.status({ dir: dir ? normalizePath(dir) : undefined });
@@ -3577,7 +3666,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private async handleGitLog(url: URL): Promise<Response> {
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = url.searchParams.get("dir");
     const depth = url.searchParams.get("depth");
     try {
@@ -3593,7 +3682,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private async handleGitDiff(url: URL): Promise<Response> {
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = url.searchParams.get("dir");
     try {
       const entries = await git.diff({ dir: dir ? normalizePath(dir) : undefined });
@@ -3609,13 +3698,13 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async handleGitBranch(request: Request): Promise<Response> {
     const body = gitBranchSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     return Response.json(await git.branch({ delete: body.delete, dir: body.dir ? normalizePath(body.dir) : undefined, list: body.list, name: body.name }));
   }
 
   private async handleGitCheckout(request: Request): Promise<Response> {
     const body = gitCheckoutSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     return Response.json(
       await git.checkout({ branch: body.branch, dir: body.dir ? normalizePath(body.dir) : undefined, force: body.force, ref: body.ref }),
     );
@@ -3623,7 +3712,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async handleGitPull(request: Request): Promise<Response> {
     const body = z.object({ dir: z.string().optional(), ref: z.string().optional(), remote: z.string().optional() }).strict().parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote, ownerEmail });
@@ -3633,7 +3722,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async handleGitPush(request: Request): Promise<Response> {
     const body = z.object({ dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional(), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     try {
@@ -3691,7 +3780,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async handleGitVerifyBranch(request: Request): Promise<Response> {
     const body = z.object({ dir: z.string().optional(), ref: z.string().min(1), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
     const verification = await verifyRemoteBranch({
@@ -3712,7 +3801,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
 
   private async handleGitRemote(request: Request): Promise<Response> {
     const body = gitRemoteSchema.parse(await request.json());
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     return Response.json(
       await git.remote({ add: body.add, dir, list: body.list, remove: body.remove }),
@@ -3741,7 +3830,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       remoteName: z.string().optional(),
     }).strict().parse(await request.json());
 
-    const git = createWorkspaceGit(this.workspace);
+    const git = createWorkspaceGit(this.computerFs);
     const dir = body.dir ? normalizePath(body.dir) : undefined;
     const remoteName = body.remoteName ?? "github";
     const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
@@ -4022,7 +4111,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   }
 
   private async exportSnapshot(): Promise<SessionSnapshot | SnapshotV2> {
-    const paths = await this.workspace._getAllPaths();
+    const paths = await this.workspace.getAllPaths();
     const files: Array<{ content: string; path: string; encoding?: "base64" }> = [];
 
     for (const path of paths) {
@@ -4280,7 +4369,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
       dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: notifyOwner });
 
-      return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, sessionId, steps: 0, toolCalls: [] });
+      return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, sessionId, steps: result.steps, toolCalls: result.toolCalls });
     } catch (error) {
       this.control.setStatus("idle");
       await this.syncSessionIndex({ status: "idle", title });
@@ -5310,7 +5399,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
   private async runThinkChat(
     userContent: string,
     options?: { authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }> },
-  ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string }> {
+  ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string; steps: number; toolCalls: string[] }> {
     // Connect MCP servers before Think calls getTools()
     await this.connectMcpServers();
 
@@ -5624,6 +5713,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     // Reset per-turn tool-call name set so the chat-monitor brain nudge
     // checks against tools actually called THIS turn.
     this._toolCallNames.clear();
+    this._llmCallsThisTurn = 0;
     // Collect assistant-generated images streamed during this turn. Uploaded
     // to R2 at onDone() once we know the assistant message id.
     const generatedImages: Array<{ mediaType: string; url: string }> = [];
@@ -5830,7 +5920,14 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
     }
 
-    return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
+    return {
+      assistantMessageId,
+      tokenInput,
+      tokenOutput,
+      text: fullText,
+      steps: this._llmCallsThisTurn,
+      toolCalls: Array.from(this._toolCallNames),
+    };
   }
 
   /**
@@ -7112,8 +7209,31 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * `buildExploreTool` when `config.exploreMode === "facet"` and from
    * the HTTP surface (via facet transcript routes).
    */
+  /**
+   * Stall-safe facet spawn. workerd's experimental facet creation can
+   * stall when the isolate has been idle between DO activity: the
+   * creation event sits queued until another facet event arrives (this
+   * reproduces on main too, so it is not migration-specific). Issuing a
+   * second subAgent call after a short timeout delivers that nudge —
+   * both attempts then resolve — so spawns stay deterministic.
+   */
+  private async subAgentStallSafe<T extends Agent>(
+    cls: SubAgentClass<T>,
+    name: string,
+  ): Promise<SubAgentStub<T>> {
+    const first = this.subAgent(cls, name);
+    const winner = await Promise.race([
+      first,
+      new Promise<SubAgentStub<T>>((resolve) =>
+        setTimeout(() => resolve(this.subAgent(cls, name)), 2_000),
+      ),
+    ]);
+    void first.catch(() => {});
+    return winner;
+  }
+
   async runExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
-    const stub = await this.subAgent(ExploreAgent, name);
+    const stub = await this.subAgentStallSafe(ExploreAgent, name);
     const parentSessionId = opts.parentSessionId ?? this.sessionId();
     const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
 
@@ -7208,7 +7328,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    * owns that side of the lifecycle.
    */
   async runTaskFacet(name: string, opts: TaskInvokeOpts): Promise<TaskInvokeResult> {
-    const stub = await this.subAgent(TaskAgent, name);
+    const stub = await this.subAgentStallSafe(TaskAgent, name);
     const parentSessionId = opts.parentSessionId ?? this.sessionId();
     const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
 
@@ -7319,11 +7439,11 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     const facetType = row[0].facetType;
     try {
       if (facetType === "explore") {
-        const stub = await this.subAgent(ExploreAgent, facetName);
+        const stub = await this.subAgentStallSafe(ExploreAgent, facetName);
         const transcript = await stub.getTranscript();
         return { facetType, messages: transcript };
       } else {
-        const stub = await this.subAgent(TaskAgent, facetName);
+        const stub = await this.subAgentStallSafe(TaskAgent, facetName);
         const transcript = await stub.getTranscript();
         return { facetType, messages: transcript };
       }
@@ -7355,7 +7475,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
       });
       this.completeFacetRun(runId, "(test-seeded)", { input: 0, output: 0 });
     }
-    const stub = await this.subAgent(TaskAgent, facetName);
+    const stub = await this.subAgentStallSafe(TaskAgent, facetName);
     return stub.writeScratchForTest(parentSessionId, path, content);
   }
 
@@ -7396,7 +7516,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
     if (!this.facetExists(facetName, "task")) {
       throw new FacetNotFoundError(facetName);
     }
-    const stub = await this.subAgent(TaskAgent, facetName);
+    const stub = await this.subAgentStallSafe(TaskAgent, facetName);
     return stub.applyFromScratch(paths);
   }
 
@@ -7413,7 +7533,7 @@ export class CodingAgent extends Think<Env, DodoConfig> {
    */
   async cleanupScratchFacet(payload: { facetName: string; parentSessionId: string }): Promise<void> {
     try {
-      const stub = await this.subAgent(TaskAgent, payload.facetName);
+      const stub = await this.subAgentStallSafe(TaskAgent, payload.facetName);
       await stub.cleanupScratch(payload.parentSessionId);
     } catch (err) {
       log("warn", "Scratch cleanup R2 sweep failed", { facetName: payload.facetName, err: err instanceof Error ? err.message : String(err) });

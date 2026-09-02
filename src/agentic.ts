@@ -1,32 +1,33 @@
+import type { WorkspaceRuntimeClient } from "@cloudflare/computer";
 import type { StateBackend } from "@cloudflare/shell";
 import { jsonSchema, tool, zodSchema } from "ai";
 import { z } from "zod";
-import type { Workspace } from "@cloudflare/shell";
+import {
+  type AgentProfile,
+  EXPLORE_PROFILE,
+  resolveProfileModel,
+  TASK_PROFILE,
+} from "./agent-profile";
 import type { AttachmentRef } from "./attachments";
 import { MAX_READ_ATTACHMENT_CHARS } from "./attachments";
+import { createBrowserTools } from "./browser/tools";
+import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { createPullRequest } from "./github-api";
-import { normalizePath } from "./paths";
-import { createBrowserTools } from "./browser/tools";
+import { log } from "./logger";
 import type { McpClient } from "./mcp-client";
+import { normalizePath } from "./paths";
 import { getKnownRepo, listKnownRepos, parseRemoteSpec } from "./repos";
+import type { WorkspaceFsView } from "./runtime/computer/workspace-view";
 import {
   buildProviderForModel,
   capToolOutputs,
   runSubagentForProfile,
 } from "./subagent-runner";
-import {
-  EXPLORE_PROFILE,
-  TASK_PROFILE,
-  resolveProfileModel,
-  type AgentProfile,
-} from "./agent-profile";
-import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
-import { createWorkspaceTools, createExecuteTool } from "./think-adapter";
-import { createShellTool } from "./tools/shell";
+import { createExecuteTool, createWorkspaceTools } from "./think-adapter";
 import { sanitizeToolJsonSchema } from "./tool-schema";
+import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";
-import { log } from "./logger";
 import type { AppConfig, Env, TodoStore } from "./types";
 
 /** Options passed through from the coding agent into tool factories. */
@@ -87,6 +88,12 @@ interface BuildToolsOptions {
    * `this.readSessionDocument`.
    */
   readAttachment?: (input: { id: string; offset?: number; limit?: number }) => Promise<unknown>;
+  /**
+   * Computer workspace runtime for the `shell` tool. When provided,
+   * commands are executed via `ws.runtime.exec()` instead of the legacy
+   * busybox wasm emulator.
+   */
+  shellRuntime?: WorkspaceRuntimeClient;
   /**
    * Parent CodingAgent reference — used when `config.exploreMode` or
    * `config.taskMode` is `"facet"` so the explore / task tools can
@@ -340,8 +347,8 @@ function getByPath(value: unknown, path: string): unknown {
   return current;
 }
 
-export function buildProvider(config: AppConfig, env: Env) {
-  return buildProviderForModel(config.model, config, env);
+export function buildProvider(config: AppConfig, env: Env, sessionAffinity?: string) {
+  return buildProviderForModel(config.model, config, env, sessionAffinity);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -359,11 +366,11 @@ const DEFAULT_CLONE_DEPTH = 20;
 
 function buildGitTools(
   env: Env,
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   ownerEmail?: string,
 ): Record<string, AnyTool> {
-  const git = createWorkspaceGit(workspace);
+  const git = createWorkspaceGit(workspace.fs);
   const knownRepoIds = listKnownRepos().map((repo) => repo.id) as [string, ...string[]];
 
   const dirSchema = zodSchema(z.object({ dir: z.string().optional().describe("Repo directory") }));
@@ -856,7 +863,7 @@ function buildSubagentTool(spec: {
  * context (~500-1000 tokens) instead of multiple raw file reads (~5-20k tokens).
  */
 function buildExploreTool(
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   env: Env,
   parentAgent?: BuildToolsOptions["parentAgent"],
@@ -1084,7 +1091,7 @@ function buildExploreTool(
  * in the main conversation.
  */
 function buildTaskTool(
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   env: Env,
   parentAgent?: BuildToolsOptions["parentAgent"],
@@ -1407,7 +1414,7 @@ function buildChatReplyTool(env: Env, opts: {
 
 function buildTools(
   env: Env,
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   options?: BuildToolsOptions,
 ): Record<string, AnyTool> {
@@ -1562,11 +1569,12 @@ function buildTools(
     },
   });
 
-  // Shell tool — busybox-in-a-worker with /workspace mounted. Pure-code,
-  // no env binding required (busybox.wasm + initramfs.wasm bundle into the
-  // Worker via wrangler's CompiledWasm rule). Lives alongside codemode:
-  // codemode for JS/API-shaped work, shell for pipelines and file ops.
-  tools.shell = createShellTool(workspace);
+  // Shell tool — computer workspace runtime with /workspace mounted.
+  // When shellRuntime is provided, commands execute via ws.runtime.exec();
+  // otherwise the tool is omitted (should not happen in production).
+  if (options?.shellRuntime) {
+    tools.shell = createShellTool(options.shellRuntime);
+  }
 
   // Git tools — only the hot-path subset is exposed at the top level.
   // See KNOWN_TOP_LEVEL_GIT_TOOLS / KNOWN_CODEMODE_GIT_TOOLS module-scope
@@ -1714,7 +1722,7 @@ function buildTools(
  */
 export function buildToolsForThink(
   env: Env,
-  workspace: Workspace,
+  workspace: WorkspaceFsView,
   config: AppConfig,
   options?: BuildToolsOptions & {
     agent?: { mcp?: unknown };
@@ -1766,7 +1774,9 @@ function buildMcpTools(gatekeepers: McpClient[], existingNames: Set<string>): Re
       if (existingNames.has(mcpTool.name) || tools[mcpTool.name]) continue;
       if (suppressChatReplyMcp && mcpTool.name.endsWith("__chat_reply")) continue;
       tools[mcpTool.name] = tool({
-        description: mcpTool.description ?? `MCP tool: ${mcpTool.name}`,
+        // Cap third-party descriptions: some servers ship multi-KB
+        // instructions blocks that ride on every request of every turn.
+        description: capToolDescription(mcpTool.description ?? `MCP tool: ${mcpTool.name}`),
         // Sanitise the third-party schema: a single tool with an invalid
         // draft-2020-12 schema makes strict providers (Workers AI glm-*)
         // 400 the entire request. See src/tool-schema.ts.
@@ -1788,6 +1798,14 @@ function buildMcpTools(gatekeepers: McpClient[], existingNames: Set<string>): Re
   }
 
   return tools;
+}
+
+/** Hard cap on third-party MCP tool descriptions. See buildMcpTools. */
+const MCP_TOOL_DESCRIPTION_CAP = 400;
+
+function capToolDescription(description: string): string {
+  if (description.length <= MCP_TOOL_DESCRIPTION_CAP) return description;
+  return `${description.slice(0, MCP_TOOL_DESCRIPTION_CAP)}… [truncated]`;
 }
 
 function slugifyToolNamespace(name: string): string {
@@ -1840,7 +1858,7 @@ function buildOAuthMcpTools(
     }
 
     tools[prefixedName] = tool({
-      description: info.description ?? `OAuth MCP tool: ${info.name}`,
+      description: capToolDescription(info.description ?? `OAuth MCP tool: ${info.name}`),
       // Sanitise the third-party schema before forwarding to the provider —
       // see buildMcpTools above and src/tool-schema.ts.
       inputSchema: jsonSchema(sanitizeToolJsonSchema(info.inputSchema)),
