@@ -2776,7 +2776,7 @@ export class UserControl extends DurableObject<Env> {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         client_name: "Dodo",
-        client_uri: "https://dodo.jonnyparris.workers.dev",
+        client_uri: "https://dodo.jonnyparris.club",
         grant_types: ["authorization_code", "refresh_token"],
         redirect_uris: [redirectUri],
         response_types: ["code"],

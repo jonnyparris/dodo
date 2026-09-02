@@ -18,13 +18,15 @@
 #   DODO_URL=http://127.0.0.1:8787 scripts/smoke-scheduled-sessions.sh
 #
 # Auth:
-#   - Uses `cloudflared access curl` when DODO_URL is behind CF Access.
-#   - Falls back to plain `curl` when AUTH_MODE=none.
+#   - Default (AUTH_MODE=none) uses plain curl: the edge injects the Access
+#     JWT from the device's WARP session — no interactive login.
+#   - AUTH_MODE=access uses `cloudflared access curl` for non-WARP machines
+#     (its token cache expires and each lapse opens a browser login).
 
 set -euo pipefail
 
-DODO_URL="${DODO_URL:-https://dodo.jonnyparris.workers.dev}"
-AUTH_MODE="${AUTH_MODE:-access}" # "access" | "none"
+DODO_URL="${DODO_URL:-https://dodo.jonnyparris.club}"
+AUTH_MODE="${AUTH_MODE:-none}" # "none" (plain curl + WARP auto-auth) | "access" (cloudflared)
 
 # ANSI colour
 red()    { printf '\033[31m%s\033[0m' "$1"; }
