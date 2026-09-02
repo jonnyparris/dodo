@@ -29,7 +29,14 @@ export default defineConfig({
   ],
   test: {
     include: ["test/**/*.test.ts"],
-    testTimeout: 10000,
+    // 60s: the first facet spawn in a file pays a documented workerd
+    // stall (subAgentStallSafe nudges at 2s, but a cold first spawn can
+    // still take ~30s — measured 30.4s on TaskAgent+scratch). The 10s
+    // default turned every cold-start test into a coin flip under load.
+    testTimeout: 60000,
+    // Same ceiling for beforeEach/setup hooks: initPasskeyIfNeeded() pays
+    // the same DO cold-start cost and defaulted to 10s separately.
+    hookTimeout: 60000,
     deps: {
       optimizer: {
         ssr: {

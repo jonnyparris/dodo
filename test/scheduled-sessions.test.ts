@@ -401,6 +401,13 @@ describe("Scheduled new-session alarm firing", () => {
 
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
+    // The handler re-arms a now+1s alarm for the 2 overdue remainders.
+    // Cancel it — under load the counting loop below takes >1s and the
+    // chained pass would clear the remainders mid-count.
+    await runInDurableObject(stub, async (_, state) => {
+      await state.storage.deleteAlarm();
+    });
+
     // After fire #1: exactly 10 one-shot rows should be gone, 2 remain.
     const remaining1: string[] = [];
     for (const id of schedIds) {
