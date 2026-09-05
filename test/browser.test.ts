@@ -255,3 +255,81 @@ describe("Per-session browser toggle", () => {
     await fetchSharedIndex("/users/dev%40dodo.local/browser", { method: "POST" });
   });
 });
+
+// ─── Admin default: browser tools on unless explicitly toggled off ───
+
+describe("Admin sessions default browser on", () => {
+  // ADMIN_EMAIL is admin@test.local in vitest.config.ts. Dev-mode HTTP auth
+  // always resolves to dev@dodo.local, so the admin default is exercised by
+  // talking to the CodingAgent DO directly with x-owner-email — the same
+  // header the router propagates on /session/:id routes.
+  const ADMIN = "admin@test.local";
+  const NON_ADMIN = "dev@dodo.local";
+
+  beforeAll(async () => {
+    for (let i = 0; i < 5; i++) {
+      try {
+        await fetchJson("/health");
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    }
+  });
+
+  async function createSession(): Promise<string> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await fetchJson("/session", { method: "POST" });
+      if (response.status === 201) {
+        return ((await response.json()) as { id: string }).id;
+      }
+      if (response.status === 500 && attempt < 2) {
+        await new Promise((r) => setTimeout(r, 10));
+        continue;
+      }
+      throw new Error(`Failed to create session: ${response.status}`);
+    }
+    throw new Error("Failed to create session after retries");
+  }
+
+  async function fetchAgentBrowser(sessionId: string, ownerEmail: string): Promise<{ browserEnabled: boolean }> {
+    const { getAgentByName } = await import("agents");
+    const testEnv = env as Env;
+    const agent = await getAgentByName(testEnv.CODING_AGENT as never, sessionId);
+    const res = await agent.fetch(new Request("https://coding-agent/browser", {
+      headers: { "x-owner-email": ownerEmail },
+    }));
+    expect(res.status).toBe(200);
+    return (await res.json()) as { browserEnabled: boolean };
+  }
+
+  it("browser defaults to enabled for admin-owned sessions", async () => {
+    const sessionId = await createSession();
+    const body = await fetchAgentBrowser(sessionId, ADMIN);
+    expect(body.browserEnabled).toBe(true);
+  });
+
+  it("browser stays defaulted off for non-admin owners", async () => {
+    const sessionId = await createSession();
+    const body = await fetchAgentBrowser(sessionId, NON_ADMIN);
+    expect(body.browserEnabled).toBe(false);
+  });
+
+  it("explicit disable wins over the admin default", async () => {
+    const sessionId = await createSession();
+    const { getAgentByName } = await import("agents");
+    const testEnv = env as Env;
+    const agent = await getAgentByName(testEnv.CODING_AGENT as never, sessionId);
+
+    const disableRes = await agent.fetch(new Request("https://coding-agent/browser", {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-owner-email": ADMIN },
+      body: JSON.stringify({ enabled: false }),
+    }));
+    expect(disableRes.status).toBe(200);
+    expect(((await disableRes.json()) as { browserEnabled: boolean }).browserEnabled).toBe(false);
+
+    const body = await fetchAgentBrowser(sessionId, ADMIN);
+    expect(body.browserEnabled).toBe(false);
+  });
+});

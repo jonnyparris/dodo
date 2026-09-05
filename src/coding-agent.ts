@@ -852,7 +852,7 @@ export class CodingAgent extends CodingAgentBase {
 
   override getSystemPrompt(): string {
     // Gather the optional sections that depend on DO state.
-    const browserEnabled = this.readMetadata("browser_enabled") === "true";
+    const browserEnabled = this.browserEnabled();
     const browserSection = browserEnabled
       ? [
           "## Browser",
@@ -1287,7 +1287,7 @@ export class CodingAgent extends CodingAgentBase {
       parentAgent: this,
       oauthTools: this.cachedOAuthTools,
       oauthToolExec: (serverId: string, name: string, args: unknown) => this.callOAuthToolViaHub(serverId, name, args),
-      browserEnabled: this.readMetadata("browser_enabled") === "true",
+      browserEnabled: this.browserEnabled(),
       isAdminUser: isAdmin(ownerEmail ?? null, this.env),
       ownerId: this.resolveOwnerId(ownerEmail),
       ownerEmail,
@@ -2812,7 +2812,7 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       if (request.method === "GET" && url.pathname === "/browser") {
-        const enabled = this.readMetadata("browser_enabled") === "true";
+        const enabled = this.browserEnabled();
         const sid = this.sessionId() || request.headers.get("x-dodo-session-id") || "";
         return Response.json({ browserEnabled: enabled, sessionId: sid });
       }
@@ -5100,7 +5100,7 @@ export class CodingAgent extends CodingAgentBase {
       sessionId: this.sessionId(),
       ownerEmail: this.readMetadata("owner_email") ?? "",
       createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
-      browserEnabled: this.readMetadata("browser_enabled") === "true",
+      browserEnabled: this.browserEnabled(),
       activeGateway: incomingGateway,
       gitAuthorEmail: this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
       gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
@@ -6643,6 +6643,18 @@ export class CodingAgent extends CodingAgentBase {
     return this.metadataKv.read(key);
   }
 
+  /**
+   * Effective browser-tool availability for this session. An explicit
+   * browser_enabled value (set via PUT /browser) always wins; when unset —
+   * every new session — browser tools default ON for admin owners. Non-admin
+   * owners keep the old opt-in behaviour (per-user flag + session toggle).
+   */
+  private browserEnabled(): boolean {
+    const explicit = this.readMetadata("browser_enabled");
+    if (explicit !== null) return explicit === "true";
+    return isAdmin(this.readMetadata("owner_email"), this.env);
+  }
+
   private writeMetadata(key: string, value: string): void {
     this.metadataKv.write(key, value);
   }
@@ -6886,7 +6898,7 @@ export class CodingAgent extends CodingAgentBase {
       // Gate browser-rendering MCP on the per-session browser_enabled flag.
       // If browser is disabled for this session, skip the browser-rendering config
       // even if the MCP config itself is enabled.
-      const browserEnabled = this.readMetadata("browser_enabled") === "true";
+      const browserEnabled = this.browserEnabled();
 
       // Filter to enabled HTTP configs with URLs. `oauth` (SDK-managed) is
       // federated through the per-user hub DO and never connected from
@@ -7137,7 +7149,7 @@ export class CodingAgent extends CodingAgentBase {
       sessionId: this.sessionId(),
       ownerEmail,
       createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
-      browserEnabled: this.readMetadata("browser_enabled") === "true",
+      browserEnabled: this.browserEnabled(),
       activeGateway: existing?.activeGateway ?? appConfig.activeGateway,
       gitAuthorEmail: appConfig.gitAuthorEmail,
       gitAuthorName: appConfig.gitAuthorName,

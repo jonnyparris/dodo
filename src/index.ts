@@ -2633,7 +2633,10 @@ app.post("/session/:id/abort", async (c) => {
 app.get("/session/:id/browser", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;
-  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser");
+  // Propagate the owner email so the DO can resolve the admin default for
+  // sessions that never explicitly toggled browser_enabled.
+  const ownerEmail = c.get("sessionOwnerEmail") || c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser", { "x-owner-email": ownerEmail });
 });
 
 app.put("/session/:id/browser", async (c) => {
@@ -2647,7 +2650,8 @@ app.put("/session/:id/browser", async (c) => {
       return c.json({ error: "Browser access not enabled for your account. Ask your admin to enable it." }, 403);
     }
   }
-  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser");
+  const ownerEmail = c.get("sessionOwnerEmail") || c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser", { "x-owner-email": ownerEmail });
 });
 
 app.post("/session/:id/cron", async (c) => {
