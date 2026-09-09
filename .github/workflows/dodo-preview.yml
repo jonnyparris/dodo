@@ -31,11 +31,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      # Checkout needs contents:read; the comment step posts to the PR via
-      # github-script, which needs issues:write. The repo's default workflow
-      # token is read-only, so without these the comment step 403s.
+      # Checkout needs contents:read. The comment step posts to the PR via
+      # github-script; GitHub gates issue comments on a pull request behind
+      # the pull-requests scope, so grant both write scopes the endpoint
+      # accepts. The repo's default workflow token is read-only, so without
+      # these the comment step 403s with "Resource not accessible by
+      # integration".
       contents: read
       issues: write
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
