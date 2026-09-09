@@ -30,6 +30,12 @@ jobs:
   deploy-preview:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      # Checkout needs contents:read; the comment step posts to the PR via
+      # github-script, which needs issues:write. The repo's default workflow
+      # token is read-only, so without these the comment step 403s.
+      contents: read
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
