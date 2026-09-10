@@ -27,7 +27,39 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
+  # The deploy below ships the PR head to a shared preview worker that binds
+  # the same R2 buckets, Durable Object namespaces, and secrets as prod, so it
+  # must not run before the branch passes CI. GitHub Actions cannot express
+  # `needs` across separate workflow files, and dodo-verify.yml checks out the
+  # PR merge ref while the deploy below checks out the head sha, so the verify
+  # gate is duplicated here to test the exact ref that ships.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Lint (Biome)
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Typecheck smoke (in-isolate tsc tool)
+        run: npm run test:typecheck-smoke
+
   deploy-preview:
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
