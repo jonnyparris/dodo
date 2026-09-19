@@ -127,6 +127,22 @@ const ORCHESTRATOR_TOOLS: ToolCatalogEntry[] = [
     alwaysOn: false,
     caveat: "Requires browser bindings, session browser config, and admin owner.",
   },
+  {
+    name: "browser_markdown",
+    description:
+      "Fetch a webpage as markdown via Browser Run, with an optional calibrated verdict on whether it answers a question.",
+    category: "browser",
+    alwaysOn: false,
+    caveat: "Requires browser binding, session browser config, and admin owner.",
+  },
+  {
+    name: "browser_triage",
+    description:
+      "Rank candidate URLs by likely relevance to a question before fetching anything (calibrated, no page loads).",
+    category: "browser",
+    alwaysOn: false,
+    caveat: "Requires browser binding, session browser config, and admin owner.",
+  },
   // Git — only the hot-path quartet is top-level. Everything else is
   // reachable inside codemode via the `git.*` provider namespace; flagged
   // with CODEMODE_GIT_CAVEAT so the UI dims them and the drift test can

@@ -11,6 +11,7 @@ import {
 import type { AttachmentRef } from "./attachments";
 import { MAX_READ_ATTACHMENT_CHARS } from "./attachments";
 import { createBrowserTools } from "./browser/tools";
+import { createWebFetchTools, type JevAi } from "./browser/web-fetch";
 import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { createPullRequest } from "./github-api";
@@ -268,8 +269,10 @@ export const KNOWN_ALWAYS_ON_TOOL_NAMES = [
  */
 export const KNOWN_CONDITIONAL_TOOL_NAMES = [
   "codemode",       // requires env.LOADER
-  "browser_search", // requires browser bindings + admin + session config
+  "browser_search", // requires browser binding + admin + session config
   "browser_execute",
+  "browser_markdown", // requires browser binding + admin + session config
+  "browser_triage",
 ] as const;
 
 export function capCodemodeResult(result: unknown, maxBytes: number): unknown {
@@ -1711,6 +1714,20 @@ function buildTools(
       onAttachments: options?.onToolAttachments,
     });
     Object.assign(tools, browserTools);
+  }
+
+  // Web fetch tools — read-only browsing via Browser Run quick actions with
+  // Jev-calibrated verdicts. Same gating as the CDP tools minus LOADER
+  // (no codemode executor needed — plain binding + AI calls).
+  if (env.BROWSER && options?.browserEnabled && options?.isAdminUser) {
+    // Cast rationale: pinned workers-types types AI.run only for catalog
+    // models (keyof AiModels); typesafe/jev is a third-party model the
+    // runtime accepts but the type can't express. Narrowed to JevAi.
+    const webFetchTools = createWebFetchTools({
+      browser: env.BROWSER,
+      ai: env.AI as unknown as JevAi,
+    });
+    Object.assign(tools, webFetchTools);
   }
 
   return tools;
