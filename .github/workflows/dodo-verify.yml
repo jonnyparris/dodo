@@ -11,6 +11,13 @@ on:
         description: Ref the dispatcher wants verified (informational — the workflow runs on the dispatched ref by default)
         required: false
         type: string
+  # Run on pushes to main so a direct push cannot reach production without
+  # verification. AGENTS.md forbids direct commits to main, but the repo
+  # settings don't enforce it; scoping to main only avoids double-running on
+  # feature-branch pushes.
+  push:
+    branches:
+      - main
   # Run on PRs so human-authored branches get the same typecheck/test signal
   # without double-running on every push.
   pull_request:
