@@ -1,5 +1,6 @@
 import { tool } from "ai";
 import { z } from "zod";
+import { connectBrowser } from "./cdp-session";
 
 /**
  * Read-only web tools backed by Browser Run quick actions + Jev evaluation.
@@ -154,9 +155,11 @@ async function verifyPageAnswers(
       ? { hasAnswer: null, note: "Jev returned an unexpected shape" }
       : { hasAnswer: noul };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("Jev page verification failed:", message);
     return {
       hasAnswer: null,
-      note: `Jev verification unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      note: `Jev verification unavailable: ${message}`,
     };
   }
 }
@@ -201,7 +204,10 @@ export async function triageUrls(
     });
 
     const choice = extractJevChoice(response, "best_source");
-    if (!choice) return null;
+    if (!choice) {
+      console.error("Jev triage returned an unexpected shape for best_source");
+      return null;
+    }
 
     const ranking = candidates
       .map((c, i) => ({
@@ -211,7 +217,11 @@ export async function triageUrls(
       .sort((a, b) => b.probability - a.probability);
 
     return { ranking, picked: ranking[0]?.url ?? candidates[0]?.url };
-  } catch {
+  } catch (error) {
+    console.error(
+      "Jev triage failed:",
+      error instanceof Error ? error.message : String(error),
+    );
     return null;
   }
 }
@@ -223,6 +233,45 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
       setTimeout(() => reject(new Error(`${what} timed out after ${ms / 1000}s`)), ms),
     ),
   ]);
+}
+
+const CDP_SETTLE_MS = 3000;
+
+/**
+ * Fallback markdown fetch via the CDP binding path: launch a browser,
+ * navigate, grab the rendered HTML, convert with AI.toMarkdown(). Works on
+ * any compatibility date — used when the quickAction() binding method is
+ * unavailable (it needs compatibility date >= 2026-03-24).
+ */
+async function fetchMarkdownViaCdp(
+  browser: Fetcher,
+  ai: JevAi,
+  url: string,
+): Promise<string> {
+  const session = await withTimeout(connectBrowser(browser), 15_000, "Browser launch");
+  try {
+    await session.send("Page.enable");
+    await session.send("Page.navigate", { url });
+    await new Promise((r) => setTimeout(r, CDP_SETTLE_MS));
+    const evalResult = (await session.send("Runtime.evaluate", {
+      expression: "document.documentElement.outerHTML",
+      returnByValue: true,
+    })) as { result?: { value?: unknown } };
+    const html = evalResult.result?.value;
+    if (typeof html !== "string" || !html.trim()) {
+      throw new Error("page rendered no HTML (client-rendered SPA or load failure)");
+    }
+    const conversion = await ai.toMarkdown({
+      name: "page.html",
+      blob: new Blob([html], { type: "text/html" }),
+    });
+    if (conversion.format === "error") {
+      throw new Error(`AI.toMarkdown failed: ${conversion.error}`);
+    }
+    return conversion.data;
+  } finally {
+    await session.close().catch(() => {});
+  }
 }
 
 export interface WebFetchToolsOptions {
@@ -241,6 +290,10 @@ export interface JevAi {
     model: "typesafe/jev",
     inputs: { state: unknown; questions: Record<string, unknown> },
   ): Promise<Record<string, unknown>>;
+  toMarkdown(
+    files: MarkdownDocument,
+    options?: ConversionRequestOptions,
+  ): Promise<ConversionResponse>;
 }
 
 const MARKDOWN_DESCRIPTION = `Fetch a webpage's content as markdown via Cloudflare Browser Run (read-only, ~2s, no browser session).
@@ -278,43 +331,61 @@ export function createWebFetchTools(
         }
 
         const binding = quickActionBinding(options.browser);
-        if (!binding) {
-          return { error: "BROWSER binding does not expose quickAction('markdown')" };
-        }
+        const errors: string[] = [];
+        let markdown: string | null = null;
+        let via: "quickAction" | "cdp" | null = null;
 
-        let markdown: string;
-        try {
-          const response = await withTimeout(
-            binding.quickAction("markdown", { url: validated.url.href }),
-            45_000,
-            "Browser Run /markdown",
+        if (binding) {
+          try {
+            const response = await withTimeout(
+              binding.quickAction("markdown", { url: validated.url.href }),
+              45_000,
+              "Browser Run /markdown",
+            );
+            if (!response.ok) {
+              const body = await response.text().catch(() => "");
+              errors.push(`quickAction /markdown (${response.status}): ${body.slice(0, 200)}`);
+            } else {
+              const contentType = response.headers.get("content-type") ?? "";
+              if (contentType.includes("application/json")) {
+                const data = (await response.json()) as { result?: unknown };
+                markdown = typeof data.result === "string" ? data.result : "";
+              } else {
+                markdown = await response.text();
+              }
+              via = "quickAction";
+            }
+          } catch (error) {
+            errors.push(`quickAction: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        } else {
+          errors.push(
+            "quickAction: browser binding does not expose the method (compatibility date < 2026-03-24)",
           );
-          if (!response.ok) {
-            const body = await response.text().catch(() => "");
-            return {
-              error: `Browser Run /markdown failed (${response.status}): ${body.slice(0, 300)}`,
-            };
-          }
-          const contentType = response.headers.get("content-type") ?? "";
-          if (contentType.includes("application/json")) {
-            const data = (await response.json()) as { result?: unknown };
-            markdown = typeof data.result === "string" ? data.result : "";
-          } else {
-            markdown = await response.text();
-          }
-        } catch (error) {
-          return { error: error instanceof Error ? error.message : String(error) };
         }
 
-        if (!markdown.trim()) {
-          return {
-            error:
-              "Page returned no content — it may be a client-rendered SPA. Retry with browser_execute (Page.navigate + Runtime.evaluate, or gotoOptions.waitUntil: networkidle0).",
-          };
+        if (!markdown || !markdown.trim()) {
+          // quickAction unavailable or returned nothing — take the CDP path.
+          try {
+            markdown = await withTimeout(
+              fetchMarkdownViaCdp(options.browser, options.ai, validated.url.href),
+              45_000,
+              "CDP markdown fetch",
+            );
+            via = "cdp";
+          } catch (error) {
+            errors.push(`cdp: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+
+        if (!markdown || !markdown.trim()) {
+          console.error("browser_markdown failed for", validated.url.href, errors);
+          return { error: `Both fetch paths failed: ${errors.join("; ")}` };
         }
 
         const result: Record<string, unknown> = {
           url: validated.url.href,
+          via,
           markdown: capMarkdown(markdown, 24000),
         };
         if (query) {
@@ -349,7 +420,7 @@ export function createWebFetchTools(
       }) => {
         const result = await triageUrls(options.ai, query, candidates);
         if (!result) {
-          return { error: "Jev triage unavailable — fall back to your own judgement of the URLs." };
+          return { error: "Jev triage unavailable (see worker logs) — fall back to your own judgement of the URLs." };
         }
         return {
           query,
