@@ -49,11 +49,25 @@ function isJevChoice(value: unknown): value is JevChoiceAnswer {
   );
 }
 
+/**
+ * Extract the answers map from a Jev response. The binding (and REST API)
+ * return a `{ state, result }` envelope whose `result` holds
+ * `{ model, answers, usage }`; older deployments/docs showed the flat
+ * `{ answers }` shape. Handle both.
+ */
 function jevAnswers(response: Record<string, unknown>): Record<string, unknown> {
-  const answers = response.answers;
-  return typeof answers === "object" && answers !== null
-    ? (answers as Record<string, unknown>)
-    : {};
+  const direct = response.answers;
+  if (typeof direct === "object" && direct !== null) {
+    return direct as Record<string, unknown>;
+  }
+  const result = response.result;
+  if (typeof result === "object" && result !== null) {
+    const answers = (result as Record<string, unknown>).answers;
+    if (typeof answers === "object" && answers !== null) {
+      return answers as Record<string, unknown>;
+    }
+  }
+  return {};
 }
 
 /** Extract the `noul` probability from a Jev response, or null on mismatch. */
