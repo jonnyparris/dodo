@@ -5,7 +5,9 @@
  *
  *  - last 5 identical tool+args calls → hard break (doom-loop)
  *  - last 3 identical tool+args calls → nudge injection
- *  - last 10 same-tool (any args) calls → hard break (doom-loop)
+ *  - last 10 same-tool (any args) calls, silent → hard break (doom-loop)
+ *  - last 10 same-tool calls with narration → run (wizard flows are legit)
+ *  - last 20 same-tool calls with narration → hard break
  *  - last 6 same-tool calls, nudge not yet fired → stop-check injection
  *  - same-tool nudge already fired → no repeat injection
  *  - cumulative input ≥ 5× budget → stop (budget-limit)
@@ -107,6 +109,36 @@ describe("decideStepGate — same-tool repetition", () => {
       expect(gate.reason).toBe("doom-loop");
       expect(gate.notice).toContain("codemode called 10 times");
     }
+  });
+
+  it("runs past 10 narrated same-tool calls (wizard flows are legit)", () => {
+    const gate = decideStepGate(
+      gateState({
+        recentToolCalls: varied("browser_session", 10),
+        recentTextPrefixes: ["Found the ticketing URL pattern, opening the seat map"],
+      }),
+    );
+    expect(gate.action).toBe("run");
+  });
+
+  it("hard-breaks narrated same-tool calls at the narrated bar (20)", () => {
+    const gate = decideStepGate(
+      gateState({
+        recentToolCalls: varied("browser_session", 20),
+        recentTextPrefixes: ["Still working through the wizard steps"],
+      }),
+    );
+    expect(gate.action).toBe("stop");
+    if (gate.action === "stop") {
+      expect(gate.reason).toBe("doom-loop");
+      expect(gate.notice).toContain("browser_session called 20 times");
+    }
+  });
+
+  it("retention covers the narrated bar so the detector can fire", () => {
+    expect(TOOL_CALL_RETENTION).toBeGreaterThanOrEqual(
+      LOOP_LIMITS.SAME_TOOL_HARD_BREAK_NARRATED_THRESHOLD,
+    );
   });
 
   it("nudges once at 6 same-tool calls", () => {

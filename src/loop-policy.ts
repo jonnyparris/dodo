@@ -42,6 +42,14 @@ export const LOOP_LIMITS = {
   SAME_TOOL_NUDGE_THRESHOLD: 6,
   /** Same-tool calls in a row before a hard break. */
   SAME_TOOL_HARD_BREAK_THRESHOLD: 10,
+  /** Same-tool calls in a row before a hard break when the model is
+   * narrating between calls. Narrated same-tool streaks are often
+   * legitimate wizard flows (cookie → login → quantity → seat map),
+   * each step narrated — killing them at 10 cut real work mid-flow
+   * (seen 2026-09-19: a 10-step ticketing journey stopped one step
+   * before the seat map). The stricter bar applies only when the model
+   * is actually communicating; silent hammering still breaks at 10. */
+  SAME_TOOL_HARD_BREAK_NARRATED_THRESHOLD: 20,
   /** Cumulative input tokens (× tokenBudget) before the runaway backstop. */
   COST_RUNAWAY_FACTOR: 5,
 } as const;
@@ -52,12 +60,12 @@ export const DOOM_LOOP_HARD_BREAK_THRESHOLD = LOOP_LIMITS.DOOM_LOOP_THRESHOLD + 
 /**
  * How many `"toolName:argsJSON"` entries to retain. Must feed both the
  * doom-loop check (last DOOM_LOOP_HARD_BREAK_THRESHOLD) and the same-tool
- * check (last SAME_TOOL_HARD_BREAK_THRESHOLD) — pick the larger so
- * neither detector starves.
+ * check (last narrated hard-break threshold — the largest same-tool bar)
+ * — pick the largest so neither detector starves.
  */
 export const TOOL_CALL_RETENTION = Math.max(
   DOOM_LOOP_HARD_BREAK_THRESHOLD,
-  LOOP_LIMITS.SAME_TOOL_HARD_BREAK_THRESHOLD,
+  LOOP_LIMITS.SAME_TOOL_HARD_BREAK_NARRATED_THRESHOLD,
 );
 
 const TEXT_PREFIX_RETENTION = LOOP_LIMITS.DOOM_LOOP_THRESHOLD * 2;
@@ -129,6 +137,10 @@ export function trackNoTextStep(
 export interface StepGateState {
   /** `"toolName:argsJSON"` entries, oldest first. */
   recentToolCalls: readonly string[];
+  /** First ~80 chars of text from recent iterations (see
+   * trackTextIteration). Non-empty means the model is narrating between
+   * tool calls rather than hammering silently. */
+  recentTextPrefixes?: readonly string[];
   cumulativeInputTokens: number;
   tokenBudget: number;
   /** Estimated size of the messages array about to be sent. */
@@ -192,15 +204,33 @@ export function decideStepGate(state: StepGateState): StepGate {
   }
 
   // ─── Same-tool repetition hard break (looser detector) ───
-  const hardTool = detectSameToolRepetition(
-    state.recentToolCalls,
-    LOOP_LIMITS.SAME_TOOL_HARD_BREAK_THRESHOLD,
-  );
+  // Narration-aware: a streak with real text between calls (the model is
+  // communicating) gets the narrated bar; a silent streak breaks at the
+  // strict bar. recentTextPrefixes holds the last 6 tracked-text
+  // iterations, so it lags a little — the no-text watchdog, doom-loop and
+  // budget gates still bound any silent grind that slips past.
+  const narrating = (state.recentTextPrefixes?.length ?? 0) > 0;
+  const narratedTool = narrating
+    ? detectSameToolRepetition(
+        state.recentToolCalls,
+        LOOP_LIMITS.SAME_TOOL_HARD_BREAK_NARRATED_THRESHOLD,
+      )
+    : null;
+  const hardTool = narratedTool
+    ? narratedTool
+    : narrating
+      ? null
+      : detectSameToolRepetition(
+          state.recentToolCalls,
+          LOOP_LIMITS.SAME_TOOL_HARD_BREAK_THRESHOLD,
+        );
   if (hardTool) {
     return {
       action: "stop",
       reason: "doom-loop",
-      notice: `\n\n[Stopped: ${hardTool} called ${LOOP_LIMITS.SAME_TOOL_HARD_BREAK_THRESHOLD} times in a row without producing a text answer — write your conclusion from what you have so far.]\n\n`,
+      notice: narrating
+        ? `\n\n[Stopped: ${hardTool} called ${LOOP_LIMITS.SAME_TOOL_HARD_BREAK_NARRATED_THRESHOLD} times in a row — write your conclusion from what you have so far.]\n\n`
+        : `\n\n[Stopped: ${hardTool} called ${LOOP_LIMITS.SAME_TOOL_HARD_BREAK_THRESHOLD} times in a row without producing a text answer — write your conclusion from what you have so far.]\n\n`,
     };
   }
 

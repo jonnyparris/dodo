@@ -1541,6 +1541,7 @@ export class CodingAgent extends CodingAgentBase {
             const projectedNextCallTokens = estimateMessagesTokens(messages);
             const gate: StepGate = decideStepGate({
               recentToolCalls,
+              recentTextPrefixes,
               cumulativeInputTokens,
               tokenBudget,
               projectedNextCallTokens,
