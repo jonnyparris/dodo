@@ -6749,7 +6749,7 @@ export class CodingAgent extends CodingAgentBase {
     await this.connectMcpServers({ forceReconnect: true });
   }
 
-  async refreshMcpState(mcpId: string): Promise<void> {
+  async refreshMcpState(mcpId: string, callbackHost?: string): Promise<void> {
     const servers = this.getMcpServers();
     const server = servers.servers[mcpId];
     if (!server) throw new Error(`MCP server not found: ${mcpId}`);
@@ -6762,7 +6762,11 @@ export class CodingAgent extends CodingAgentBase {
     // parameter — see the long comment in /api/mcp/start-auth.
     const userId = this.env.USER_CONTROL.idFromName(this.name).toString();
     await this.addMcpServer(name, url, {
-      callbackHost: this.env.WORKER_URL,
+      // Fall back to the env value only for callers that predate the
+      // callback-host parameter; the /api/mcp/refresh-state route always
+      // passes a request-derived host so a loopback WORKER_URL never
+      // reaches the incoming MCP OAuth redirect_uri registration.
+      callbackHost: callbackHost ?? this.env.WORKER_URL,
       callbackPath: `/agents/coding-agent/${userId}/callback`,
     });
   }
