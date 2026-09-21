@@ -30,6 +30,10 @@ jobs:
   deploy-preview:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,6 +49,21 @@ jobs:
         run: npm ci
       - name: Deploy preview
         run: npx wrangler deploy --config wrangler.preview.jsonc
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Detach inherited production MCP token
+        # `wrangler deploy` inherits secrets from the previous version, so the
+        # preview worker keeps whatever DODO_MCP_TOKEN was last set on it. That
+        # secret is the production MCP credential — its Access apps bypass
+        # Cloudflare Access and it resolves to ADMIN_EMAIL — so it must not live
+        # on a worker that runs unmerged pull-request code. Remove it if present.
+        run: |
+          if npx wrangler secret list --config wrangler.preview.jsonc | grep -q '"DODO_MCP_TOKEN"'; then
+            npx wrangler secret delete DODO_MCP_TOKEN --config wrangler.preview.jsonc
+          else
+            echo "DODO_MCP_TOKEN is not bound to dodo-preview; nothing to remove."
+          fi
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
