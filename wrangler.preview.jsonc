@@ -8,7 +8,8 @@
    * (driven by .github/workflows/dodo-preview.yml)
    *
    * IMPORTANT: Keep everything in sync with wrangler.jsonc except name,
-   * routes, the OUTBOUND service target, and the preview-specific vars.
+   * routes, the OUTBOUND service target, the preview-specific vars, and any
+   * binding that would touch production state (see r2_buckets below).
    * If you add a new DO class or binding in wrangler.jsonc, add it here too.
    */
   "$schema": "node_modules/wrangler/config-schema.json",
@@ -59,10 +60,13 @@
       "new_sqlite_classes": ["ChatMonitorAgent"]
     }
   ],
-  "r2_buckets": [
-    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" },
-    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-fork-snapshots" }
-  ],
+  // Deliberately no R2 bindings. This worker runs the head commit of unmerged
+  // pull requests, so it must never bind production objects. The production
+  // buckets (dodo-workspaces, dodo-fork-snapshots) belong to prod `dodo`;
+  // binding them here gave every preview deploy read/write on the production
+  // workspace and fork-snapshot stores. If preview needs R2-backed spill,
+  // create dedicated preview buckets first (e.g. dodo-workspaces-preview,
+  // dodo-fork-snapshots-preview) and bind those here instead.
   "browser": {
     "binding": "BROWSER"
   },
