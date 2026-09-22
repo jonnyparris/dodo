@@ -1,6 +1,6 @@
 name: dodo-preview
 
-# Deploy a branch to the `dodo-preview` worker on
+# Deploy a ref to the `dodo-preview` worker on
 # https://dodo-preview.jonnyparris.club so changes can be validated before
 # merging to main and redeploying prod.
 #
@@ -13,6 +13,16 @@ name: dodo-preview
 #   CLOUDFLARE_API_TOKEN — API token with Workers Scripts Write + Workers
 #     Routes Write + Access Apps and Policies Write on the account/zone.
 #   CLOUDFLARE_ACCOUNT_ID — the account id (also set as a var in the config).
+#
+# Deploys run on explicit `workflow_dispatch` only. This workflow previously
+# also ran on `pull_request`: GitHub runs a pull_request workflow from the
+# pull request's own copy of the file (the merge commit), and the checkout used
+# the head commit, so any unmerged branch that edited this file or
+# `wrangler.preview.jsonc` reconfigured the live `dodo-preview` worker on every
+# push — its bindings, vars and triggers, including re-binding the production
+# R2 buckets (`dodo-workspaces`, `dodo-fork-snapshots`) that the preview config
+# is meant to stay detached from. Deploying a ref to the shared preview worker
+# is now a deliberate action, never a side effect of pushing to a branch.
 
 on:
   workflow_dispatch:
@@ -21,10 +31,6 @@ on:
         description: Branch or ref to deploy as preview
         required: true
         default: main
-  pull_request:
-    branches:
-      - main
-    types: [opened, synchronize, reopened]
 
 jobs:
   deploy-preview:
@@ -34,7 +40,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha }}
+          ref: ${{ github.event.inputs.ref }}
           fetch-depth: 0
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -48,31 +54,3 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      - name: Comment preview URL on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const url = "https://dodo-preview.jonnyparris.club";
-            const body = `Preview deployed: ${url}\n\nAccess-gated (same policies as prod). Load it in a Browser Run session with the Dodo service token to verify UI changes.`;
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const existing = comments.find((c) => c.body && c.body.includes("Preview deployed:"));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
