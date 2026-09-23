@@ -79,9 +79,6 @@
       "enabled": true
     }
   },
-  "triggers": {
-    "crons": ["0 */6 * * *"]
-  },
   "build": {
     "command": "npm run build"
   },
