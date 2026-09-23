@@ -59,10 +59,10 @@
       "new_sqlite_classes": ["ChatMonitorAgent"]
     }
   ],
-  "r2_buckets": [
-    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" },
-    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-fork-snapshots" }
-  ],
+  // No r2_buckets on purpose: the preview worker must never be bound to the
+  // production buckets (dodo-workspaces / dodo-fork-snapshots). Every branch
+  // deployed here runs unreviewed code, so it gets no production storage.
+  // See .github/workflows/dodo-preview.yml, which refuses such a deploy.
   "browser": {
     "binding": "BROWSER"
   },
@@ -78,9 +78,6 @@
     "traces": {
       "enabled": true
     }
-  },
-  "triggers": {
-    "crons": ["0 */6 * * *"]
   },
   "build": {
     "command": "npm run build"
