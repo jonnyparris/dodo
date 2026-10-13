@@ -860,7 +860,7 @@ export class CodingAgent extends CodingAgentBase {
           "You have full browser automation via the Chrome DevTools Protocol (CDP).",
           "",
           "**Four tools:**",
-          "- `browser_markdown` — Fetch a page as markdown via Browser Run. Fast, read-only, no browser session (~2s). Pass `query` to also get a calibrated `hasAnswer` probability telling you whether the page answers your question.",
+          "- `browser_markdown` — Fetch a page or document (HTML, PDF, Office, JSON) as markdown. Read-only. Plain fetch first, Browser Run only if the site blocks it or needs JavaScript. Long pages are windowed: call again with `offset: nextOffset` to read on. Pass `query` to also get a calibrated `hasAnswer` probability telling you whether the window answers your question.",
           "- `browser_triage` — Rank up to 8 candidate URLs by likely relevance BEFORE fetching anything. Calibrated probabilities, no page loads.",
           "- `browser_search` — Write JS to query the CDP spec (~1.7MB, stays server-side). Use this to discover available commands, events, and types before executing them.",
           "- `browser_execute` — Write JS using a `cdp` helper to run CDP commands against a live headless Chrome session. The session is opened fresh per call and closed after.",

@@ -130,7 +130,7 @@ const ORCHESTRATOR_TOOLS: ToolCatalogEntry[] = [
   {
     name: "browser_markdown",
     description:
-      "Fetch a webpage as markdown via Browser Run, with an optional calibrated verdict on whether it answers a question.",
+      "Fetch a webpage or document as markdown (plain fetch first, Browser Run fallback), windowed for long pages, with an optional calibrated verdict on whether it answers a question.",
     category: "browser",
     alwaysOn: false,
     caveat: "Requires browser binding, session browser config, and admin owner.",

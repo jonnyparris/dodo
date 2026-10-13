@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  capMarkdown,
   extractJevChoice,
   extractJevNoul,
   triageUrls,
@@ -65,20 +64,6 @@ describe("validateTargetUrl", () => {
     ]) {
       expect("error" in validateTargetUrl(bad), `expected rejection: ${bad}`).toBe(true);
     }
-  });
-});
-
-describe("capMarkdown", () => {
-  it("passes short content through unchanged", () => {
-    expect(capMarkdown("short", 100)).toBe("short");
-  });
-
-  it("truncates long content with an explanatory note", () => {
-    const long = "x".repeat(500);
-    const capped = capMarkdown(long, 100);
-    expect(capped.startsWith("x".repeat(100))).toBe(true);
-    expect(capped).toContain("TRUNCATED");
-    expect(capped).toContain("500");
   });
 });
 

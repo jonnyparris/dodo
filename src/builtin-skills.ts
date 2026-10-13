@@ -97,7 +97,7 @@ const BUILTIN_SKILLS: Array<Pick<Skill, "name" | "description" | "body">> = [
       "Dodo exposes four browser tools. Two are covered by this skill (both backed by Cloudflare Browser Rendering and `@cloudflare/puppeteer`); the other two are read-only fetch tools that don't need it:",
       "",
       "- **`browser_triage`** — rank candidate URLs by likely relevance before fetching anything (calibrated probabilities, no page loads). No session involved — this skill does not apply.",
-      "- **`browser_markdown`** — fetch a page's content as markdown (~2s, read-only, no browser session), with an optional calibrated `hasAnswer` verdict. No CDP involved — **this skill does not apply**. Prefer it over `browser_execute` for pure reading tasks.",
+      "- **`browser_markdown`** — fetch a page or document as markdown (read-only; plain fetch first, Browser Run only as a fallback; windowed via `offset`/`nextOffset`), with an optional calibrated `hasAnswer` verdict. No CDP involved — **this skill does not apply**. Prefer it over `browser_execute` for pure reading tasks.",
       "- **`browser_search`** — run JS against the ~1.7MB CDP spec, server-side. Use this to discover the right CDP method/params/event before executing. Cheap (~50ms), no browser launched.",
       "- **`browser_execute`** — run JS against a live headless Chrome session via a `cdp` helper. **A fresh browser with one blank page is launched per call**, then closed when the function returns. No state persists between calls.",
       "",
