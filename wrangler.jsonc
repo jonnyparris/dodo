@@ -121,8 +121,9 @@
     // Built-in web_search tool (env.AI.websearch via AI Gateway). Admin-only,
     // billed per search to this gateway's account. Remove to disable.
     "WEB_SEARCH_GATEWAY_ID": "jp-gw",
-    // ceramic (default, ZDR, $0.25/1k) | linkup (ZDR, $5/1k) | exa (no ZDR, $7/1k)
-    "WEB_SEARCH_PROVIDER": "ceramic",
+    // linkup (ZDR, $5/1k) | ceramic (ZDR, $0.25/1k) | exa (no ZDR, $7/1k).
+    // Ceramic returned spam/off-topic results on test queries (2026-10-13).
+    "WEB_SEARCH_PROVIDER": "linkup",
     // Default Replicate image model for /generate and image editing. Per-user
     // overridable via the replicateImageModel config field. Requires the
     // REPLICATE_API_TOKEN secret to be set.

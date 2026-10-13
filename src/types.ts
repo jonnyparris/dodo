@@ -33,7 +33,7 @@ export interface Env {
   WORKER_URL: string;
   /** AI Gateway id for the built-in web_search tool. Unset = tool off. */
   WEB_SEARCH_GATEWAY_ID?: string;
-  /** Web Search provider: ceramic (default, ZDR, $0.25/1k) | linkup | exa. */
+  /** Web Search provider: linkup (set in wrangler.jsonc) | ceramic (code default) | exa. */
   WEB_SEARCH_PROVIDER?: string;
   WORKSPACE_BUCKET?: R2Bucket;
   /**
