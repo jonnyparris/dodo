@@ -118,6 +118,11 @@
     // Default model used when a new session is created with activeGateway=ai-gateway.
     // Workers AI models (`@cf/…`) are only routable via AI Gateway.
     "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
+    // Built-in web_search tool (env.AI.websearch via AI Gateway). Admin-only,
+    // billed per search to this gateway's account. Remove to disable.
+    "WEB_SEARCH_GATEWAY_ID": "jp-gw",
+    // ceramic (default, ZDR, $0.25/1k) | linkup (ZDR, $5/1k) | exa (no ZDR, $7/1k)
+    "WEB_SEARCH_PROVIDER": "ceramic",
     // Default Replicate image model for /generate and image editing. Per-user
     // overridable via the replicateImageModel config field. Requires the
     // REPLICATE_API_TOKEN secret to be set.

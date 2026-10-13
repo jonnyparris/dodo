@@ -31,6 +31,10 @@ export interface Env {
   OPENCODE_BASE_URL: string;
   OUTBOUND?: Fetcher;
   WORKER_URL: string;
+  /** AI Gateway id for the built-in web_search tool. Unset = tool off. */
+  WEB_SEARCH_GATEWAY_ID?: string;
+  /** Web Search provider: ceramic (default, ZDR, $0.25/1k) | linkup | exa. */
+  WEB_SEARCH_PROVIDER?: string;
   WORKSPACE_BUCKET?: R2Bucket;
   /**
    * Bucket for inter-DO fork snapshots. Snapshots are JSON payloads
