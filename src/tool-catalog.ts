@@ -143,6 +143,14 @@ const ORCHESTRATOR_TOOLS: ToolCatalogEntry[] = [
     alwaysOn: false,
     caveat: "Requires browser binding, session browser config, and admin owner.",
   },
+  {
+    name: "web_search",
+    description:
+      "Search the public web via the Cloudflare Web Search API (AI Gateway). Returns titles, URLs and short descriptions.",
+    category: "browser",
+    alwaysOn: false,
+    caveat: "Requires admin owner and WEB_SEARCH_GATEWAY_ID (billed per search).",
+  },
   // Git — only the hot-path quartet is top-level. Everything else is
   // reachable inside codemode via the `git.*` provider namespace; flagged
   // with CODEMODE_GIT_CAVEAT so the UI dims them and the drift test can

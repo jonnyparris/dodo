@@ -56,10 +56,10 @@ const DEFAULT_CLOUDFLARE_REMOTE_MCP_CATALOG: McpCatalogEntry[] = [
     // Staging endpoint. Same *.mcp.cloudflare.com OAuth family as the
     // Browser Rendering MCP above (which works from Dodo), unlike cf-portal
     // on portal.mcp.cfdata.org (loopback-only redirect, excluded below).
-    // The companion `web_search` Worker binding (env.WEBSEARCH) was tried and
-    // reverted — the control plane silently drops the binding so it never
-    // materialises at runtime. This MCP is the working path until the binding
-    // GAs. See commit reverting "add Cloudflare Web Search binding".
+    // Admin-owned sessions get the built-in `web_search` tool instead
+    // (env.AI.websearch() via AI Gateway — see src/web-search.ts), which
+    // replaced the reverted dedicated env.WEBSEARCH binding. This MCP stays
+    // for non-admin users, who bill their own account.
     url: "https://websearch-staging.mcp.cloudflare.com/mcp",
     setupGuide:
       "Connect with OAuth. Staging: your Cloudflare account must be enabled for Web Search by the Web Search team before queries succeed.",

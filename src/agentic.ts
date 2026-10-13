@@ -30,6 +30,17 @@ import { sanitizeToolJsonSchema } from "./tool-schema";
 import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";
 import type { AppConfig, Env, TodoStore } from "./types";
+import {
+  createWebSearchTool,
+  hasWebSearch,
+  parseWebSearchProvider,
+  type WebSearchAi,
+} from "./web-search";
+
+/** True when the built-in web_search tool should be registered. */
+export function isWebSearchEnabled(env: Env, isAdminUser: boolean | undefined): boolean {
+  return Boolean(isAdminUser && env.WEB_SEARCH_GATEWAY_ID && hasWebSearch(env.AI));
+}
 
 /** Options passed through from the coding agent into tool factories. */
 /** Metadata describing an OAuth-connected MCP tool federated from the per-user hub DO. */
@@ -273,6 +284,7 @@ export const KNOWN_CONDITIONAL_TOOL_NAMES = [
   "browser_execute",
   "browser_markdown", // requires browser binding + admin + session config
   "browser_triage",
+  "web_search",     // requires admin owner + WEB_SEARCH_GATEWAY_ID + AI.websearch
 ] as const;
 
 export function capCodemodeResult(result: unknown, maxBytes: number): unknown {
@@ -1728,6 +1740,18 @@ function buildTools(
       ai: env.AI as unknown as JevAi,
     });
     Object.assign(tools, webFetchTools);
+  }
+
+  // Web search — Cloudflare Web Search API via env.AI.websearch() through
+  // AI Gateway. Admin-only because every call bills the gateway's account;
+  // WEB_SEARCH_GATEWAY_ID is the kill switch. Independent of browserEnabled
+  // (no browser session involved).
+  if (isWebSearchEnabled(env, options?.isAdminUser)) {
+    tools.web_search = createWebSearchTool({
+      ai: env.AI as unknown as WebSearchAi,
+      gatewayId: env.WEB_SEARCH_GATEWAY_ID!,
+      provider: parseWebSearchProvider(env.WEB_SEARCH_PROVIDER),
+    });
   }
 
   return tools;
