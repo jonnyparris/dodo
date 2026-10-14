@@ -3,26 +3,46 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Ported from Signal agent (agent/src/browser/pool.test.ts, 36981d6).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const launched: any[] = [];
-function fakeTarget(url: string) {
-  const cdp = { url, send: vi.fn(async () => ({ result: { value: url } })) };
-  return { type: () => "page", url: () => url, createCDPSession: vi.fn(async () => cdp), cdp };
-}
+// Mirrors live Browser Run after puppeteer.connect: puppeteer sees no
+// targets, but raw CDP lists the tab we worked in plus stray blank tabs.
 function fakeBrowser(id: string) {
-  // Mirrors live Browser Run: the tab we worked in, plus stray blank tabs.
-  const targets = [fakeTarget("about:blank"), fakeTarget("https://x.test/p"), fakeTarget("about:blank")];
-  const page = { url: () => "https://x.test/p", createCDPSession: async () => targets[1].cdp };
-  return {
-    id,
-    targets: () => targets,
-    targetsList: targets,
-    sessionId: () => id,
-    waitForTarget: vi.fn(async () => {
-      throw new Error("timeout");
+  const tabs = [
+    { targetId: "blank-0", type: "page", url: "about:blank" },
+    { targetId: "work", type: "page", url: "https://x.test/p" },
+  ];
+  const attached = new Map<string, unknown>();
+  const closed: string[] = [];
+  let tmpCount = 0;
+  const conn = {
+    send: vi.fn(async (method: string, params?: { targetId?: string }) => {
+      if (method === "Target.getTargets") return { targetInfos: tabs };
+      if (method === "Target.attachToTarget") {
+        const sid = `sess-${params!.targetId}`;
+        attached.set(sid, { attachedTo: params!.targetId, send: vi.fn(async () => ({ result: { value: "https://x.test/p" } })) });
+        return { sessionId: sid };
+      }
+      if (method === "Target.closeTarget") {
+        closed.push(params!.targetId!);
+        return {};
+      }
+      throw new Error(`unexpected ${method}`);
     }),
-    newPage: vi.fn(async () => page),
-    close: vi.fn(),
-    disconnect: vi.fn(),
+    session: (sid: string) => attached.get(sid) ?? null,
   };
+  const newPage = vi.fn(async () => {
+    const targetId = `tmp-${tmpCount++}`;
+    tabs.push({ targetId, type: "page", url: "about:blank" });
+    const session = {
+      connection: () => conn,
+      send: vi.fn(async (method: string) => {
+        if (method === "Target.getTargetInfo") return { targetInfo: { targetId } };
+        // First call navigates this fresh tab; currentUrl() reads it back.
+        return { result: { value: "https://x.test/p" } };
+      }),
+    };
+    return { createCDPSession: async () => session };
+  });
+  return { id, sessionId: () => id, newPage, conn, attached, closed, close: vi.fn(), disconnect: vi.fn() };
 }
 vi.mock("@cloudflare/puppeteer", () => ({
   default: {
@@ -94,15 +114,24 @@ describe("leaseBrowser", () => {
     expect(launched).toHaveLength(2);
   });
 
-  it("reattaches to the tab it left, not a blank one, without opening a new tab", async () => {
+  it("reattaches to the tab it left via raw CDP and closes the temp tab", async () => {
     const a = await leaseBrowser(B, "t1");
     await a.release(true);
-    const b = launched[0].b;
-    expect(b.newPage).toHaveBeenCalledTimes(1);
-    await leaseBrowser(B, "t1");
-    expect(b.newPage).toHaveBeenCalledTimes(1);
-    expect(b.targetsList[1].createCDPSession).toHaveBeenCalled();
-    expect(b.targetsList[0].createCDPSession).not.toHaveBeenCalled();
-    expect(b.targetsList[2].createCDPSession).not.toHaveBeenCalled();
+    const b = await leaseBrowser(B, "t1");
+    expect(b.reused).toBe(true);
+    const br = launched[0].b;
+    expect([...br.attached.values()].map((s: { attachedTo: string }) => s.attachedTo)).toEqual(["work"]);
+    expect(br.closed).toEqual(["tmp-1"]);
+  });
+
+  it("keeps the temp tab as a fresh page when the old tab is gone", async () => {
+    const a = await leaseBrowser(B, "t1");
+    await a.release(true);
+    const br = launched[0].b;
+    br.conn.send.mockImplementationOnce(async () => ({ targetInfos: [] }));
+    const b = await leaseBrowser(B, "t1");
+    expect(b.reused).toBe(true);
+    expect(br.attached.size).toBe(0);
+    expect(br.closed).toEqual([]);
   });
 });

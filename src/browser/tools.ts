@@ -285,9 +285,11 @@ export function createBrowserTools(options: BrowserToolsOptions): Record<string,
                 .then((r) => String((r as { result?: { value?: unknown } }).result?.value ?? ""))
                 .catch(() => "")
             : "";
-          const sessionNote = lease.reused
-            ? `[Browser reused from your previous browser_execute call. The page is still open at ${resumedAt || "(unknown URL)"}; continue from it instead of re-navigating.]`
-            : "";
+          const sessionNote = !lease.reused
+            ? ""
+            : resumedAt && resumedAt !== "about:blank"
+              ? `[Browser reused from your previous browser_execute call. The page is still open at ${resumedAt}; continue from it instead of re-navigating.]`
+              : "[Browser reused from your previous browser_execute call (cookies kept), but the previous tab could not be found: you are on a blank page. Navigate again.]";
           const withNote = (out: string): string => (sessionNote ? `${sessionNote}\n${out}` : out);
 
           const providers: ResolvedProvider[] = [

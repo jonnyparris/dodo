@@ -187,36 +187,52 @@ const isBlank = (url: string): boolean => !url || url === "about:blank";
 
 /**
  * Find the tab the previous call left behind and open a CDP session on it.
- * `browser.pages()` on a reconnected Browser Run session does not return the
- * existing tabs (live 2026-10-14: every reuse opened a new about:blank tab),
- * so match page targets by URL instead. Target discovery is async after
- * connect, hence the short wait. Falls back to a new tab.
+ *
+ * After puppeteer.connect, Browser Run's puppeteer exposes no targets
+ * (live 2026-10-14: browser.pages() and browser.targets() both empty, even
+ * after waiting), so the old tab is invisible to puppeteer. Raw CDP still
+ * sees it. Open a temporary tab to get at the connection, list targets at
+ * the browser level, attach to the old tab with a flat browser-owned session
+ * (so it survives closing the temp tab), then close the temp tab. Any
+ * failure keeps the temp tab as a fresh page.
  */
 async function reattach(
   browser: Browser,
   lastUrl: string | undefined,
   diag: Record<string, unknown> = {},
 ): Promise<PuppeteerCDPSession> {
-  const pageTargets = () => browser.targets().filter((t) => t.type() === "page");
-  const pick = () => {
-    const pages = pageTargets();
-    return (
-      (lastUrl && !isBlank(lastUrl) ? pages.find((t) => t.url() === lastUrl) : undefined) ??
-      [...pages].reverse().find((t) => !isBlank(t.url()))
-    );
-  };
-  diag.targetsAtConnect = browser.targets().map((t) => `${t.type()} ${t.url()}`);
-  let target = pick();
-  if (!target && lastUrl && !isBlank(lastUrl)) {
-    target = await browser
-      .waitForTarget((t) => t.type() === "page" && t.url() === lastUrl, { timeout: 2_000 })
-      .catch(() => undefined);
-  }
-  diag.targetsAfterWait = browser.targets().map((t) => `${t.type()} ${t.url()}`);
-  diag.picked = target ? target.url() : "new tab";
-  if (target) return target.createCDPSession();
   const page = await browser.newPage();
-  return page.createCDPSession();
+  const tmp = await page.createCDPSession();
+  if (!lastUrl || isBlank(lastUrl)) {
+    diag.picked = "new tab (no previous URL)";
+    return tmp;
+  }
+  try {
+    const conn = tmp.connection();
+    if (!conn) throw new Error("no connection");
+    const { targetInfo: self } = await tmp.send("Target.getTargetInfo");
+    const { targetInfos } = await conn.send("Target.getTargets");
+    const pages = targetInfos.filter((t) => t.type === "page" && t.targetId !== self.targetId);
+    diag.targets = pages.map((t) => t.url);
+    const hit = pages.find((t) => t.url === lastUrl) ?? [...pages].reverse().find((t) => !isBlank(t.url));
+    if (!hit) throw new Error("previous tab not found");
+    const { sessionId } = await conn.send("Target.attachToTarget", { targetId: hit.targetId, flatten: true });
+    // The Connection registers the session on the Target.attachedToTarget
+    // event, which normally arrives before the command response.
+    let session = conn.session(sessionId);
+    for (let i = 0; !session && i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+      session = conn.session(sessionId);
+    }
+    if (!session) throw new Error("attached session not registered");
+    await conn.send("Target.closeTarget", { targetId: self.targetId }).catch(() => undefined);
+    diag.picked = hit.url;
+    return session;
+  } catch (error) {
+    diag.error = error instanceof Error ? error.message : String(error);
+    diag.picked = "new tab";
+    return tmp;
+  }
 }
 
 async function currentUrl(session: CdpSession): Promise<string | undefined> {
