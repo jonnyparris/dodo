@@ -24,22 +24,17 @@
 # Usage:
 #   scripts/post-deploy-smoke.sh                                  # against prod
 #   DODO_URL=https://staging.dodo.example.com scripts/post-deploy-smoke.sh
-#   AUTH_MODE=access scripts/post-deploy-smoke.sh                 # non-WARP machine
+#   AUTH_MODE=access scripts/post-deploy-smoke.sh                 # browser login
 #   AUTH_MODE=none DODO_URL=http://127.0.0.1:8787 scripts/post-deploy-smoke.sh
 #
-# Auth:
-#   - Default (AUTH_MODE=none) uses plain curl: the edge injects the Access
-#     JWT from the device's WARP session, so auth-gated paths pass with no
-#     interactive login and no local token cache. Verified: POST /session
-#     returns 201 with the owner identity auto-resolved.
-#   - AUTH_MODE=access uses `cloudflared access curl` — only needed on
-#     machines without a WARP session; its token cache expires and each
-#     lapse opens a browser login window.
+# Auth: see scripts/lib/smoke-auth.sh. Default AUTH_MODE=auto uses an Access
+# service token when one is configured (env or macOS keychain), else plain curl.
 
 set -euo pipefail
 
 DODO_URL="${DODO_URL:-https://dodo.jonnyparris.club}"
-AUTH_MODE="${AUTH_MODE:-none}" # "none" (plain curl + WARP auto-auth) | "access" (cloudflared)
+# shellcheck source=lib/smoke-auth.sh
+source "$(dirname "$0")/lib/smoke-auth.sh"
 EXPECTED_COMMIT="${EXPECTED_COMMIT:-}"  # if set, fail unless /version.json matches
 
 # ANSI colour
@@ -60,11 +55,7 @@ call() {
   if [[ -n "$body" ]]; then
     curl_args+=(-H "content-type: application/json" --data "$body")
   fi
-  if [[ "$AUTH_MODE" == "access" ]]; then
-    cloudflared access curl "$url" "${curl_args[@]}"
-  else
-    curl "${curl_args[@]}" "$url"
-  fi
+  smoke_curl "$url" "${curl_args[@]}"
 }
 
 # Split "body\nHTTPCODE" → RESP_BODY + RESP_CODE
