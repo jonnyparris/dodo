@@ -118,6 +118,24 @@ export class CdpSession {
     }
   }
 
+  /** Drop the devtools connection but leave the browser running (keep_alive). */
+  async disconnect(): Promise<void> {
+    try {
+      await this.#browser.disconnect();
+    } catch {
+      // already gone
+    }
+  }
+
+  /** Browser Run session id, used to reconnect on the next call. */
+  get browserSessionId(): string | undefined {
+    try {
+      return this.#browser.sessionId();
+    } catch {
+      return undefined;
+    }
+  }
+
   #recordDebug(type: string, data: Record<string, unknown>): void {
     this.#debugLog.push({ at: new Date().toISOString(), type, ...data });
     if (this.#debugLog.length > MAX_DEBUG_ENTRIES) {
@@ -139,4 +157,92 @@ export async function connectBrowser(
   const page = await browser.newPage();
   const cdpSession = await page.createCDPSession();
   return new CdpSession(browser, cdpSession);
+}
+
+/**
+ * How long a released browser stays alive for the next browser_execute call.
+ * Ported from Signal agent (36981d6): without reuse, every call re-opened the
+ * site, re-dismissed the cookie wall, and lost half-filled forms the model
+ * assumed were still there. Calls within a turn are usually 5-40s apart.
+ */
+export const BROWSER_KEEP_ALIVE_MS = 180_000;
+
+/** Reconnect only if the browser has this much keep_alive left. */
+const REUSE_SAFETY_MARGIN_MS = 10_000;
+
+interface PooledBrowser {
+  sessionId: string;
+  releasedAt: number;
+  busy: boolean;
+}
+
+/**
+ * One reusable browser per key (Dodo session). Lives in isolate memory, so
+ * an evicted Durable Object just falls back to a fresh launch; Browser Run
+ * closes the orphaned browser when keep_alive runs out.
+ */
+const pool = new Map<string, PooledBrowser>();
+
+export interface LeasedBrowser {
+  session: CdpSession;
+  /** True when this is the previous call's browser, page left where it was. */
+  reused: boolean;
+  /** Give the browser back for reuse (ok) or throw it away (broken). */
+  release(ok: boolean): Promise<void>;
+}
+
+/**
+ * Reconnect to this key's browser if it was released recently, else launch a
+ * fresh one with keep_alive so it can be reused. Any reconnect failure falls
+ * back to a fresh launch: reuse is an optimisation, never a dependency.
+ */
+export async function leaseBrowser(
+  browserBinding: Fetcher,
+  key: string,
+  now: () => number = Date.now,
+): Promise<LeasedBrowser> {
+  const prev = pool.get(key);
+  let session: CdpSession | undefined;
+  let reused = false;
+  if (prev && !prev.busy && now() - prev.releasedAt < BROWSER_KEEP_ALIVE_MS - REUSE_SAFETY_MARGIN_MS) {
+    prev.busy = true;
+    try {
+      const browser = await puppeteer.connect(browserBinding, prev.sessionId);
+      const pages = await browser.pages();
+      const page = pages.find((p) => p.url() !== "about:blank") ?? pages[0] ?? (await browser.newPage());
+      session = new CdpSession(browser, await page.createCDPSession());
+      reused = true;
+    } catch {
+      pool.delete(key);
+      session = undefined;
+    }
+  }
+  if (!session) {
+    const browser = await puppeteer.launch(browserBinding, { keep_alive: BROWSER_KEEP_ALIVE_MS });
+    const page = await browser.newPage();
+    session = new CdpSession(browser, await page.createCDPSession());
+  }
+  const s = session;
+  const sid = s.browserSessionId;
+  if (sid) pool.set(key, { sessionId: sid, releasedAt: now(), busy: true });
+  return {
+    session: s,
+    reused,
+    release: async (ok: boolean) => {
+      const entry = pool.get(key);
+      if (ok && sid && entry?.sessionId === sid) {
+        entry.busy = false;
+        entry.releasedAt = now();
+        await s.disconnect();
+      } else {
+        if (entry?.sessionId === sid) pool.delete(key);
+        await s.close();
+      }
+    },
+  };
+}
+
+/** Test hook. */
+export function _resetBrowserPool(): void {
+  pool.clear();
 }

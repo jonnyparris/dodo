@@ -2,7 +2,7 @@ import { tool } from "ai";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import type { ResolvedProvider } from "@cloudflare/codemode";
 import { z } from "zod";
-import { CdpSession, connectBrowser } from "./cdp-session";
+import { BROWSER_KEEP_ALIVE_MS, leaseBrowser, type CdpSession, type LeasedBrowser } from "./cdp-session";
 import { truncateResponse } from "./truncate";
 import { uploadAttachment, type AttachmentRef } from "../attachments";
 import type { Env } from "../types";
@@ -64,8 +64,15 @@ async () => {
 
 const EXECUTE_DESCRIPTION = `Execute CDP commands against a live browser session using JavaScript code.
 
-A fresh browser with one blank page is launched per call. The CDP session is already
-attached to that page — you can send page-scoped commands directly without attaching.
+The browser persists between calls in this session. If your previous browser_execute
+call finished less than ~${Math.round(BROWSER_KEEP_ALIVE_MS / 60_000) - 1} minutes ago, you get the same browser back with the page
+still where you left it (URL, cookies, dismissed dialogs, half-filled forms). The result
+says so when that happens: continue from the open page instead of re-navigating.
+Otherwise a fresh browser with one blank page is launched. Either way the CDP session is
+already attached to the page, so you can send page-scoped commands without attaching.
+A call that times out throws its browser away; the next call starts fresh.
+Each call gets a new CDP session, so re-enable domains (Page.enable etc.) and re-apply
+the viewport override even when the browser was reused.
 
 Available in your code:
 
@@ -264,8 +271,24 @@ export function createBrowserTools(options: BrowserToolsOptions): Record<string,
       }),
       execute: async ({ code }: { code: string }, execOptions: { toolCallId: string }) => {
         let session: CdpSession | undefined;
+        let lease: LeasedBrowser | undefined;
+        let healthy = false;
         try {
-          session = await connectBrowser(options.browser);
+          // One browser per Dodo session, kept alive between calls (see
+          // leaseBrowser). Fallback key only matters for callers that don't
+          // pass a sessionId (tests).
+          lease = await leaseBrowser(options.browser, options.sessionId ?? "default");
+          session = lease.session;
+          const resumedAt = lease.reused
+            ? await session
+                .send("Runtime.evaluate", { expression: "location.href", returnByValue: true })
+                .then((r) => String((r as { result?: { value?: unknown } }).result?.value ?? ""))
+                .catch(() => "")
+            : "";
+          const sessionNote = lease.reused
+            ? `[Browser reused from your previous browser_execute call. The page is still open at ${resumedAt || "(unknown URL)"}; continue from it instead of re-navigating.]`
+            : "";
+          const withNote = (out: string): string => (sessionNote ? `${sessionNote}\n${out}` : out);
 
           const providers: ResolvedProvider[] = [
             {
@@ -291,8 +314,11 @@ export function createBrowserTools(options: BrowserToolsOptions): Record<string,
           ];
 
           const result = await executor.execute(code, providers);
+          // A bug in the model's code leaves the page usable. A timeout may
+          // leave host-side work still driving it, so that browser is dropped.
+          healthy = !result.error || !/timed? ?out/i.test(result.error);
           if (result.error) {
-            return { error: result.error };
+            return sessionNote ? { error: result.error, note: sessionNote } : { error: result.error };
           }
 
           // Pull screenshots out of the result before stringifying — base64
@@ -328,19 +354,19 @@ export function createBrowserTools(options: BrowserToolsOptions): Record<string,
                   `  ${i + 1}. ${r.mediaType} (${Math.round(r.size / 1024)}KB) — ${r.url}`,
                 )
                 .join("\n");
-              return [
+              return withNote([
                 scrubbedText,
                 "",
                 `[${uploaded.length} screenshot${uploaded.length === 1 ? "" : "s"} captured and rendered inline in the chat — base64 data stripped from this tool output to conserve context. The user sees the image${uploaded.length === 1 ? "" : "s"} above.]`,
                 refs,
-              ].join("\n");
+              ].join("\n"));
             }
           }
-          return truncateResponse(result.result);
+          return withNote(truncateResponse(result.result));
         } catch (error) {
           return { error: formatError(error) };
         } finally {
-          await session?.close();
+          await lease?.release(healthy);
         }
       },
     }),
