@@ -35,3 +35,7 @@ Branch `feat/deps-agents-028`. Deps bump only; **does not typecheck**. Do not me
 - **A. Rebuild the loop on Think 0.20 hooks.** Biggest change. Gains durable submissions, chat recovery, built-in overflow compaction, media eviction, `agentTool` for explore/task, and `agents/webfetch`.
 - **B. Rebase CodingAgent on `AIChatAgent` (`@cloudflare/ai-chat` 0.12.1).** It still has `onChatMessage(onFinish, options)`, so the loop stays as it is. Lose Think's workspace/session/config. Needs a different message-storage migration (`cf_ai_chat_agent_messages`), and Dodo's own compaction table has to be rebuilt.
 - **C. Stay on 0.8.7 and pull in only `agents/webfetch` via an npm alias.** Cheapest. Goes against "upgrade separately first".
+
+## Flue check (2026-10-14)
+
+Rejected. `@cloudflare/computer` worker-shell (Dynamic Worker) needs the `experimental` flag no matter which framework we use, so Flue doesn't unblock Workers Builds. Flue also has no per-step hook or message rewrite (the transcript is append-only), its tools aren't AI SDK, and its storage is new. Path A continues.
