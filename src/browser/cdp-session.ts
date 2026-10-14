@@ -101,6 +101,11 @@ export class CdpSession {
     return sessionId;
   }
 
+  /** Record a host-side event (e.g. reattach diagnostics) in the debug log. */
+  note(type: string, data: Record<string, unknown>): void {
+    this.#recordDebug(type, data);
+  }
+
   getDebugLog(limit = 50): DebugEntry[] {
     const normalized = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 50;
     return this.#debugLog.slice(-normalized);
@@ -187,7 +192,11 @@ const isBlank = (url: string): boolean => !url || url === "about:blank";
  * so match page targets by URL instead. Target discovery is async after
  * connect, hence the short wait. Falls back to a new tab.
  */
-async function reattach(browser: Browser, lastUrl: string | undefined): Promise<PuppeteerCDPSession> {
+async function reattach(
+  browser: Browser,
+  lastUrl: string | undefined,
+  diag: Record<string, unknown> = {},
+): Promise<PuppeteerCDPSession> {
   const pageTargets = () => browser.targets().filter((t) => t.type() === "page");
   const pick = () => {
     const pages = pageTargets();
@@ -196,12 +205,15 @@ async function reattach(browser: Browser, lastUrl: string | undefined): Promise<
       [...pages].reverse().find((t) => !isBlank(t.url()))
     );
   };
+  diag.targetsAtConnect = browser.targets().map((t) => `${t.type()} ${t.url()}`);
   let target = pick();
   if (!target && lastUrl && !isBlank(lastUrl)) {
     target = await browser
       .waitForTarget((t) => t.type() === "page" && t.url() === lastUrl, { timeout: 2_000 })
       .catch(() => undefined);
   }
+  diag.targetsAfterWait = browser.targets().map((t) => `${t.type()} ${t.url()}`);
+  diag.picked = target ? target.url() : "new tab";
   if (target) return target.createCDPSession();
   const page = await browser.newPage();
   return page.createCDPSession();
@@ -251,7 +263,9 @@ export async function leaseBrowser(
     prev.busy = true;
     try {
       const browser = await puppeteer.connect(browserBinding, prev.sessionId);
-      session = new CdpSession(browser, await reattach(browser, prev.lastUrl));
+      const diag: Record<string, unknown> = { lastUrl: prev.lastUrl };
+      session = new CdpSession(browser, await reattach(browser, prev.lastUrl, diag));
+      session.note("reattach", diag);
       reused = true;
     } catch {
       pool.delete(key);
@@ -273,6 +287,7 @@ export async function leaseBrowser(
       const entry = pool.get(key);
       if (ok && sid && entry?.sessionId === sid) {
         entry.lastUrl = await currentUrl(s);
+        s.note("release", { lastUrl: entry.lastUrl });
         entry.busy = false;
         entry.releasedAt = now();
         await s.disconnect();
