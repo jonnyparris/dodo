@@ -3,13 +3,23 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Ported from Signal agent (agent/src/browser/pool.test.ts, 36981d6).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const launched: any[] = [];
+function fakeTarget(url: string) {
+  const cdp = { url, send: vi.fn(async () => ({ result: { value: url } })) };
+  return { type: () => "page", url: () => url, createCDPSession: vi.fn(async () => cdp), cdp };
+}
 function fakeBrowser(id: string) {
-  const page = { url: () => "https://x.test/p", createCDPSession: async () => ({ send: vi.fn() }) };
+  // Mirrors live Browser Run: the tab we worked in, plus stray blank tabs.
+  const targets = [fakeTarget("about:blank"), fakeTarget("https://x.test/p"), fakeTarget("about:blank")];
+  const page = { url: () => "https://x.test/p", createCDPSession: async () => targets[1].cdp };
   return {
     id,
+    targets: () => targets,
+    targetsList: targets,
     sessionId: () => id,
-    pages: async () => [page],
-    newPage: async () => page,
+    waitForTarget: vi.fn(async () => {
+      throw new Error("timeout");
+    }),
+    newPage: vi.fn(async () => page),
     close: vi.fn(),
     disconnect: vi.fn(),
   };
@@ -82,5 +92,17 @@ describe("leaseBrowser", () => {
     const b = await leaseBrowser(B, "t1");
     expect(b.reused).toBe(false);
     expect(launched).toHaveLength(2);
+  });
+
+  it("reattaches to the tab it left, not a blank one, without opening a new tab", async () => {
+    const a = await leaseBrowser(B, "t1");
+    await a.release(true);
+    const b = launched[0].b;
+    expect(b.newPage).toHaveBeenCalledTimes(1);
+    await leaseBrowser(B, "t1");
+    expect(b.newPage).toHaveBeenCalledTimes(1);
+    expect(b.targetsList[1].createCDPSession).toHaveBeenCalled();
+    expect(b.targetsList[0].createCDPSession).not.toHaveBeenCalled();
+    expect(b.targetsList[2].createCDPSession).not.toHaveBeenCalled();
   });
 });

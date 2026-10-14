@@ -174,6 +174,49 @@ interface PooledBrowser {
   sessionId: string;
   releasedAt: number;
   busy: boolean;
+  /** URL of the page when it was released, used to find the same tab again. */
+  lastUrl?: string;
+}
+
+const isBlank = (url: string): boolean => !url || url === "about:blank";
+
+/**
+ * Find the tab the previous call left behind and open a CDP session on it.
+ * `browser.pages()` on a reconnected Browser Run session does not return the
+ * existing tabs (live 2026-10-14: every reuse opened a new about:blank tab),
+ * so match page targets by URL instead. Target discovery is async after
+ * connect, hence the short wait. Falls back to a new tab.
+ */
+async function reattach(browser: Browser, lastUrl: string | undefined): Promise<PuppeteerCDPSession> {
+  const pageTargets = () => browser.targets().filter((t) => t.type() === "page");
+  const pick = () => {
+    const pages = pageTargets();
+    return (
+      (lastUrl && !isBlank(lastUrl) ? pages.find((t) => t.url() === lastUrl) : undefined) ??
+      [...pages].reverse().find((t) => !isBlank(t.url()))
+    );
+  };
+  let target = pick();
+  if (!target && lastUrl && !isBlank(lastUrl)) {
+    target = await browser
+      .waitForTarget((t) => t.type() === "page" && t.url() === lastUrl, { timeout: 2_000 })
+      .catch(() => undefined);
+  }
+  if (target) return target.createCDPSession();
+  const page = await browser.newPage();
+  return page.createCDPSession();
+}
+
+async function currentUrl(session: CdpSession): Promise<string | undefined> {
+  try {
+    const r = (await session.send("Runtime.evaluate", {
+      expression: "location.href",
+      returnByValue: true,
+    })) as { result?: { value?: unknown } };
+    return typeof r?.result?.value === "string" ? r.result.value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -208,9 +251,7 @@ export async function leaseBrowser(
     prev.busy = true;
     try {
       const browser = await puppeteer.connect(browserBinding, prev.sessionId);
-      const pages = await browser.pages();
-      const page = pages.find((p) => p.url() !== "about:blank") ?? pages[0] ?? (await browser.newPage());
-      session = new CdpSession(browser, await page.createCDPSession());
+      session = new CdpSession(browser, await reattach(browser, prev.lastUrl));
       reused = true;
     } catch {
       pool.delete(key);
@@ -231,6 +272,7 @@ export async function leaseBrowser(
     release: async (ok: boolean) => {
       const entry = pool.get(key);
       if (ok && sid && entry?.sessionId === sid) {
+        entry.lastUrl = await currentUrl(s);
         entry.busy = false;
         entry.releasedAt = now();
         await s.disconnect();
