@@ -21,7 +21,7 @@
     "@ai-sdk/openai-compatible": "^3.0.68",
     "@cloudflare/codemode": "^0.5.4",
     "@cloudflare/computer": "^0.5.1",
-    "@cloudflare/puppeteer": "^1.0.6",
+    "@cloudflare/puppeteer": "^1.4.0",
     "@cloudflare/shell": "^0.4.3",
     "@cloudflare/think": "^0.20.2",
     "@hono/capnweb": "^0.1.0",
