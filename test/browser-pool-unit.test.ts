@@ -3,46 +3,21 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Ported from Signal agent (agent/src/browser/pool.test.ts, 36981d6).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const launched: any[] = [];
-// Mirrors live Browser Run after puppeteer.connect: puppeteer sees no
-// targets, but raw CDP lists the tab we worked in plus stray blank tabs.
+// Mirrors live Browser Run on @cloudflare/puppeteer 1.4.0 after connect:
+// pages() lists the tab we worked in plus a stray blank tab.
 function fakeBrowser(id: string) {
-  const tabs = [
-    { targetId: "blank-0", type: "page", url: "about:blank" },
-    { targetId: "work", type: "page", url: "https://x.test/p" },
-  ];
-  const attached = new Map<string, unknown>();
-  const closed: string[] = [];
-  let tmpCount = 0;
-  const conn = {
-    send: vi.fn(async (method: string, params?: { targetId?: string }) => {
-      if (method === "Target.getTargets") return { targetInfos: tabs };
-      if (method === "Target.attachToTarget") {
-        const sid = `sess-${params!.targetId}`;
-        attached.set(sid, { attachedTo: params!.targetId, send: vi.fn(async () => ({ result: { value: "https://x.test/p" } })) });
-        return { sessionId: sid };
-      }
-      if (method === "Target.closeTarget") {
-        closed.push(params!.targetId!);
-        return {};
-      }
-      throw new Error(`unexpected ${method}`);
-    }),
-    session: (sid: string) => attached.get(sid) ?? null,
+  const mkPage = (url: string) => {
+    const session = { send: vi.fn(async () => ({ result: { value: "https://x.test/p" } })) };
+    return { url: () => url, session, createCDPSession: vi.fn(async () => session) };
   };
+  const tabs = [mkPage("about:blank"), mkPage("https://x.test/p")];
   const newPage = vi.fn(async () => {
-    const targetId = `tmp-${tmpCount++}`;
-    tabs.push({ targetId, type: "page", url: "about:blank" });
-    const session = {
-      connection: () => conn,
-      send: vi.fn(async (method: string) => {
-        if (method === "Target.getTargetInfo") return { targetInfo: { targetId } };
-        // First call navigates this fresh tab; currentUrl() reads it back.
-        return { result: { value: "https://x.test/p" } };
-      }),
-    };
-    return { createCDPSession: async () => session };
+    const p = mkPage("about:blank");
+    tabs.push(p);
+    return p;
   });
-  return { id, sessionId: () => id, newPage, conn, attached, closed, close: vi.fn(), disconnect: vi.fn() };
+  const pages = vi.fn(async () => [...tabs]);
+  return { id, sessionId: () => id, newPage, pages, tabs, close: vi.fn(), disconnect: vi.fn() };
 }
 vi.mock("@cloudflare/puppeteer", () => ({
   default: {
@@ -114,24 +89,26 @@ describe("leaseBrowser", () => {
     expect(launched).toHaveLength(2);
   });
 
-  it("reattaches to the tab it left via raw CDP and closes the temp tab", async () => {
+  it("reattaches to the tab it left via browser.pages()", async () => {
     const a = await leaseBrowser(B, "t1");
     await a.release(true);
+    const br = launched[0].b;
+    const opened = br.newPage.mock.calls.length;
     const b = await leaseBrowser(B, "t1");
     expect(b.reused).toBe(true);
-    const br = launched[0].b;
-    expect([...br.attached.values()].map((s: { attachedTo: string }) => s.attachedTo)).toEqual(["work"]);
-    expect(br.closed).toEqual(["tmp-1"]);
+    const work = br.tabs.find((t: { url: () => string }) => t.url() === "https://x.test/p");
+    expect(work.createCDPSession).toHaveBeenCalledTimes(1);
+    expect(br.newPage.mock.calls.length).toBe(opened);
   });
 
-  it("keeps the temp tab as a fresh page when the old tab is gone", async () => {
+  it("opens a fresh tab when the old tab is gone", async () => {
     const a = await leaseBrowser(B, "t1");
     await a.release(true);
     const br = launched[0].b;
-    br.conn.send.mockImplementationOnce(async () => ({ targetInfos: [] }));
+    br.pages.mockImplementationOnce(async () => [br.tabs[0]]);
+    const opened = br.newPage.mock.calls.length;
     const b = await leaseBrowser(B, "t1");
     expect(b.reused).toBe(true);
-    expect(br.attached.size).toBe(0);
-    expect(br.closed).toEqual([]);
+    expect(br.newPage.mock.calls.length).toBe(opened + 1);
   });
 });

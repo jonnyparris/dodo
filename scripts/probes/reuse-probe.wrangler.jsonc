@@ -1,0 +1,1 @@
+{ "name": "dodo-reuse-probe", "main": "reuse-probe.worker.ts", "compatibility_date": "2026-07-28", "compatibility_flags": ["nodejs_compat"], "workers_dev": true, "browser": { "binding": "BROWSER" } }
