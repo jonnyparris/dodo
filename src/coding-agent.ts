@@ -1,6 +1,7 @@
 import { DynamicWorkerExecutor, type ExecuteResult, resolveProvider } from "@cloudflare/codemode";
 import type { WorkspaceRuntimeClient } from "@cloudflare/computer";
 import { Workspace as WorkspaceComputer } from "@cloudflare/computer";
+import { Browser, browserRun } from "agents/browser";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 
 import { createMemoryStateBackend, Workspace } from "@cloudflare/shell";
@@ -513,6 +514,9 @@ class FacetNotFoundError extends Error {
 
 const CodingAgentBase = Think<Env, DodoConfig>;
 
+/** Platform keep_alive for the session browser: how long an idle browser lives. */
+const BROWSER_KEEP_ALIVE_MS = 180_000;
+
 export class CodingAgent extends CodingAgentBase {
   initialState: SessionState = {
     activePromptId: null,
@@ -728,7 +732,9 @@ export class CodingAgent extends CodingAgentBase {
    * src/session-lifecycle.ts. Consumes the four stores above plus a
    * FiberDriver adapter over Think's inherited fiber methods.
    */
-  private readonly lifecycle: SessionLifecycle;
+  // Named sessionLifecycle, not lifecycle: agents >=0.28 owns
+  // `this.lifecycle` (the capability Lifecycle the Browser installs on).
+  private readonly sessionLifecycle: SessionLifecycle;
 
   /** The computer Workspace instance backing the single store. */
   private get computerWorkspace(): WorkspaceComputer {
@@ -747,9 +753,24 @@ export class CodingAgent extends CodingAgentBase {
     return ws.stub();
   }
 
+  /**
+   * The session's persistent Browser Run browser (agents/browser). Installed
+   * on the agents Lifecycle so it keeps its record in this DO's storage;
+   * browser_execute (agents browserTool) drives it. Tabs, cookies and logins
+   * survive between calls until keep_alive lapses, then the next call gets a
+   * fresh browser with `restarted: true`. Replaces the f8d78bf keep_alive pool.
+   */
+  readonly browser?: Browser;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.initializeSchema();
+    if (env.BROWSER) {
+      this.browser = new Browser({
+        provider: browserRun(env.BROWSER, { keepAliveMs: BROWSER_KEEP_ALIVE_MS }),
+      });
+      this.lifecycle.use(this.browser);
+    }
 
     // ─── The ONE workspace store ───
     //
@@ -785,7 +806,7 @@ export class CodingAgent extends CodingAgentBase {
     this.goalStore = createGoalStateStore(this.metadataKv);
     this.watchdogStore = createWatchdogState(this.metadataKv);
 
-    this.lifecycle = createSessionLifecycle({
+    this.sessionLifecycle = createSessionLifecycle({
       control: this.control,
       goal: this.goalStore,
       fibers: {
@@ -863,22 +884,21 @@ export class CodingAgent extends CodingAgentBase {
           "- `browser_markdown` — Fetch a page or document (HTML, PDF, Office, JSON) as markdown. Read-only. Plain fetch first, Browser Run only if the site blocks it or needs JavaScript. Long pages are windowed: call again with `offset: nextOffset` to read on. Pass `query` to also get a calibrated `hasAnswer` probability telling you whether the window answers your question.",
           "- `browser_triage` — Rank up to 8 candidate URLs by likely relevance BEFORE fetching anything. Calibrated probabilities, no page loads.",
           "- `browser_search` — Write JS to query the CDP spec (~1.7MB, stays server-side). Use this to discover available commands, events, and types before executing them.",
-          "- `browser_execute` — Write JS using a `cdp` helper to run CDP commands against a live headless Chrome session. The session is opened fresh per call and closed after.",
+          "- `browser_execute` — Write JS using a `cdp` global to drive this session's persistent Chrome. Tabs, cookies and logins carry over between calls; `restarted: true` means it was replaced.",
           "",
           "**Which tool when:**",
           "Read-only text (docs, articles, search results) → `browser_triage` (if choosing between URLs) → `browser_markdown`. Interactive pages, screenshots, DOM inspection, clicks → `browser_execute`.",
           "",
           "**`browser_execute` pattern:**",
-          "A fresh browser with a blank page is launched per call. The CDP session is already attached to that page,",
-          "so you can send page-scoped commands directly:",
-          '1. Enable domains: `cdp.send("Page.enable")`',
-          '2. Navigate: `cdp.send("Page.navigate", { url: "..." })`',
-          '3. Wait for load, then act: `cdp.send("Page.captureScreenshot", { format: "png" })`',
+          "Call shape is `cdp.send({ method, params, sessionId })`. Pass `sessionId: \"active\"` for page-scoped commands (the tab you last used):",
+          '1. Navigate: `cdp.send({ method: "Page.navigate", params: { url: "..." }, sessionId: "active" })`',
+          '2. Wait for load, then act: `cdp.send({ method: "Page.captureScreenshot", params: { format: "jpeg", quality: 75 }, sessionId: "active" })`',
+          '3. Return screenshots as `{ type: "browser_screenshot", mediaType: "image/jpeg", data }` so they render in chat',
           "",
           "**Common tasks:**",
           "- Read-only page text: `browser_markdown` — prefer over browser_execute for pure reading",
           '- Navigate + get text: `Page.navigate` → `Runtime.evaluate` with `document.body.innerText`',
-          '- Screenshot: `Page.captureScreenshot` → returns base64 PNG',
+          '- Screenshot: `Page.captureScreenshot` (JPEG; 1MB result limit) → return as `browser_screenshot`',
           '- Click/type: `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`',
           '- Network: `Network.enable` → intercept/monitor requests',
           '- DOM inspection: `DOM.getDocument` → `DOM.querySelectorAll`',
@@ -1294,6 +1314,7 @@ export class CodingAgent extends CodingAgentBase {
       oauthTools: this.cachedOAuthTools,
       oauthToolExec: (serverId: string, name: string, args: unknown) => this.callOAuthToolViaHub(serverId, name, args),
       browserEnabled: this.browserEnabled(),
+      browser: this.browser,
       isAdminUser: isAdmin(ownerEmail ?? null, this.env),
       ownerId: this.resolveOwnerId(ownerEmail),
       ownerEmail,
@@ -2520,7 +2541,7 @@ export class CodingAgent extends CodingAgentBase {
     const authorEmail = next.author_email ? String(next.author_email) : null;
     this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", queuedId);
     this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
-    await this.lifecycle.start({ source: "queue", content, authorEmail });
+    await this.sessionLifecycle.start({ source: "queue", content, authorEmail });
   }
 
   /**
@@ -3127,7 +3148,7 @@ export class CodingAgent extends CodingAgentBase {
           connection.send(JSON.stringify({ type: "error", error: "Session not initialized" }));
           return;
         }
-        const r = await this.lifecycle.start({ source: "user", content, authorEmail: entry?.email });
+        const r = await this.sessionLifecycle.start({ source: "user", content, authorEmail: entry?.email });
         if (r.kind === "rejected") {
           connection.send(JSON.stringify({ type: "error", error: r.message }));
         } else if (r.kind === "queued") {
@@ -3139,7 +3160,7 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       case "abort": {
-        const r = await this.lifecycle.abortActive();
+        const r = await this.sessionLifecycle.abortActive();
         if (r.kind === "noop") {
           connection.send(JSON.stringify({ type: "error", error: "No active prompt" }));
         } else {
@@ -4055,7 +4076,7 @@ export class CodingAgent extends CodingAgentBase {
     if (verdict.recommend === "nudge") {
       const nudge = config.nudgePrompt ?? DEFAULT_NUDGE_PROMPT;
       try {
-        await this.lifecycle.start({ source: "watchdog", content: nudge });
+        await this.sessionLifecycle.start({ source: "watchdog", content: nudge });
       } catch (err) {
         log("warn", "watchdog: nudge dispatch failed", { sessionId, err: err instanceof Error ? err.message : String(err) });
       }
@@ -4090,7 +4111,7 @@ export class CodingAgent extends CodingAgentBase {
     if (!this.control.readTitle()) {
       this.control.setTitle(payload.description);
     }
-    await this.lifecycle.start({ source: "cron", content: payload.prompt });
+    await this.sessionLifecycle.start({ source: "cron", content: payload.prompt });
   }
 
   private listCronJobs(): CronJobRecord[] {
@@ -4447,7 +4468,7 @@ export class CodingAgent extends CodingAgentBase {
       }
     }
 
-    const r = await this.lifecycle.start({
+    const r = await this.sessionLifecycle.start({
       source: "user",
       content: input.content,
       authorEmail,
@@ -4538,7 +4559,7 @@ export class CodingAgent extends CodingAgentBase {
     // Start a synchronous prompt via lifecycle. image-gen's policy rejects
     // when busy (matches the pre-refactor 409 behaviour) and uses
     // synchronous=true so no fiber is spawned — we run inline below.
-    const startResult = await this.lifecycle.start({
+    const startResult = await this.sessionLifecycle.start({
       source: "image-gen",
       content: opts.prompt,
       authorEmail: opts.authorEmail,
@@ -4733,7 +4754,7 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   private async handleAbort(): Promise<Response> {
-    const r = await this.lifecycle.abortActive();
+    const r = await this.sessionLifecycle.abortActive();
     if (r.kind === "noop") {
       return Response.json({ error: "No active prompt" }, { status: 409 });
     }
@@ -4745,25 +4766,25 @@ export class CodingAgent extends CodingAgentBase {
   /**
    * Legacy thin wrapper kept so call sites in runFiberPrompt /
    * runImageGeneration / onFiberComplete still compile. New code should
-   * call `this.lifecycle.finish(...)` directly with a typed FinishCause.
+   * call `this.sessionLifecycle.finish(...)` directly with a typed FinishCause.
    */
   private async finishPrompt(
     promptId: string,
     patch: { error?: string; resultMessageId?: string; status: PromptRecord["status"]; text?: string },
   ): Promise<void> {
     if (patch.status === "completed") {
-      await this.lifecycle.finish(promptId, {
+      await this.sessionLifecycle.finish(promptId, {
         kind: "completed",
         resultMessageId: patch.resultMessageId,
         text: patch.text,
       });
     } else if (patch.status === "failed") {
-      await this.lifecycle.finish(promptId, {
+      await this.sessionLifecycle.finish(promptId, {
         kind: "failed",
         error: patch.error ?? "Prompt failed",
       });
     } else {
-      await this.lifecycle.finish(promptId, {
+      await this.sessionLifecycle.finish(promptId, {
         kind: "aborted",
         reason: patch.error,
       });
@@ -4918,7 +4939,7 @@ export class CodingAgent extends CodingAgentBase {
     );
 
     this.emitEvent({ data: assistantRecord, type: "message" });
-    await this.lifecycle.finish(promptId, {
+    await this.sessionLifecycle.finish(promptId, {
       kind: "completed",
       resultMessageId: snapshot.assistantMessageId,
       text,
@@ -4981,7 +5002,7 @@ export class CodingAgent extends CodingAgentBase {
       attempt: prior + 1,
     });
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
-    await this.lifecycle.start({
+    await this.sessionLifecycle.start({
       source: "user",
       content:
         `[System nudge — not from a human in chat]\n\n` +

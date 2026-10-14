@@ -2,7 +2,8 @@ import { tool } from "ai";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import type { ResolvedProvider } from "@cloudflare/codemode";
 import { z } from "zod";
-import { CdpSession, connectBrowser } from "./cdp-session";
+import { browserTool } from "agents/browser/ai-sdk";
+import type { BrowserSource, BrowserToolOutput } from "agents/browser/ai-sdk";
 import { truncateResponse } from "./truncate";
 import { uploadAttachment, type AttachmentRef } from "../attachments";
 import type { Env } from "../types";
@@ -11,9 +12,13 @@ import summary from "./data/cdp/summary.json";
 import { CDP_DOMAINS } from "./data/cdp/domains";
 
 export interface BrowserToolsOptions {
-  /** Browser Rendering binding (Fetcher) */
-  browser: Fetcher;
-  /** Worker loader binding for DynamicWorkerExecutor */
+  /**
+   * The persistent browser `browser_execute` drives: the `Browser` installed
+   * on the host agent's Lifecycle (`agents/browser`). Tabs, cookies and
+   * logins carry over between calls. Keep-alive is set on its provider.
+   */
+  browser: BrowserSource;
+  /** Worker loader binding for the sandboxed executors */
   loader: WorkerLoader;
   /** Execution timeout in ms (default: 30000) */
   timeout?: number;
@@ -26,7 +31,10 @@ export interface BrowserToolsOptions {
   onAttachments?: (toolCallId: string, attachments: AttachmentRef[]) => void;
   /** Full worker env — required for R2 attachment uploads. */
   env?: Env;
-  /** Session ID — required for R2 attachment key scoping. */
+  /**
+   * Session ID — required for R2 attachment key scoping, and the
+   * browserTool `scope` so each Dodo session keeps its own active tab.
+   */
   sessionId?: string;
   /** Owner email — stored as R2 custom metadata for audit. */
   ownerEmail?: string;
@@ -62,89 +70,6 @@ async () => {
     .map(c => ({ method: c.method, description: c.description }));
 }`;
 
-const EXECUTE_DESCRIPTION = `Execute CDP commands against a live browser session using JavaScript code.
-
-A fresh browser with one blank page is launched per call. The CDP session is already
-attached to that page — you can send page-scoped commands directly without attaching.
-
-Available in your code:
-
-declare const cdp: {
-  send(method: string, params?: unknown, options?: {
-    timeoutMs?: number;
-    sessionId?: string;
-  }): Promise<unknown>;
-  attachToTarget(targetId: string, options?: {
-    timeoutMs?: number;
-  }): Promise<string>;
-  getDebugLog(limit?: number): Promise<unknown[]>;
-  clearDebugLog(): Promise<void>;
-};
-
-Write an async arrow function in JavaScript. Do NOT use TypeScript syntax.
-
-The default viewport is 800×600. For most user-visible work (reviewing a
-page, capturing a UI bug, etc.) you should override this to a desktop
-resolution before navigating — otherwise screenshots look cramped and
-mobile-styled. Set deviceScaleFactor:2 for crisp images on HiDPI displays.
-
-Common patterns:
-// Desktop screenshot (recommended default for most tasks)
-async () => {
-  await cdp.send("Emulation.setDeviceMetricsOverride", {
-    width: 1440, height: 900, deviceScaleFactor: 2, mobile: false
-  });
-  await cdp.send("Page.enable");
-  await cdp.send("Page.navigate", { url: "https://example.com" });
-  await new Promise(r => setTimeout(r, 3000));
-  const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
-  return { screenshot: data, format: "png", encoding: "base64" };
-}
-
-// Full-page screenshot (captures the entire scrollable page, not just the viewport)
-async () => {
-  await cdp.send("Emulation.setDeviceMetricsOverride", {
-    width: 1440, height: 900, deviceScaleFactor: 2, mobile: false
-  });
-  await cdp.send("Page.enable");
-  await cdp.send("Page.navigate", { url: "https://example.com" });
-  await new Promise(r => setTimeout(r, 3000));
-  const { data } = await cdp.send("Page.captureScreenshot", {
-    format: "png",
-    captureBeyondViewport: true
-  });
-  return { screenshot: data, format: "png", encoding: "base64" };
-}
-
-// Mobile screenshot (only when the user specifically asks for a mobile view)
-async () => {
-  await cdp.send("Emulation.setDeviceMetricsOverride", {
-    width: 390, height: 844, deviceScaleFactor: 3, mobile: true
-  });
-  await cdp.send("Page.enable");
-  await cdp.send("Page.navigate", { url: "https://example.com" });
-  await new Promise(r => setTimeout(r, 3000));
-  const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
-  return { screenshot: data, format: "png", encoding: "base64" };
-}
-
-// Get page text content
-async () => {
-  await cdp.send("Page.enable");
-  await cdp.send("Page.navigate", { url: "https://example.com" });
-  await new Promise(r => setTimeout(r, 2000));
-  const { result } = await cdp.send("Runtime.evaluate", {
-    expression: "document.body.innerText",
-    returnByValue: true
-  });
-  return result.value;
-}
-
-// Get browser version
-async () => {
-  return await cdp.send("Browser.getVersion");
-}`;
-
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -156,6 +81,8 @@ function formatError(error: unknown): string {
  * model as tool output text.
  *
  * Shapes recognised:
+ *   - agents browserTool shape: { type: "browser_screenshot", mediaType, data }
+ *     (the only one that survives browserTool's base64 redaction)
  *   - Raw CDP Page.captureScreenshot response: { data: "base64...", format: "png" }
  *   - Author-returned docstring shape: { screenshot: "base64...", format: "png" }
  */
@@ -180,6 +107,16 @@ function extractScreenshotsInPlace(value: unknown, images: ExtractedImage[]): un
     return value.map((v) => extractScreenshotsInPlace(v, images));
   }
   const obj = value as Record<string, unknown>;
+  // agents browserTool shape: { type: "browser_screenshot", mediaType, data }
+  if (
+    obj.type === "browser_screenshot" &&
+    typeof obj.mediaType === "string" && obj.mediaType.startsWith("image/") &&
+    typeof obj.data === "string" && obj.data.length >= MIN_SCREENSHOT_BASE64_LENGTH
+  ) {
+    images.push({ data: obj.data, mediaType: obj.mediaType });
+    const { data: _data, ...rest } = obj;
+    return { ...rest, _attachmentPlaceholder: true };
+  }
   const format = typeof obj.format === "string" ? obj.format.toLowerCase() : null;
   // Raw CDP shape: { data, format: "png"|"jpeg"|"webp" }
   if (
@@ -210,6 +147,9 @@ function extractScreenshotsInPlace(value: unknown, images: ExtractedImage[]): un
   return result;
 }
 
+/** browser_execute output after Dodo has lifted screenshots into R2. */
+type DodoBrowserOutput = BrowserToolOutput & { attachments?: AttachmentRef[] };
+
 export function extractScreenshots(value: unknown): ExtractResult {
   const images: ExtractedImage[] = [];
   const scrubbed = extractScreenshotsInPlace(value, images);
@@ -220,7 +160,8 @@ export function extractScreenshots(value: unknown): ExtractResult {
  * Create AI SDK tools for browser automation via CDP code mode.
  *
  * Returns `browser_search` (query the CDP spec) and `browser_execute`
- * (run CDP commands against a live browser). The ~1.7MB CDP spec stays
+ * (the agents SDK browserTool against the session's persistent browser,
+ * with screenshots lifted into R2 attachments). The ~1.7MB CDP spec stays
  * server-side — only query results enter the context window.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -234,6 +175,13 @@ export function createBrowserTools(options: BrowserToolsOptions): Record<string,
   });
 
   const specData = spec;
+
+  const sdkBrowser = browserTool({
+    browser: options.browser,
+    loader: options.loader,
+    timeoutMs: options.timeout ?? 30_000,
+    scope: options.sessionId,
+  });
 
   return {
     browser_search: tool({
@@ -257,92 +205,65 @@ export function createBrowserTools(options: BrowserToolsOptions): Record<string,
       },
     }),
 
-    browser_execute: tool({
-      description: EXECUTE_DESCRIPTION,
-      inputSchema: z.object({
-        code: z.string().describe("JavaScript async arrow function that uses the cdp helper"),
-      }),
-      execute: async ({ code }: { code: string }, execOptions: { toolCallId: string }) => {
-        let session: CdpSession | undefined;
+    // browser_execute is the agents SDK browserTool (agents/browser/ai-sdk):
+    // a persistent Browser Run browser, scoped per Dodo session. Wrapped only
+    // to keep Dodo's screenshot path: the SDK adapter hands the model a text
+    // summary but leaves the base64 on the persisted tool part, so we lift
+    // screenshots into R2 attachments and strip the payload first.
+    browser_execute: {
+      description: sdkBrowser.description,
+      inputSchema: sdkBrowser.inputSchema,
+      execute: async (input: { code: string }, execOptions: { toolCallId: string }) => {
+        let output: BrowserToolOutput;
         try {
-          session = await connectBrowser(options.browser);
-
-          const providers: ResolvedProvider[] = [
-            {
-              name: "cdp",
-              fns: {
-                send: async (method: unknown, params: unknown, opts: unknown) =>
-                  session!.send(
-                    method as string,
-                    params,
-                    opts as { timeoutMs?: number; sessionId?: string },
-                  ),
-                attachToTarget: async (targetId: unknown, opts: unknown) =>
-                  session!.attachToTarget(
-                    targetId as string,
-                    opts as { timeoutMs?: number },
-                  ),
-                getDebugLog: async (limit: unknown) =>
-                  session!.getDebugLog(limit as number | undefined),
-                clearDebugLog: async () => session!.clearDebugLog(),
-              },
-              positionalArgs: true,
-            },
-          ];
-
-          const result = await executor.execute(code, providers);
-          if (result.error) {
-            return { error: result.error };
-          }
-
-          // Pull screenshots out of the result before stringifying — base64
-          // blobs should not go back to the LLM as tool-output text (wastes
-          // context) nor get persisted in the message row (Think's compaction
-          // would replace them with placeholder text anyway).
-          const { images, scrubbed } = extractScreenshots(result.result);
-          if (images.length > 0 && options.env && options.sessionId) {
-            const uploaded: AttachmentRef[] = [];
-            for (const img of images) {
-              const ref = await uploadAttachment(options.env, {
-                sessionId: options.sessionId,
-                // toolCallId buckets attachments per tool invocation. Using
-                // this instead of a messageId means they are linkable before
-                // the assistant message has finished persisting.
-                messageId: `toolcall-${execOptions.toolCallId}`,
-                mediaType: img.mediaType,
-                data: img.data,
-                ownerEmail: options.ownerEmail,
-                source: "tool",
-                toolName: "browser_execute",
-              });
-              if (ref) uploaded.push(ref);
-            }
-            if (uploaded.length > 0) {
-              options.onAttachments?.(execOptions.toolCallId, uploaded);
-              // Give the model a short, useful summary — it knows a screenshot
-              // exists and is rendered in the chat, but doesn't burn tokens
-              // re-reading the base64.
-              const scrubbedText = truncateResponse(scrubbed);
-              const refs = uploaded
-                .map((r, i) =>
-                  `  ${i + 1}. ${r.mediaType} (${Math.round(r.size / 1024)}KB) — ${r.url}`,
-                )
-                .join("\n");
-              return [
-                scrubbedText,
-                "",
-                `[${uploaded.length} screenshot${uploaded.length === 1 ? "" : "s"} captured and rendered inline in the chat — base64 data stripped from this tool output to conserve context. The user sees the image${uploaded.length === 1 ? "" : "s"} above.]`,
-                refs,
-              ].join("\n");
-            }
-          }
-          return truncateResponse(result.result);
+          output = await sdkBrowser.execute(input, execOptions);
         } catch (error) {
           return { error: formatError(error) };
-        } finally {
-          await session?.close();
         }
+        if (output.status !== "completed" || !options.env || !options.sessionId) return output;
+        const { images, scrubbed } = extractScreenshots(output.result);
+        if (images.length === 0) return output;
+        const uploaded: AttachmentRef[] = [];
+        for (const img of images) {
+          const ref = await uploadAttachment(options.env, {
+            sessionId: options.sessionId,
+            // toolCallId buckets attachments per tool invocation, so they are
+            // linkable before the assistant message has finished persisting.
+            messageId: `toolcall-${execOptions.toolCallId}`,
+            mediaType: img.mediaType,
+            data: img.data,
+            ownerEmail: options.ownerEmail,
+            source: "tool",
+            toolName: "browser_execute",
+          });
+          if (ref) uploaded.push(ref);
+        }
+        if (uploaded.length === 0) return output;
+        options.onAttachments?.(execOptions.toolCallId, uploaded);
+        return { ...output, result: scrubbed, attachments: uploaded } as DodoBrowserOutput;
       },
-    }),
+      toModelOutput: ({ output }: { output: DodoBrowserOutput | { error: string } }) => {
+        if ("error" in output && !("status" in output)) {
+          return { type: "text" as const, value: `Error: ${output.error}` };
+        }
+        const o = output as DodoBrowserOutput;
+        if (!o.attachments?.length) return sdkBrowser.toModelOutput({ output: o });
+        const refs = o.attachments
+          .map((r, i) => `  ${i + 1}. ${r.mediaType} (${Math.round(r.size / 1024)}KB) — ${r.url}`)
+          .join("\n");
+        const notes = [o.notice, o.newTabs?.length ? `New tabs opened by the page: ${JSON.stringify(o.newTabs)}` : undefined]
+          .filter(Boolean)
+          .join(" ");
+        const n = o.attachments.length;
+        return {
+          type: "text" as const,
+          value: [
+            `[${n} screenshot${n === 1 ? "" : "s"} captured and rendered inline in the chat — base64 data stripped to conserve context. The user sees the image${n === 1 ? "" : "s"} above.]`,
+            refs,
+            notes,
+          ].filter(Boolean).join("\n"),
+        };
+      },
+    },
   };
 }

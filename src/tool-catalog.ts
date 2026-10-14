@@ -122,7 +122,7 @@ const ORCHESTRATOR_TOOLS: ToolCatalogEntry[] = [
   },
   {
     name: "browser_execute",
-    description: "Run Chrome DevTools Protocol commands against a headless browser session.",
+    description: "Run Chrome DevTools Protocol commands against the session's persistent browser.",
     category: "browser",
     alwaysOn: false,
     caveat: "Requires browser bindings, session browser config, and admin owner.",

@@ -39,3 +39,14 @@ Branch `feat/deps-agents-028`. Deps bump only; **does not typecheck**. Do not me
 ## Flue check (2026-10-14)
 
 Rejected. `@cloudflare/computer` worker-shell (Dynamic Worker) needs the `experimental` flag no matter which framework we use, so Flue doesn't unblock Workers Builds. Flue also has no per-step hook or message rewrite (the transcript is append-only), its tools aren't AI SDK, and its storage is new. Path A continues.
+
+## browser_execute → SDK `browserTool` (2026-10-14, on this branch)
+
+Done ahead of the Path A loop rebuild, so it lands with the bump instead of after it. Adds 0 tsc errors (142 → 136; it removes the `positionalArgs` error and the `lifecycle` clash).
+
+- `CodingAgent` owns `browser = new Browser({ provider: browserRun(env.BROWSER, { keepAliveMs: 180_000 }) })` and installs it with `this.lifecycle.use(this.browser)`. Dodo's own `SessionLifecycle` field is renamed `sessionLifecycle`: agents 0.28 owns `this.lifecycle`.
+- `src/browser/tools.ts` `browser_execute` = `browserTool({ browser, loader: LOADER, scope: sessionId })`, wrapped to keep Dodo's R2 screenshot attachments. The wrapper strips the `{ type: "browser_screenshot", mediaType, data }` payload from the persisted output, uploads it, and gives the model a text line with the attachment URL. `browser_search` is unchanged.
+- `src/index.ts` exports `CodemodeRuntime` (browserTool runs code in a codemode facet).
+- The model-facing API changed: `cdp.send({ method, params, sessionId: "active" })` (object form), screenshots must be returned as `browser_screenshot` (other base64 is redacted by the SDK), 1 MB cap per `cdp.send` result. The system prompt and the `browser-cdp-perf` builtin skill are rewritten for this.
+- **Merging main:** main has the f8d78bf keep_alive pool (`leaseBrowser` etc. in `cdp-session.ts`, `test/browser-pool-unit.test.ts`). Take this branch's `src/browser/tools.ts` and drop the pool. `connectBrowser` stays, because `web-fetch.ts` still uses it.
+- Not verified at runtime: the branch doesn't typecheck or deploy yet. Smoke test after the loop rebuild: two `browser_execute` calls in one session share a tab, screenshot renders in the chat, `restarted: true` after keep_alive lapses.

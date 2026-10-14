@@ -11,6 +11,7 @@ import {
 import type { AttachmentRef } from "./attachments";
 import { MAX_READ_ATTACHMENT_CHARS } from "./attachments";
 import { createBrowserTools } from "./browser/tools";
+import type { BrowserSource } from "agents/browser/ai-sdk";
 import { createWebFetchTools, type JevAi } from "./browser/web-fetch";
 import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
@@ -55,6 +56,11 @@ interface OAuthToolInfo {
 interface BuildToolsOptions {
   authorEmail?: string;
   browserEnabled?: boolean;
+  /**
+   * The host agent's persistent `Browser` (agents/browser), installed on
+   * its Lifecycle. browser_execute is only registered when this is present.
+   */
+  browser?: BrowserSource;
   isAdminUser?: boolean;
   ownerId?: string;
   ownerEmail?: string;
@@ -1711,13 +1717,13 @@ function buildTools(
 
   // Browser tools — full CDP access via code-mode pattern.
   // Two tools: browser_search (query the ~1.7MB CDP spec server-side) and
-  // browser_execute (run CDP commands against a live headless Chrome session).
-  // Gated on: BROWSER + LOADER bindings exist, session has browser enabled,
-  // AND the session owner is admin. Non-admin users get browser via the MCP
-  // path (which bills to their own Cloudflare account).
-  if (env.BROWSER && env.LOADER && options?.browserEnabled && options?.isAdminUser) {
+  // browser_execute (agents SDK browserTool on the agent's persistent Browser).
+  // Gated on: the host passed its Browser (built from env.BROWSER), LOADER
+  // exists, session has browser enabled, AND the session owner is admin.
+  // Non-admin users get browser via the MCP path (bills to their account).
+  if (options?.browser && env.LOADER && options?.browserEnabled && options?.isAdminUser) {
     const browserTools = createBrowserTools({
-      browser: env.BROWSER,
+      browser: options.browser,
       loader: env.LOADER,
       timeout: 30_000,
       env,

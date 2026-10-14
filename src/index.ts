@@ -2926,6 +2926,10 @@ export { AllowlistOutbound, ChatMonitorAgent, CodingAgent, ExploreAgent, SharedI
 // exists if the class is exported from the worker entrypoint.
 export { WorkspaceServiceProxy } from "@cloudflare/computer";
 
+// agents browserTool (browser_execute) runs its code in a CodemodeRuntime
+// facet of CodingAgent; facets need the class exported from the entry.
+export { CodemodeRuntime } from "@cloudflare/codemode";
+
 export default {
   fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {
     return Promise.resolve(app.fetch(request, env, executionContext));

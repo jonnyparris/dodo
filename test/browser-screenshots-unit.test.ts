@@ -17,6 +17,17 @@ describe("extractScreenshots", () => {
     expect(scrubbed).toEqual({ format: "png", _attachmentPlaceholder: true });
   });
 
+  it("handles the agents browserTool shape { type: 'browser_screenshot', mediaType, data }", () => {
+    const input = { type: "browser_screenshot", mediaType: "image/jpeg", data: TINY_PNG };
+    const { images, scrubbed } = extractScreenshots(input);
+    expect(images).toEqual([{ data: TINY_PNG, mediaType: "image/jpeg" }]);
+    expect(scrubbed).toEqual({
+      type: "browser_screenshot",
+      mediaType: "image/jpeg",
+      _attachmentPlaceholder: true,
+    });
+  });
+
   it("handles the docstring shape { screenshot, format }", () => {
     const input = { screenshot: TINY_PNG, format: "jpeg", encoding: "base64" };
     const { images, scrubbed } = extractScreenshots(input);
