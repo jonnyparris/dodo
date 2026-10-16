@@ -1,0 +1,178 @@
+import { runInDurableObject } from "cloudflare:test";
+import type { Env } from "../src/types";
+import { env } from "cloudflare:workers";
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { tool, zodSchema } from "ai";
+import { describe, expect, it } from "vitest";
+import { z } from "zod";
+import { entriesToMessages, PiEngine, type PiEngineHost } from "../src/pi/engine";
+import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "../src/pi/tools";
+import { dodoModel } from "../src/pi/models";
+
+function host(storage: DurableObjectStorage, faux: ReturnType<typeof fauxProvider>, events: Array<{ type: string; data: unknown }>): PiEngineHost {
+  return {
+    storage,
+    configureModels: (models) => models.setProvider(faux.provider),
+    modelRef: () => ({ provider: "faux", modelId: "faux-1" }),
+    systemPrompt: () => "You are Dodo.",
+    emit: (e) => events.push(e),
+    log: () => {},
+  };
+}
+
+const entry = (text: string) => ({ messageId: `u-${text}`, text, authorEmail: "a@b.c", createdAt: 1 });
+
+describe("PiEngine", () => {
+  it("runs Dodo AI SDK tools, bridges events, and lists messages", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-1"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const faux = fauxProvider();
+      faux.setResponses([
+        fauxAssistantMessage([fauxText("Checking. "), fauxToolCall("git_status", { dir: "/repo" }, { id: "c1" })], { stopReason: "toolUse" }),
+        fauxAssistantMessage([fauxText("Clean tree.")]),
+      ]);
+      const seen: unknown[] = [];
+      const tools = {
+        git_status: tool({
+          description: "status",
+          inputSchema: zodSchema(z.object({ dir: z.string().optional() })),
+          execute: async (input) => {
+            seen.push(input);
+            return { clean: true };
+          },
+        }),
+      };
+      const events: Array<{ type: string; data: unknown }> = [];
+      const engine = new PiEngine(host(state.storage, faux, events));
+      const result = await engine.run({
+        promptId: "p1",
+        prepare: async () => ({ content: "status?", entry: entry("status?") }),
+        tools: await buildToolsExtension(tools),
+      });
+      expect(result.status).toBe("done");
+      expect(result.text).toBe("Clean tree.");
+      expect(result.steps).toBe(2);
+      expect(result.toolCalls).toEqual(["git_status"]);
+      expect(seen).toEqual([{ dir: "/repo" }]);
+      const types = events.map((e) => e.type);
+      expect(types).toContain("tool_call");
+      expect(types).toContain("tool_result");
+      const toolResult = events.find((e) => e.type === "tool_result")?.data as { output: string };
+      expect(toolResult.output).toBe('{"clean":true}');
+
+      const messages = entriesToMessages(await engine.entries());
+      expect(messages.map((m) => [m.role, m.content])).toEqual([
+        ["user", "status?"],
+        ["assistant", "Checking. \n\nClean tree."],
+      ]);
+      expect(messages[0]?.id).toBe("u-status?");
+      expect(messages[1]?.id).toBe(result.assistantMessageId);
+      await engine.close();
+    });
+  });
+
+  it("re-running the same prompt after a restart reattaches instead of resubmitting", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-2"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const faux = fauxProvider();
+      faux.setResponses([
+        fauxAssistantMessage([fauxToolCall("git_push", {}, { id: "c1" })], { stopReason: "toolUse" }),
+        fauxAssistantMessage([fauxText("after restart")]),
+      ]);
+      let pushes = 0;
+      let entered: () => void = () => {};
+      const enteredP = new Promise<void>((r) => { entered = r; });
+      const tools = {
+        git_push: tool({
+          description: "push",
+          inputSchema: zodSchema(z.object({})),
+          execute: async (_input, { abortSignal }) => {
+            pushes++;
+            entered();
+            await new Promise<void>((resolve) => abortSignal?.addEventListener("abort", () => resolve()));
+            return "pushed";
+          },
+        }),
+      };
+      let prepared = 0;
+      const prepare = async () => { prepared++; return { content: "push it", entry: entry("push it") }; };
+
+      const first = new PiEngine(host(state.storage, faux, []));
+      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) });
+      await enteredP;
+      await first.close(); // eviction
+      await running.catch(() => {});
+
+      const second = new PiEngine(host(state.storage, faux, []));
+      const result = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) });
+      expect(prepared).toBe(1); // user turn not re-prepared / re-emitted
+      expect(result.recovered).toBe(true);
+      expect(result.status).toBe("done");
+      expect(result.text).toBe("after restart");
+      // git_push is replay-unsafe: it is NOT rerun; the model got an `interrupted` result.
+      expect(pushes).toBe(1);
+      await second.close();
+    });
+  });
+
+  it("abort settles the prompt as unanswered", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-3"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const faux = fauxProvider();
+      faux.setResponses([fauxAssistantMessage([fauxToolCall("slow", {}, { id: "c1" })], { stopReason: "toolUse" })]);
+      let entered: () => void = () => {};
+      const enteredP = new Promise<void>((r) => { entered = r; });
+      const tools = {
+        slow: tool({
+          description: "slow",
+          inputSchema: zodSchema(z.object({})),
+          execute: async (_i, { abortSignal }) => {
+            entered();
+            await new Promise<void>((resolve) => abortSignal?.addEventListener("abort", () => resolve()));
+            return "x";
+          },
+        }),
+      };
+      const engine = new PiEngine(host(state.storage, faux, []));
+      const controller = new AbortController();
+      const running = engine.run({
+        promptId: "p1",
+        prepare: async () => ({ content: "go", entry: entry("go") }),
+        tools: await buildToolsExtension(tools),
+        signal: controller.signal,
+      });
+      await enteredP;
+      controller.abort();
+      const result = await running;
+      expect(result.status).toBe("unanswered");
+      await engine.close();
+    });
+  });
+});
+
+describe("pi adapters", () => {
+  it("maps AI SDK content output, including images", () => {
+    const { content } = modelOutputToContent({
+      type: "content",
+      value: [{ type: "text", text: "shot" }, { type: "media", data: "data:image/png;base64,AAAA", mediaType: "image/png" }],
+    });
+    expect(content).toEqual([{ type: "text", text: "shot" }, { type: "image", data: "AAAA", mimeType: "image/png" }]);
+  });
+
+  it("only read-only tools replay", () => {
+    expect(REPLAY_SAFE_TOOLS.has("read")).toBe(true);
+    expect(REPLAY_SAFE_TOOLS.has("git_push")).toBe(false);
+    expect(REPLAY_SAFE_TOOLS.has("write")).toBe(false);
+  });
+
+  it("maps gateway config to an openai-completions model with Anthropic cache markers", () => {
+    const m = dodoModel("anthropic/claude-sonnet-4-6", { activeGateway: "ai-gateway", opencodeBaseURL: "", aiGatewayBaseURL: "https://gw/v1/" }, { AI_GATEWAY_KEY: "k" } as never);
+    expect(m.baseUrl).toBe("https://gw/v1");
+    expect(m.contextWindow).toBe(200_000);
+    expect(m.compat?.cacheControlFormat).toBe("anthropic");
+    expect(m.headers?.["cf-aig-authorization"]).toBe("Bearer k");
+    const w = dodoModel("@cf/moonshotai/kimi-k2.6", { activeGateway: "ai-gateway", opencodeBaseURL: "", aiGatewayBaseURL: "https://gw/v1" }, {} as never);
+    expect(w.id).toBe("workers-ai/@cf/moonshotai/kimi-k2.6");
+    expect(w.compat?.cacheControlFormat).toBeUndefined();
+  });
+});
