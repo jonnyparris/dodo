@@ -107,6 +107,15 @@ function textOf(message: AssistantMessage | UserMessage | undefined): string {
     .join("");
 }
 
+interface BridgeState {
+  steps: number;
+  input: number;
+  output: number;
+  toolCalls: string[];
+  /** Text of the current assistant message already sent as text_delta. */
+  streamed: string;
+}
+
 export class PiEngine {
   private harness: Harness | undefined;
   private opening: Promise<Harness> | undefined;
@@ -218,7 +227,7 @@ export class PiEngine {
     }
     harness.resume();
 
-    const acc = { steps: 0, input: 0, output: 0, toolCalls: [] as string[] };
+    const acc: BridgeState = { steps: 0, input: 0, output: 0, toolCalls: [], streamed: "" };
     const stream = await watchEvents(harness, root.id, this.ctx);
     stream.start(async (events) => {
       for (const event of events) this.bridge(event, acc);
@@ -271,17 +280,33 @@ export class PiEngine {
   }
 
   /** Translate pi agent events into Dodo's SSE protocol. */
-  private bridge(event: AgentEvent, acc: { steps: number; input: number; output: number; toolCalls: string[] }): void {
+  private bridge(event: AgentEvent, acc: BridgeState): void {
+    const emitText = (text: string) => {
+      // Partials are committed on an interval: text can arrive as deltas,
+      // whole in a block, or only with the final message. Emit each
+      // message's text exactly once, as the not-yet-streamed suffix.
+      if (text.length > acc.streamed.length && text.startsWith(acc.streamed)) {
+        this.host.emit({ type: "text_delta", data: { delta: text.slice(acc.streamed.length) } });
+        acc.streamed = text;
+      }
+    };
     switch (event.type) {
+      case "message_start":
+        acc.streamed = "";
+        if (event.message.role === "assistant") emitText(textOf(event.message));
+        return;
       case "message_update":
         for (const change of event.changes) {
-          if (change.type === "text_delta") this.host.emit({ type: "text_delta", data: { delta: change.delta } });
+          if (change.type === "text_delta") emitText(acc.streamed + change.delta);
+          else if (change.type === "message") emitText(textOf(change.message));
         }
         return;
       case "message_end": {
         if (event.entry.kind !== "pi.assistant") return;
         acc.steps++;
         const m = event.entry.model?.[0] as AssistantMessage | undefined;
+        if (m?.stopReason !== "aborted" && m?.stopReason !== "error") emitText(textOf(m));
+        acc.streamed = "";
         acc.input += m?.usage?.input ?? 0;
         acc.output += m?.usage?.output ?? 0;
         return;

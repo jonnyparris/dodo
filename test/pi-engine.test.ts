@@ -60,6 +60,8 @@ describe("PiEngine", () => {
       expect(types).toContain("tool_result");
       const toolResult = events.find((e) => e.type === "tool_result")?.data as { output: string };
       expect(toolResult.output).toBe('{"clean":true}');
+      const streamed = events.filter((e) => e.type === "text_delta").map((e) => (e.data as { delta: string }).delta).join("");
+      expect(streamed).toBe("Checking. Clean tree.");
 
       const messages = entriesToMessages(await engine.entries());
       expect(messages.map((m) => [m.role, m.content])).toEqual([
