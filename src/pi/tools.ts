@@ -37,6 +37,8 @@ export const REPLAY_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "skill",
   "explore",
   "typecheck",
+  // CI in a fresh Kitebuild sandbox: reruns cost compute, never side effects.
+  "ci_run",
 ]);
 
 type AiTool = {

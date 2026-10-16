@@ -36,6 +36,7 @@ import {
   parseWebSearchProvider,
   type WebSearchAi,
 } from "./web-search";
+import { buildCiRunTool, kitebuildConfigured } from "./tools/kitebuild";
 
 /** True when the built-in web_search tool should be registered. */
 export function isWebSearchEnabled(env: Env, isAdminUser: boolean | undefined): boolean {
@@ -1452,6 +1453,10 @@ function buildTools(
 
   const workspaceTools = createWorkspaceTools(workspace);
   const gitTools = buildGitTools(env, workspace, config, options?.ownerEmail);
+
+  // Kitebuild CI (npm/vitest/tsc in a BusyBox-on-Workers sandbox) — only
+  // when the deployment has an Access service token for it.
+  if (kitebuildConfigured(env)) tools.ci_run = buildCiRunTool(env);
 
   if (env.LOADER) {
     // Pass the real OUTBOUND ServiceStub directly. workerd rejects any
