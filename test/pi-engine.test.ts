@@ -3,11 +3,12 @@ import type { Env } from "../src/types";
 import { env } from "cloudflare:workers";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { tool, zodSchema } from "ai";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { entriesToMessages, PiEngine, type PiEngineHost } from "../src/pi/engine";
 import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "../src/pi/tools";
-import { dodoModel } from "../src/pi/models";
+import { agentModelRef, dodoModel, gatewayHeaders, setDodoProvider } from "../src/pi/models";
+import { createModels } from "@earendil-works/pi-ai/models";
 
 function host(storage: DurableObjectStorage, faux: ReturnType<typeof fauxProvider>, events: Array<{ type: string; data: unknown }>): PiEngineHost {
   return {
@@ -170,9 +171,39 @@ describe("pi adapters", () => {
     expect(m.baseUrl).toBe("https://gw/v1");
     expect(m.contextWindow).toBe(200_000);
     expect(m.compat?.cacheControlFormat).toBe("anthropic");
-    expect(m.headers?.["cf-aig-authorization"]).toBe("Bearer k");
+    const h = gatewayHeaders({ activeGateway: "ai-gateway", opencodeBaseURL: "", aiGatewayBaseURL: "" }, { AI_GATEWAY_KEY: "k" } as never);
+    expect(h["cf-aig-authorization"]).toBe("Bearer k");
+    expect(h.Authorization).toBeNull();
     const w = dodoModel("@cf/moonshotai/kimi-k2.6", { activeGateway: "ai-gateway", opencodeBaseURL: "", aiGatewayBaseURL: "https://gw/v1" }, {} as never);
     expect(w.id).toBe("workers-ai/@cf/moonshotai/kimi-k2.6");
     expect(w.compat?.cacheControlFormat).toBeUndefined();
   });
+});
+
+describe("pi gateway wire", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  for (const activeGateway of ["ai-gateway", "opencode"] as const) {
+    it(`${activeGateway}: sends gateway auth and no placeholder Authorization`, async () => {
+      const seen: Headers[] = [];
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = new Request(input, init);
+        seen.push(req.headers);
+        return new Response("nope", { status: 400 });
+      });
+      const config = { activeGateway, opencodeBaseURL: "https://oc.example/v1", aiGatewayBaseURL: "https://gw.example/v1" };
+      const env = { AI_GATEWAY_KEY: "gw-key", OPENCODE_GATEWAY_TOKEN: "oc-token" } as never;
+      const models = createModels();
+      setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
+      const ref = agentModelRef("anthropic/claude-sonnet-4-6", config);
+      const model = models.getModel(ref.provider, ref.modelId)!;
+      const res = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+      expect(res.stopReason).toBe("error");
+      expect(seen.length).toBeGreaterThan(0);
+      const h = seen[0]!;
+      expect(h.get("authorization")).toBeNull();
+      if (activeGateway === "ai-gateway") expect(h.get("cf-aig-authorization")).toBe("Bearer gw-key");
+      else expect(h.get("cf-access-token")).toBe("oc-token");
+    });
+  }
 });

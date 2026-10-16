@@ -52,12 +52,6 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
     },
     contextWindow: entry?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: DEFAULT_MAX_TOKENS,
-    headers: isOpencode
-      ? { "cf-access-token": env.OPENCODE_GATEWAY_TOKEN ?? "" }
-      : {
-          "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
-          "x-api-key": env.AI_GATEWAY_KEY ?? "",
-        },
     compat: {
       // Both gateways are unified OpenAI-compatible endpoints in front of
       // many vendors; stick to the lowest common denominator.
@@ -75,6 +69,22 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
   };
 }
 
+/**
+ * Gateway auth headers. `Authorization: null` stops the OpenAI client from
+ * sending its placeholder bearer token, which AI Gateway would otherwise
+ * read as a (bad) Cloudflare API token — the same thing pi-ai's own
+ * cloudflare-ai-gateway provider does.
+ */
+export function gatewayHeaders(config: GatewayConfig, env: Env): Record<string, string | null> {
+  return config.activeGateway === "opencode"
+    ? { "cf-access-token": env.OPENCODE_GATEWAY_TOKEN ?? "", Authorization: null }
+    : {
+        "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
+        "x-api-key": env.AI_GATEWAY_KEY ?? "",
+        Authorization: null,
+      };
+}
+
 /** Install (or replace) the Dodo gateway provider with exactly these models. */
 export function setDodoProvider(models: MutableModels, modelIds: readonly string[], config: GatewayConfig, env: Env): MutableModels {
   const unique = [...new Set(modelIds.filter(Boolean))];
@@ -86,12 +96,9 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       auth: {
         apiKey: {
           name: "Dodo gateway",
-          // OpenCode authenticates with cf-access-token, which pi-ai does not
-          // recognise as an auth header; hand it the same token as the key.
-          resolve: async () =>
-            config.activeGateway === "opencode"
-              ? { auth: { apiKey: env.OPENCODE_GATEWAY_TOKEN ?? "unused" } }
-              : { auth: {} },
+          // Placeholder key satisfies pi-ai's key check; the header it would
+          // produce is removed by `Authorization: null` in gatewayHeaders().
+          resolve: async () => ({ auth: { apiKey: "unused", headers: gatewayHeaders(config, env) } }),
         },
       },
       models: list,
