@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dodo on pi-durable — what changed</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#5f6368; --bg:#fff; --card:#f6f7f9; --line:#d8dbe0; --bad:#c62828; --good:#1b7f3b; --accent:#f6821f; --blue:#2463eb; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e8ea; --muted:#a0a4ab; --bg:#141518; --card:#1e2024; --line:#353840; --bad:#ef6b6b; --good:#4cc47a; --blue:#6b9bff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--fg); background:var(--bg); }
+  main { max-width: 980px; margin: 0 auto; padding: 28px 22px 40px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 26px 0 8px; }
+  p { margin: 6px 0; }
+  .lede { color: var(--muted); margin-bottom: 14px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  figure { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  figcaption { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  svg { width: 100%; height: auto; display: block; }
+  svg text { fill: var(--fg); font: 12px system-ui, sans-serif; }
+  svg .muted { fill: var(--muted); }
+  svg .bad { fill: var(--bad); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; }
+  code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--card); padding: 1px 4px; border-radius: 4px; }
+  ul { margin: 6px 0; padding-left: 20px; }
+  li { margin: 3px 0; }
+  .good { color: var(--good); font-weight: 600; }
+  .bad { color: var(--bad); font-weight: 600; }
+  footer { margin-top: 26px; font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Dodo now runs its agent loop on pi-durable</h1>
+    <p class="lede">One page on what was swapped, why, and what is left. Phase 1 is live, opt-in per session (<code>PUT /session/:id/engine {"engine":"pi"}</code>). Existing sessions are untouched.</p>
+  </header>
+
+  <section aria-labelledby="what">
+    <h2 id="what">The change in one sentence</h2>
+    <p>The code that runs a turn (call the model, run the tools it asks for, repeat) used to be Dodo's own loop on top of <code>@cloudflare/think</code>. It is now the <code>Harness</code> from <code>@earendil-works/pi-durable</code>, a maintained library that <strong>saves every step to the Durable Object's SQLite before it moves on</strong>.</p>
+  </section>
+
+  <section aria-labelledby="where">
+    <h2 id="where">Where a turn's work lives</h2>
+    <div class="grid">
+      <figure>
+        <svg viewBox="0 0 440 210" role="img" aria-labelledby="b1t b1d">
+          <title id="b1t">Before: Think</title>
+          <desc id="b1d">All steps of a turn live in isolate memory. Only the final answer is saved, once the whole turn finishes.</desc>
+          <text x="10" y="18" font-weight="600">Before (Think + Dodo own-loop)</text>
+          <rect x="10" y="30" width="420" height="110" rx="8" fill="none" stroke="var(--bad)" stroke-dasharray="5 4"/>
+          <text x="20" y="48" class="muted">isolate memory (lost on eviction)</text>
+          <g>
+            <rect x="20" y="60" width="70" height="30" rx="5" fill="var(--blue)" opacity=".18"/><text x="30" y="80">model 1</text>
+            <rect x="100" y="60" width="70" height="30" rx="5" fill="var(--accent)" opacity=".22"/><text x="110" y="80">tool: write</text>
+            <rect x="180" y="60" width="70" height="30" rx="5" fill="var(--blue)" opacity=".18"/><text x="190" y="80">model 2</text>
+            <rect x="260" y="60" width="70" height="30" rx="5" fill="var(--accent)" opacity=".22"/><text x="268" y="80">tool: push</text>
+            <rect x="340" y="60" width="80" height="30" rx="5" fill="var(--blue)" opacity=".18"/><text x="350" y="80">model 3 …</text>
+          </g>
+          <text x="20" y="120" class="muted">+ in-memory pruning, mid-loop compaction,</text>
+          <text x="20" y="134" class="muted">overflow retry, final-summary turn (Dodo code)</text>
+          <line x1="380" y1="140" x2="380" y2="168" stroke="var(--fg)" marker-end="url(#a1)"/>
+          <defs><marker id="a1" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+          <rect x="300" y="170" width="130" height="30" rx="5" fill="none" stroke="var(--line)"/>
+          <text x="310" y="190">SQLite: final answer</text>
+        </svg>
+        <figcaption>Think saves the assistant message only after the whole turn ends. 40 steps in, nothing is on disk yet.</figcaption>
+      </figure>
+      <figure>
+        <svg viewBox="0 0 440 210" role="img" aria-labelledby="a1t a1d">
+          <title id="a1t">After: pi-durable</title>
+          <desc id="a1d">Each model step and each tool call is committed to SQLite before the next one starts.</desc>
+          <text x="10" y="18" font-weight="600">After (pi-durable Harness)</text>
+          <g>
+            <rect x="20" y="40" width="70" height="30" rx="5" fill="var(--blue)" opacity=".18"/><text x="30" y="60">model 1</text>
+            <rect x="100" y="40" width="70" height="30" rx="5" fill="var(--accent)" opacity=".22"/><text x="110" y="60">tool: write</text>
+            <rect x="180" y="40" width="70" height="30" rx="5" fill="var(--blue)" opacity=".18"/><text x="190" y="60">model 2</text>
+            <rect x="260" y="40" width="70" height="30" rx="5" fill="var(--accent)" opacity=".22"/><text x="268" y="60">tool: push</text>
+            <rect x="340" y="40" width="80" height="30" rx="5" fill="var(--blue)" opacity=".18"/><text x="350" y="60">model 3 …</text>
+          </g>
+          <g stroke="var(--good)" marker-end="url(#a2)">
+            <line x1="55" y1="72" x2="55" y2="128"/><line x1="135" y1="72" x2="135" y2="128"/><line x1="215" y1="72" x2="215" y2="128"/><line x1="295" y1="72" x2="295" y2="128"/><line x1="380" y1="72" x2="380" y2="128"/>
+          </g>
+          <defs><marker id="a2" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--good)"/></marker></defs>
+          <rect x="10" y="132" width="420" height="34" rx="6" fill="none" stroke="var(--good)"/>
+          <text x="20" y="154">DO SQLite (pi_* tables): every step committed, then shown</text>
+          <text x="20" y="190" class="muted">compaction, retries, abort, replay rules: inside the library</text>
+        </svg>
+        <figcaption>Same tools, same DO. The unit of saving went from "whole turn" to "each step".</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section aria-labelledby="evict">
+    <h2 id="evict">What happens if the Durable Object is evicted mid-turn</h2>
+    <figure>
+      <svg viewBox="0 0 940 150" role="img" aria-labelledby="e1t e1d">
+        <title id="e1t">Eviction timeline, before and after</title>
+        <desc id="e1d">Before: the turn restarts from the top and git push runs twice. After: the turn resumes after the last saved step; the interrupted push is not repeated and the model is told it was interrupted.</desc>
+        <text x="10" y="22" font-weight="600">Before</text>
+        <rect x="80" y="8" width="90" height="24" rx="4" fill="var(--blue)" opacity=".18"/><text x="90" y="25">model</text>
+        <rect x="175" y="8" width="90" height="24" rx="4" fill="var(--accent)" opacity=".22"/><text x="185" y="25">git push</text>
+        <text x="275" y="25" class="bad">✕ evicted</text>
+        <rect x="360" y="8" width="90" height="24" rx="4" fill="var(--blue)" opacity=".18"/><text x="370" y="25">model (again)</text>
+        <rect x="455" y="8" width="110" height="24" rx="4" fill="var(--bad)" opacity=".2"/><text x="463" y="25">git push (again)</text>
+        <text x="575" y="25" class="muted">whole turn replayed from the fiber's top; tokens and side effects repeated</text>
+
+        <text x="10" y="92" font-weight="600">After</text>
+        <rect x="80" y="78" width="90" height="24" rx="4" fill="var(--blue)" opacity=".18"/><text x="90" y="95">model ✓</text>
+        <rect x="175" y="78" width="90" height="24" rx="4" fill="var(--accent)" opacity=".22"/><text x="185" y="95">git push</text>
+        <text x="275" y="95" class="bad">✕ evicted</text>
+        <rect x="360" y="78" width="170" height="24" rx="4" fill="var(--good)" opacity=".18"/><text x="368" y="95">push → "interrupted" result</text>
+        <rect x="535" y="78" width="120" height="24" rx="4" fill="var(--blue)" opacity=".18"/><text x="543" y="95">model decides next</text>
+        <text x="665" y="95" class="muted">resumes after the last saved step</text>
+        <text x="80" y="130" class="muted">Read-only tools (read, grep, git_status, browser_markdown, ci_run…) simply rerun. Anything with side effects is never silently repeated.</text>
+      </svg>
+      <figcaption>Proven in workerd tests (<code>test/pi-engine.test.ts</code>): evicted inside <code>git_push</code> → push ran once, user message not re-sent, turn finished. A production redeploy mid-turn did <em>not</em> evict the running DO, so live proof is still pending.</figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="swap">
+    <h2 id="swap">What was swapped out</h2>
+    <table>
+      <thead><tr><th>Job</th><th>Before (Dodo-owned)</th><th>Now (pi-durable / pi-ai)</th></tr></thead>
+      <tbody>
+        <tr><td>Run the turn</td><td>Own-loop in <code>onChatMessage</code>, one <code>streamText</code> per step (~700 lines)</td><td><code>Harness</code> generation task</td></tr>
+        <tr><td>Run a tool call</td><td>Inline in the loop, in memory</td><td>A durable task per call, saved before it runs, with a replay rule</td></tr>
+        <tr><td>Survive eviction</td><td>Fiber checkpoint after the whole chat</td><td>Submission keyed by prompt id; reattach and continue</td></tr>
+        <tr><td>Keep context small</td><td><code>maybeCompactContext</code>, compaction policy, in-memory pruning, overflow retry</td><td>Built-in background + blocking compaction, overflow retry</td></tr>
+        <tr><td>Talk to the gateway</td><td>AI SDK provider + Dodo's Anthropic cache-marker rewrite + affinity header</td><td>pi-ai <code>openai-completions</code> with <code>compat</code> settings</td></tr>
+        <tr><td>Retries / abort</td><td>Ad hoc in the loop</td><td>Retry with backoff; abort cascades into running tools</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Unchanged:</strong> every tool (adapted, not rewritten), the system prompt, the prompt queue and lifecycle, goals, watchdog, attachments, and the SSE events the UI listens to.</p>
+  </section>
+
+  <section aria-labelledby="gain">
+    <h2 id="gain">What we get</h2>
+    <ul>
+      <li><span class="good">Reliability:</span> progress inside a turn survives restarts; side effects aren't replayed; storage errors fail loud instead of half-saving.</li>
+      <li><span class="good">Performance:</span> only changed system-prompt sections are re-sent, which keeps provider prompt caches warm. Live: turn 2 of a pi session sent 445 uncached input tokens against 20,218 for turn 1 (the rest came from the provider's cache). Fewer replays means fewer wasted tokens.</li>
+      <li><span class="good">Less code to own:</span> about 1,900 lines become deletable once pi is the default, plus the <code>@cloudflare/think</code> dependency.</li>
+      <li><span class="good">Maintained upstream:</span> fixes land in a shared library with its own test suite. We contribute back instead of patching locally.</li>
+      <li><span class="bad">Cost:</span> the Worker bundle grows by 343 KiB gzipped (the OpenAI SDK inside pi-ai) until the Think path is deleted.</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="next">
+    <h2 id="next">Also shipped, and what's next</h2>
+    <ul>
+      <li><strong>Kitebuild <code>ci_run</code> tool:</strong> Dodo pushes a branch, and Kitebuild (BusyBox on Workers, no container) clones it and runs <code>npm ci</code>, <code>npm test</code>, <code>tsc</code>, and so on. It stays off until a Kitebuild Access service token is configured.</li>
+      <li><strong>Upstream fix ready:</strong> pi-ai sent <code>Authorization: Bearer unused</code> next to AI Gateway's header, which caused a 401. The patch and test are on a local branch. pi requires the issue to be filed by a person, in their own words.</li>
+      <li><strong>Before pi becomes the default:</strong> session fork/snapshot on pi history, context-usage numbers from <code>pi.usage</code>, and the doom-loop check ported as a pi hook. Then delete the Think path.</li>
+    </ul>
+  </section>
+
+  <footer>Decision record: <code>docs/adr/0002-pi-durable-foundation.md</code> · Code: <code>src/pi/</code> · Inspect a session: <code>GET /session/:id/engine?detail=1</code></footer>
+</main>
+</body>
+</html>

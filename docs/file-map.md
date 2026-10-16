@@ -14,6 +14,10 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 
 - `src/coding-agent.ts` — per-session agent DO (extends Think, chat via Think.chat(), fibers, workspace, git, cron, prompts, snapshots, SSE). **Contains the system prompt.** Also: goal state + `maybeAutoContinue` hook for goal-driven self-continuation.
 - `src/session-goal.ts` — pure helpers + types for session goals (status enum, system-prompt snippet renderer, continue-prompt builder). See `docs/session-goals.md`.
+- `src/pi/engine.ts` — PiEngine: agent loop on `@earendil-works/pi-durable` (Harness on DO SQLite, `pi_` tables), SSE event bridge, transcript view. Opt-in per session; see `docs/adr/0002-pi-durable-foundation.md`
+- `src/pi/models.ts` — Dodo gateways as a pi-ai `openai-completions` provider
+- `src/pi/tools.ts` — adapts AI SDK `tool()` objects to durable pi tools; `REPLAY_SAFE_TOOLS`
+- `src/tools/kitebuild.ts` — `ci_run`: verify a pushed branch in Kitebuild (enabled by `KITEBUILD_*` config)
 - `src/think-adapter.ts` — Think integration boundary: re-exports, types (DodoConfig, MessageMetadata, SnapshotV2), adapter functions
 - `src/agentic.ts` — LLM provider construction (buildProvider), tool composition (buildToolsForThink), git tools, `set_goal_status` tool
 - `src/executor.ts` — DynamicWorkerExecutor wrapper for sandboxed code execution (direct API route)

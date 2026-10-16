@@ -5,7 +5,7 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
 ## Focus
 
 - Multi-tenant: per-user state in UserControl DO, global state in SharedIndex DO.
-- CodingAgent built on `@cloudflare/think` (chat loop, message persistence, durable fibers).
+- CodingAgent built on `@cloudflare/think` (chat loop, message persistence, durable fibers), migrating to `@earendil-works/pi-durable` (`src/pi/`, opt-in per session). Build on pi-durable, delete what it covers, upstream fixes — see `docs/adr/0002-pi-durable-foundation.md`.
 - Keep publishable and self-hostable. No container- or VM-specific assumptions.
 - Correctness and test coverage over feature expansion.
 
@@ -39,6 +39,7 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
 | Goal-driven sessions (self-continuation) | `docs/session-goals.md` |
 | Testing patterns | `docs/testing.md` |
 | Watchdog | `docs/session-watchdog.md` |
+| pi-durable engine (decision, keep/delete, parity gaps) | `docs/adr/0002-pi-durable-foundation.md`, `docs/pi-durable-explainer.html` |
 
 ## Git Discipline
 
