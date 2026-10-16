@@ -2701,7 +2701,9 @@ export class CodingAgent extends CodingAgentBase {
       // + counters; DELETE removes the watchdog and cancels its
       // schedule. See src/watchdog.ts for the pure decision logic.
       if (request.method === "GET" && url.pathname === "/engine") {
-        return Response.json({ engine: this.agentEngine() });
+        const engine = this.agentEngine();
+        if (engine !== "pi" || url.searchParams.get("detail") !== "1") return Response.json({ engine });
+        return Response.json({ engine, ...(await this.piEngine().inspect()) });
       }
       if (request.method === "PUT" && url.pathname === "/engine") {
         const body = (await request.json().catch(() => ({}))) as { engine?: unknown };

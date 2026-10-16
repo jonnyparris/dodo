@@ -367,6 +367,35 @@ export class PiEngine {
     return out;
   }
 
+  /**
+   * Operator view: live tasks/submissions and a compact transcript (entry
+   * kinds, tool names, error flags, short text). For debugging recovery.
+   */
+  async inspect(): Promise<{ live: unknown; transcript: Array<Record<string, unknown>> }> {
+    const harness = await this.open();
+    const live = await harness.inspect(this.ctx);
+    const transcript = (await this.entries()).map((e) => {
+      const m = e.model?.[0] as { role?: string; content?: unknown; toolName?: string; isError?: boolean; stopReason?: string } | undefined;
+      const blocks = Array.isArray(m?.content) ? (m.content as Array<{ type: string; text?: string; name?: string }>) : [];
+      return {
+        id: e.id,
+        kind: e.kind,
+        ...(m?.toolName ? { tool: m.toolName, isError: m.isError ?? false } : {}),
+        ...(m?.stopReason ? { stopReason: m.stopReason } : {}),
+        ...(blocks.some((b) => b.type === "toolCall") ? { calls: blocks.filter((b) => b.type === "toolCall").map((b) => b.name) } : {}),
+        text: (typeof m?.content === "string" ? m.content : blocks.filter((b) => b.type === "text").map((b) => b.text).join("")).slice(0, 160),
+      };
+    });
+    return {
+      live: {
+        scheduling: live.scheduling,
+        tasks: live.tasks.map((t) => ({ id: t.record.id, kind: t.record.kind, state: t.state.kind })),
+        submissions: live.submissions.map((s) => ({ id: s.id, status: s.status })),
+      },
+      transcript,
+    };
+  }
+
   async close(): Promise<void> {
     const harness = this.harness;
     this.harness = undefined;
