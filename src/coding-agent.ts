@@ -42,6 +42,9 @@ import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, 
 import { dispatchNotification } from "./notify";
 import { nextRetry } from "./overflow-retry";
 import { pruneOversizedToolResults } from "./own-loop-prune";
+import { entriesToMessages, PiEngine, type PiUserContent } from "./pi/engine";
+import { agentModelRef, setDodoProvider } from "./pi/models";
+import { buildToolsExtension } from "./pi/tools";
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
 import { assembleSystemPrompt } from "./prompt-composer";
@@ -651,6 +654,9 @@ export class CodingAgent extends CodingAgentBase {
   private _toolCallNames: Set<string> = new Set();
   /** LLM calls made during the current turn — surfaced as message metadata. */
   private _llmCallsThisTurn = 0;
+  private _piEngine: PiEngine | null = null;
+  /** Last known pi transcript length, for the sync messageCount() read. */
+  private _piMessageCount = 0;
   private readonly presence = new PresenceTracker();
   #wsChain: {
     computerWs: WorkspaceComputer;
@@ -1360,24 +1366,7 @@ export class CodingAgent extends CodingAgentBase {
   override async onChatMessage(options?: ChatMessageOptions): Promise<StreamableResult> {
     this._lastUsage = null;
 
-    // Warm project instructions (AGENTS.md / CLAUDE.md) before getSystemPrompt()
-    // reads them. Idempotent — only loads once per session.
-    await this.warmProjectInstructions();
-
-    // Warm the skill registry — populates the manifest read by getSystemPrompt()
-    // and the cache used by the `skill` tool. Refreshed every turn so newly
-    // created/imported skills become visible without restarting the session.
-    await this.warmSkills();
-
-    // Refresh the admin-managed global prompt prefix from SharedIndex.
-    // TTL-cached on the DO so this is a no-op for most turns.
-    await this.warmGlobalPrompt();
-
-    // One-time copy of legacy R2 workspace files into the computer workspace.
-    await this.ensureSessionCompat();
-
-    // Refresh the root listing served (synchronously) to getSystemPrompt.
-    await this.refreshWorkspaceSummary();
+    await this.warmTurnContext();
 
     const baseTools = this.getTools();
     const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
@@ -2666,7 +2655,7 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       if (request.method === "GET" && url.pathname === "/messages") {
-        return Response.json({ messages: this.listMessages() });
+        return Response.json({ messages: await this.listMessages() });
       }
 
       if (request.method === "GET" && url.pathname === "/prompts") {
@@ -2711,6 +2700,13 @@ export class CodingAgent extends CodingAgentBase {
       // prompts. PUT installs/replaces a watchdog; GET reports config
       // + counters; DELETE removes the watchdog and cancels its
       // schedule. See src/watchdog.ts for the pure decision logic.
+      if (request.method === "GET" && url.pathname === "/engine") {
+        return Response.json({ engine: this.agentEngine() });
+      }
+      if (request.method === "PUT" && url.pathname === "/engine") {
+        const body = (await request.json().catch(() => ({}))) as { engine?: unknown };
+        return this.handleSetEngine(body.engine);
+      }
       if (request.method === "GET" && url.pathname === "/watchdog") {
         return Response.json(this.watchdogStore.read());
       }
@@ -3057,7 +3053,7 @@ export class CodingAgent extends CodingAgentBase {
     // Determine which messages to send in the ready payload.
     // If the client provides lastMessageCount (reconnection), only send
     // messages they haven't seen yet. Otherwise send the last 50.
-    const allMessages = this.listMessages();
+    const allMessages = await this.listMessages();
     let messages: ChatMessageRecord[];
     if (lastMessageCountParam !== null) {
       const lastCount = Math.max(0, parseInt(lastMessageCountParam, 10) || 0);
@@ -4835,7 +4831,9 @@ export class CodingAgent extends CodingAgentBase {
     this._fiberAbortController = new AbortController();
     const signal = this._fiberAbortController.signal;
     try {
-      const result = await this.runThinkChat(content, { authorEmail, signal, images });
+      const result = this.pinAgentEngine() === "pi"
+        ? await this.runPiChat(content, { promptId, authorEmail, signal, images })
+        : await this.runThinkChat(content, { authorEmail, signal, images });
 
       // Guard: treat empty LLM response as a failure — UNLESS the prompt
       // was aborted, in which case the empty result is expected and
@@ -5399,19 +5397,208 @@ export class CodingAgent extends CodingAgentBase {
     return records;
   }
 
-  /**
-   * Run a chat turn via Think.chat().
-   * Bridges Think streaming events to Dodo's SSE/WS event format.
-   * Returns the assistant message ID and token usage.
-   */
-  private async runThinkChat(
-    userContent: string,
-    options?: { authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }> },
-  ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string; steps: number; toolCalls: string[] }> {
-    // Connect MCP servers before Think calls getTools()
-    await this.connectMcpServers();
+  // ─── pi-durable engine ───
 
-    // Insert user message metadata
+  /**
+   * Which agent loop this session runs on. Pinned to session metadata at the
+   * first prompt (history lives in one engine's tables), defaulting to the
+   * `DODO_AGENT_ENGINE` var, else Think.
+   */
+  agentEngine(): "think" | "pi" {
+    const stored = this.readMetadata("agent_engine");
+    if (stored === "pi" || stored === "think") return stored;
+    return this.env.DODO_AGENT_ENGINE === "pi" ? "pi" : "think";
+  }
+
+  private pinAgentEngine(): "think" | "pi" {
+    const engine = this.agentEngine();
+    if (!this.readMetadata("agent_engine")) this.writeMetadata("agent_engine", engine);
+    return engine;
+  }
+
+  /** Choose the engine for a session that has not run a prompt yet. */
+  private handleSetEngine(engine: unknown): Response {
+    if (engine !== "pi" && engine !== "think") {
+      return Response.json({ error: "engine must be 'pi' or 'think'" }, { status: 400 });
+    }
+    const current = this.readMetadata("agent_engine");
+    const hasHistory = this.listPrompts().length > 0;
+    if (current && current !== engine && hasHistory) {
+      return Response.json({ error: `session already runs on ${current}` }, { status: 409 });
+    }
+    this.writeMetadata("agent_engine", engine);
+    return Response.json({ engine });
+  }
+
+  private piEngine(): PiEngine {
+    this._piEngine ??= new PiEngine({
+      storage: this.ctx.storage,
+      configureModels: (models) => {
+        const config = this.getConfig();
+        if (!config) throw new Error("pi engine: session not configured yet");
+        setDodoProvider(models, [config.model], config, this.env);
+      },
+      modelRef: () => {
+        const config = this.getConfig();
+        if (!config) throw new Error("pi engine: session not configured yet");
+        return agentModelRef(config.model, config);
+      },
+      systemPrompt: () => this.getSystemPrompt(),
+      emit: (event) => {
+        if (event.type === "tool_result") {
+          const data = event.data as { toolCallId: string; output: unknown };
+          const refs = this._toolAttachments.get(data.toolCallId) ?? [];
+          this.emitEvent({
+            type: "tool_result",
+            data: {
+              ...data,
+              attachments: rewriteAttachmentsForClient(refs.map((r) => ({ mediaType: r.mediaType, url: r.url, size: r.size }))),
+            },
+          } as never);
+          return;
+        }
+        this.emitEvent(event as never);
+      },
+      log: (level, message, fields) => log(level, message, { sessionId: this.sessionId(), ...fields }),
+    });
+    return this._piEngine;
+  }
+
+  private async listPiMessages(): Promise<ChatMessageRecord[]> {
+    const views = entriesToMessages(await this.piEngine().entries());
+    this._piMessageCount = views.length;
+    const records: ChatMessageRecord[] = views.map((v) => {
+      const meta = this.readMessageMetadata(v.id);
+      return {
+        id: v.id,
+        role: v.role,
+        content: v.content,
+        authorEmail: meta?.authorEmail ?? v.authorEmail,
+        model: meta?.model ?? null,
+        provider: meta?.provider ?? null,
+        tokenInput: meta?.tokenInput ?? 0,
+        tokenOutput: meta?.tokenOutput ?? 0,
+        createdAt: epochToIso(meta?.createdAt ?? v.createdAt ?? nowEpoch()),
+      };
+    });
+    const attachments = this.listMessageAttachments(records.map((r) => r.id));
+    for (const record of records) {
+      const persisted = attachments.get(record.id);
+      if (persisted?.length) record.attachments = rewriteAttachmentsForClient(persisted) ?? persisted;
+    }
+    return records;
+  }
+
+  /**
+   * Run a turn on pi-durable. Same contract as runThinkChat. On fiber
+   * recovery after an eviction this reattaches to the durable submission
+   * for `promptId` — completed steps are not redone, the user turn is not
+   * re-emitted, and replay-unsafe tools are not repeated.
+   */
+  private async runPiChat(
+    userContent: string,
+    options: { promptId: string; authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }> },
+  ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string; steps: number; toolCalls: string[] }> {
+    await this.connectMcpServers();
+    await this.warmTurnContext();
+    this._toolAttachments.clear();
+    this._toolCallNames.clear();
+    const tools = await buildToolsExtension(this.getTools(), { onCall: (name) => this._toolCallNames.add(name) });
+    const result = await this.piEngine().run({
+      promptId: options.promptId,
+      tools,
+      signal: options.signal,
+      prepare: async () => {
+        const { userMsgId, userMsg } = await this.prepareUserTurn(userContent, options);
+        return {
+          content: uiPartsToPiContent(userMsg.parts),
+          entry: { messageId: userMsgId, text: userContent, authorEmail: options.authorEmail ?? null, createdAt: nowEpoch() },
+        };
+      },
+    });
+    this._llmCallsThisTurn = result.steps;
+    this.flushTurnArtifacts(options.authorEmail);
+    if (result.recovered) log("info", "pi: reattached to prompt after restart", { sessionId: this.sessionId(), promptId: options.promptId });
+    if (result.status !== "done") {
+      if (options.signal?.aborted) return { assistantMessageId: "", tokenInput: 0, tokenOutput: 0, text: "", steps: result.steps, toolCalls: result.toolCalls };
+      throw new Error(`Turn ended without an answer (${result.reason ?? "unknown"})`);
+    }
+    const config = this.getConfig();
+    this.insertMessageMetadata({
+      messageId: result.assistantMessageId,
+      model: config?.model ?? this.env.DEFAULT_MODEL,
+      provider: config?.activeGateway ?? "opencode",
+      tokenInput: result.tokenInput,
+      tokenOutput: result.tokenOutput,
+    });
+    const toolCallIds = Array.from(this._toolAttachments.keys());
+    if (toolCallIds.length > 0) this.rebindToolAttachments(toolCallIds, result.assistantMessageId);
+    this._piMessageCount += 2;
+    return result;
+  }
+
+
+  /**
+   * Per-turn warm-up read synchronously by getSystemPrompt()/getTools().
+   * Shared by the Think own-loop and the pi engine.
+   */
+  private async warmTurnContext(): Promise<void> {
+    // Warm project instructions (AGENTS.md / CLAUDE.md) before getSystemPrompt()
+    // reads them. Idempotent — only loads once per session.
+    await this.warmProjectInstructions();
+
+    // Warm the skill registry — populates the manifest read by getSystemPrompt()
+    // and the cache used by the `skill` tool. Refreshed every turn so newly
+    // created/imported skills become visible without restarting the session.
+    await this.warmSkills();
+
+    // Refresh the admin-managed global prompt prefix from SharedIndex.
+    // TTL-cached on the DO so this is a no-op for most turns.
+    await this.warmGlobalPrompt();
+
+    // One-time copy of legacy R2 workspace files into the computer workspace.
+    await this.ensureSessionCompat();
+
+    // Refresh the root listing served (synchronously) to getSystemPrompt.
+    await this.refreshWorkspaceSummary();
+  }
+
+  /** Fire-and-forget flush of workspace changes to Artifacts. Never blocks the turn. */
+  private flushTurnArtifacts(authorEmail?: string): void {
+    const options = { authorEmail };
+    void this.getOrCreateArtifactsContext()
+      .then((artifactsCtx) => {
+        if (!artifactsCtx) return;
+        return flushTurnToArtifacts({
+          workspace: this.workspace,
+          remote: artifactsCtx.remote,
+          tokenSecret: artifactsCtx.tokenSecret,
+          message: `dodo: turn ${new Date().toISOString()}`,
+          author: options?.authorEmail
+            ? { name: options.authorEmail, email: options.authorEmail }
+            : { name: "Dodo", email: "dodo@workers.dev" },
+        }).then((pushed) => {
+          // On a successful push, lift the first-flush gate and mark
+          // any existing read-side cache stale.
+          if (pushed) this.markArtifactsFsDirty();
+        });
+      })
+      .catch(() => {
+        // getOrCreateArtifactsContext / flushTurnToArtifacts both swallow
+        // their own errors, but belt-and-braces so a rejection here can
+        // never surface as an unhandled-rejection warning.
+      });
+  }
+
+  /**
+   * Build the user turn shared by both engines: decode/inline/stub
+   * attachments, persist doc chips + metadata, and emit the user message
+   * event. Returns the UIMessage (Think path) and its id.
+   */
+  private async prepareUserTurn(
+    userContent: string,
+    options?: { authorEmail?: string; images?: Array<{ data: string; mediaType: string; name?: string }> },
+  ): Promise<{ userMsgId: string; userMsg: UIMessage }> {
     const userMsgId = crypto.randomUUID();
     // Text-doc attachments are decoded and inlined into a single trailing text
     // part so every model sees them; collect them here and append after the
@@ -5707,6 +5894,21 @@ export class CodingAgent extends CodingAgentBase {
       userRecord.attachments = [...(userRecord.attachments ?? []), ...rewritten];
     }
     this.emitEvent({ data: userRecord, type: "message" });
+    return { userMsgId, userMsg };
+  }
+
+  /**
+   * Run a chat turn via Think.chat().
+   * Bridges Think streaming events to Dodo's SSE/WS event format.
+   * Returns the assistant message ID and token usage.
+   */
+  private async runThinkChat(
+    userContent: string,
+    options?: { authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }> },
+  ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string; steps: number; toolCalls: string[] }> {
+    // Connect MCP servers before Think calls getTools()
+    await this.connectMcpServers();
+    const { userMsg } = await this.prepareUserTurn(userContent, options);
 
     // Track assistant response metadata
     let assistantMessageId = "";
@@ -5813,28 +6015,7 @@ export class CodingAgent extends CodingAgentBase {
     // so the session appears permanently stuck even though the LLM already
     // produced its answer. Keep the whole flush off the hot path; a slow or
     // dead ARTIFACTS binding must only cost us the (best-effort) flush.
-    void this.getOrCreateArtifactsContext()
-      .then((artifactsCtx) => {
-        if (!artifactsCtx) return;
-        return flushTurnToArtifacts({
-          workspace: this.workspace,
-          remote: artifactsCtx.remote,
-          tokenSecret: artifactsCtx.tokenSecret,
-          message: `dodo: turn ${new Date().toISOString()}`,
-          author: options?.authorEmail
-            ? { name: options.authorEmail, email: options.authorEmail }
-            : { name: "Dodo", email: "dodo@workers.dev" },
-        }).then((pushed) => {
-          // On a successful push, lift the first-flush gate and mark
-          // any existing read-side cache stale.
-          if (pushed) this.markArtifactsFsDirty();
-        });
-      })
-      .catch(() => {
-        // getOrCreateArtifactsContext / flushTurnToArtifacts both swallow
-        // their own errors, but belt-and-braces so a rejection here can
-        // never surface as an unhandled-rejection warning.
-      });
+    this.flushTurnArtifacts(options?.authorEmail);
 
     // If the stream contained an error chunk that Think silently dropped,
     // throw it so the caller (runFiberPrompt) can surface it properly.
@@ -6354,11 +6535,13 @@ export class CodingAgent extends CodingAgentBase {
    * Build a token usage report for the current session.
    * Returns cumulative totals, context window info, and per-message breakdown.
    */
-  private listMessages(): ChatMessageRecord[] {
+  private async listMessages(): Promise<ChatMessageRecord[]> {
+    if (this.agentEngine() === "pi") return this.listPiMessages();
     return this.listThinkMessages();
   }
 
   private messageCount(): number {
+    if (this.agentEngine() === "pi") return this._piMessageCount;
     const thinkSessionId = this.getCurrentSessionId();
     if (!thinkSessionId) return 0;
     return this.sessions.getMessageCount(thinkSessionId);
@@ -7637,4 +7820,21 @@ export class CodingAgent extends CodingAgentBase {
 export function stripTokenExpiry(token: string): string {
   const idx = token.indexOf("?expires=");
   return idx === -1 ? token : token.slice(0, idx);
+}
+
+/** UIMessage parts (Dodo's prepared user turn) → pi user content. */
+export function uiPartsToPiContent(parts: UIMessage["parts"]): PiUserContent {
+  const out: Exclude<PiUserContent, string> = [];
+  for (const part of parts) {
+    if (part.type === "text") {
+      out.push({ type: "text", text: part.text });
+    } else if (part.type === "file" && typeof part.mediaType === "string" && part.mediaType.startsWith("image/")) {
+      const url = String(part.url ?? "");
+      const comma = url.indexOf(",");
+      const data = url.startsWith("data:") && comma >= 0 ? url.slice(comma + 1) : url;
+      out.push({ type: "image", data, mimeType: part.mediaType });
+    }
+  }
+  if (out.length === 1 && out[0]?.type === "text") return out[0].text;
+  return out;
 }

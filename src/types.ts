@@ -16,6 +16,8 @@ export interface Env {
   CF_ACCESS_AUD?: string;
   CF_ACCESS_TEAM_DOMAIN?: string;
   DEFAULT_MODEL: string;
+  /** Default agent engine for new sessions: "think" (default) or "pi" (pi-durable). */
+  DODO_AGENT_ENGINE?: string;
   /** Default model for the `explore` subagent. When unset, falls back to
    *  the getExploreModel() heuristic (cheap model by provider family). */
   DEFAULT_EXPLORE_MODEL?: string;

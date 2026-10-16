@@ -2666,6 +2666,16 @@ app.delete("/session/:id/cron/:cronId", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/cron/${encodeURIComponent(c.req.param("cronId"))}`);
 });
 
+app.get("/session/:id/engine", async (c) => {
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/engine");
+});
+
+app.put("/session/:id/engine", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/engine");
+});
+
 app.put("/session/:id/watchdog", async (c) => {
   const denied = requirePermission(c, "write");
   if (denied) return denied;
