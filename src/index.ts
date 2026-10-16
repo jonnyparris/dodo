@@ -2667,7 +2667,7 @@ app.delete("/session/:id/cron/:cronId", async (c) => {
 });
 
 app.get("/session/:id/engine", async (c) => {
-  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/engine");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/engine${new URL(c.req.url).search}`);
 });
 
 app.put("/session/:id/engine", async (c) => {
