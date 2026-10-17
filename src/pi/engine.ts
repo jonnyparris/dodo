@@ -503,6 +503,22 @@ export class PiEngine {
     this.opening = undefined;
     if (harness) await harness.close(this.ctx);
   }
+
+  /**
+   * Delete everything pi stored for this session (transcript, tasks, prompt
+   * map): drops every `pi_` table. The engine is unusable afterwards; make a
+   * new one, which recreates the schema on open.
+   */
+  async destroy(): Promise<number> {
+    await this.close().catch(() => {});
+    this.database = undefined;
+    const sql = this.host.storage.sql;
+    const tables = Array.from(
+      sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? ESCAPE '\\'", `${PI_TABLE_PREFIX.replace(/_/g, "\\_")}%`),
+    ).map((r) => String(r.name));
+    for (const t of tables) sql.exec(`DROP TABLE IF EXISTS "${t.replace(/"/g, '""')}"`);
+    return tables.length;
+  }
 }
 
 export interface PiMessageView {

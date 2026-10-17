@@ -269,6 +269,21 @@ describe("pi is the default engine", () => {
     expect(JSON.stringify(seenContexts.at(-1)!.messages)).toContain("still there?");
   });
 
+  it("deleting a session deletes its pi history", async () => {
+    const id = await newSession();
+    await send(`/session/${id}/message`, { content: "secret: kumquat" });
+    const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<T>) => Promise<T>;
+    const piTables = async () =>
+      inDO(await agent(id), async (_i, state) =>
+        Array.from(state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi\\_%' ESCAPE '\\'")).length,
+      );
+    expect(await piTables()).toBeGreaterThan(0);
+    expect((await call(`/session/${id}`, { method: "DELETE" })).status).toBe(200);
+    expect(await piTables()).toBe(0);
+    const left = await inDO(await agent(id), async (instance) => JSON.stringify(await instance.piEngine().entries()));
+    expect(left).not.toContain("kumquat");
+  });
+
   it("only pi can be chosen", async () => {
     const id = await newSession();
     expect((await send(`/session/${id}/engine`, { engine: "think" }, "PUT")).status).toBe(400);

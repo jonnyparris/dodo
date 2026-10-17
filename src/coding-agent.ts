@@ -6203,13 +6203,23 @@ export class CodingAgent extends CodingAgentBase {
     this.ctx.storage.sql.exec("DELETE FROM facet_runs");
     this.ctx.storage.sql.exec("DELETE FROM metadata");
 
-    // Clear the daily MCP-hygiene alarm armed in onStart. ctx.storage is
-    // shared with cancelSchedule so we drop any remaining alarm wholesale.
+    // Drop any remaining alarm (schedules were cancelled above).
     try {
       await this.ctx.storage.deleteAlarm();
     } catch (err) {
       log("warn", "destroyStorage: deleteAlarm failed", { err: err instanceof Error ? err.message : String(err) });
     }
+
+    // pi transcript and tasks (every pi_ table). Without this a deleted
+    // session's conversation stayed in storage.
+    try {
+      const dropped = await this.piEngine().destroy();
+      log("info", "destroyStorage: dropped pi tables", { sessionId: this.sessionId(), tables: dropped });
+    } catch (err) {
+      log("warn", "destroyStorage: pi cleanup failed", { err: err instanceof Error ? err.message : String(err) });
+    }
+    this._piEngine = null;
+    this._piMessageCount = 0;
 
     // Clean up Think sessions
     const thinkSessionId = this.getCurrentSessionId();
