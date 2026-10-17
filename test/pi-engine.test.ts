@@ -74,6 +74,23 @@ describe("PiEngine", () => {
     });
   });
 
+  it("tokenInput counts cache reads and writes (as the AI SDK did on Think)", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-usage"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const faux = fauxProvider();
+      faux.setResponses([fauxAssistantMessage([fauxText("one")]), fauxAssistantMessage([fauxText("two")])]);
+      const engine = new PiEngine(host(state.storage, faux, []));
+      const tools = await buildToolsExtension({});
+      const first = await engine.run({ promptId: "u1", prepare: async () => ({ content: "hello", entry: entry("hello") }), tools });
+      const second = await engine.run({ promptId: "u2", prepare: async () => ({ content: "again", entry: entry("again") }), tools });
+      // Single-step turns: tokens in = the whole prompt, cached or not.
+      expect(first.tokenInput).toBe(first.contextTokens);
+      expect(second.tokenInput).toBe(second.contextTokens);
+      expect(second.tokenInput).toBeGreaterThan(first.tokenInput);
+      await engine.close();
+    });
+  });
+
   it("re-running the same prompt after a restart reattaches instead of resubmitting", async () => {
     const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-2"));
     await runInDurableObject(stub, async (_i, state) => {
