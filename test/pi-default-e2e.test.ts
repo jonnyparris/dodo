@@ -155,13 +155,17 @@ describe("pi is the default engine", () => {
     await inDO(await agent(id), async (instance, state) => {
       // A pre-pi session: Think history, no agent_engine metadata.
       const sid = instance.getCurrentSessionId() ?? instance.createSession("default").id;
+      // Two old turns, compacted into a summary (Think shows it as a system message).
+      instance.sessions.append(sid, { id: "old-u", role: "user", parts: [{ type: "text", text: "my dog is called Biscuit" }] });
+      instance.sessions.append(sid, { id: "old-a", role: "assistant", parts: [{ type: "text", text: "Noted." }] });
+      instance.sessions.addCompaction(sid, "The user's dog is called Biscuit.", "old-u", "old-a");
       instance.sessions.append(sid, { id: "legacy-u", role: "user", parts: [{ type: "text", text: "the password is swordfish" }] });
       instance.sessions.append(sid, {
         id: "legacy-a",
         role: "assistant",
         parts: [
           { type: "text", text: "Got it." },
-          { type: "tool-read", toolCallId: "t1", state: "output-available", input: {}, output: "ignored" },
+          { type: "tool-browser", toolCallId: "t1", state: "output-available", input: {}, output: { type: "content", value: [{ type: "text", text: "shot" }, { type: "image-data", mediaType: "image/jpeg", data: "BBBB" }] } },
           { type: "file", mediaType: "image/png", url: "data:image/png;base64,AAAA" },
         ],
       });
@@ -171,20 +175,23 @@ describe("pi is the default engine", () => {
       state.storage.sql.exec("DELETE FROM metadata WHERE key = 'agent_engine'");
     });
     expect(await json(await call(`/session/${id}/engine`))).toEqual({ engine: "think" });
-    expect((await messages(id)).map((m) => m.content)).toEqual(["the password is swordfish", "Got it."]);
+    const before = await messages(id);
+    expect(before.map((m) => m.role)).toEqual(["system", "user", "assistant"]);
+    expect(before[0]!.content).toContain("The user's dog is called Biscuit.");
 
     const res = await send(`/session/${id}/message`, { content: "what is the password?" });
     expect(res.status).toBe(200);
     expect(await json(await call(`/session/${id}/engine`))).toEqual({ engine: "pi" });
-    expect(JSON.stringify(seenContexts.at(-1)!.messages)).toContain("swordfish");
+    const seen = JSON.stringify(seenContexts.at(-1)!.messages);
+    expect(seen).toContain("swordfish");
+    expect(seen).toContain("Biscuit"); // the summary reaches the model
 
     const after = await messages(id);
-    expect(after.map((m) => [m.id, m.content]).slice(0, 2)).toEqual([
-      ["legacy-u", "the password is swordfish"],
-      ["legacy-a", "Got it."],
-    ]);
-    expect(after.slice(2).map((m) => m.content)).toEqual(["what is the password?", "opencode:what is the password?"]);
-    expect(after[1]!.attachments?.[0]?.mediaType).toBe("image/png");
+    // Same rows the Think view showed: ids, roles, text.
+    expect(after.slice(0, 3).map((m) => [m.id, m.role, m.content])).toEqual(before.map((m) => [m.id, m.role, m.content]));
+    expect(after.slice(3).map((m) => m.content)).toEqual(["what is the password?", "opencode:what is the password?"]);
+    // Both the file part and the tool-output screenshot carry over.
+    expect(after[2]!.attachments?.map((a) => a.mediaType).sort()).toEqual(["image/jpeg", "image/png"]);
 
     // A second prompt doesn't re-import anything.
     await send(`/session/${id}/message`, { content: "again" });

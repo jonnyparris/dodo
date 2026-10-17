@@ -43,6 +43,12 @@ export const PI_TABLE_PREFIX = "pi_";
 export const DODO_USER_ENTRY = "dodo.user";
 /** An assistant message written without a model run: imported history, generated images. */
 export const DODO_ASSISTANT_ENTRY = "dodo.assistant";
+/**
+ * A summary of earlier conversation (a Think-era compaction summary carried
+ * over by migration/import). Written with `head: "self"`, so the model's
+ * context starts at it, like pi's own reset-with-handoff. Shown as a system row.
+ */
+export const DODO_SUMMARY_ENTRY = "dodo.summary";
 
 export type PiUserContent = string | Array<TextContent | ImageContent>;
 
@@ -55,7 +61,8 @@ export interface DodoAssistantEntryData {
 
 /** One message to write into the transcript as-is (no model call). */
 export interface PiImportedMessage {
-  role: "user" | "assistant";
+  /** "system" = summary of earlier conversation; the model's context restarts at it. */
+  role: "user" | "assistant" | "system";
   id: string;
   /** What the chat shows. */
   text: string;
@@ -404,7 +411,11 @@ export class PiEngine {
       // Dodo stores epoch seconds; pi messages carry ms timestamps.
       const createdAt = m.createdAt ?? Math.floor(Date.now() / 1000);
       const timestamp = createdAt * 1000;
-      if (m.role === "user") {
+      if (m.role === "system") {
+        const data: DodoAssistantEntryData = { messageId: m.id, text: m.text, createdAt };
+        const content = `Summary of the conversation so far:\n\n${m.contextText ?? m.text}`;
+        await write({ type: "write", entry: { kind: DODO_SUMMARY_ENTRY, data, head: "self", model: [{ role: "user", content, timestamp }] } });
+      } else if (m.role === "user") {
         const data: DodoUserEntryData = { messageId: m.id, text: m.text, authorEmail: m.authorEmail ?? null, createdAt };
         await write({ type: "write", entry: { kind: DODO_USER_ENTRY, data, model: [{ role: "user", content: m.contextText ?? m.text, timestamp }] } });
       } else {
@@ -483,7 +494,7 @@ export class PiEngine {
 }
 
 export interface PiMessageView {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   /** Dodo message id: the user's prepared id, or the answer entry id. */
   id: string;
   content: string;
@@ -526,6 +537,10 @@ export function entriesToMessages(entries: readonly EntryRecord[]): PiMessageVie
         createdAt: data.createdAt ?? null,
         ...(images.length ? { images } : {}),
       });
+    } else if (entry.kind === DODO_SUMMARY_ENTRY) {
+      flush();
+      const data = (entry.data ?? {}) as Partial<DodoAssistantEntryData>;
+      out.push({ role: "system", id: data.messageId ?? String(entry.id), content: data.text ?? "", authorEmail: null, createdAt: data.createdAt ?? null });
     } else if (entry.kind === DODO_ASSISTANT_ENTRY) {
       flush();
       const data = (entry.data ?? {}) as Partial<DodoAssistantEntryData>;

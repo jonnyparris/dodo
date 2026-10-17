@@ -66,6 +66,7 @@ import {
   type MessageMetadata,
   Think,
   type UIMessage,
+  messageAttachmentRefs,
   uiMessageToChatRecord,
 } from "./think-adapter";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, TodoItem, TodoPriority, TodoStatus, TodoStore, WorkspaceEntry } from "./types";
@@ -4250,7 +4251,7 @@ export class CodingAgent extends CodingAgentBase {
     }
     const thinkSessionId = this.getCurrentSessionId();
     const history = (thinkSessionId ? this.sessions.getHistory(thinkSessionId) : [])
-      .filter((m) => (m.role === "user" || m.role === "assistant") && !m.id.startsWith("compaction_"));
+      .filter((m) => m.role === "user" || m.role === "assistant" || (m.role === "system" && m.id.startsWith("compaction_")));
     const engine = this.piEngine();
     const have = new Set(entriesToMessages(await engine.entries()).map((m) => m.id));
     const todo = history.filter((m) => !have.has(m.id));
@@ -4262,14 +4263,9 @@ export class CodingAgent extends CodingAgentBase {
         .filter((p): p is { type: "text"; text: string } => p.type === "text")
         .map((p) => p.text)
         .join("");
-      // Attachments Think kept inside the message (uploads, generated images, screenshots).
-      const seen = new Set((known.get(m.id) ?? []).map((a) => a.url));
-      for (const a of record.attachments ?? []) {
-        if (seen.has(a.url)) continue;
-        this.insertMessageAttachment({ messageId: m.id, mediaType: a.mediaType, url: a.url, size: 0, source: m.role === "user" ? "user" : "assistant", name: a.name ?? null });
-      }
+      this.copyThinkAttachments(m, known.get(m.id));
       return {
-        role: m.role as "user" | "assistant",
+        role: m.role as "user" | "assistant" | "system",
         id: m.id,
         text: record.content,
         ...(contextText !== record.content ? { contextText } : {}),
@@ -4282,6 +4278,20 @@ export class CodingAgent extends CodingAgentBase {
     this.writeMetadata("agent_engine", "pi");
     this._piMessageCount = have.size + imported.length;
     log("info", "migrated Think session to pi", { sessionId: this.sessionId(), messages: imported.length, alreadyThere: have.size });
+  }
+
+  /**
+   * Copy the attachments a Think-shaped message carries inside itself
+   * (uploads, generated images, tool-output screenshots) into attachment
+   * rows, skipping ones already there. pi entries hold text only.
+   */
+  private copyThinkAttachments(msg: UIMessage, existing: ReadonlyArray<{ url: string }> | undefined): void {
+    const seen = new Set((existing ?? []).map((a) => a.url));
+    for (const a of messageAttachmentRefs(msg)) {
+      if (seen.has(a.url)) continue;
+      seen.add(a.url);
+      this.insertMessageAttachment({ messageId: msg.id, mediaType: a.mediaType, url: a.url, size: 0, source: a.fromTool ? "tool" : msg.role === "user" ? "user" : "assistant", name: a.name ?? null });
+    }
   }
 
   /** Kept for API compatibility: pi is the only engine. */
@@ -4380,10 +4390,12 @@ export class CodingAgent extends CodingAgentBase {
   ): Promise<void> {
     await this.migrateThinkSessionToPi();
     {
-      const kept = entries.filter((e) => e.uiMessage.role === "user" || e.uiMessage.role === "assistant");
+      // Compaction summaries (Think exports them as system messages) come along
+      // as summary entries, so the model keeps the earlier context.
+      const kept = entries.filter((e) => e.uiMessage.role === "user" || e.uiMessage.role === "assistant" || e.uiMessage.role === "system");
       await this.piEngine().append(
         kept.map((e) => ({
-          role: e.uiMessage.role as "user" | "assistant",
+          role: e.uiMessage.role as "user" | "assistant" | "system",
           id: e.uiMessage.id,
           text: (e.uiMessage.parts ?? [])
             .filter((p): p is { type: "text"; text: string } => p.type === "text")
@@ -4393,20 +4405,8 @@ export class CodingAgent extends CodingAgentBase {
           model: e.metadata.model ?? undefined,
         })),
       );
-      for (const e of kept) {
-        for (const part of e.uiMessage.parts ?? []) {
-          if (part.type !== "file") continue;
-          const file = part as FileUIPart;
-          this.insertMessageAttachment({
-            messageId: e.uiMessage.id,
-            mediaType: file.mediaType,
-            url: file.url,
-            size: 0,
-            source: e.uiMessage.role === "user" ? "user" : "assistant",
-            name: file.filename ?? null,
-          });
-        }
-      }
+      const known = this.listMessageAttachments(kept.map((e) => e.uiMessage.id));
+      for (const e of kept) this.copyThinkAttachments(e.uiMessage, known.get(e.uiMessage.id));
       this._piMessageCount += kept.length;
     }
     for (const e of entries) {

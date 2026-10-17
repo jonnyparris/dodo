@@ -183,6 +183,7 @@ const INLINED_DOC_SENTINEL_PREFIX = "--- Attached document: ";
 function collectToolOutputImages(
   output: unknown,
   attachments: Array<{ mediaType: string; url: string }>,
+  fileUrl: (url: string, mediaType: string) => string | null = toClientUrl,
 ): void {
   if (!output || typeof output !== "object") return;
   const o = output as { type?: string; value?: unknown };
@@ -201,7 +202,7 @@ function collectToolOutputImages(
     }
     // file-url carries a URL we can serve through directly
     if (p.type === "file-url" && typeof p.url === "string") {
-      const url = toClientUrl(p.url, p.mediaType);
+      const url = fileUrl(p.url, p.mediaType);
       if (url) attachments.push({ mediaType: p.mediaType, url });
     }
   }
@@ -219,6 +220,33 @@ function toClientUrl(rawUrl: string, mediaType: string): string | null {
   // Treat anything else as raw base64 (legacy path — pre-R2 messages stored
   // the base64 payload directly in `url` to dodge AI SDK downloadAssets).
   return `data:${mediaType};base64,${rawUrl}`;
+}
+
+/**
+ * Attachments a stored Think message carries inside itself (uploads,
+ * generated images, tool-output screenshots), with their stored URLs
+ * (`dodo-attachment://…` or data URLs), for copying into attachment rows.
+ * uiMessageToChatRecord() shows the same set, rewritten for the browser.
+ */
+export function messageAttachmentRefs(msg: UIMessage): Array<{ mediaType: string; url: string; name?: string; fromTool?: true }> {
+  const out: Array<{ mediaType: string; url: string; name?: string; fromTool?: true }> = [];
+  for (const p of msg.parts ?? []) {
+    if (p.type === "file") {
+      const { mediaType, url, filename } = p as { mediaType?: string; url?: string; filename?: string };
+      if (!mediaType || !(SAFE_IMAGE_MEDIA_TYPES.has(mediaType) || SAFE_DOC_MEDIA_TYPES.has(mediaType))) continue;
+      if (typeof url !== "string" || url.length === 0) continue;
+      const stored = url.startsWith("data:") || isAttachmentUrl(url) ? url : `data:${mediaType};base64,${url}`;
+      out.push({ mediaType, url: stored, ...(filename ? { name: filename } : {}) });
+      continue;
+    }
+    const typed = p as { type?: string; output?: unknown };
+    if (typeof typed.type === "string" && typed.type.startsWith("tool-") && typed.output) {
+      const found: Array<{ mediaType: string; url: string }> = [];
+      collectToolOutputImages(typed.output, found, (u) => u);
+      out.push(...found.map((a) => ({ ...a, fromTool: true as const })));
+    }
+  }
+  return out;
 }
 
 export function uiMessageToChatRecord(
