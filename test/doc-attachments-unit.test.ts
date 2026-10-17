@@ -6,7 +6,7 @@ import {
   isPdfMediaType,
   isTextDocMediaType,
 } from "../src/coding-agent";
-import { uiMessageToChatRecord } from "../src/think-adapter";
+import { uiMessageToChatRecord } from "../src/transcript";
 
 const b64 = (s: string): string => btoa(unescape(encodeURIComponent(s)));
 

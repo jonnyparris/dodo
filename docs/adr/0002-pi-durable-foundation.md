@@ -100,9 +100,12 @@ Gaps 1–4 closed. Every prompt runs on pi; `DODO_AGENT_ENGINE` is gone and
   `final-summary-policy.ts` and their tests.
 - **No Think base class.** `CodingAgent extends DodoAgentBase`
   (`src/agent-base.ts`): `withFibers(Agent)` plus config in the same
-  `_think_config` row (no data migration) and a read-only `SessionManager` over
-  Think's tables for unmigrated history. `@cloudflare/think` stays only as a
-  tool library (workspace + execute tools) and for `SessionManager`.
+  `_think_config` row (no data migration) and a read-only `ThinkHistory`
+  (`src/think-history.ts`) over Think's tables for unmigrated history.
+- **`@cloudflare/think` removed.** File tools (`src/tools/workspace-tools.ts`)
+  and codemode `execute` (`src/tools/execute-tool.ts`) are ported with the same
+  names, descriptions and schemas. One behaviour fix: `edit` no longer expands
+  `$&` / `$1` in `new_string`.
 - **Gap 5 closed (2026-10-17):** `POST /session/:id/debug/evict` (admin) resets
   the DO mid-turn; the prompt resumes from the alarm heartbeat with no client
   request, each side effect once. That needed a fix: `CodingAgent.alarm()` was a

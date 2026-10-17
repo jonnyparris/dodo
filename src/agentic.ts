@@ -25,7 +25,8 @@ import {
   capToolOutputs,
   runSubagentForProfile,
 } from "./subagent-runner";
-import { createExecuteTool, createWorkspaceTools } from "./think-adapter";
+import { createExecuteTool } from "./tools/execute-tool";
+import { createWorkspaceTools } from "./tools/workspace-tools";
 import { sanitizeToolJsonSchema } from "./tool-schema";
 import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";

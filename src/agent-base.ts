@@ -4,33 +4,29 @@
  *
  * - Config: one JSON row in `_think_config`, the table Think used, so
  *   existing sessions keep their config with no migration.
- * - Think-era history: a SessionManager over Think's session tables, read
- *   only until a session migrates to pi on its next prompt
- *   (CodingAgent.migrateThinkSessionToPi). Nothing writes new Think history.
+ * - Think-era history: a read-only ThinkHistory over Think's old tables,
+ *   until a session migrates to pi on its next prompt
+ *   (CodingAgent.migrateThinkSessionToPi). Nothing writes Think history.
  *
  * Dodo's agent loop is pi (src/pi/). ADR 0002, phase 2.
  */
 import { Agent } from "agents";
 import { withFibers } from "agents/experimental/forever";
-import { SessionManager } from "@cloudflare/think/session";
+import { ThinkHistory } from "./think-history";
 import type { Env } from "./types";
 
 const FiberAgent = withFibers(Agent);
 
 export class DodoAgentBase<Config> extends FiberAgent<Env> {
-  /** Think-era transcript tables (read-only in practice). */
-  sessions!: SessionManager;
+  /** Think-era transcript tables, read-only. */
+  sessions!: ThinkHistory;
   #thinkSessionId: string | null = null;
   #config: Config | null = null;
   #configTableReady = false;
 
   override onStart(): void | Promise<void> {
-    this.sessions = new SessionManager(this as never, {
-      exec: (query: string, ...values: unknown[]) => {
-        this.ctx.storage.sql.exec(query, ...(values as never[]));
-      },
-    } as never);
-    this.#thinkSessionId = this.sessions.list()[0]?.id ?? null;
+    this.sessions = new ThinkHistory(this.ctx.storage.sql);
+    this.#thinkSessionId = this.sessions.sessionIds()[0] ?? null;
     // Restart fibers an eviction interrupted (the alarm heartbeat also does this).
     void this.checkFibers();
   }

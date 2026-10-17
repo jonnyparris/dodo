@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { uiMessageToChatRecord } from "../src/think-adapter";
+import { uiMessageToChatRecord } from "../src/transcript";
 import type { UIMessage } from "ai";
 
 describe("uiMessageToChatRecord — multimodal", () => {

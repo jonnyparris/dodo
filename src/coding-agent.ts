@@ -59,7 +59,7 @@ import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
 import { DodoAgentBase } from "./agent-base";
 import type { FiberCompleteContext, FiberRecoveryContext } from "agents/experimental/forever";
-import type { SnapshotV2 } from "./think-adapter";
+import type { SnapshotV2 } from "./transcript";
 import {
   chatRecordToUIMessage,
   type DodoConfig,
@@ -67,7 +67,7 @@ import {
   type UIMessage,
   messageAttachmentRefs,
   uiMessageToChatRecord,
-} from "./think-adapter";
+} from "./transcript";
 import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, TodoItem, TodoPriority, TodoStatus, TodoStore, WorkspaceEntry } from "./types";
 import {
   DEFAULT_NUDGE_PROMPT,
@@ -1321,12 +1321,12 @@ export class CodingAgent extends CodingAgentBase {
 
     // Sessions from before the single-session rule could hold several Think
     // sessions; keep the most recent so migration reads one history.
-    const thinkSessions = this.sessions.list();
+    const thinkSessions = this.sessions.sessionIds();
     if (thinkSessions.length > 1) {
-      const [latest, ...rest] = [...thinkSessions].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+      const [latest, ...rest] = thinkSessions;
       log("warn", "multiple think sessions found, using most recent", { sessionId: this.sessionId(), count: thinkSessions.length });
-      this.setThinkSessionId(latest!.id);
-      for (const extra of rest) this.sessions.delete(extra.id);
+      this.setThinkSessionId(latest!);
+      for (const extra of rest) this.sessions.delete(extra);
     }
 
     // Dodo's existing init logic
@@ -4857,7 +4857,7 @@ export class CodingAgent extends CodingAgentBase {
     const thinkSid = this.getCurrentSessionId();
     const compactionCount = onPi
       ? parseInt(this.readMetadata("pi_compactions") ?? "0", 10) || 0
-      : thinkSid ? this.sessions.getCompactions(thinkSid).length : 0;
+      : thinkSid ? this.sessions.compactionCount(thinkSid) : 0;
 
     return {
       activePromptId,

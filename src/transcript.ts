@@ -1,44 +1,12 @@
 /**
- * @cloudflare/think boundary. Dodo no longer runs Think's agent loop or
- * extends its class (pi is the loop; see src/agent-base.ts). What's left:
- * Think's workspace + execute tools, and helpers for the Think-era
- * UIMessage transcript shape (session views, snapshots, migration).
+ * Transcript shapes and conversions: the UIMessage form Dodo's views,
+ * snapshots and Think-era history use, message metadata, and the
+ * per-session config type.
  */
-
-import type { Workspace } from "@cloudflare/shell";
-import {
-  createWorkspaceTools as thinkCreateWorkspaceTools,
-} from "@cloudflare/think/tools/workspace";
-import type { WorkspaceFsView } from "./runtime/computer/workspace-view";
-
-export { createExecuteTool } from "@cloudflare/think/tools/execute";
-export {
-  createEditTool,
-  createFindTool,
-  createGrepTool,
-  createListTool,
-  createReadTool,
-  createWriteTool,
-} from "@cloudflare/think/tools/workspace";
-
-/**
- * think's workspace tools are typed against shell's Workspace class, which
- * can't be satisfied structurally (private fields). The runtime contract is
- * what think's ops actually call — readFile/stat/writeFile/mkdir/readDir/
- * glob/rm — all provided by WorkspaceFsView. The cast lives here, at the
- * think boundary, so the rest of Dodo stays typed against the view.
- */
-export function createWorkspaceTools(workspace: WorkspaceFsView) {
-  return thinkCreateWorkspaceTools(workspace as unknown as Workspace);
-}
-
-// ─── Transcript shape ───
 
 export type { UIMessage } from "ai";
 
-// ─── Dodo-specific Think types ───
-
-/** Per-session config stored via Think.configure() / Think.getConfig(). */
+/** Per-session config (DodoAgentBase.configure / getConfig). */
 export interface DodoConfig {
   sessionId: string;
   ownerEmail: string;

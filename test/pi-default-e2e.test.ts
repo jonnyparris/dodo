@@ -9,6 +9,7 @@ import { getAgentByName } from "agents";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/types";
 import { releaseMockSlowPrompt, resetMockAgentic } from "./helpers/agentic-mock";
+import { ThinkHistoryWriter } from "./helpers/think-history";
 
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/pi/models", async () => await import("./helpers/pi-models-mock"));
@@ -48,11 +49,11 @@ const internal = async (id: string, path: string, body: unknown) =>
     body: JSON.stringify(body),
   });
 
-/** Give a session a Think-era history table, as sessions from before pi have. */
-function seedThinkSession(instance: any): string {
-  const sid = instance.getCurrentSessionId() ?? instance.sessions.create("default").id;
-  instance.setThinkSessionId(sid);
-  return sid;
+/** Give a session Think-era history, as sessions from before pi have. */
+function seedThinkSession(instance: any, state: DurableObjectState): ThinkHistoryWriter {
+  const w = new ThinkHistoryWriter(state.storage.sql);
+  instance.setThinkSessionId(w.sessionId);
+  return w;
 }
 
 async function waitForPrompt(id: string, promptId: string, ms = 2000) {
@@ -161,13 +162,13 @@ describe("pi is the default engine", () => {
     const inDO = runInDurableObject as unknown as (stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<void>) => Promise<void>;
     await inDO(await agent(id), async (instance, state) => {
       // A pre-pi session: Think history, no agent_engine metadata.
-      const sid = seedThinkSession(instance);
+      const sid = seedThinkSession(instance, state);
       // Two old turns, compacted into a summary (Think shows it as a system message).
-      instance.sessions.append(sid, { id: "old-u", role: "user", parts: [{ type: "text", text: "my dog is called Biscuit" }] });
-      instance.sessions.append(sid, { id: "old-a", role: "assistant", parts: [{ type: "text", text: "Noted." }] });
-      instance.sessions.addCompaction(sid, "The user's dog is called Biscuit.", "old-u", "old-a");
-      instance.sessions.append(sid, { id: "legacy-u", role: "user", parts: [{ type: "text", text: "the password is swordfish" }] });
-      instance.sessions.append(sid, {
+      sid.append({ id: "old-u", role: "user", parts: [{ type: "text", text: "my dog is called Biscuit" }] });
+      sid.append({ id: "old-a", role: "assistant", parts: [{ type: "text", text: "Noted." }] });
+      sid.compact("The user's dog is called Biscuit.", "old-u", "old-a");
+      sid.append({ id: "legacy-u", role: "user", parts: [{ type: "text", text: "the password is swordfish" }] });
+      sid.append({
         id: "legacy-a",
         role: "assistant",
         parts: [
@@ -256,9 +257,9 @@ describe("pi is the default engine", () => {
     const id = await newSession();
     const inDO = runInDurableObject as unknown as (stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<void>) => Promise<void>;
     await inDO(await agent(id), async (instance, state) => {
-      const sid = seedThinkSession(instance);
-      instance.sessions.append(sid, { id: "t-u", role: "user", parts: [{ type: "text", text: "screenshot the page" }] });
-      instance.sessions.append(sid, { id: "t-a", role: "assistant", parts: [{ type: "text", text: "Here it is." }] });
+      const sid = seedThinkSession(instance, state);
+      sid.append({ id: "t-u", role: "user", parts: [{ type: "text", text: "screenshot the page" }] });
+      sid.append({ id: "t-a", role: "assistant", parts: [{ type: "text", text: "Here it is." }] });
       state.storage.sql.exec(
         "INSERT INTO message_attachments (message_id, media_type, url, size, source, name, created_at) VALUES ('t-a', 'image/jpeg', 'data:image/jpeg;base64,CCCC', 4, 'tool', NULL, 1700000000)",
       );

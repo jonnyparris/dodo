@@ -8,7 +8,7 @@ import {
   createGrepTool,
   createWriteTool,
   createEditTool,
-} from "./think-adapter";
+} from "./tools/workspace-tools";
 import { runSubagentForProfile } from "./subagent-runner";
 import { TASK_PROFILE, resolveProfileModel } from "./agent-profile";
 import type { AppConfig, Env } from "./types";
