@@ -11,17 +11,17 @@ import {
 
 /**
  * Read-only web tools: fetch-first page reading with Browser Run fallback,
- * plus Jev evaluation.
+ * plus Clef (decision model) evaluation.
  *
  * Two tools:
  *   browser_markdown — fetch a page as markdown. Plain GET first
  *     (Accept: text/markdown, then Workers AI toMarkdown for HTML/PDF/
  *     Office), Browser Run /markdown then CDP only when the direct fetch is
  *     blocked or the page is JS-rendered. Long pages are windowed with
- *     nextOffset. Optionally verified against a query with a calibrated Jev
+ *     nextOffset. Optionally verified against a query with a calibrated Clef
  *     `noul` verdict so the agent can decide whether to keep browsing.
  *   browser_triage — rank candidate URLs by how likely each answers a
- *     question BEFORE spending any fetch. Pure Jev evaluation on metadata.
+ *     question BEFORE spending any fetch. Pure Clef evaluation on metadata.
  *
  * Both complement (not replace) browser_execute: interactive pages
  * (login, clicks, screenshots, DOM inspection) still need full CDP.
@@ -147,14 +147,24 @@ export function validateTargetUrl(raw: string): { url: URL } | { error: string }
 
 const MARKDOWN_STATE_CHAR_LIMIT = 18000;
 
-/** Ask Jev whether the page content answers the query. */
+/**
+ * Decision models (Jev-API compatible). Clef-flash for "does this page answer
+ * the query" (cheapest; 24k context, pages are capped at 18k chars). Full Clef
+ * for URL triage, a retrieval-style pick where Clef-flash trails (BRIGHT 39 vs
+ * Clef 46 / Jev 48); its state is tiny, so the price gap doesn't matter.
+ */
+const CLEF = "@cf/cloudflare/clef" as const;
+const CLEF_FLASH = "@cf/cloudflare/clef-flash" as const;
+
+/** Ask Clef whether the page content answers the query. */
 async function verifyPageAnswers(
   ai: JevAi,
   markdown: string,
   query: string,
 ): Promise<{ hasAnswer: number | null; note?: string }> {
   try {
-    const response = await ai.run("typesafe/jev", {
+    const response = await ai.run(CLEF_FLASH, {
+      model: "clef-flash",
       state: { query, page: markdown.slice(0, MARKDOWN_STATE_CHAR_LIMIT) },
       questions: {
         has_answer: {
@@ -169,11 +179,11 @@ async function verifyPageAnswers(
     });
     const noul = extractJevNoul(response, "has_answer");
     return noul === null
-      ? { hasAnswer: null, note: "Jev returned an unexpected shape" }
+      ? { hasAnswer: null, note: "Clef returned an unexpected shape" }
       : { hasAnswer: noul };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error("Jev page verification failed:", message);
+    console.error("Clef page verification failed:", message);
     return {
       hasAnswer: null,
       note: `Jev verification unavailable: ${message}`,
@@ -208,7 +218,8 @@ export async function triageUrls(
   });
 
   try {
-    const response = await ai.run("typesafe/jev", {
+    const response = await ai.run(CLEF, {
+      model: "clef",
       state: { query, candidates },
       questions: {
         best_source: {
@@ -222,7 +233,7 @@ export async function triageUrls(
 
     const choice = extractJevChoice(response, "best_source");
     if (!choice) {
-      console.error("Jev triage returned an unexpected shape for best_source");
+      console.error("Clef triage returned an unexpected shape for best_source");
       return null;
     }
 
@@ -236,7 +247,7 @@ export async function triageUrls(
     return { ranking, picked: ranking[0]?.url ?? candidates[0]?.url };
   } catch (error) {
     console.error(
-      "Jev triage failed:",
+      "Clef triage failed:",
       error instanceof Error ? error.message : String(error),
     );
     return null;
@@ -429,8 +440,8 @@ export async function loadPageMarkdown(
  */
 export interface JevAi {
   run(
-    model: "typesafe/jev",
-    inputs: { state: unknown; questions: Record<string, unknown> },
+    model: typeof CLEF | typeof CLEF_FLASH,
+    inputs: { model: "clef" | "clef-flash"; state: unknown; questions: Record<string, unknown> },
   ): Promise<Record<string, unknown>>;
   toMarkdown(
     files: MarkdownDocument,

@@ -27,6 +27,7 @@ import {
 } from "./subagent-runner";
 import { createExecuteTool } from "./tools/execute-tool";
 import { createWorkspaceTools } from "./tools/workspace-tools";
+import { createImageCheckTool, type ResolveImage } from "./tools/image-check";
 import { sanitizeToolJsonSchema } from "./tool-schema";
 import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";
@@ -102,6 +103,11 @@ interface BuildToolsOptions {
    * `this.readSessionDocument`.
    */
   readAttachment?: (input: { id: string; offset?: number; limit?: number }) => Promise<unknown>;
+  /**
+   * Resolve an image reference (session attachment URL or workspace path)
+   * to a data URL. Backs `image_check` (Clef questions about images).
+   */
+  resolveImage?: ResolveImage;
   /**
    * Computer workspace runtime for the `shell` tool. When provided,
    * commands are executed via `ws.runtime.exec()` instead of the legacy
@@ -287,6 +293,7 @@ export const KNOWN_CONDITIONAL_TOOL_NAMES = [
   "browser_markdown", // requires browser binding + admin + session config
   "browser_triage",
   "web_search",     // requires admin owner + WEB_SEARCH_GATEWAY_ID + AI.websearch
+  "image_check",    // requires env.AI (Clef)
 ] as const;
 
 export function capCodemodeResult(result: unknown, maxBytes: number): unknown {
@@ -1708,6 +1715,12 @@ function buildTools(
     });
   }
 
+  // image_check — Clef decision-model questions about images. Lets text-only
+  // models check uploads and keeps screenshots out of context for all models.
+  if (options?.resolveImage && env.AI) {
+    tools.image_check = createImageCheckTool({ ai: env.AI, resolveImage: options.resolveImage });
+  }
+
   // Goal status tool — only present when the parent agent exposes the
   // goal hooks. Lets a session that has a goal declare it complete /
   // blocked / needs_input so the auto-continue loop can stop.
@@ -1739,8 +1752,8 @@ function buildTools(
   // (no codemode executor needed — plain binding + AI calls).
   if (env.BROWSER && options?.browserEnabled && options?.isAdminUser) {
     // Cast rationale: pinned workers-types types AI.run only for catalog
-    // models (keyof AiModels); typesafe/jev is a third-party model the
-    // runtime accepts but the type can't express. Narrowed to JevAi.
+    // models it knows (keyof AiModels); the Clef models are newer than the
+    // pinned types. Narrowed to JevAi (Clef speaks the Jev API).
     const webFetchTools = createWebFetchTools({
       browser: env.BROWSER,
       ai: env.AI as unknown as JevAi,

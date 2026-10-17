@@ -110,6 +110,14 @@ const ORCHESTRATOR_TOOLS: ToolCatalogEntry[] = [
     category: "execution",
     alwaysOn: true,
   },
+  {
+    name: "image_check",
+    description:
+      "Ask Clef (fast decision model) yes/no, choice or score questions about uploaded images, screenshots or workspace images.",
+    category: "execution",
+    alwaysOn: false,
+    caveat: "Requires the Workers AI binding.",
+  },
   // Browser tools — gated on BROWSER + LOADER bindings, session-enabled
   // browser config, and admin owner. Listed so users know they exist even
   // when their current session has them off.

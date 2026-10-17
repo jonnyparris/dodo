@@ -12,7 +12,7 @@ import { buildToolsForThink } from "./agentic";
 import { ARTIFACTS_TOKEN_TTL_SECONDS, type ArtifactsFsCache, buildArtifactsCloneUrl, flushTurnToArtifacts, listArtifactsTree, readArtifactsFile, refreshArtifactsFs } from "./artifacts";
 import type { ArtifactsRepo } from "./artifacts-types";
 import type { AttachmentRef } from "./attachments";
-import { attachmentUrlToKey, MAX_READ_ATTACHMENT_CHARS, rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
+import { attachmentUrlToKey, isAttachmentUrl, MAX_READ_ATTACHMENT_CHARS, rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
 import { listBuiltinSkills } from "./builtin-skills";
 import { bytesToBase64Chunked } from "./crypto";
@@ -58,6 +58,7 @@ import {
 import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
 import { DodoAgentBase } from "./agent-base";
+import { classifyImageIntent } from "./clef";
 import type { FiberCompleteContext, FiberRecoveryContext } from "agents/experimental/forever";
 import type { SnapshotV2 } from "./transcript";
 import {
@@ -1269,6 +1270,7 @@ export class CodingAgent extends CodingAgentBase {
       mcpGatekeepers: this.mcpGatekeepers,
       todoStore: this.todoStore(),
       readAttachment: (i: { id: string; offset?: number; limit?: number }) => this.readSessionDocument(i),
+      resolveImage: (ref: string) => this.resolveImageRef(ref),
     });
   }
 
@@ -3059,45 +3061,13 @@ export class CodingAgent extends CodingAgentBase {
       });
     }
 
-    // When images are attached and the chat model can't see them, route to
-    // Replicate image editing instead of sending to the text LLM (which would
-    // either reject the image or hallucinate). This lets users on non-vision
-    // models edit images via "add dreadlocks" + upload without /generate.
-    // When no new images are attached but the last assistant message has an
-    // image, reuse it for follow-up editing (e.g. "make it blue" after a
-    // previous edit).
-    if (input.images?.length) {
-      this.ensureThinkConfig(request);
-      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
-      if (!modelSupportsVision(modelId)) {
-        const replicateImages = input.images
-          .filter((att) => isImageMediaType(att.mediaType))
-          .map((att) => ({ data: att.data, mediaType: att.mediaType }));
-        if (replicateImages.length > 0) {
-          return this.runImageGeneration({
-            prompt: input.content,
-            sessionId,
-            authorEmail,
-            ownerEmail,
-            images: replicateImages,
-          });
-        }
-      }
-    } else {
-      this.ensureThinkConfig(request);
-      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
-      if (!modelSupportsVision(modelId)) {
-        const lastImage = await this.fetchLastAssistantImage();
-        if (lastImage) {
-          return this.runImageGeneration({
-            prompt: input.content,
-            sessionId,
-            authorEmail,
-            ownerEmail,
-            images: [lastImage],
-          });
-        }
-      }
+    // Text-only model + an image in play (attached, or the last generated
+    // one): Clef decides edit (Replicate) vs question (the model, which can
+    // use image_check). Needs the model config, hence ensureThinkConfig first.
+    this.ensureThinkConfig(request);
+    const editImages = await this.imageEditTarget(input.content, input.images);
+    if (editImages) {
+      return this.runImageGeneration({ prompt: input.content, sessionId, authorEmail, ownerEmail, images: editImages });
     }
 
     // handleMessage is synchronous — callers (MCP, external integrations) expect the
@@ -3181,40 +3151,11 @@ export class CodingAgent extends CodingAgentBase {
       });
     }
 
-    // When images are attached and the chat model can't see them, route to
-    // Replicate image editing instead of the text LLM. When no new images
-    // are attached but the last assistant message has an image, reuse it
-    // for follow-up editing.
-    if (input.images?.length) {
-      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
-      if (!modelSupportsVision(modelId)) {
-        const replicateImages = input.images
-          .filter((att) => isImageMediaType(att.mediaType))
-          .map((att) => ({ data: att.data, mediaType: att.mediaType }));
-        if (replicateImages.length > 0) {
-          return this.runImageGeneration({
-            prompt: input.content,
-            sessionId,
-            authorEmail,
-            ownerEmail,
-            images: replicateImages,
-          });
-        }
-      }
-    } else {
-      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
-      if (!modelSupportsVision(modelId)) {
-        const lastImage = await this.fetchLastAssistantImage();
-        if (lastImage) {
-          return this.runImageGeneration({
-            prompt: input.content,
-            sessionId,
-            authorEmail,
-            ownerEmail,
-            images: [lastImage],
-          });
-        }
-      }
+    // Text-only model + an image in play: Clef decides whether this is an
+    // edit (Replicate) or a question (the model, with image_check).
+    const editImages = await this.imageEditTarget(input.content, input.images);
+    if (editImages) {
+      return this.runImageGeneration({ prompt: input.content, sessionId, authorEmail, ownerEmail, images: editImages });
     }
 
     const r = await this.lifecycle.start({
@@ -4389,6 +4330,60 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   /**
+   * For a model that can't see images: the image(s) to edit with Replicate,
+   * or null to answer with the model. Clef reads the message (text only,
+   * ~150 ms) and says edit vs ask; before this, every image message, and
+   * every message after a generated image ("thanks!"), became an edit.
+   * Vision models always answer themselves.
+   */
+  private async imageEditTarget(content: string, images?: Array<{ data: string; mediaType: string }>): Promise<ReplicateImageInput[] | null> {
+    const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
+    if (modelSupportsVision(modelId)) return null;
+    let target: ReplicateImageInput[];
+    let context: string;
+    if (images?.length) {
+      target = images.filter((a) => isImageMediaType(a.mediaType)).map((a) => ({ data: a.data, mediaType: a.mediaType }));
+      if (target.length === 0) return null;
+      context = `The user attached ${target.length} image(s) to this message.`;
+    } else {
+      const last = await this.fetchLastAssistantImage();
+      if (!last) return null;
+      target = [last];
+      context = "The assistant's previous message was an image it generated.";
+    }
+    const { intent, pEdit } = await classifyImageIntent(this.env.AI, content, context);
+    log("info", "image intent", { sessionId: this.sessionId(), intent, pEdit, newImages: Boolean(images?.length) });
+    return intent === "edit" ? target : null;
+  }
+
+  /**
+   * Image bytes for image_check, as a data URL. Accepts this session's own
+   * attachment URLs (uploads, generated images, screenshots: anything in
+   * message_attachments) or a workspace path. Other sessions' attachments
+   * are refused even if the URL is known.
+   */
+  private async resolveImageRef(ref: string): Promise<{ mediaType: string; dataUrl: string } | { error: string }> {
+    const trimmed = ref.trim();
+    if (isAttachmentUrl(trimmed) || trimmed.startsWith("data:")) {
+      const row = Array.from(this.ctx.storage.sql.exec("SELECT media_type, url FROM message_attachments WHERE url = ? LIMIT 1", trimmed))[0];
+      if (!row) return { error: "not an attachment of this session" };
+      const mediaType = String(row.media_type);
+      if (trimmed.startsWith("data:")) return { mediaType, dataUrl: trimmed };
+      const key = attachmentUrlToKey(trimmed);
+      const obj = key && this.env.WORKSPACE_BUCKET ? await this.env.WORKSPACE_BUCKET.get(key) : null;
+      if (!obj) return { error: "attachment missing from storage" };
+      return { mediaType, dataUrl: `data:${mediaType};base64,${bytesToBase64Chunked(new Uint8Array(await obj.arrayBuffer()))}` };
+    }
+    const path = normalizePath(trimmed.startsWith("/") ? trimmed : `/${trimmed}`);
+    const ext = path.split(".").pop()?.toLowerCase() ?? "";
+    const mediaType = ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp" } as Record<string, string>)[ext];
+    if (!mediaType) return { error: "workspace image must be .png, .jpg, .jpeg or .webp" };
+    const bytes = await this.workspace.readFileBytes(path).catch(() => null);
+    if (!bytes) return { error: `no such workspace file: ${path}` };
+    return { mediaType, dataUrl: `data:${mediaType};base64,${bytesToBase64Chunked(bytes)}` };
+  }
+
+  /**
    * Cache the number of compaction summaries in the transcript for the sync
    * session-details read. Counted from entries, not compaction events: a
    * background compaction can finish after the turn stops listening.
@@ -4527,6 +4522,8 @@ export class CodingAgent extends CodingAgentBase {
     // Per-turn budget for inlined doc text. Once spent, later docs stub even
     // if individually small.
     let turnInlineChars = 0;
+    // Images stored for a text-only model (shown in the chat, read by image_check).
+    const imageChips: Array<{ mediaType: string; url: string; size: number; name?: string }> = [];
     if (options?.images?.length) {
       const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
       const visionOk = modelSupportsVision(modelId);
@@ -4725,8 +4722,24 @@ export class CodingAgent extends CodingAgentBase {
           continue;
         }
         if (!visionOk) {
+          // The model can't see it: store it (so the user sees it in the
+          // chat and image_check can read it) and tell the model how to ask.
+          const label = att.name ?? att.mediaType;
+          const ref = await uploadAttachment(this.env, {
+            sessionId: this.sessionId(), messageId: userMsgId,
+            mediaType: att.mediaType, data: url, source: "user",
+            ownerEmail: options?.authorEmail,
+          }).catch(() => null);
+          if (!ref) {
+            inlinedDocs.push(`[Image uploaded: ${label} — this model cannot process images, and it could not be stored]`);
+            continue;
+          }
+          this.insertMessageAttachment({ messageId: userMsgId, mediaType: ref.mediaType, url: ref.url, size: ref.size, source: "user", name: att.name ?? null });
+          imageChips.push({ mediaType: ref.mediaType, url: ref.url, size: ref.size, ...(att.name ? { name: att.name } : {}) });
           inlinedDocs.push(
-            `[Image uploaded: ${att.name ?? att.mediaType} — this model cannot process images]`,
+            `[Image attached: ${label} (${ref.mediaType}) — ${ref.url}\n` +
+              "You can't see images on this model. Ask about it with image_check, e.g. " +
+              `image_check({ images: ["${ref.url}"], questions: [{ id: "colour", kind: "choice", question: "What is the main colour?", options: ["red", "green", "blue", "black", "white", "other"] }] }).]`,
           );
           continue;
         }
@@ -4803,6 +4816,7 @@ export class CodingAgent extends CodingAgentBase {
       tokenOutput: 0,
       createdAt: nowEpoch(),
     });
+    docChipAttachments.push(...imageChips);
     if (docChipAttachments.length > 0) {
       const rewritten = rewriteAttachmentsForClient(docChipAttachments) ?? docChipAttachments;
       userRecord.attachments = [...(userRecord.attachments ?? []), ...rewritten];
