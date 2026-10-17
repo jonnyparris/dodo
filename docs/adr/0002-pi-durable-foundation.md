@@ -98,12 +98,20 @@ Gaps 1–4 closed. Every prompt runs on pi; `DODO_AGENT_ENGINE` is gone and
   `maybeCompactContext`, `runThinkChat`, `getMaxSteps`; `loop-policy.ts`,
   `compaction-policy.ts`, `overflow-retry.ts`, `own-loop-prune.ts`,
   `final-summary-policy.ts` and their tests.
-- **Still on Think (next):** `CodingAgent extends Think` for config storage
-  (`getConfig`/`configure`), fibers (`stashFiber` recovery re-enters
-  `runFiberPrompt`, and pi reattaches by prompt id), and reads of unmigrated
-  history. Dropping the base class needs a config-table migration; do it after a
-  soak, together with `think-adapter.ts` and `@cloudflare/think`.
-- Gap 5 (live eviction proof) is still open.
+- **No Think base class.** `CodingAgent extends DodoAgentBase`
+  (`src/agent-base.ts`): `withFibers(Agent)` plus config in the same
+  `_think_config` row (no data migration) and a read-only `SessionManager` over
+  Think's tables for unmigrated history. `@cloudflare/think` stays only as a
+  tool library (workspace + execute tools) and for `SessionManager`.
+- **Gap 5 closed (2026-10-17):** `POST /session/:id/debug/evict` (admin) resets
+  the DO mid-turn; the prompt resumes from the alarm heartbeat with no client
+  request, each side effect once. That needed a fix: `CodingAgent.alarm()` was a
+  no-op override that never called `Agent.alarm()`, so cron, watchdog and fiber
+  recovery had never run from alarms.
+- Production validation, all on real data: Think→pi of all 19 Think-era
+  sessions (fork diff identical, incl. compaction summaries and screenshots),
+  forced compaction (`/debug/compact`), loop guard, abort, explore subagent, MCP,
+  vision input, UI streaming.
 
 ## Kitebuild and containers
 

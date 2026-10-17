@@ -6,9 +6,9 @@ import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { createMemoryStateBackend, Workspace } from "@cloudflare/shell";
 import { stateToolsFromBackend } from "@cloudflare/shell/workers";
 import { type Agent, type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type SubAgentClass, type SubAgentStub, type WSMessage } from "agents";
-import { type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
+import { type FileUIPart, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
-import { buildProvider, buildToolsForThink } from "./agentic";
+import { buildToolsForThink } from "./agentic";
 import { ARTIFACTS_TOKEN_TTL_SECONDS, type ArtifactsFsCache, buildArtifactsCloneUrl, flushTurnToArtifacts, listArtifactsTree, readArtifactsFile, refreshArtifactsFs } from "./artifacts";
 import type { ArtifactsRepo } from "./artifacts-types";
 import type { AttachmentRef } from "./attachments";
@@ -57,14 +57,13 @@ import {
 } from "./skill-registry";
 import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
+import { DodoAgentBase } from "./agent-base";
+import type { FiberCompleteContext, FiberRecoveryContext } from "agents/experimental/forever";
 import type { SnapshotV2 } from "./think-adapter";
 import {
   chatRecordToUIMessage,
   type DodoConfig,
-  type FiberCompleteContext,
-  type FiberRecoveryContext,
   type MessageMetadata,
-  Think,
   type UIMessage,
   messageAttachmentRefs,
   uiMessageToChatRecord,
@@ -449,19 +448,6 @@ const SYSTEM_PROMPT = [
   "",
   "When something fails: state what failed, fix it, move on. Don't apologize repeatedly.",
 ].join("\n");
-/** Build a LanguageModel from DodoConfig (Think per-session config). */
-function buildProviderFromConfig(config: DodoConfig, env: Env, sessionAffinity?: string): LanguageModel {
-  const appConfig: AppConfig = {
-    activeGateway: config.activeGateway,
-    aiGatewayBaseURL: config.aiGatewayBaseURL,
-    gitAuthorEmail: config.gitAuthorEmail,
-    gitAuthorName: config.gitAuthorName,
-    model: config.model,
-    opencodeBaseURL: config.opencodeBaseURL,
-  };
-  return buildProvider(appConfig, env, sessionAffinity).chatModel(config.model);
-}
-
 // normalizePath imported at top of file from ./paths
 
 /**
@@ -475,7 +461,7 @@ class FacetNotFoundError extends Error {
   }
 }
 
-const CodingAgentBase = Think<Env, DodoConfig>;
+const CodingAgentBase = DodoAgentBase<DodoConfig>;
 
 export class CodingAgent extends CodingAgentBase {
   initialState: SessionState = {
@@ -495,8 +481,6 @@ export class CodingAgent extends CodingAgentBase {
     updatedAt: "",
   };
 
-  /** Enable durable fiber recovery for async prompts. */
-  override fibers = true;
 
   private readonly clients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
   /** Connected MCP gatekeepers, populated by connectMcpServers(). */
@@ -798,17 +782,7 @@ export class CodingAgent extends CodingAgentBase {
     });
   }
 
-  // ─── Think overrides ───
-
-  override getModel(): LanguageModel {
-    const config = this.getConfig();
-    if (!config) {
-      throw new Error("getModel(): no Think config — session not configured yet");
-    }
-    return buildProviderFromConfig(config, this.env, this.sessionId());
-  }
-
-  override getSystemPrompt(): string {
+  getSystemPrompt(): string {
     // Gather the optional sections that depend on DO state.
     const browserEnabled = this.browserEnabled();
     const browserSection = browserEnabled
@@ -847,7 +821,7 @@ export class CodingAgent extends CodingAgentBase {
       : undefined;
 
     // Inject bounded workspace summary on first turn only.
-    const firstTurn = this.agentEngine() === "pi" ? this.listPrompts().length <= 1 : this.messages.length <= 1;
+    const firstTurn = this.listPrompts().length <= 1;
     const workspaceSummary = firstTurn ? this.getWorkspaceSummary() ?? undefined : undefined;
 
     const config = this.getConfig();
@@ -1240,8 +1214,8 @@ export class CodingAgent extends CodingAgentBase {
     return this._workspaceSummary;
   }
 
-  override getTools(): ToolSet {
-    const appConfig = this.getAppConfigFromThink();
+  getTools(): ToolSet {
+    const appConfig = this.appConfigFromSession();
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
     const isChatMonitorBrain = this.readMetadata("is_chat_monitor_brain") === "true";
     const chatMonitorSpaceId = this.readMetadata("chat_monitor_space_id") || undefined;
@@ -1299,7 +1273,7 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   /** Build an AppConfig from Think's per-session config, falling back to env defaults. */
-  private getAppConfigFromThink(): AppConfig {
+  private appConfigFromSession(): AppConfig {
     const config = this.getConfig();
     if (config) {
       return {
@@ -1330,20 +1304,9 @@ export class CodingAgent extends CodingAgentBase {
     };
   }
 
-  /**
-   * Think's host bridge (extension Workers) calls readFile/writeFile/
-   * deleteFile/readDir on this. Think types it as shell's Workspace, which
-   * our WorkspaceFsView can't satisfy nominally (shell Workspace has
-   * private fields) — the runtime contract is those four methods, which
-   * the view provides over the computer VFS.
-   */
-  override getWorkspace(): Workspace {
-    return this.workspace as unknown as Workspace;
-  }
-
   override onStart(): void {
-    // Initialize Think: creates SessionManager, loads existing sessions,
-    // sets up protocol handlers, checks fibers if enabled.
+    // Opens the Think-era SessionManager (read-only history) and restarts
+    // fibers an eviction interrupted. See DodoAgentBase.
     super.onStart();
     this.mcp.configureOAuthCallback({
       successRedirect: "/mcp-oauth-success",
@@ -1356,30 +1319,15 @@ export class CodingAgent extends CodingAgentBase {
     // "mcp-hygiene" override did both until 2026-10 and silently broke
     // session cron jobs, the watchdog and mid-turn eviction recovery.
 
-    // Suppress Think's WebSocket chat protocol.
-    // super.onStart() wraps onMessage via _setupProtocolHandlers() to intercept
-    // cf_agent_chat_* messages. We re-wrap onMessage to skip those protocol
-    // messages entirely, routing everything through Dodo's own handlers.
-    const thinkWrappedOnMessage = this.onMessage.bind(this);
-    this.onMessage = async (connection: Connection, message: WSMessage) => {
-      if (typeof message === "string") {
-        try {
-          const data = JSON.parse(message);
-          // Block Think's chat protocol messages
-          if (data.type === "cf_agent_use_chat_request" ||
-              data.type === "cf_agent_chat_clear" ||
-              data.type === "cf_agent_chat_request_cancel") {
-            return;
-          }
-        } catch {
-          // Not JSON — let it through
-        }
-      }
-      return thinkWrappedOnMessage(connection, message);
-    };
-
-    // Enforce single Think session per Dodo DO
-    this.ensureSingleThinkSession();
+    // Sessions from before the single-session rule could hold several Think
+    // sessions; keep the most recent so migration reads one history.
+    const thinkSessions = this.sessions.list();
+    if (thinkSessions.length > 1) {
+      const [latest, ...rest] = [...thinkSessions].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+      log("warn", "multiple think sessions found, using most recent", { sessionId: this.sessionId(), count: thinkSessions.length });
+      this.setThinkSessionId(latest!.id);
+      for (const extra of rest) this.sessions.delete(extra.id);
+    }
 
     // Dodo's existing init logic
     const details = this.readSessionDetails();
@@ -1408,34 +1356,6 @@ export class CodingAgent extends CodingAgentBase {
     this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", queuedId);
     this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
     await this.lifecycle.start({ source: "queue", content, authorEmail });
-  }
-
-  /**
-   * Ensure exactly one Think session exists per Dodo DO.
-   * Called from onStart() after super.onStart() initializes SessionManager.
-   */
-  private ensureSingleThinkSession(): void {
-    const existing = this.sessions.list();
-    if (existing.length === 0) {
-      // No session yet — create one. super.onStart() may have already
-      // created one if there were existing sessions, but not if the DO is fresh.
-      if (!this.getCurrentSessionId()) {
-        this.createSession("default");
-      }
-    } else if (existing.length > 1) {
-      // Multiple sessions — use most recent, delete extras
-      log("warn", "multiple think sessions found, using most recent", {
-        sessionId: this.sessionId(),
-        count: existing.length,
-      });
-      const sorted = [...existing].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-      // Switch to the most recent
-      this.switchSession(sorted[0].id);
-      for (let i = 1; i < sorted.length; i++) {
-        this.sessions.delete(sorted[i].id);
-      }
-    }
-    // If exactly 1 exists, super.onStart() already loaded it
   }
 
   async onRequest(request: Request): Promise<Response> {
@@ -3059,7 +2979,7 @@ export class CodingAgent extends CodingAgentBase {
     const version = typeof raw.version === "number" ? raw.version : 1;
 
     if (version === 2) {
-      // V2 import: UIMessages + sidecar metadata → Think session
+      // V2 import: UIMessages + sidecar metadata → pi transcript
       const v2 = snapshotInput as SnapshotV2;
       if (v2.title) this.writeMetadata("title", v2.title);
       for (const file of v2.files) {
@@ -3081,7 +3001,7 @@ export class CodingAgent extends CodingAgentBase {
       return Response.json({ imported: true, version: 2, messages: v2.messages.length, files: v2.files.length });
     }
 
-    // V1 import: flat ChatMessageRecord[] → Think session
+    // V1 import: flat ChatMessageRecord[] → pi transcript
     const snapshot = z.object({ files: z.array(z.object({ content: z.string(), path: z.string().min(1) })), messages: z.array(z.object({ content: z.string(), createdAt: z.string(), id: z.string(), model: z.string().nullable(), provider: z.string().nullable(), role: z.enum(["assistant", "system", "tool", "user"]) })), title: z.string().nullable() }).parse(snapshotInput) as SessionSnapshot;
 
     if (snapshot.title) {
@@ -3642,7 +3562,7 @@ export class CodingAgent extends CodingAgentBase {
       return;
     }
 
-    // Refresh Think config from the latest account config before each prompt run.
+    // Refresh the session config from the latest account config before each prompt run.
     await this.readAppConfig();
 
     // Check fiber snapshot — if chat already completed, skip to finalization

@@ -48,6 +48,13 @@ const internal = async (id: string, path: string, body: unknown) =>
     body: JSON.stringify(body),
   });
 
+/** Give a session a Think-era history table, as sessions from before pi have. */
+function seedThinkSession(instance: any): string {
+  const sid = instance.getCurrentSessionId() ?? instance.sessions.create("default").id;
+  instance.setThinkSessionId(sid);
+  return sid;
+}
+
 async function waitForPrompt(id: string, promptId: string, ms = 2000) {
   for (let i = 0; i < ms / 10; i++) {
     const { prompts } = await json<{ prompts: Array<{ id: string; status: string; error?: string }> }>(await call(`/session/${id}/prompts`));
@@ -154,7 +161,7 @@ describe("pi is the default engine", () => {
     const inDO = runInDurableObject as unknown as (stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<void>) => Promise<void>;
     await inDO(await agent(id), async (instance, state) => {
       // A pre-pi session: Think history, no agent_engine metadata.
-      const sid = instance.getCurrentSessionId() ?? instance.createSession("default").id;
+      const sid = seedThinkSession(instance);
       // Two old turns, compacted into a summary (Think shows it as a system message).
       instance.sessions.append(sid, { id: "old-u", role: "user", parts: [{ type: "text", text: "my dog is called Biscuit" }] });
       instance.sessions.append(sid, { id: "old-a", role: "assistant", parts: [{ type: "text", text: "Noted." }] });
@@ -232,7 +239,7 @@ describe("pi is the default engine", () => {
     const id = await newSession();
     const inDO = runInDurableObject as unknown as (stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<void>) => Promise<void>;
     await inDO(await agent(id), async (instance, state) => {
-      const sid = instance.getCurrentSessionId() ?? instance.createSession("default").id;
+      const sid = seedThinkSession(instance);
       instance.sessions.append(sid, { id: "t-u", role: "user", parts: [{ type: "text", text: "screenshot the page" }] });
       instance.sessions.append(sid, { id: "t-a", role: "assistant", parts: [{ type: "text", text: "Here it is." }] });
       state.storage.sql.exec(

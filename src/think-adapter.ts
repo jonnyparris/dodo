@@ -1,11 +1,9 @@
 /**
- * Think adapter — all @cloudflare/think imports route through this file.
- *
- * Provides types, re-exports, and adapters to isolate Think coupling
- * from the rest of the Dodo codebase.
+ * @cloudflare/think boundary. Dodo no longer runs Think's agent loop or
+ * extends its class (pi is the loop; see src/agent-base.ts). What's left:
+ * Think's workspace + execute tools, and helpers for the Think-era
+ * UIMessage transcript shape (session views, snapshots, migration).
  */
-
-// ─── Re-exports from @cloudflare/think ───
 
 import type { Workspace } from "@cloudflare/shell";
 import {
@@ -13,15 +11,6 @@ import {
 } from "@cloudflare/think/tools/workspace";
 import type { WorkspaceFsView } from "./runtime/computer/workspace-view";
 
-export type {
-  ChatMessageOptions,
-  FiberCompleteContext,
-  FiberRecoveryContext,
-  StreamableResult,
-  StreamCallback,
-} from "@cloudflare/think";
-export { Think } from "@cloudflare/think";
-export { truncateToolOutput } from "@cloudflare/think/session";
 export { createExecuteTool } from "@cloudflare/think/tools/execute";
 export {
   createEditTool,
@@ -43,7 +32,7 @@ export function createWorkspaceTools(workspace: WorkspaceFsView) {
   return thinkCreateWorkspaceTools(workspace as unknown as Workspace);
 }
 
-// ─── Re-exports from AI SDK (used alongside Think) ───
+// ─── Transcript shape ───
 
 export type { UIMessage } from "ai";
 
