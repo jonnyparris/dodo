@@ -3,12 +3,12 @@
 // persistence, session details, /debug/compaction), and legacy sessions that
 // must stay on Think.
 
-import { createExecutionContext, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, runDurableObjectAlarm, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { getAgentByName } from "agents";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/types";
-import { resetMockAgentic } from "./helpers/agentic-mock";
+import { releaseMockSlowPrompt, resetMockAgentic } from "./helpers/agentic-mock";
 
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/pi/models", async () => await import("./helpers/pi-models-mock"));
@@ -189,6 +189,36 @@ describe("pi is the default engine", () => {
     // A second prompt doesn't re-import anything.
     await send(`/session/${id}/message`, { content: "again" });
     expect((await messages(id)).filter((m) => m.id === "legacy-u")).toHaveLength(1);
+  });
+
+  // CodingAgent used to override alarm() (a no-op "mcp-hygiene" timer that
+  // re-armed itself for +24h), so Agent.alarm() never ran: session cron jobs
+  // never fired and an evicted prompt only recovered when a client called in.
+  it("the DO alarm runs Agents SDK schedules: a session cron job fires", async () => {
+    const id = await newSession();
+    const res = await send(`/session/${id}/cron`, { type: "delayed", delayInSeconds: 1, description: "probe", prompt: "cron says hi" });
+    expect(res.status).toBeLessThan(300);
+    await new Promise((r) => setTimeout(r, 1100));
+    expect(await runDurableObjectAlarm(await agent(id))).toBe(true);
+    for (let i = 0; i < 200; i++) {
+      const { prompts } = await json<{ prompts: Array<{ content: string; status: string }> }>(await call(`/session/${id}/prompts`));
+      if (prompts.some((p) => p.content.includes("cron says hi") && p.status === "completed")) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("cron prompt never ran");
+  });
+
+  it("while an async prompt runs, the alarm stays a 30s heartbeat (so an evicted run wakes and recovers)", async () => {
+    const id = await newSession();
+    const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<T>) => Promise<T>;
+    const alarmIn = async () => inDO(await agent(id), async (_i, state) => ((await state.storage.getAlarm()) ?? Infinity) - Date.now());
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "slow async prompt" }));
+    for (let i = 0; i < 100 && (await alarmIn()) > 30_000; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(await alarmIn()).toBeLessThanOrEqual(30_000);
+    await runDurableObjectAlarm(await agent(id));
+    expect(await alarmIn()).toBeLessThanOrEqual(30_000);
+    releaseMockSlowPrompt();
+    expect((await waitForPrompt(id, promptId)).status).toBe("completed");
   });
 
   it("only pi can be chosen", async () => {

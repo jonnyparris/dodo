@@ -78,6 +78,8 @@ import {
 import { evaluateSession } from "./watchdog-policy";
 import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 
+type FiberPromptPayload = { promptId: string; content: string; images?: Array<{ data: string; mediaType: string; name?: string }>; authorEmail?: string; title: string };
+
 /**
  * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
  *
@@ -1347,19 +1349,11 @@ export class CodingAgent extends CodingAgentBase {
       errorRedirect: "/mcp-oauth-error",
     });
 
-    // Arm the daily MCP-hygiene alarm if not already set. The alarm handler
-    // re-arms itself, so we only need to kick it off once per DO lifetime.
-    // Fire-and-forget — onStart() is sync per the Agents SDK contract.
-    this.ctx.waitUntil((async () => {
-      try {
-        const existing = await this.ctx.storage.getAlarm();
-        if (existing === null) {
-          await this.ctx.storage.setAlarm(Date.now() + 24 * 60 * 60 * 1000);
-        }
-      } catch (err) {
-        log("warn", "Failed to arm mcp-hygiene alarm", { err: err instanceof Error ? err.message : String(err) });
-      }
-    })());
+    // The Agents SDK owns this DO's alarm: schedule() tasks, the fiber
+    // keep-alive heartbeat and eviction recovery all run from Agent.alarm().
+    // Don't override alarm() or call storage.setAlarm() here — a no-op
+    // "mcp-hygiene" override did both until 2026-10 and silently broke
+    // session cron jobs, the watchdog and mid-turn eviction recovery.
 
     // Suppress Think's WebSocket chat protocol.
     // super.onStart() wraps onMessage via _setupProtocolHandlers() to intercept
@@ -3623,7 +3617,7 @@ export class CodingAgent extends CodingAgentBase {
    * if the DO is evicted mid-chat, recovery replays from the top and
    * skips already-completed work.
    */
-  async runFiberPrompt(payload: { promptId: string; content: string; images?: Array<{ data: string; mediaType: string; name?: string }>; authorEmail?: string; title: string }): Promise<void> {
+  async runFiberPrompt(payload: FiberPromptPayload): Promise<void> {
     const { promptId, content, images, authorEmail, title } = payload;
 
     // If the prompt was aborted (or otherwise finished) before the fiber
@@ -5719,12 +5713,6 @@ export class CodingAgent extends CodingAgentBase {
         error: error instanceof Error ? error.message : String(error),
       });
     }
-  }
-
-  async alarm(): Promise<void> {
-    const ownerEmail = this.readMetadata("owner_email");
-    log("info", "mcp-revocation alarm fired", { ownerEmail: ownerEmail ?? null });
-    await this.ctx.storage.setAlarm(Date.now() + 24 * 60 * 60 * 1000);
   }
 
   private async readAppConfig(): Promise<AppConfig> {
