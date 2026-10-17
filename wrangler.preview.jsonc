@@ -13,6 +13,7 @@
    */
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "dodo-preview",
+  "account_id": "4b430e167a301330d13a9bb42f3986a2",
   "main": "src/index.ts",
   "routes": [{ "pattern": "dodo-preview.jonnyparris.club", "custom_domain": true }],
   "compatibility_date": "2026-03-10",
