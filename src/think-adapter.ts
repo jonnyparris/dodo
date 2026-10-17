@@ -228,22 +228,27 @@ function toClientUrl(rawUrl: string, mediaType: string): string | null {
  * (`dodo-attachment://…` or data URLs), for copying into attachment rows.
  * uiMessageToChatRecord() shows the same set, rewritten for the browser.
  */
-export function messageAttachmentRefs(msg: UIMessage): Array<{ mediaType: string; url: string; name?: string; fromTool?: true }> {
-  const out: Array<{ mediaType: string; url: string; name?: string; fromTool?: true }> = [];
+export type AttachmentSource = "user" | "assistant" | "tool";
+export function messageAttachmentRefs(msg: UIMessage): Array<{ mediaType: string; url: string; name?: string; source?: AttachmentSource; size?: number }> {
+  const out: Array<{ mediaType: string; url: string; name?: string; source?: AttachmentSource; size?: number }> = [];
   for (const p of msg.parts ?? []) {
     if (p.type === "file") {
-      const { mediaType, url, filename } = p as { mediaType?: string; url?: string; filename?: string };
+      const { mediaType, url, filename, providerMetadata } = p as { mediaType?: string; url?: string; filename?: string; providerMetadata?: { dodo?: { source?: string; size?: number } } };
+      // Exported attachment rows carry their original source (see transcriptUIMessages).
+      const tagged = providerMetadata?.dodo?.source;
+      const source = tagged === "user" || tagged === "assistant" || tagged === "tool" ? tagged : undefined;
+      const size = providerMetadata?.dodo?.size;
       if (!mediaType || !(SAFE_IMAGE_MEDIA_TYPES.has(mediaType) || SAFE_DOC_MEDIA_TYPES.has(mediaType))) continue;
       if (typeof url !== "string" || url.length === 0) continue;
       const stored = url.startsWith("data:") || isAttachmentUrl(url) ? url : `data:${mediaType};base64,${url}`;
-      out.push({ mediaType, url: stored, ...(filename ? { name: filename } : {}) });
+      out.push({ mediaType, url: stored, ...(filename ? { name: filename } : {}), ...(source ? { source } : {}), ...(typeof size === "number" ? { size } : {}) });
       continue;
     }
     const typed = p as { type?: string; output?: unknown };
     if (typeof typed.type === "string" && typed.type.startsWith("tool-") && typed.output) {
       const found: Array<{ mediaType: string; url: string }> = [];
       collectToolOutputImages(typed.output, found, (u) => u);
-      out.push(...found.map((a) => ({ ...a, fromTool: true as const })));
+      out.push(...found.map((a) => ({ ...a, source: "tool" as const })));
     }
   }
   return out;

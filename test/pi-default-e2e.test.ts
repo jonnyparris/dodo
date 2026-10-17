@@ -228,6 +228,31 @@ describe("pi is the default engine", () => {
     expect((await waitForPrompt(id, promptId)).status).toBe("completed");
   });
 
+  it("forking a Think-era session keeps attachment rows (browser screenshots) with their source", async () => {
+    const id = await newSession();
+    const inDO = runInDurableObject as unknown as (stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<void>) => Promise<void>;
+    await inDO(await agent(id), async (instance, state) => {
+      const sid = instance.getCurrentSessionId() ?? instance.createSession("default").id;
+      instance.sessions.append(sid, { id: "t-u", role: "user", parts: [{ type: "text", text: "screenshot the page" }] });
+      instance.sessions.append(sid, { id: "t-a", role: "assistant", parts: [{ type: "text", text: "Here it is." }] });
+      state.storage.sql.exec(
+        "INSERT INTO message_attachments (message_id, media_type, url, size, source, name, created_at) VALUES ('t-a', 'image/jpeg', 'data:image/jpeg;base64,CCCC', 4, 'tool', NULL, 1700000000)",
+      );
+      state.storage.sql.exec("DELETE FROM metadata WHERE key = 'agent_engine'");
+    });
+    const src = await messages(id);
+    expect(src[1]!.attachments?.map((a) => a.mediaType)).toEqual(["image/jpeg"]);
+
+    const forked = await json<{ id: string }>(await call(`/session/${id}/fork`, { method: "POST" }));
+    expect(await json(await call(`/session/${forked.id}/engine`))).toEqual({ engine: "pi" });
+    const dst = await messages(forked.id);
+    expect(dst.map((m) => [m.id, m.role, m.content])).toEqual(src.map((m) => [m.id, m.role, m.content]));
+    expect(dst[1]!.attachments).toEqual(src[1]!.attachments);
+    // Fork the fork (pi → pi): still exactly one copy.
+    const again = await json<{ id: string }>(await call(`/session/${forked.id}/fork`, { method: "POST" }));
+    expect((await messages(again.id))[1]!.attachments).toEqual(src[1]!.attachments);
+  });
+
   it("only pi can be chosen", async () => {
     const id = await newSession();
     expect((await send(`/session/${id}/engine`, { engine: "think" }, "PUT")).status).toBe(400);

@@ -4290,7 +4290,7 @@ export class CodingAgent extends CodingAgentBase {
     for (const a of messageAttachmentRefs(msg)) {
       if (seen.has(a.url)) continue;
       seen.add(a.url);
-      this.insertMessageAttachment({ messageId: msg.id, mediaType: a.mediaType, url: a.url, size: 0, source: a.fromTool ? "tool" : msg.role === "user" ? "user" : "assistant", name: a.name ?? null });
+      this.insertMessageAttachment({ messageId: msg.id, mediaType: a.mediaType, url: a.url, size: a.size ?? 0, source: a.source ?? (msg.role === "user" ? "user" : "assistant"), name: a.name ?? null });
     }
   }
 
@@ -4364,9 +4364,23 @@ export class CodingAgent extends CodingAgentBase {
 
   /** The transcript as UIMessages, whichever engine holds it (snapshot export, fork). */
   private async transcriptUIMessages(): Promise<UIMessage[]> {
+    const asPart = (a: { mediaType: string; url: string; name?: string; source: string; size: number }) => ({
+      type: "file" as const,
+      mediaType: a.mediaType,
+      url: a.url,
+      ...(a.name ? { filename: a.name } : {}),
+      providerMetadata: { dodo: { source: a.source, size: a.size } },
+    });
     if (this.agentEngine() !== "pi") {
       const thinkSessionId = this.getCurrentSessionId();
-      return thinkSessionId ? this.sessions.getHistory(thinkSessionId) : [];
+      const history = thinkSessionId ? this.sessions.getHistory(thinkSessionId) : [];
+      // Attachment rows (browser screenshots, uploads) live beside the message, not in it.
+      const rows = this.listMessageAttachments(history.map((m) => m.id));
+      return history.map((m) => {
+        const inline = new Set(messageAttachmentRefs(m).map((a) => a.url));
+        const extra = (rows.get(m.id) ?? []).filter((a) => !inline.has(a.url));
+        return extra.length ? ({ ...m, parts: [...(m.parts ?? []), ...extra.map(asPart)] } as UIMessage) : m;
+      });
     }
     const views = entriesToMessages(await this.piEngine().entries());
     const attachments = this.listMessageAttachments(views.map((v) => v.id));
@@ -4376,7 +4390,7 @@ export class CodingAgent extends CodingAgentBase {
       parts: [
         ...(v.content ? [{ type: "text" as const, text: v.content }] : []),
         ...(v.images ?? []).map((img) => ({ type: "file" as const, mediaType: img.mediaType, url: img.url })),
-        ...(attachments.get(v.id) ?? []).map((a) => ({ type: "file" as const, mediaType: a.mediaType, url: a.url, ...(a.name ? { filename: a.name } : {}) })),
+        ...(attachments.get(v.id) ?? []).map(asPart),
       ],
     })) as UIMessage[];
   }
