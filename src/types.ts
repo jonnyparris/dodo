@@ -32,6 +32,8 @@ export interface Env {
   GIT_AUTHOR_EMAIL?: string;
   GIT_AUTHOR_NAME?: string;
   LOADER?: WorkerLoader;
+  /** Test-only override for the shell Dynamic Worker's compatibility date. */
+  SHELL_COMPATIBILITY_DATE?: string;
   OPENCODE_BASE_URL: string;
   OUTBOUND?: Fetcher;
   WORKER_URL: string;

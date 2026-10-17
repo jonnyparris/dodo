@@ -11,6 +11,7 @@ export default defineConfig({
           CF_ACCESS_AUD: "test-audience",
           CF_ACCESS_TEAM_DOMAIN: "https://example.cloudflareaccess.com",
           DEFAULT_MODEL: "claude-test",
+          SHELL_COMPATIBILITY_DATE: "2026-03-24",
           OPENCODE_BASE_URL: "https://mock-opencode.example/v1",
           AI_GATEWAY_BASE_URL: "https://mock-ai-gateway.example/v1",
           OPENCODE_GATEWAY_TOKEN: "opencode-token",

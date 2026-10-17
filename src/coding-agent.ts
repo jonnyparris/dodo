@@ -2,6 +2,7 @@ import { DynamicWorkerExecutor, type ExecuteResult, resolveProvider } from "@clo
 import type { WorkspaceRuntimeClient } from "@cloudflare/computer";
 import { Workspace as WorkspaceComputer } from "@cloudflare/computer";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
+import { byteSafeShellModules } from "./tools/shell-patch";
 
 import { createMemoryStateBackend, Workspace } from "@cloudflare/shell";
 import { stateToolsFromBackend } from "@cloudflare/shell/workers";
@@ -626,6 +627,10 @@ export class CodingAgent extends CodingAgentBase {
             // every test that boots a USER_CONTROL -> CodingAgent chain.
             workspace: { binding: "CODING_AGENT", id: this.ctx.id.toString() },
             ctx: this.ctx,
+            // Byte-safe redirects (upstream adapter drops "binary"); see shell-patch.ts.
+            commands: [byteSafeShellModules()],
+            // Test-only: vitest's workerd is older than computer's default date.
+            ...(this.env.SHELL_COMPATIBILITY_DATE ? { compatibilityDate: this.env.SHELL_COMPATIBILITY_DATE } : {}),
           }),
         ],
         sessionId: this.ctx.id.toString(),
