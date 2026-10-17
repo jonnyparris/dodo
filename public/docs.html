@@ -6,8 +6,8 @@
   <title>Dodo — Documentation</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
   <style>
-    :root{--bg:#f5f5f0;--panel:#fff;--text:#1a1a1a;--muted:#666;--accent:#0a7c66;--accent-bg:rgba(10,124,102,.06);--border:#e0e0e0;--radius:8px;--mono:"SFMono-Regular",Consolas,monospace;--brand:#6c47ff;--danger:#c62828;--success:#0a7c66;--warning:#e65100}
-    @media(prefers-color-scheme:dark){:root{--bg:#111;--panel:#1a1a1a;--text:#e5e5e5;--muted:#999;--accent:#4ecdc4;--accent-bg:rgba(78,205,196,.08);--border:#333;--brand:#9b7dff;--danger:#ef5350;--success:#4ecdc4;--warning:#ffb74d}}
+    :root{--bg:#f5f5f0;--panel:#fff;--text:#1a1a1a;--muted:#666;--accent:#6d28d9;--accent-bg:rgba(109,40,217,.07);--border:#e0e0e0;--radius:8px;--mono:"SFMono-Regular",Consolas,monospace;--brand:#6c47ff;--danger:#c62828;--success:#0a7c66;--warning:#e65100}
+    @media(prefers-color-scheme:dark){:root{--bg:#111;--panel:#1a1a1a;--text:#e5e5e5;--muted:#999;--accent:#8b5cf6;--accent-bg:rgba(139,92,246,.12);--border:#333;--brand:#9b7dff;--danger:#ef5350;--success:#4ecdc4;--warning:#ffb74d}}
     *{box-sizing:border-box;margin:0}
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);font-size:15px;line-height:1.65}
     main{max-width:820px;margin:0 auto;padding:32px 20px 80px}
@@ -86,7 +86,7 @@
         <text x="80" y="209" text-anchor="middle" font-size="9" fill="#e65100">SQLite</text>
         <rect x="370" y="100" width="340" height="120" rx="12" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
         <text x="540" y="125" text-anchor="middle" font-size="13" font-weight="600" fill="#1565c0">CodingAgent DO (per session)</text>
-        <text x="540" y="148" text-anchor="middle" font-size="11" fill="#666">Think Chat Loop · Fibers · Git</text>
+        <text x="540" y="148" text-anchor="middle" font-size="11" fill="#666">pi-durable loop · Fibers · Git</text>
         <text x="540" y="166" text-anchor="middle" font-size="11" fill="#666">Workspace · Codemode · SSE</text>
         <text x="540" y="184" text-anchor="middle" font-size="11" fill="#666">Prompts · Cron · Notifications</text>
         <rect x="390" y="198" width="60" height="14" rx="4" fill="#e8eaf6"/>
@@ -94,7 +94,7 @@
         <rect x="460" y="198" width="60" height="14" rx="4" fill="#e8eaf6"/>
         <text x="490" y="209" text-anchor="middle" font-size="9" fill="#1565c0">Shell</text>
         <rect x="530" y="198" width="60" height="14" rx="4" fill="#e8eaf6"/>
-        <text x="560" y="209" text-anchor="middle" font-size="9" fill="#1565c0">Think</text>
+        <text x="560" y="209" text-anchor="middle" font-size="9" fill="#1565c0">Browser</text>
         <rect x="10" y="260" width="160" height="50" rx="12" fill="#fce4ec" stroke="#c62828" stroke-width="1"/>
         <text x="90" y="283" text-anchor="middle" font-size="12" font-weight="600" fill="#c62828">LLM Gateway</text>
         <text x="90" y="298" text-anchor="middle" font-size="10" fill="#666">OpenCode / AI GW</text>
@@ -140,7 +140,7 @@
         <line x1="600" y1="30" x2="640" y2="30" stroke="#999" marker-end="url(#a)"/>
         <text x="50" y="72" text-anchor="middle" font-size="10" fill="#666">1. Message</text>
         <text x="170" y="72" text-anchor="middle" font-size="10" fill="#666">2. Auth</text>
-        <text x="300" y="72" text-anchor="middle" font-size="10" fill="#666">3. Think loop</text>
+        <text x="300" y="72" text-anchor="middle" font-size="10" fill="#666">3. pi-durable</text>
         <text x="430" y="72" text-anchor="middle" font-size="10" fill="#666">4. Generate</text>
         <text x="555" y="72" text-anchor="middle" font-size="10" fill="#666">5. Tool calls</text>
         <text x="675" y="72" text-anchor="middle" font-size="10" fill="#666">6. Read/Write</text>
@@ -444,7 +444,7 @@
       <tr><th>Section</th><th>What it does</th></tr>
       <tr><td><strong>Sharing</strong></td><td>Create share links with read-only or read-write access. Revoke links at any time.</td></tr>
       <tr><td><strong>Permissions</strong></td><td>Grant other users direct access by email address. Choose read-only or read-write.</td></tr>
-      <tr><td><strong>Browser Tools</strong></td><td>Toggle browser capabilities for this session. Requires an admin to enable browser access for your account first. Admin sessions use the platform's built-in browser binding; other users connect via their own Cloudflare Browser Rendering credentials (configured in the sidebar).</td></tr>
+      <tr><td><strong>Browser Tools</strong></td><td>Toggle browser tools for this session. Admin sessions get the built-in session browser: one Chrome kept between messages, with <strong>Open live browser</strong> (watch it, or do a login yourself) and <strong>Close browser</strong>. Other users need an admin to enable browser access, then connect their own Browser Run credentials in the sidebar.</td></tr>
 
       <tr><td><strong>MCP Overrides</strong></td><td>Enable or disable integrations for this session only. Reset to follow the global config.</td></tr>
     </table>
@@ -490,7 +490,7 @@
       <tr><td>*</td><td><code>/api/secrets</code></td><td>Encrypted secrets CRUD</td></tr>
       <tr><td>*</td><td><code>/api/mcp-configs</code></td><td>Integration (MCP server) CRUD</td></tr>
       <tr><td>*</td><td><code>/api/passkey</code></td><td>Init, change passkey</td></tr>
-      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth) — 55 tools for orchestration</td></tr>
+      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth) — 74 tools for orchestration</td></tr>
       <tr><td>ALL</td><td><code>/mcp/codemode</code></td><td>Code-mode MCP endpoint — 2 tools (<code>search</code> + <code>execute</code>), ~1k tokens context. Ideal for coding agents.</td></tr>
     </table>
 
@@ -519,33 +519,34 @@
 
       <tr><td>*</td><td><code>/session/:id/mcp-configs</code></td><td>Per-session MCP overrides</td></tr>
       <tr><td>GET/PUT</td><td><code>/session/:id/browser</code></td><td>Toggle browser tools</td></tr>
+      <tr><td>GET/DELETE</td><td><code>/session/:id/browser/live</code></td><td>Live View link for the session browser / close it</td></tr>
       <tr><td>GET</td><td><code>/session/:id/ws</code></td><td>WebSocket (presence, typing indicators)</td></tr>
     </table>
 
-    <!-- ─── Browser Rendering ─── -->
-    <h2 id="browser">Browser Rendering</h2>
-    <p>Browser tools let the agent navigate web pages, read documentation, and scrape content. There are two paths, with different billing targets:</p>
+    <!-- ─── Browser ─── -->
+    <h2 id="browser">Browser</h2>
+    <p>Browser tools let the agent read pages, click through sites, log in, and take screenshots. There are two paths, with different billing targets:</p>
 
     <table>
       <tr><th>Path</th><th>Who gets it</th><th>Bills to</th><th>How to enable</th></tr>
       <tr>
-        <td><strong>Native binding</strong> (<code>browser_navigate</code> tool)</td>
+        <td><strong>Session browser</strong> (<code>browser_execute</code>, plus <code>browser_markdown</code> and <code>browser_triage</code>)</td>
         <td>Admin only</td>
         <td>The Dodo instance owner's Cloudflare account</td>
-        <td>Automatic when the <code>BROWSER</code> binding is configured in wrangler.jsonc and browser is enabled on the session.</td>
+        <td>Automatic when the <code>BROWSER</code> binding is configured in wrangler.jsonc and browser is enabled on the session. One Chrome per session (Agents SDK <code>Browser</code>): tabs, cookies and logins carry over between messages; it closes after 3 idle minutes.</td>
       </tr>
       <tr>
-        <td><strong>MCP server</strong> (Browser Rendering MCP)</td>
+        <td><strong>MCP server</strong> (Browser Run MCP)</td>
         <td>Any user with browser access enabled</td>
         <td>The user's own Cloudflare account</td>
-        <td>User provides their Account ID and API Token in the sidebar under Browser Rendering. An admin must first enable browser access for the user via <code>POST /api/admin/users/:email/browser</code>.</td>
+        <td>User provides their Account ID and API Token in the sidebar under Browser Run. An admin must first enable browser access for the user via <code>POST /api/admin/users/:email/browser</code>.</td>
       </tr>
     </table>
 
     <h3>Access control</h3>
     <ol>
       <li><strong>Admin enables browser for a user</strong> — <code>POST /api/admin/users/:email/browser</code>. Without this, the user cannot toggle browser on any session.</li>
-      <li><strong>User configures credentials</strong> (non-admin only) — <code>PUT /api/browser-config</code> with their own <code>cfAccountId</code> and <code>cfApiToken</code>. This creates an MCP connection to Cloudflare's Browser Rendering service, billed to the user's account.</li>
+      <li><strong>User configures credentials</strong> (non-admin only) — <code>PUT /api/browser-config</code> with their own <code>cfAccountId</code> and <code>cfApiToken</code>. This creates an MCP connection to Cloudflare's Browser Run service, billed to the user's account.</li>
       <li><strong>User enables browser per session</strong> — <code>PUT /session/:id/browser</code> with <code>{"enabled": true}</code>. The agent's tool set then includes browser capabilities.</li>
     </ol>
 

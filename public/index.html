@@ -296,7 +296,15 @@
 
     .section{margin-bottom:24px}
     .kv{display:flex;justify-content:space-between;padding:6px 0;font-size:12px;align-items:center;gap:8px}
-    .tag{display:inline-block;background:var(--brand-tint);color:var(--text-info);padding:2px 8px;border-radius:100px;font-size:11px;font-weight:500;margin-right:4px}
+    .tag{display:inline-block;background:var(--brand-tint);color:var(--text-info);padding:2px 8px;border-radius:100px;font-size:11px;font-weight:500;margin-right:4px;white-space:nowrap}
+    .sessions-header{gap:8px}
+    .sessions-header .field-row{flex-wrap:nowrap}
+    .sessions-header button{white-space:nowrap}
+    .memory-entry{flex-wrap:wrap;align-items:flex-start}
+    .memory-title{cursor:pointer;font-size:12px;flex:1 1 100%;min-width:0}
+    .memory-tags{display:flex;flex-wrap:wrap;gap:4px;align-items:center;min-width:0}
+    .memory-tags .tag{margin-right:0}
+    .session-todo[data-status="completed"] .todo-priority,.session-todo[data-status="cancelled"] .todo-priority{opacity:.45}
     /* MCP connect-status pill — surfaced next to each session MCP toggle.
        States: ok (green), fail (red, error in title), pending (grey dash,
        no connect attempted yet), off (muted, MCP disabled this session). */
@@ -598,6 +606,7 @@
       .right.mobile-visible{
         display:block !important;position:fixed;inset:0;z-index:90;bottom:56px;
         overflow-y:auto;background:var(--elevated);padding-top:0;
+        padding-bottom:88px; /* clear the floating + button */
       }
 
       /* Backdrop for the Sessions drawer */
@@ -698,12 +707,12 @@
         <img src="/favicon.svg" alt="Dodo" class="dodo-logo sm dodo-logo-img"/>
         <div id="identity-display" class="identity-text"></div>
       </div>
-      <div class="field-row-between">
+      <div class="field-row-between sessions-header">
         <h2>Sessions</h2>
         <div class="field-row" style="margin-bottom:0">
-          <button onclick="clearOtherSessions()" title="Delete all sessions except the current one">Clear</button>
-          <button onclick="openSessionPicker()" aria-label="Pick skills and MCPs for new session" title="Pick skills and MCPs for new session">Pick…</button>
-          <button class="primary" onclick="createSession()" aria-label="Create new session">+ New</button>
+          <button class="sm" onclick="clearOtherSessions()" title="Delete all sessions except the current one">Clear</button>
+          <button class="sm" onclick="openSessionPicker()" aria-label="Pick skills and MCPs for new session" title="Pick skills and MCPs for new session">Pick…</button>
+          <button class="sm primary" onclick="createSession()" aria-label="Create new session">+ New</button>
         </div>
       </div>
       <input id="session-search" class="session-search" placeholder="Search sessions..." oninput="filterSessions(this.value)" aria-label="Search sessions"/>
@@ -799,12 +808,12 @@
           <div class="onboarding-col">
             <h2 id="example-prompts-heading">Try these prompts</h2>
             <ul role="list" aria-labelledby="example-prompts-heading" class="reset-list">
-              <li><button type="button" class="example-prompt" onclick="useExample(this)">Create a Cloudflare Worker that returns the current time as JSON. Write it to /src/index.ts</button></li>
-              <li><button type="button" class="example-prompt" onclick="useExample(this)">Write a fibonacci function in /src/fib.ts, then write tests for it in /test/fib.test.ts</button></li>
-              <li><button type="button" class="example-prompt" onclick="useExample(this)">Read all files in the workspace and give me a summary of what's there</button></li>
-              <li><button type="button" class="example-prompt" onclick="useExample(this)">Initialize a git repo, create a README.md with a project description, and make an initial commit</button></li>
-              <li><button type="button" class="example-prompt" onclick="useExample(this)">Create a simple TODO app with an HTML file and a Worker API backend. Put files in /src/</button></li>
-              <li><button type="button" class="example-prompt" onclick="useExample(this)">/generate a cyberpunk cat wearing sunglasses, neon city background</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Open news.ycombinator.com in the browser, take a screenshot, and tell me which story has the most points.</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Clone github.com/jonnyparris/dodo, then use three explore subagents in parallel to map its HTTP routes, Durable Objects and cron jobs. Merge the answers into one table.</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Read developers.cloudflare.com/workers/platform/limits and tell me the CPU time limit per request on the paid plan. Quote the line.</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Open github.com/trending in the browser, open the top repo in a new tab, and summarise its README. Keep both tabs open for my next question.</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">Go to github.com/login. At the sign-in form, stop and ask me to sign in through the live browser, then list my five most recently updated repos.</button></li>
+              <li><button type="button" class="example-prompt" onclick="useExample(this)">/generate a dodo in a hard hat, flat vector style, purple and orange</button></li>
             </ul>
           </div>
         </div>
@@ -898,7 +907,7 @@
           <h2>Watchdog</h2>
           <p style="margin:0 0 6px;color:var(--muted);font-size:12px">Auto-detect stalled prompts. Fires a notification (and optionally aborts or nudges) when the active prompt is idle past the threshold.</p>
           <div id="watchdog-status">
-            <div class="empty">Loading…</div>
+            <div class="empty">No session</div>
           </div>
           <details style="margin-top:6px">
             <summary>Arm watchdog</summary>
@@ -917,7 +926,7 @@
             <label for="mem-search" class="visually-hidden">Search memory entries</label>
             <input id="mem-search" placeholder="Search..." style="flex:1" oninput="loadMemory(this.value)"/>
           </div>
-          <p style="margin:0 0 6px">Memory entries persist across sessions. Use them to store context the agent should remember.</p>
+          <p style="margin:0 0 6px;color:var(--muted);font-size:12px">Memory entries persist across sessions. Use them to store context the agent should remember.</p>
           <div id="memory-list"></div>
           <details style="margin-top:6px">
             <summary>Add / Edit entry</summary>
@@ -935,12 +944,12 @@
           </details>
         </div>
         <div class="section">
-          <h2>Browser Rendering</h2>
+          <h2>Browser Run</h2>
           <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Browser tools let the agent navigate web pages, read documentation, and scrape data. An admin must enable browser access for your account before you can use it. Admin sessions use the platform's built-in browser; other users supply their own Cloudflare credentials below.</p>
           <div id="browser-config-status" style="font-size:12px;margin-bottom:8px"></div>
           <details style="margin-top:4px" id="browser-config-details">
             <summary>Configure your own credentials</summary>
-            <p style="font-size:11px;color:var(--muted);margin:6px 0">Enter your Cloudflare Account ID and an API Token with <strong>Browser Rendering - Edit</strong> permission. Browser sessions bill to your account.</p>
+            <p style="font-size:11px;color:var(--muted);margin:6px 0">Enter your Cloudflare Account ID and an API Token with the <strong>Browser Rendering - Edit</strong> permission (Browser Run's API permission). Browser sessions bill to your account.</p>
             <label for="browser-cf-account" class="visually-hidden">Cloudflare Account ID</label>
             <input id="browser-cf-account" placeholder="Cloudflare Account ID" style="margin-bottom:4px"/>
             <label for="browser-cf-token" class="visually-hidden">Cloudflare API Token</label>
@@ -1109,10 +1118,10 @@
         </div>
         <div style="display:flex;gap:6px;margin-top:8px">
           <button class="sm" onclick="openLiveBrowser()" title="Watch or take over the session's browser (logins, CAPTCHAs)">Open live browser</button>
-          <button class="sm danger" onclick="closeSessionBrowser()" title="Close the session's browser; the next browser call starts a fresh one">Close browser</button>
+          <button class="sm" onclick="closeSessionBrowser()" title="Close the session's browser; the next browser call starts a fresh one">Close browser</button>
         </div>
         <span style="font-size:12px" id="browser-live-status"></span>
-        <p class="field-help-tight">An admin must enable browser access for your account first. Configure credentials under Browser Rendering in the sidebar, or use the built-in browser (admin only).</p>
+        <p class="field-help-tight">Admins get this Dodo's built-in browser: one Chrome per session, kept between messages. Open the live browser to watch it or to do a login yourself. Other users need an admin to enable browser access, then add their own Browser Run credentials in the sidebar.</p>
       </div>
 
       <!-- Session MCP Overrides -->

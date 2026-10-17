@@ -48,17 +48,28 @@ When modifying the system prompt:
 1. Keep it factual. If you add a section about a tool, verify the tool exists in `buildToolsForThink()`.
 2. Test with real prompts. The prompt shapes every interaction — small wording changes can have outsized effects on behavior.
 3. Don't duplicate tool descriptions. The AI SDK sends tool schemas automatically. The prompt should explain *when* and *why* to use tools, not re-document their parameters.
-4. The max steps limit (10) is set in `getMaxSteps()` on the `CodingAgent` class. If you change it, update the prompt too.
+4. The agent loop is pi-durable (`src/pi/engine.ts`); it has no fixed step cap. Goals have a turn budget (`docs/session-goals.md`) and subagents have their own step budgets (`src/agent-profile.ts`).
 
 ## Tool surface
 
 These tools are available to the agent at runtime (built in `src/agentic.ts`):
 
-**Workspace tools** (from `@cloudflare/think/tools/workspace`):
-- `read_file` — read file contents
-- `write_file` — create or overwrite a file
-- `search_files` — glob + content search
-- `replace_in_file` — find-and-replace within a file
+**Workspace tools** (`src/tools/workspace-tools.ts`):
+- `read` — read file contents with line offsets
+- `write` — create or overwrite a file
+- `edit` / `replace_all` — find-and-replace in one file
+- `grep` / `find` / `list` — search and browse the workspace
+- `delete` — remove a file or directory
+
+**Shell** (`src/tools/shell.ts`):
+- `shell` — busybox-style shell (pipes, redirects, coreutils) on the workspace. Not a container: no `npm install` or test runners
+
+**Browser** (`src/browser/`):
+- `browser_execute` — the session's persistent Chrome via CDP (admins; `BROWSER` binding)
+- `browser_markdown` / `browser_triage` — read a page as markdown / rank URLs before fetching
+
+**Clef** (`src/clef.ts`):
+- `image_check` — yes/no, choice or score questions about an image, for models without vision
 
 **Git tools** (built in `buildGitTools()`):
 - **Top-level (hot path):** `git_status`, `git_add`, `git_commit`, `git_diff`
@@ -66,7 +77,7 @@ These tools are available to the agent at runtime (built in `src/agentic.ts`):
 
 The lower-frequency git tools are reachable via codemode's `git` provider namespace rather than as individual top-level tools. This saves roughly 1k tokens of tool-schema budget per turn without losing any capability — see `buildTools()` in `src/agentic.ts` for the split.
 
-**Code execution** (from `@cloudflare/think/tools/execute`):
+**Code execution** (`src/tools/execute-tool.ts`):
 - `codemode` — sandboxed JS execution with workspace filesystem and git access, gated outbound fetch
 
 **Typecheck** (from `src/typecheck.ts`):

@@ -138,7 +138,7 @@ document.querySelectorAll('details').forEach(d=>{
     const above=r.top-tip.offsetHeight-6;
     if(above>4){tip.style.top=above+'px'}else{tip.style.top=(r.bottom+6)+'px'}
     tip.style.transform='translateX(-50%)';
-    requestAnimationFrame(()=>tip.classList.add('visible'));
+    const shown=tip;requestAnimationFrame(()=>shown.classList.add('visible'));
   }
   function hide(){if(tip){tip.remove();tip=null}}
   document.querySelectorAll('[title]').forEach(el=>{

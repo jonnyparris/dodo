@@ -1,42 +1,139 @@
-# Dodo
+<p align="center">
+  <img src="assets/dodo.svg" alt="Dodo" width="132"/>
+</p>
+
+<h1 align="center">Dodo</h1>
 
 <p align="center">
-  <img src="assets/dodo.svg" alt="Dodo" width="120"/>
+  <strong>A coding agent that runs on your own Cloudflare account.</strong><br/>
+  Give it a task, a repo and a model. It clones, codes, browses, commits and pushes, and it keeps going when you close the tab.
 </p>
 
 <p align="center">
-  <strong>A coding agent that runs on your Cloudflare account.</strong><br/>
-  Give it a task, a repo, and an LLM. It clones, codes, tests, commits, and pushes -- autonomously.
+  <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/jonnyparris/dodo"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/></a>
 </p>
 
 <p align="center">
-  <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/jonnyparris/dodo">
-    <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/>
-  </a>
-  &nbsp;
-  <a href="https://dash.cloudflare.com/4b430e167a301330d13a9bb42f3986a2/workers/services/view/dodo/production/builds">
-    <img src="https://img.shields.io/github/check-runs/jonnyparris/dodo/main?nameFilter=Workers+Builds%3A+dodo&label=workers%20build&logo=cloudflare&logoColor=white" alt="Workers Build status"/>
-  </a>
+  <img src="https://img.shields.io/badge/runs_on-Cloudflare_Workers-F38020?logo=cloudflare&logoColor=white" alt="Runs on Cloudflare Workers"/>
+  <img src="https://img.shields.io/badge/agent_loop-pi--durable-6D28D9" alt="Agent loop: pi-durable"/>
+  <img src="https://img.shields.io/badge/agents_SDK-0.28-6D28D9" alt="Agents SDK 0.28"/>
+  <img src="https://img.shields.io/badge/license-MIT-informational" alt="MIT license"/>
+</p>
+
+<p align="center">
+  <a href="#try-these-prompts">Demo prompts</a> ·
+  <a href="#whats-new">What's new</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#connect-via-mcp">MCP</a> ·
+  <a href="#reference">Reference</a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/02-desktop-chat.png" alt="A Dodo session: the agent drove a real browser and reports back with a screenshot" width="88%"/>
 </p>
 
 ---
 
-## What can you do with it?
+## Try these prompts
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/use-cases.svg">
-  <img alt="Use cases: autonomous coding, parallel dispatch, MCP orchestration, scheduled agents, team sharing, browser research" src="docs/use-cases.svg" width="100%">
-</picture>
+Paste any of these into a new session. Every one was run on a live Dodo with the default Workers AI model (`@cf/zai-org/glm-5.3-flash`) before it went in this list.
 
-**Some real examples:**
+### A browser that remembers
 
-- **"Fix the bug in auth.ts and push a branch"** -- Dodo clones the repo, reads the code, makes the fix, runs the tests, and pushes. You review the PR.
-- **"Rename X to Y everywhere"** -- Set a goal, walk away. The session auto-continues across grep, edits, typecheck, and the final commit, then declares itself done. No mid-task nudges.
-- **10 tasks on the kanban, one click** -- Dispatch all of them in parallel. Each gets its own isolated session with its own workspace.
-- **"Every morning at 9am, run the test suite"** -- Schedule prompts with cron expressions. Your agent works while you sleep.
-- **"Read the Cloudflare docs and write a migration script"** -- Headless Chrome is built in. The agent can browse the web, read documentation, and use what it finds.
-- **Dodo fixes Dodo** -- Install the autopilot supervisor and let scheduled worker sessions investigate recent log errors and open draft PRs against this repo.
-- **Share a session with your team** -- Read-only or read-write access, with per-user encrypted secrets.
+Each session has its own Chrome. Tabs, cookies and logins carry over from one message to the next.
+
+```text
+Open https://news.ycombinator.com in the browser and take a screenshot.
+Which story on the front page has the most points?
+```
+```text
+Now open the comments for that story in a new tab and summarise the top three threads.
+Keep the front page tab open.
+```
+```text
+Switch back to the front page tab without reloading it. What is story number 3?
+```
+
+The screenshot shows up in the chat. The third answer comes from the tab that was already open. The browser closes after 3 idle minutes; if that happens, the agent says so and reopens the page.
+
+### Hand the browser to a human
+
+```text
+Go to github.com/login. At the sign-in form, stop and ask me to sign in through
+the live browser, then list my five most recently updated repos.
+```
+
+The agent stops at the form. Open **Settings → Browser Tools → Open live browser**, sign in (2FA included), and reply "done". It carries on in the same tab. Your password never passes through the model.
+
+### Read the web, with receipts
+
+```text
+Read https://developers.cloudflare.com/workers/platform/limits/ and tell me the maximum
+CPU time per request on the Workers Paid plan. Quote the exact line you found.
+```
+
+`browser_markdown` does a plain fetch first and falls back to a real browser. A fast [Clef](docs/adr/0003-clef-decision-models.md) check confirms that the page actually answers the question.
+
+### Fan out
+
+```text
+Clone https://github.com/jonnyparris/dodo. Then use three explore subagents in parallel:
+one maps the HTTP routes in src/index.ts, one lists the Durable Object classes and what
+each one stores, one finds every scheduled or cron job. Merge their answers into one short table.
+```
+
+Each `explore` subagent works in its own context window, with a cheap model. With `exploreMode: "facet"` they run at the same time as separate Durable Objects.
+
+### Real bytes in the shell, checked by Clef
+
+```text
+In the shell, run:
+echo 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC' | base64 -d > /pixel.png && ls -l /pixel.png && od -An -tx1 /pixel.png | head -2
+Then use image_check to tell me what colour the pixel is.
+```
+
+Redirects write raw bytes, so the file is a valid 69-byte PNG. `image_check` asks Clef "what colour is this?" and gets *red, 0.94*. It works on models that can't see images.
+
+### Survive a restart mid-task
+
+```text
+Use the shell tool to run 'sleep 15' three times, one call at a time,
+then reply with exactly: recovered done
+```
+
+While it runs, deploy, or restart the session with `POST /session/:id/debug/evict` (admin). The turn picks up where it stopped and finishes. Steps that already finished are not repeated. See [Durable by default](#durable-by-default).
+
+### Edit an image, or just talk about it
+
+Attach a photo and say *"make the sky purple"*. Dodo edits it with Replicate (`google/nano-banana-2`). Attach one and say *"thanks, looks great"*, and it just replies. Clef decides which you meant, so a text-only model doesn't edit pictures nobody asked to change.
+
+```text
+/generate a dodo in a hard hat, flat vector style, purple and orange
+```
+
+### Goals: set it and walk away
+
+```sh
+SID=$(curl -sX POST $DODO/session | jq -r .id)
+curl -sX PUT  $DODO/session/$SID/goal   -d '{"text":"Rename getCwd to getCurrentWorkingDirectory everywhere. Run typecheck. Commit.","maxTurns":40}'
+curl -sX POST $DODO/session/$SID/prompt -d '{"content":"Begin."}'
+```
+
+The session keeps going until the model calls `set_goal_status` with `done`, `blocked` or `needs_input`, or until it runs out of turns. More in [`docs/session-goals.md`](docs/session-goals.md).
+
+---
+
+## What's new
+
+| | |
+|---|---|
+| 🧠 **pi-durable agent loop** | The loop now runs on [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable). Every model step and tool call is saved to the session's SQLite as it happens. A deploy or restart mid-turn resumes; it doesn't start over. Think is gone. ([ADR 0002](docs/adr/0002-pi-durable-foundation.md)) |
+| 🌐 **Persistent session browser** | Agents SDK 0.28 `Browser` + `browserTool`. One Chrome per session, kept between messages. Screenshots go to chat. Live View lets a human take over for logins, CAPTCHAs and MFA. |
+| 🎯 **Clef decision models** | Small Cloudflare models answer yes/no, choice and score questions in about 300 ms: `image_check`, image edit-vs-reply routing, and page checks in `browser_markdown` / `browser_triage`. ([ADR 0003](docs/adr/0003-clef-decision-models.md)) |
+| 🐚 **Binary-safe shell** | `base64 -d > file.png`, `>>` and pipes write real bytes. Codemode can pass `Uint8Array`s to the host. |
+| ⏰ **Busy-safe schedules** | A one-off scheduled prompt that fires while the session is busy waits in the queue instead of being dropped. Recurring jobs still skip a busy tick. |
+| 🔁 **Upgrade-safe sessions** | Sessions from older versions carry on. History, compaction summaries, attachments and cron jobs all migrate. A prompt cut off by an upgrade fails clearly: *"Interrupted by a Dodo upgrade. Send it again."* |
 
 ---
 
@@ -47,13 +144,13 @@
   <img alt="Session lifecycle: prompt, session starts, agent works, results, reuse" src="docs/how-it-works.svg" width="100%">
 </picture>
 
-1. **You prompt** -- From the web UI, an MCP client (Claude Code, Cursor, OpenCode), or a scheduled cron job.
-2. **A session starts** -- A Durable Object spins up with its own filesystem, git, and sandboxed code execution.
-3. **The agent works** -- The LLM reads files, writes code, runs tests, and iterates in an agentic loop with built-in guardrails (doom loop detection, token budget management, context compaction).
-4. **Results** -- Code is committed, branches are pushed, and the full session is preserved.
-5. **Reuse** -- Fork the session, share it with teammates, schedule follow-ups, or dispatch new work from it.
+1. **You prompt.** From the web UI, an MCP client (Claude Code, Cursor, OpenCode, another agent), the API, or a schedule.
+2. **A session starts.** A Durable Object with its own files, git, shell, JavaScript sandbox and browser.
+3. **The agent works.** pi-durable runs the model and its tools, saving each step. Compaction keeps long tasks inside the context window, and a loop guard stops it repeating itself.
+4. **Results.** Commits, pushed branches, draft PRs, screenshots. Every turn also flushes to a per-session [Artifacts](https://developers.cloudflare.com/artifacts/) git repo.
+5. **Reuse.** Fork it, share it, schedule follow-ups, or dispatch more work from it.
 
-Sessions survive Worker evictions and reconnect seamlessly via durable fibers. You pick the LLM. You control costs. Your data stays in your account.
+You pick the model. You control the cost. Your data stays in your account.
 
 ---
 
@@ -61,381 +158,232 @@ Sessions survive Worker evictions and reconnect seamlessly via durable fibers. Y
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture.svg">
-  <img alt="Architecture: Worker with Hono router connecting to three Durable Objects (SharedIndex, UserControl, CodingAgent) backed by R2, Browser Rendering, and an LLM gateway" src="docs/architecture.svg" width="100%">
+  <img alt="Architecture: a Worker with a Hono router in front of SharedIndex, UserControl and CodingAgent Durable Objects, backed by R2, Browser Run, Artifacts and an LLM gateway" src="docs/architecture.svg" width="100%">
 </picture>
 
-One Worker, three Durable Object classes:
+| Durable Object | Scope | Holds |
+|---|---|---|
+| **SharedIndex** | One, global | Users, allowlist, permissions, session sharing, model cache |
+| **UserControl** | One per user | Config, session index, memory, tasks, skills, encrypted secrets |
+| **CodingAgent** | One per session | pi-durable transcript, prompt queue, workspace (files + git), schedules, browser |
+| **ChatMonitor** | One per watched space | Polls a Google Chat space and feeds a session |
 
-| Component | Scope | What it manages |
-|-----------|-------|----------------|
-| **SharedIndex** | Global singleton | User registry, allowlist, permissions, session sharing |
-| **UserControl** | One per user | Config, sessions, memory, tasks, encrypted secrets |
-| **CodingAgent** | One per session | Chat loop, workspace (files + git), sandbox, prompts |
-
-Plus R2 for large file and attachment storage, Browser Rendering for headless Chrome, a per-session [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/) repo (git-compatible, hosted at `artifacts.cloudflare.net`) for a durable record of workspace changes, and your choice of LLM gateway (OpenCode, AI Gateway, or Workers AI via AI Gateway).
+Plus R2 for big files and attachments, Browser Run for Chrome, Workers AI for Clef, and the LLM gateway of your choice (OpenCode, AI Gateway, or Workers AI through AI Gateway).
 
 ---
 
 ## Quick start
 
-### Option A: One-click deploy
+### One-click
 
-Click the button, follow the prompts, and you'll have a running instance in under 2 minutes:
+Click **Deploy to Cloudflare** above. The only required secret is `ADMIN_EMAIL`, your email address. Open the URL when it's done and you're the admin.
 
-<p align="center">
-  <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/jonnyparris/dodo">
-    <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/>
-  </a>
-</p>
-
-You'll be prompted for secrets during setup. The only required one is `ADMIN_EMAIL` -- your email address. After deploy, visit the URL and you'll be logged in as the admin.
-
-### Option B: Manual deploy
+### Manual
 
 ```bash
-git clone https://github.com/jonnyparris/dodo.git
-cd dodo
+git clone https://github.com/jonnyparris/dodo.git && cd dodo
 npm install
 
-# Set the one required secret -- your email:
-wrangler secret put ADMIN_EMAIL
+npx wrangler secret put ADMIN_EMAIL             # required
+npx wrangler secret put SECRETS_MASTER_KEY      # recommended: openssl rand -hex 32
+npx wrangler secret put COOKIE_SECRET           # recommended: openssl rand -hex 32
+npx wrangler secret put DODO_MCP_TOKEN          # recommended: openssl rand -base64url 32
+npx wrangler secret put AI_GATEWAY_KEY          # or OPENCODE_GATEWAY_TOKEN
 
-# Optional but recommended:
-wrangler secret put SECRETS_MASTER_KEY      # openssl rand -hex 32
-wrangler secret put COOKIE_SECRET           # openssl rand -hex 32
-wrangler secret put DODO_MCP_TOKEN          # openssl rand -base64url 32
-wrangler secret put OPENCODE_GATEWAY_TOKEN  # your LLM gateway token
-
-# Deploy (with post-deploy smoke probe — recommended)
-npm run deploy:safe
-
-# Or, for ad-hoc deploys without the probe
-npm run deploy
+npm run deploy:safe   # deploy, then run the post-deploy smoke probe
 ```
 
-The `deploy:safe` script runs `scripts/post-deploy-smoke.sh` against the deployed Worker after a successful upload, asserting that:
-
-- `/health` and `/version.json` respond
-- The `/version.json` `commit` field matches the local HEAD (catches deploys that uploaded but didn't apply)
-- A trivial codemode `execute` round-trips through `globalOutbound`
-- A real `git clone` lands files in the workspace
-
-If anything fails the script exits non-zero. Run `npm run smoke` to invoke the probe against an already-deployed Worker without re-deploying.
+`deploy:safe` checks that `/health` and `/version.json` respond and that the commit matches your HEAD, then that codemode round-trips through `globalOutbound` and a real `git clone` lands files. If any check fails, it exits non-zero. `npm run smoke` runs the probe again without deploying.
 
 ### Local development
 
 ```bash
-cp .dev.vars.example .dev.vars
-# Edit .dev.vars with your secrets
+cp .dev.vars.example .dev.vars   # ALLOW_UNAUTHENTICATED_DEV=true skips auth locally
 npm run dev
 ```
 
-The dev server bypasses authentication locally via `ALLOW_UNAUTHENTICATED_DEV=true`.
+**You need:** a Cloudflare account on Workers Paid (for Durable Objects) and a model gateway: [AI Gateway](https://developers.cloudflare.com/ai-gateway/) (works with Workers AI models) or [OpenCode](https://opencode.cloudflare.dev). Optional: [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) for more than one user, a `REPLICATE_API_TOKEN` for images.
 
 ---
 
-## Prerequisites
+## Features
 
-- A [Cloudflare account](https://dash.cloudflare.com/sign-up) (Workers Paid plan for Durable Objects)
-- An LLM gateway token -- either [OpenCode](https://opencode.cloudflare.dev) or [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/)
-- Optional: [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) for multi-user deployments
+### Durable by default
 
----
+pi-durable writes each model response and each tool call to the session's SQLite before showing it to you. If the Durable Object is evicted mid-turn (a deploy, a crash, a runtime restart), the turn reattaches by prompt id when it wakes up:
 
-## Connect your LLM
+- finished steps are **not** redone, and the user message is not sent twice;
+- read-only tools that were cut off run again; tools with side effects report `interrupted`, so the model decides what to do next;
+- compaction runs in the background and again if the context overflows, and the summary is kept across restarts.
 
-Dodo doesn't bundle an LLM -- you bring your own. After deploying, open the UI and set your model and gateway in the sidebar config panel.
+`GET /session/:id/engine?detail=1` shows the live tasks and a compact transcript, so you can see exactly what a turn did.
 
-| Gateway | Setup |
-|---------|-------|
-| **OpenCode** | Set `OPENCODE_GATEWAY_TOKEN` as a secret. Models populate automatically. |
-| **AI Gateway** | Set `AI_GATEWAY_KEY` as a secret. Set `AI_GATEWAY_BASE_URL` in wrangler.jsonc vars. Workers AI models (`@cf/…`) route through the same gateway. |
+### Tools the agent has
 
-Model IDs use `provider/model` format (e.g. `anthropic/claude-sonnet-4`, `openai/gpt-4o`, `@cf/moonshotai/kimi-k2.6`). The model list is filtered by gateway -- OpenCode won't offer models it can't route. Switch models per-session from the UI.
+| Area | Tools |
+|---|---|
+| **Files** | `read`, `write`, `edit`, `replace_all`, `delete`, `grep`, `find`, `list` |
+| **Shell + code** | `shell` (pipes, redirects, coreutils; byte-safe), `codemode` (sandboxed JS in a Dynamic Worker, gated outbound fetch), `typecheck` (`tsc --noEmit` in the isolate) |
+| **Git** | `git_status`, `git_add`, `git_commit`, `git_diff` on top. Clone, push, pull, branch, checkout, log, verify and `pr_create` inside codemode. GitHub and GitLab tokens are added for you. |
+| **Browser** | `browser_execute` (CDP on the session's Chrome), `browser_markdown` (page → markdown, with an optional Clef verdict), `browser_triage` (rank URLs before fetching), `web_search` |
+| **Images** | `image_check` (Clef questions about any image), `/generate` and image edits (Replicate) |
+| **Planning** | `todo_*`, `set_goal_status`, `skill`, `explore` / `task` subagents |
+| **Integrations** | Any MCP server you add, per user or per session |
+
+### Session browser
+
+- **One Chrome per session**, from the Agents SDK `Browser` on Browser Run. It closes after 3 minutes idle and starts again on the next call. `restarted: true` tells the model it lost its tabs.
+- **`cdp.send({ method, params, sessionId: "active" })`** works on the tab the agent last used, across calls.
+- **Screenshots.** When a call returns `{ type: "browser_screenshot", mediaType, data }`, the image goes to R2 and shows in the chat. Vision models see it. Text-only models can ask `image_check` about it.
+- **Live View.** Settings → Browser Tools has **Open live browser** (watch or drive it yourself) and **Close browser**. The API is `GET` / `DELETE /session/:id/browser/live`.
+- Admins get the built-in browser. Other users can connect their own Browser Run credentials (billed to them) once an admin enables it.
+
+### Subagents (`explore` and `task`)
+
+`explore` is read-only. It runs a grep/find/read investigation with a cheap model and returns a short summary. `task` can write; in **scratch** mode its writes go to a separate R2 prefix, and the parent merges only what it wants. Both run in the parent turn (`inprocess`, the default) or as separate facet Durable Objects (`facet`), which lets several run at once. In a prod A/B, a three-question prompt took **163 s with facets vs 272 s in-process**. Details: [`docs/facets.md`](docs/facets.md).
+
+### Goals, schedules and the watchdog
+
+- **Goals.** The session prompts itself to continue until it's done, blocked, needs you, or runs out of turns (default 50, max 200). [`docs/session-goals.md`](docs/session-goals.md)
+- **Schedules.** Delayed, at-a-time, cron and interval prompts, from the UI Cron panel or `POST /session/:id/cron`. One-offs wait in the queue if the session is busy. [`docs/scheduled-sessions.md`](docs/scheduled-sessions.md)
+- **Watchdog.** Spots a prompt that has stalled and notifies you, nudges it, or aborts it. [`docs/session-watchdog.md`](docs/session-watchdog.md)
+
+### Orchestration and autopilot
+
+- **Seed sessions.** Clone a repo once, then fork it for each task in under a second. The seed cache is shared by all users.
+- **Dispatch → verified draft PR.** `dispatch_repo_prompt` runs a worker session, verifies the push, and can gate a draft PR on a GitHub Actions workflow (`verifyWorkflow`). There's a template in `.github/workflows/dodo-verify.yml.example`.
+- **Task board.** A kanban with batch dispatch (up to 10 sessions at once). A task completes when its session finishes.
+- **ntfy notifications** on run state changes, and **failure snapshots** (git status, diff, log, messages) for runs that break.
+- **Autopilot.** A scheduled supervisor reads the Worker's logs and dispatches goal-driven worker sessions that open draft PRs against Dodo itself. Start it from `/admin/autopilot`.
+
+### Memory and skills
+
+- **Memory.** A per-user key-value store with search, shared across sessions.
+- **Skills.** Drop in a `SKILL.md` in the same format as [Claude Skills](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/skills) and [OpenCode skills](https://opencode.ai/docs/skills/). Dodo finds skills in your personal library, the workspace (`.dodo/skills/`, `.claude/skills/`, `.agents/skills/`, `.opencode/skill/`) and the built-ins. Only names and descriptions go in the prompt; the full body loads when the model picks one. [`docs/skills.md`](docs/skills.md)
+
+### Sharing and teams
+
+Share a session read-only or read-write, by link or by email. Live presence shows who's watching. Each user's GitHub/GitLab tokens and other secrets are envelope-encrypted (AES-256-GCM) in their own Durable Object.
+
+### Artifacts and publishing
+
+Every session gets a git repo on [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/), flushed at the end of each turn and forked with the session. The Git panel's **Clone this session** gives you a `git clone` URL with a one-hour token. When a project is ready, the `publish_to_github` MCP tool creates a GitHub repo and pushes to it.
 
 ---
 
 ## Connect via MCP
 
-Dodo exposes two MCP endpoints. Use the one that fits your use case:
-
-| Endpoint | Tools | Best for |
-|----------|-------|----------|
-| `/mcp` | 55 | **Orchestrators** -- full control over sessions, tasks, git, memory, skills, dispatch |
-| `/mcp/codemode` | 2 | **Coding agents** -- just `search` + `execute` (~1k tokens context) |
-
-**Example config** (works with OpenCode, Claude Code, Cursor, or any MCP client):
+| Endpoint | Tools | For |
+|---|---|---|
+| `/mcp` | 74 | **Orchestrators**: sessions, prompts, files, git, dispatch, memory, skills, tasks, config |
+| `/mcp/codemode` | 2 | **Coding agents**: `search` + `execute` in about 1k tokens of context |
 
 ```json
 {
   "mcp": {
     "dodo": {
       "type": "remote",
-      "url": "https://your-dodo.workers.dev/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_DODO_MCP_TOKEN"
-      }
+      "url": "https://your-dodo.example.com/mcp",
+      "headers": { "Authorization": "Bearer YOUR_DODO_MCP_TOKEN" }
     }
   }
 }
 ```
 
----
-
-## Features
-
-### Sessions and workspace
-
-Each session gets an isolated workspace with a full filesystem (SQLite-backed with R2 spill for large files), git support (clone, commit, push, pull, branch, diff with automatic GitHub/GitLab token injection), and sandboxed JavaScript execution with gated outbound networking.
-
-Sessions can be forked (copies files + messages), soft-deleted (5-minute recovery window), and shared with read-only or read-write permissions.
-
-### Agentic loop
-
-Dodo runs its own agentic loop rather than delegating to a framework. Each iteration calls the LLM once, executes tool calls, and decides whether to continue. Built-in guardrails:
-
-- **Doom loop detection** -- Identical tool calls 3x triggers a warning; 5x forces a hard break.
-- **Token budget management** -- 70% warn, 85% wrap-up, 95% hard stop.
-- **Context compaction** -- When the context gets too large, older messages are summarized to free space.
-- **Multi-phase continuation** -- When step limits are hit, context is compacted and the agent continues for up to 5 phases. A structured tool-call digest (not just tool names) is injected at each phase boundary so the agent knows exactly which calls have already been made and avoids repeating them.
-- **Overflow recovery** -- Emergency compaction on context-length errors.
-
-### Explore and task subagents (facets)
-
-For search-heavy and bounded-side-work tasks, Dodo spawns subagents that run in isolation from the parent turn. Two flavours:
-
-- **`explore`** -- a read-only investigator. Runs up to 16 steps of grep/find/list/read with a cheap model (Haiku, GPT-4.1 Mini, Gemini Flash) and returns a compact summary. Per-tool output caps plus inter-step message pruning keep input-token growth bounded across long investigations.
-- **`task`** -- a write-capable side task. Same tool set as the parent plus optional **scratch workspace** mode where writes land in an isolated R2 prefix and the parent only sees them if it explicitly merges them back.
-
-Both subagents have two execution modes, configurable per-user via `exploreMode` and `taskMode`:
-
-| Mode | Where it runs | When to use |
-|---|---|---|
-| `inprocess` (default) | Blocking `generateText` call inside the parent turn | One-off searches, low step count, no parallelism needed |
-| `facet` | A separate Durable Object ("facet") addressable from the parent | Parallel fan-out, long-running tasks, scratch workspaces |
-
-**Parallel explore** is the headline facet feature. Ask for three investigations and the model can fire all three as separate facets that run concurrently in their own DOs, each with their own step budget (instead of serialising them in the parent's turn budget). In a real prod A/B run, a three-query prompt completed in **163s with facets vs 272s in-process** — 40% faster, same prompt, same model.
-
-**Scratch workspace** lets the `task` subagent experiment without touching the parent workspace. The task writes go to `workspace/<sessionId>/scratch/<facetName>/` in R2. The parent can then pass a subset of paths to `POST /session/:id/facets/:name/apply` to merge them back, or discard the whole lot (a 24h alarm wipes scratch R2 automatically).
-
-Full details — HTTP surface, failure modes, lifecycle — in [`docs/facets.md`](docs/facets.md).
-
-### Task board
-
-Kanban-style task management with backlog/todo/in_progress/done/cancelled states. Tasks can be dispatched to sessions individually or in batch (up to 10 at once). Tasks auto-complete when their linked session finishes.
-
-### Scheduling
-
-Four job types: delayed (N seconds), datetime (specific time), cron expression, and interval (repeating). Jobs dispatch prompts to the session automatically.
-
-### Goal-driven sessions
-
-Set a goal on a session and it keeps running until the model declares it's finished. After every turn, Dodo auto-prompts the session to continue. The model calls `set_goal_status` with `done`, `blocked`, or `needs_input` to stop — or the configurable turn budget (default 50, max 200) runs out and the session is `exhausted`.
-
-Why: without goals, a session is reactive — model finishes one turn, session goes idle, waits for a human. Goals invert that: the session is responsible for finishing what it started.
-
-Three API calls turn any session into a goal-driven one:
-
-```sh
-# 1. Create a session
-SID=$(curl -X POST $URL/session | jq -r .id)
-# 2. Set a goal (text + optional max-turn budget)
-curl -X PUT $URL/session/$SID/goal -d '{"text":"Rename getCwd to getCurrentWorkingDirectory everywhere. Run typecheck. Commit.","maxTurns":40}'
-# 3. Kick it off
-curl -X POST $URL/session/$SID/prompt -d '{"content":"Begin."}'
-```
-
-Example goals that work today:
-
-- **Long refactor** — "Rename `X` to `Y` everywhere. Run typecheck. Commit."
-- **PRD → implementation** — "Implement the feature in this PRD: <paste>. Open a draft PR when done."
-- **Incident triage** — "Investigate why session-prompt latency spiked between 14:00 and 15:00 UTC. Write a 5-line finding."
-- **Doc generation** — "Write a CONTEXT.md for every package that lacks one."
-- **PR review** — "Review PR #123. Leave inline comments. Summarise verdict."
-- **Migration runner** — "Apply this migration to every `*.db` file. Verify each one."
-- **Autopilot self-diagnose** — Dodo's own use case: read worker logs, fix a bug, open a draft PR.
-
-Full details, lifecycle, and safety rails in [`docs/session-goals.md`](docs/session-goals.md).
-
-### Autopilot
-
-Goal-driven sessions plus the existing scheduling + log access give Dodo a self-diagnose loop. Install a scheduled **supervisor** (cron) that reads worker logs and dispatches **workers** — fresh goal-driven sessions that investigate one issue each and open draft PRs. The supervisor uses `ntfy` to alert when it pauses on a repeated failure pattern.
-
-- Manual kickoff: `/admin/autopilot` (one-click "spawn worker" form)
-- Scheduled supervisor: `POST /api/admin/autopilot/supervisor` with a cron
-- MCP tools: `fetch_worker_logs`, `list_failed_sessions`, `dispatch_autopilot_worker`, `autopilot_notify`
-
-Requires `CLOUDFLARE_API_TOKEN` (secret), `CLOUDFLARE_ACCOUNT_ID` (var), and `DODO_WORKER_NAME` (var) for log access. Without them the worker sessions fall back to running on whatever the session can see directly.
-
-### Memory
-
-Per-user key-value store with text search, persistent across sessions. Your agent can save learnings, preferences, and context that carry forward to future sessions.
-
-### Skills
-
-Drop a `SKILL.md` file into a workspace, store one in your personal library, or import one from a URL — Dodo loads it like a tool. The format is identical to [Claude Skills](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/skills) and [OpenCode skills](https://opencode.ai/docs/skills/), so anything written for either runs in Dodo unchanged.
-
-Three sources, merged with personal > workspace > builtin precedence:
-
-| Source | Where it lives | Editable from Dodo |
-|--------|----------------|---------------------|
-| **Personal** | UserControl Durable Object SQLite (per-user) | Yes — via `skill_write` MCP tool, `skill_import_url`, or `POST /api/skills` |
-| **Workspace** | Auto-discovered at `.dodo/skills/`, `.claude/skills/`, `.agents/skills/`, `.opencode/skill/` (workspace root + first-level subdirs of any cloned repo) | Read-only — copy a body via `skill_write` to fork it |
-| **Builtin** | Bundled in the Worker (`src/builtin-skills.ts`) | Read-only — extend the source file and redeploy |
-
-Loaded with two-stage progressive disclosure (matches Claude Code / OpenCode):
-
-1. **Session start** — every enabled skill's `name + description` lands in the system prompt under `<available_skills>` (~150 tokens each, capped at 4 KB total).
-2. **On demand** — when the model picks one, the `skill` tool returns the full body and a sampled list of bundled files. Bundled files (`references/`, `scripts/`, `assets/`) are listed by relative path but never auto-loaded; the model uses `read` to fetch them.
-
-The frontmatter parser is loose — only `name` and `description` are required. Extra fields (`version`, `last_updated`, etc.) are preserved verbatim, so a skill written for Anthropic's [`anthropics/skills`](https://github.com/anthropics/skills) repo loads in Dodo without modification. Personal skills can spill bundled assets to R2 under `skills/{userId}/{skillName}/...`.
-
-### Browser
-
-Headless Chrome via Cloudflare Browser Rendering. Full CDP (Chrome DevTools Protocol) access through two code-mode tools: `browser_search` (query the CDP spec) and `browser_execute` (run CDP commands). The agent can navigate pages, read documentation, fill forms, and scrape data. Desktop viewport + full-page capture work out of the box. Screenshots captured via `Page.captureScreenshot` render inline in the chat and persist across reloads -- see Attachments below.
-
-### Image generation (/generate)
-
-Type `/generate a cyberpunk cat` in any chat to generate an image with Workers AI FLUX-1-schnell. Bypasses the chat LLM entirely — the image comes back in a few seconds and renders inline.
-
-- **Autocomplete** — start typing `/` in the input box to see the command menu.
-- **Routes everywhere** — works from the browser UI, MCP (`generate_image` tool, or any message containing `/generate` via `send_message`/`send_prompt`), and the dedicated `POST /session/:id/generate` endpoint.
-- **Limits** — 2048-char prompt cap (FLUX schema), 30 images/hour + 100/day per user, concurrent-prompt guard (returns 409 if another prompt is running).
-- **Requires** — the `AI` binding in `wrangler.jsonc`:
-
-  ```jsonc
-  "ai": {
-    "binding": "AI"
-  }
-  ```
-
-  Workers AI is enabled on every paid Workers plan; the free tier has a daily neuron quota.
-
-### Attachments (images in chat)
-
-Images surface in the chat from four sources and flow through the same R2-backed pipeline:
-
-- **User uploads** -- Paste an image or click the paperclip to send a screenshot to a multimodal model (Claude, Gemini, GPT-4o, Gemma). Limits: 5 images per message, 3MB raw per image, PNG/JPEG/GIF/WebP/SVG. SVGs are sanitized (scripts, event handlers, and `javascript:` URLs stripped) before storage, and served with a restrictive CSP.
-- **Browser tool screenshots** -- `browser_execute` extracts screenshots from the CDP result, stashes them in R2, and returns a short text summary to the model (so base64 doesn't burn context). Images render inline on the tool-result bubble.
-- **Model-generated images** -- Responses from image-generating models (e.g. Gemini imagen, Gemma vision) are captured during the stream, uploaded to R2, and rendered on the assistant bubble.
-- **`/generate` slash command** -- Type `/generate <prompt>` in any chat to bypass the LLM and hit Workers AI FLUX-1-schnell directly. Image appears inline in a few seconds. Works from the browser UI (with autocomplete — type `/` to see the menu), the MCP `generate_image` tool, or any chat message containing `/generate` (server-side slash routing catches it). Rate-limited to 30 images/hour and 100/day per user; prompts capped at 2048 chars per the FLUX schema. Requires the `AI` binding in `wrangler.jsonc`.
-
-**Storage:** Attachments live in the `dodo-workspaces` R2 bucket under the `attachments/{sessionId}/{messageId}/` prefix. Run `scripts/setup-attachment-lifecycle.sh` once per account to install the **30-day auto-expiry** lifecycle rule (lifecycle rules aren't yet configurable via `wrangler.jsonc`). Access is ACL-gated via the existing `/session/:id/*` ownership middleware — if you can't read the session, you can't read its attachments.
-
-### Orchestration
-
-Built-in support for dispatching work to worker sessions and shepherding it to a reviewable PR:
-
-- **Seed sessions** -- Clone a repo once, fork for each task (avoids repeated clones). The seed cache is **global** — the first call across all users cold-clones, every subsequent call across all users forks it in sub-second time. Stacked PRs work too: when `baseBranch != main`, the clone goes deeper so the LLM can see the stack's history.
-- **Deterministic edit pipelines** -- Apply text edits, commit, push, verify.
-- **Agent-driven dispatch** -- Send a prompt to a session and verify the result later.
-- **Worker run tracking** -- State machine from session creation through push verification to merged PR.
-- **Auto-draft-PR** -- When a dispatched run verifies successfully, Dodo opens a draft PR on GitHub and stores the URL on the run record. You get a link, not a checklist item.
-- **External verify gate (opt-in)** -- The Workers sandbox can't run `npm`/`tsc`/`vitest`, so the LLM was trusted to self-verify and routinely skipped. Pass a `verifyWorkflow` filename (e.g. `dodo-verify.yml`) and Dodo triggers a GitHub Actions workflow via `workflow_dispatch`, polls for the result, and blocks the auto-PR until checks pass. 30-minute hard cap, `head_sha`-matched run tracking. A template is in `.github/workflows/dodo-verify.yml.example`.
-- **ntfy push notifications** -- Every worker run state transition fires a notification via [ntfy](https://ntfy.sh) if `NTFY_TOPIC` is set. You know when your dispatched work lands, fails, or gets stuck in checks.
-- **Failure snapshots** -- Captures git status/diff/log/messages (and the Actions run URL for verify failures) for debugging failed runs.
-
-### Artifacts
-
-Every Dodo session automatically gets its own [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/) repo -- a git-compatible repo hosted at `artifacts.cloudflare.net`, cloneable by any standard git client with a repo-scoped token. Workspace changes flush to it at the end of each agent turn. Forked sessions fork the Artifacts repo too, so branch history is preserved. You get a reviewable git history of what the agent did, without waiting for the agent to remember to commit.
-
-**Clone your session locally.** The Git panel in the right sidebar has a `Clone this session` collapsible. Expand it, copy the URL (which embeds a 1-hour authenticated token), paste into a terminal, and `git clone`. Refresh the panel to mint a new token when one expires.
-
-**Faster file tree.** Once a session has flushed at least once, the file tree and file viewer in the UI read from an in-Worker clone of the Artifacts repo instead of round-tripping to the workspace shell. First turn behaviour is unchanged; subsequent file-tree expansions are RAM-speed.
-
-Note: this is **separate** from the auto-draft-PR feature on GitHub, which only applies to orchestrated dispatch runs (`dispatch_repo_prompt`) that target a user-configured GitHub repo. Artifacts repos are always per-session and always on Cloudflare.
-
-### Publishing to GitHub
-
-When a session-only / Artifacts-only project graduates into something you want on GitHub, call the MCP tool `publish_to_github` (params: `sessionId`, `name`, optional `owner`, `private`, `description`, `ref`, `dir`). It:
-
-1. Creates a fresh repo via `POST /user/repos` (or `POST /orgs/<owner>/repos` if `owner` is set).
-2. Adds a `github` remote in the session workspace pointing at the new clone URL.
-3. Pushes the workspace's current branch (or whatever you pass as `ref`) to it.
-
-Defaults to a private repo on the authenticated user's account. Requires a `github_token` saved via the secrets UI with the `repo` scope (classic PAT) or `Administration: Write` (fine-grained PAT). If the push fails after the repo is created, the response includes the empty repo's URL so you can retry or delete it.
-
----
-
-## Secrets
-
-Set via `wrangler secret put <NAME>` or through the Deploy to Cloudflare flow.
-
-| Secret | Required | Purpose |
-|--------|----------|---------|
-| `ADMIN_EMAIL` | **Yes** | Your email address. Auto-added to the allowlist. |
-| `SECRETS_MASTER_KEY` | Recommended | Encrypts per-user secrets at rest |
-| `COOKIE_SECRET` | Recommended | Signs session-sharing cookies |
-| `DODO_MCP_TOKEN` | Recommended | Bearer token for MCP endpoints |
-| `OPENCODE_GATEWAY_TOKEN` | If using OpenCode | Auth token for the OpenCode LLM gateway |
-| `AI_GATEWAY_KEY` | If using AI Gateway | Auth key for the Cloudflare AI Gateway |
-| `CF_ACCESS_AUD` | If using Access | Cloudflare Access application audience tag |
-| `CF_ACCESS_TEAM_DOMAIN` | If using Access | Cloudflare Access team domain URL |
-| `NTFY_TOPIC` | Optional | ntfy topic for worker run push notifications |
-| `NTFY_BASE_URL` | Optional | Override the publish endpoint. Defaults to `https://ntfy.sh`; set to a self-hosted ntfy-compatible worker URL otherwise |
-| `NTFY_TOKEN` | Optional | Bearer token sent on every ntfy publish. Required by self-hosted workers with auth; leave unset for public ntfy.sh |
-| `GITHUB_TOKEN` | Optional | Admin-only env fallback when no per-user GitHub token is set |
-| `GITLAB_TOKEN` | Optional | Admin-only env fallback when no per-user GitLab token is set |
-
-Per-user secrets (GitHub token, GitLab token) are stored encrypted in each user's Durable Object using envelope encryption (AES-256-GCM) -- not as environment variables. The `GITHUB_TOKEN` / `GITLAB_TOKEN` env vars exist only as a fallback for the admin account when no per-user secret has been provisioned.
+Other agents use this to hand off long jobs. [Signal Agent](https://github.com/jonnyparris/signal-agent), for example, passes multi-minute browser tasks to Dodo and posts the result back into the chat.
 
 ---
 
 ## Screenshots
 
 | Desktop | Mobile |
-|---------|--------|
+|---|---|
 | ![Landing page](docs/screenshots/01-desktop-landing.png) | ![Mobile chat](docs/screenshots/05-mobile-chat.png) |
-| Landing page with prompt suggestions | Chat view on a phone |
-| ![Active coding session](docs/screenshots/02-desktop-chat.png) | ![Mobile tools panel](docs/screenshots/06-mobile-tools.png) |
-| Dispatched task running in a session | Tools and config on mobile |
-| ![Browser screenshot inline](docs/screenshots/03-desktop-browser-capture.png) | |
-| Inline browser capture in chat | |
-| ![MCP config panel](docs/screenshots/04-desktop-mcp-config.png) | |
-| Config + integrations sidebar | |
+| Landing page and demo prompts | Chat on a phone |
+| ![Explore subagents](docs/screenshots/03-desktop-browser-capture.png) | ![Mobile tools panel](docs/screenshots/06-mobile-tools.png) |
+| Three explore subagents, merged into one table | Tools, schedules and memory on mobile |
+| ![Session settings](docs/screenshots/04-desktop-mcp-config.png) | |
+| Session settings: sharing, browser, MCP | |
 
 ---
 
-## Authentication
+## Reference
 
-**Single-user (default).** Set `ADMIN_EMAIL` and you're done. No login page, no external auth provider. Good for personal deployments.
+<details>
+<summary><b>Models and gateways</b></summary>
 
-**Multi-user with Cloudflare Access.** Put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) in front of your Worker, then set `CF_ACCESS_AUD` and `CF_ACCESS_TEAM_DOMAIN` as secrets. Dodo validates the Access JWT on every request and identifies users by email. Add users to the allowlist from the admin panel.
+Dodo doesn't bundle a model. Set the model and gateway in the UI (Settings) or with `PUT /api/config`.
+
+| Gateway | Setup |
+|---|---|
+| **AI Gateway** | Secret `AI_GATEWAY_KEY`, var `AI_GATEWAY_BASE_URL`. Workers AI models (`@cf/…`) go through the same gateway. |
+| **OpenCode** | Secret `OPENCODE_GATEWAY_TOKEN`. Models fill in automatically. |
+
+Model ids look like `anthropic/claude-sonnet-4` or `@cf/zai-org/glm-5.3-flash`. The picker only offers models the active gateway can route.
+
+**Verified on pi-durable:** GLM 5.3 Flash (the default, with vision), Kimi K2.6 and Gemma on Workers AI. **Known issue:** tool calls on the text-only Workers AI models `gpt-oss-120b` and `qwen2.5-coder-32b` fail with a 400 (they reject array user content).
+
+</details>
+
+<details>
+<summary><b>Secrets</b></summary>
+
+| Secret | Required | Purpose |
+|---|---|---|
+| `ADMIN_EMAIL` | **Yes** | Your email. Added to the allowlist automatically. |
+| `SECRETS_MASTER_KEY` | Recommended | Encrypts per-user secrets at rest |
+| `COOKIE_SECRET` | Recommended | Signs share-link cookies |
+| `DODO_MCP_TOKEN` | Recommended | Bearer token for `/mcp` |
+| `AI_GATEWAY_KEY` | If using AI Gateway | Gateway auth |
+| `OPENCODE_GATEWAY_TOKEN` | If using OpenCode | Gateway auth |
+| `REPLICATE_API_TOKEN` | For images | `/generate` and image edits |
+| `CF_ACCESS_AUD` / `CF_ACCESS_TEAM_DOMAIN` | If using Access | Multi-user auth |
+| `CLOUDFLARE_API_TOKEN` | For autopilot | Read Worker logs (`fetch_worker_logs`) |
+| `NTFY_TOPIC` / `NTFY_BASE_URL` / `NTFY_TOKEN` | Optional | Push notifications (defaults to ntfy.sh) |
+| `GITHUB_TOKEN` / `GITLAB_TOKEN` | Optional | Fallback for the admin when no per-user token is set |
+
+Per-user GitHub/GitLab tokens live encrypted in each user's Durable Object, not in the environment.
+
+</details>
+
+<details>
+<summary><b>Images and attachments</b></summary>
+
+- **Uploads:** up to 5 images per message, 3 MB each (PNG, JPEG, GIF, WebP, SVG). SVGs are sanitised and served with a strict CSP.
+- **Vision models** see uploads directly. **Text-only models** get the upload as an attachment plus `image_check`. Clef decides whether a message asks for an edit.
+- **`/generate <prompt>`** and edits use Replicate (`google/nano-banana-2`, changeable per user). They're limited to 30 an hour and 100 a day per user, and work from the UI, MCP (`generate_image`) and `POST /session/:id/generate`.
+- **Storage:** R2 under `attachments/{sessionId}/{messageId}/`, readable only by people who can read the session. `scripts/setup-attachment-lifecycle.sh` adds 30-day expiry.
+
+</details>
+
+<details>
+<summary><b>Authentication</b></summary>
+
+**Single user (default).** Set `ADMIN_EMAIL`. No login page.
+
+**Multi-user.** Put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) in front of the Worker and set `CF_ACCESS_AUD` and `CF_ACCESS_TEAM_DOMAIN`. Dodo checks the Access JWT on every request and identifies users by email. Add users from the admin panel. Service tokens work too.
+
+</details>
+
+<details>
+<summary><b>Development</b></summary>
 
 ```bash
-wrangler secret put CF_ACCESS_AUD
-wrangler secret put CF_ACCESS_TEAM_DOMAIN
+npm test             # ~1,100 tests on vitest-pool-workers (real workerd + Durable Objects)
+npm run typecheck
+npm run lint
+npm run deploy:safe  # build + deploy + smoke probe
 ```
 
----
+- Deploys are manual. Workers Builds is off because the `experimental` compat flag (needed for facets) blocks versioned uploads ([#46](https://github.com/jonnyparris/dodo/issues/46)).
+- A preview Worker (`wrangler.preview.jsonc`) is for testing upgrades before prod. Deploy main, create sessions, then deploy your branch.
+- Docs: [`docs/file-map.md`](docs/file-map.md), [`docs/testing.md`](docs/testing.md), [`docs/deploying.md`](docs/deploying.md), [`docs/system-prompt.md`](docs/system-prompt.md), [ADRs](docs/adr/).
 
-## Development
-
-```bash
-npm install          # Install dependencies
-npm run dev          # Local dev server
-npm test             # Run tests (vitest + Workers pool)
-npm run typecheck    # Type check
-npm run deploy       # Build + deploy (no post-deploy probe)
-npm run deploy:safe  # Build + deploy + post-deploy smoke probe (recommended)
-npm run smoke        # Run the smoke probe against an already-deployed Worker
-```
-
-### Deploying
-
-Deploys are **manual**: run `npm run deploy:safe` from a workstation authenticated to your Cloudflare account. The `:safe` variant runs `scripts/post-deploy-smoke.sh` against the freshly-deployed Worker, asserting end-to-end that the codemode sandbox boots, `globalOutbound` is wired correctly, and a real `git clone` lands files in the workspace. See `scripts/post-deploy-smoke.sh` for the full check list.
-
-Workers Builds CI was intentionally disabled because Dodo uses the `"experimental"` compatibility flag (required by `@cloudflare/think` and the Agents SDK `subAgent()` facet API). The `experimental` flag is designed to block non-local deploys — local `wrangler deploy` currently works, but the Workers Builds service enforces the policy and rejects every automated deploy. See [issue #46](https://github.com/jonnyparris/dodo/issues/46) for the full diagnosis.
-
-When `@cloudflare/think` graduates out of experimental, the flag can be removed and Workers Builds re-enabled.
+</details>
 
 ## Contributing
 
-Contributions welcome. Open an issue first for anything non-trivial.
-
-- Run `npm test` and `npm run typecheck` before submitting
-- Keep commits atomic with clear messages
-- All `@cloudflare/think` imports must go through `src/think-adapter.ts`
+Issues and PRs welcome. Open an issue first for anything big. Run `npm test` and `npm run typecheck` before you push. Bug fixes come with a test that fails without the fix.
 
 ## License
 

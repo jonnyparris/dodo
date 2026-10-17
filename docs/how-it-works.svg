@@ -78,7 +78,7 @@
       <rect x="239" y="270" width="112" height="18" rx="3" fill="#172554" stroke="#3b82f6" stroke-width="0.75"/>
       <text x="295" y="283" text-anchor="middle" fill="#93c5fd" font-family="system-ui, sans-serif" font-size="8">Git (clone/push)</text>
       <rect x="239" y="292" width="112" height="18" rx="3" fill="#172554" stroke="#3b82f6" stroke-width="0.75"/>
-      <text x="295" y="305" text-anchor="middle" fill="#93c5fd" font-family="system-ui, sans-serif" font-size="8">Sandbox (JS exec)</text>
+      <text x="295" y="305" text-anchor="middle" fill="#93c5fd" font-family="system-ui, sans-serif" font-size="8">Shell + JS sandbox</text>
     </g>
   </a>
 
@@ -99,9 +99,9 @@
 
       <rect x="422" y="216" width="136" height="90" rx="6" fill="#0f172a"/>
       <text x="490" y="236" text-anchor="middle" fill="#a78bfa" font-family="system-ui, sans-serif" font-size="9" font-weight="600">AGENTIC LOOP</text>
-      <text x="438" y="254" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">1. Think (LLM call)</text>
-      <text x="438" y="268" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">2. Act (tool call)</text>
-      <text x="438" y="282" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">3. Observe (result)</text>
+      <text x="438" y="254" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">1. Model step (saved)</text>
+      <text x="438" y="268" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">2. Tool call (saved)</text>
+      <text x="438" y="282" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">3. Read the result</text>
       <text x="438" y="296" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="8">4. Repeat or finish</text>
     </g>
   </a>
@@ -156,8 +156,8 @@
 
   <!-- Bottom: safety features -->
   <rect x="60" y="345" width="800" height="58" rx="10" fill="#172554" stroke="#3b82f6" stroke-width="1"/>
-  <text x="460" y="368" text-anchor="middle" fill="#93c5fd" font-family="system-ui, sans-serif" font-size="12" font-weight="600">Built-in guardrails: doom loop detection, token budget management, context compaction, gated networking</text>
-  <text x="460" y="388" text-anchor="middle" fill="#64748b" font-family="system-ui, sans-serif" font-size="10">Sessions survive Worker evictions and reconnect seamlessly via durable fibers.</text>
+  <text x="460" y="368" text-anchor="middle" fill="#93c5fd" font-family="system-ui, sans-serif" font-size="12" font-weight="600">Built-in guardrails: loop detection, context compaction, gated networking, turn budgets</text>
+  <text x="460" y="388" text-anchor="middle" fill="#64748b" font-family="system-ui, sans-serif" font-size="10">Every step is saved as it happens (pi-durable), so a deploy or restart resumes mid-turn.</text>
 
   <!-- Footer -->
   <text x="460" y="437" text-anchor="middle" fill="#475569" font-family="system-ui, sans-serif" font-size="11">From prompt to pushed branch -- no babysitting required.</text>

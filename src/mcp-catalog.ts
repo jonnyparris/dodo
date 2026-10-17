@@ -19,7 +19,7 @@ const CORE_MCP_CATALOG: McpCatalogEntry[] = [
   {
     id: "dodo-self",
     name: "Dodo Self",
-    description: "Connect to this Dodo instance's own MCP server for multi-session orchestration. Use /mcp/codemode for coding agents (2 tools, ~1k tokens) or /mcp for orchestrators (40+ tools).",
+    description: "Connect to this Dodo instance's own MCP server for multi-session orchestration. Use /mcp/codemode for coding agents (2 tools, ~1k tokens) or /mcp for orchestrators (70+ tools).",
     url: "/mcp/codemode",
     setupGuide: "Add your DODO_MCP_TOKEN as the Authorization Bearer token. The /mcp/codemode endpoint uses code-mode (search + execute) to minimize context usage.",
     auth_type: "static_headers",

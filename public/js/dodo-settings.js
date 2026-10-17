@@ -219,14 +219,14 @@ async function saveBrowserConfig(){
     await json("/api/browser-config",{cfAccountId,cfApiToken,labMode:false},"PUT");
     $("browser-cf-token").value="";
     $("browser-config-details").open=false;
-    toast("Browser Rendering configured","success");
+    toast("Browser Run configured","success");
     await loadBrowserConfig();
     await loadIntegrations();
   }catch(e){toast("Failed: "+(e.message||e),"error")}
 }
 
 async function deleteBrowserConfig(){
-  const ok=await appConfirm("Remove Browser Rendering configuration? This deletes the stored credentials.");
+  const ok=await appConfirm("Remove Browser Run configuration? This deletes the stored credentials.");
   if(!ok)return;
   try{
     await api("/api/browser-config",{method:"DELETE"});

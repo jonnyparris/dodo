@@ -3,6 +3,8 @@
 let userEventSource=null;
 
 let _sessionsLoaded=false;
+/** Session titles live in the session index, not the session DO. */
+function _sessionTitle(id){const s=(typeof allSessions!=='undefined'&&Array.isArray(allSessions))?allSessions.find(x=>x.id===id):null;return (s&&s.title)||id.slice(0,8)}
 async function loadSessions(){
   const el=$("session-list");
   // Only show skeleton on first load — SSE refreshes should be seamless
@@ -10,6 +12,7 @@ async function loadSessions(){
   const d=await apiSafe("/session");if(!d)return;const{sessions}=d;
   allSessions=sessions;
   renderSessionList(sessions);
+  if(currentSession){const t=$("session-title-display");const want=_sessionTitle(currentSession);if(t&&t.textContent!==want)t.textContent=want}
   _sessionsLoaded=true;
 }
 
@@ -218,7 +221,7 @@ async function selectSession(id){
   if(typeof hideContextWarning==='function')hideContextWarning();
   showSkeleton($("chat"),5);
   $("session-id-display").textContent=id.slice(0,8);
-  $("session-title-display").textContent=id.slice(0,8);
+  $("session-title-display").textContent=_sessionTitle(id);
   // Clear stale todos from the previous session immediately so users don't
   // see a flash of the wrong list while the new session loads.
   if(typeof renderSessionTodos==='function')renderSessionTodos([]);
@@ -236,7 +239,7 @@ async function selectSession(id){
     el.textContent="Failed to load session. Check your connection and try again.";
     $("chat").appendChild(el);return;
   }
-  if(state){$("session-title-display").textContent=state.title||id.slice(0,8);setStatusDot(state.status);updateTokenSummary(state);if(state.status==="running")setProcessing(true)}
+  if(state){$("session-title-display").textContent=state.title||_sessionTitle(id);setStatusDot(state.status);updateTokenSummary(state);if(state.status==="running")setProcessing(true)}
   if(msgData){const{messages}=msgData;messages.forEach(renderMessage);requestAnimationFrame(()=>{const c=$("chat");c.scrollTop=c.scrollHeight})}
   else{const el=document.createElement("div");el.className="msg error";el.textContent="Couldn\u2019t load messages. They may appear once the connection recovers.";$("chat").appendChild(el)}
   connectSSE(id);connectWebSocket(id);
@@ -271,3 +274,6 @@ function renderOnboardingSessions(){
   // redundant and a label-mismatch violation.
   list.innerHTML=recent.map(s=>{const id=esc(s.id);const title=esc(s.title||s.id.slice(0,8));return `<button type="button" class="example-prompt" onclick="selectSession('${id}')"><strong>${title}</strong><div class="recent-session-meta">${esc(s.status)} &middot; ${esc(new Date(s.updatedAt).toLocaleString())}</div></button>`}).join('');
 }
+
+// Back/forward and pasted #session= links switch sessions without a reload.
+window.addEventListener('hashchange',()=>{const m=location.hash.match(/^#session=([\w-]+)$/);if(m&&m[1]!==currentSession)selectSession(m[1])});

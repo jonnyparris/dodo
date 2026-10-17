@@ -1,15 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
-  <rect width="32" height="32" rx="6" fill="#0D1117"/>
-  <path d="M4 16 L10 10 L10 12 L6.5 16 L10 20 L10 22 L4 16Z" fill="#7B2CF5"/>
-  <path d="M28 16 L22 10 L22 12 L25.5 16 L22 20 L22 22 L28 16Z" fill="#7B2CF5"/>
-  <ellipse cx="16" cy="17" rx="5.5" ry="4.2" fill="#F5A623"/>
-  <circle cx="19" cy="13" r="2.8" fill="#F5A623"/>
-  <circle cx="20" cy="12.3" r="0.7" fill="#0D1117"/>
-  <path d="M21.2 13.5 Q23.5 13 23.2 14.2 Q23 15 21.5 14.5Z" fill="#7B2CF5"/>
-  <path d="M12.5 16 Q14.5 14.5 15.8 16 Q16.8 17.3 14.5 17.8 Q12.5 18 12.5 16Z" fill="#D4891A" opacity="0.9"/>
-  <path d="M10.5 17 L8.8 15.5 L8.5 16.5 L10 17.5 L8.5 19 L8.8 19.5 L10.5 18Z" fill="#7B2CF5" opacity="0.7"/>
-  <!-- Blinking cursor -->
-  <rect x="13" y="24" width="6" height="1" rx=".5" fill="#7B2CF5" opacity="0.8">
-    <animate attributeName="opacity" values="0.8;0.2;0.8" dur="1.2s" repeatCount="indefinite"/>
-  </rect>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="Dodo">
+    <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F7B03C"/>
+      <stop offset="1" stop-color="#E8860D"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="192" height="192" rx="44" fill="#0D1117"/>
+  <!-- brackets -->
+  <path fill="#8B5CF6" d="M58 62 L22 100 L58 138 L58 126 L34 100 L58 74 Z"/>
+  <path fill="#8B5CF6" d="M142 62 L178 100 L142 138 L142 126 L166 100 L142 74 Z"/>
+  <g transform="translate(100 104) scale(0.8) translate(-106 -104)">
+  <!-- legs -->
+  <rect fill="#8B5CF6" x="90" y="126" width="7" height="20" rx="3.5"/>
+  <rect fill="#8B5CF6" x="106" y="126" width="7" height="20" rx="3.5"/>
+  <rect fill="#8B5CF6" x="88" y="141" width="15" height="7" rx="3.5"/>
+  <rect fill="#8B5CF6" x="104" y="141" width="15" height="7" rx="3.5"/>
+  <!-- tail tuft -->
+  <path fill="#FDE7C0" d="M70 98 C58 92 56 80 62 72 C64 84 70 90 76 93 Z"/>
+  <path fill="#FDE7C0" d="M68 106 C55 104 49 94 51 85 C57 96 64 100 72 101 Z"/>
+  <!-- body + neck -->
+  <path fill="url(#body)" d="M72 104 C72 84 90 76 106 80 C112 70 120 62 128 64 C138 66 140 80 134 92 C131 100 132 108 128 116 C120 132 98 136 84 128 C76 123 72 114 72 104 Z"/>
+  <!-- wing -->
+  <path fill="#D9740A" opacity="0.85" d="M84 102 C92 94 106 96 110 106 C104 116 92 118 86 112 C83 109 83 105 84 102 Z"/>
+  <!-- beak -->
+  <path fill="#FDE7C0" d="M130 70 C140 66 152 68 158 76 C162 82 160 90 154 92 C152 86 148 84 142 84 L132 85 Z"/>
+  <path fill="#8B5CF6" d="M150 72 C158 75 162 82 158 89 C157 92 155 93 153 93 C153 87 150 84 145 83 C147 79 149 76 150 72 Z"/>
+  <!-- eye -->
+  <circle cx="125" cy="74" r="4.2" fill="#0D1117"/>
+  <circle cx="126.6" cy="72.6" r="1.4" fill="#FFFFFF"/>
+  </g>
 </svg>

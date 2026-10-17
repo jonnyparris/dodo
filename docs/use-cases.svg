@@ -83,7 +83,7 @@
       <text x="42" y="390" fill="#f97316" font-family="monospace" font-size="9">dispatch work to the cloud.</text>
       <text x="32" y="424" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Claude Code, Cursor, or OpenCode connect</text>
       <text x="32" y="440" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">via MCP and dispatch heavy jobs to Dodo.</text>
-      <text x="32" y="466" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">47-tool MCP server, or 2-tool code-mode.</text>
+      <text x="32" y="466" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">74-tool MCP server, or 2-tool code-mode.</text>
     </g>
   </a>
 
@@ -115,8 +115,8 @@
       <text x="642" y="362" fill="#f97316" font-family="monospace" font-size="9">"Read the Cloudflare docs for</text>
       <text x="642" y="376" fill="#f97316" font-family="monospace" font-size="9"> D1 and write a migration</text>
       <text x="642" y="390" fill="#f97316" font-family="monospace" font-size="9"> script based on what you find."</text>
-      <text x="632" y="424" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Headless Chrome via Browser Rendering.</text>
-      <text x="632" y="440" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Full-page screenshots render in chat.</text>
+      <text x="632" y="424" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">One Chrome per session via Browser Run.</text>
+      <text x="632" y="440" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Logins carry over; hand off via Live View.</text>
       <text x="632" y="466" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">Full CDP access for any web automation.</text>
     </g>
   </a>
@@ -167,7 +167,7 @@
       <text x="642" y="572" fill="#f97316" font-family="monospace" font-size="9">Paste a screenshot of a bug.</text>
       <text x="642" y="586" fill="#f97316" font-family="monospace" font-size="9">The agent sees the UI, reads</text>
       <text x="642" y="600" fill="#f97316" font-family="monospace" font-size="9">the error, fixes the code.</text>
-      <text x="632" y="634" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Vision models (Claude, Gemini, GPT-4o).</text>
+      <text x="632" y="634" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Vision models, or Clef checks for the rest.</text>
       <text x="632" y="650" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="10">Tool + model-generated images too.</text>
       <text x="632" y="676" class="cta" fill="#4ade80" font-family="system-ui, sans-serif" font-size="10" font-weight="500">R2-backed, persist across reloads.</text>
     </g>

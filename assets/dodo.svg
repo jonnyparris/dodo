@@ -1,55 +1,46 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="Dodo">
   <style>
-    .bg { fill: #f0f0f0; }
-    .eye-bg { fill: #f0f0f0; }
-    .bracket-stop1 { stop-color: #6B21A8; }
-    .bracket-stop2 { stop-color: #7C3AED; }
-    .eye-iris { fill: #6B21A8; }
-    .slash { opacity: 0.1; }
+    .bg { fill: #F4F1FB; }
+    .ink { fill: #6D28D9; }
+    .eye { fill: #1F1033; }
+    .glint { fill: #FFFFFF; }
+    .beak { fill: #FDE7C0; }
+    .tuft { fill: #E9C584; }
     @media (prefers-color-scheme: dark) {
       .bg { fill: #0D1117; }
-      .eye-bg { fill: #0D1117; }
-      .bracket-stop1 { stop-color: #7B2CF5; }
-      .bracket-stop2 { stop-color: #9B59B6; }
-      .eye-iris { fill: #7B2CF5; }
-      .slash { opacity: 0.12; }
+      .ink { fill: #8B5CF6; }
+      .eye { fill: #0D1117; }
+      .tuft { fill: #FDE7C0; }
     }
   </style>
   <defs>
-    <linearGradient id="bracketGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" class="bracket-stop1" />
-      <stop offset="100%" class="bracket-stop2" />
-    </linearGradient>
-    <linearGradient id="birdGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#F5A623" />
-      <stop offset="100%" style="stop-color:#E8920D" />
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F7B03C"/>
+      <stop offset="1" stop-color="#E8860D"/>
     </linearGradient>
   </defs>
-  <!-- Background rounded square -->
-  <rect x="5" y="5" width="190" height="190" rx="30" ry="30" class="bg" />
-  <!-- Left angle bracket -->
-  <path d="M25 95 L60 65 L60 73 L33 95 L60 117 L60 125 L25 95Z" fill="url(#bracketGrad)" />
-  <!-- Right angle bracket -->
-  <path d="M175 95 L140 65 L140 73 L167 95 L140 117 L140 125 L175 95Z" fill="url(#bracketGrad)" />
-  <!-- Dodo bird body -->
-  <ellipse cx="100" cy="105" rx="32" ry="25" fill="url(#birdGrad)" />
-  <!-- Head -->
-  <circle cx="118" cy="80" r="16" fill="url(#birdGrad)" />
-  <!-- Eye -->
-  <circle cx="123" cy="76" r="4" class="eye-bg" />
-  <circle cx="124.5" cy="74.5" r="1.5" class="eye-iris" />
-  <!-- Beak -->
-  <path d="M131 82 Q148 78 146 86 Q144 92 134 89 Q131 87 131 85Z" fill="url(#bracketGrad)" />
-  <!-- Wing -->
-  <path d="M78 98 Q90 88 98 96 Q104 104 90 108 Q78 110 78 98Z" fill="#D4891A" opacity="0.9" />
-  <!-- Tail as cursor/caret -->
-  <path d="M68 102 L58 94 L56 98 L66 106 L56 114 L58 118 L68 110Z" fill="url(#bracketGrad)" opacity="0.7" />
-  <!-- Forward slash (subtle code reference) -->
-  <line x1="108" y1="55" x2="92" y2="140" stroke="url(#bracketGrad)" stroke-width="3" class="slash" />
-  <!-- Terminal underscore cursor -->
-  <rect x="90" y="148" width="20" height="3" rx="1" fill="url(#bracketGrad)" opacity="0.8">
-    <animate attributeName="opacity" values="0.8;0.2;0.8" dur="1.2s" repeatCount="indefinite" />
-  </rect>
-  <!-- Text -->
-  <text x="100" y="175" text-anchor="middle" font-family="'SF Mono', 'Fira Code', monospace" font-size="14" font-weight="600" fill="url(#bracketGrad)" letter-spacing="4">DODO</text>
+  <rect x="4" y="4" width="192" height="192" rx="44" class="bg"/>
+  <!-- brackets -->
+  <path class="ink" d="M58 62 L22 100 L58 138 L58 126 L34 100 L58 74 Z"/>
+  <path class="ink" d="M142 62 L178 100 L142 138 L142 126 L166 100 L142 74 Z"/>
+  <g transform="translate(100 104) scale(0.8) translate(-106 -104)">
+  <!-- legs -->
+  <rect class="ink" x="90" y="126" width="7" height="20" rx="3.5"/>
+  <rect class="ink" x="106" y="126" width="7" height="20" rx="3.5"/>
+  <rect class="ink" x="88" y="141" width="15" height="7" rx="3.5"/>
+  <rect class="ink" x="104" y="141" width="15" height="7" rx="3.5"/>
+  <!-- tail tuft -->
+  <path class="tuft" d="M70 98 C58 92 56 80 62 72 C64 84 70 90 76 93 Z"/>
+  <path class="tuft" d="M68 106 C55 104 49 94 51 85 C57 96 64 100 72 101 Z"/>
+  <!-- body + neck -->
+  <path fill="url(#body)" d="M72 104 C72 84 90 76 106 80 C112 70 120 62 128 64 C138 66 140 80 134 92 C131 100 132 108 128 116 C120 132 98 136 84 128 C76 123 72 114 72 104 Z"/>
+  <!-- wing -->
+  <path fill="#D9740A" opacity="0.85" d="M84 102 C92 94 106 96 110 106 C104 116 92 118 86 112 C83 109 83 105 84 102 Z"/>
+  <!-- beak -->
+  <path class="beak" d="M130 70 C140 66 152 68 158 76 C162 82 160 90 154 92 C152 86 148 84 142 84 L132 85 Z"/>
+  <path class="ink" d="M150 72 C158 75 162 82 158 89 C157 92 155 93 153 93 C153 87 150 84 145 83 C147 79 149 76 150 72 Z"/>
+  <!-- eye -->
+  <circle cx="125" cy="74" r="4.2" class="eye"/>
+  <circle cx="126.6" cy="72.6" r="1.4" class="glint"/>
+  </g>
 </svg>

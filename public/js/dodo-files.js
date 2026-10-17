@@ -74,7 +74,7 @@ function loadPrompts(){}
 const TODO_STATUS_ICONS={
   pending:'<i class="ph ph-circle"></i>',
   in_progress:'<i class="ph ph-spinner-gap"></i>',
-  completed:'<i class="ph ph-check-circle-fill"></i>',
+  completed:'<i class="ph ph-check-circle"></i>',
   cancelled:'<i class="ph ph-x-circle"></i>',
 };
 function renderSessionTodos(items){
@@ -115,7 +115,7 @@ async function armWatchdog(action){if(!currentSession)return;const stall=parseIn
 async function disarmWatchdog(){if(!currentSession)return;await apiSafe(`/session/${currentSession}/watchdog`,{method:"DELETE"});toast('Watchdog disarmed','success');await loadWatchdog()}
 
 // --- Memory ---
-async function loadMemory(query){const q=query??$("mem-search")?.value??"";const d=await apiSafe(`/api/memory${q?`?q=${encodeURIComponent(q)}`:""}`);if(!d)return;const{entries}=d;$("memory-list").innerHTML=entries.length?entries.slice(0,15).map(e=>{const id=esc(e.id);const title=esc(e.title);return `<div class="kv" style="flex-wrap:wrap"><span role="button" tabindex="0" style="cursor:pointer" onclick="editMemory('${id}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();editMemory('${id}')}" aria-label="Edit memory entry: ${title}">${title}</span><span style="display:flex;gap:4px;align-items:center">${(e.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}<button onclick="deleteMemory('${id}')" class="sm" aria-label="Delete memory entry: ${title}">x</button></span></div>`}).join(""):'<div class="empty">No entries</div>'}
+async function loadMemory(query){const q=query??$("mem-search")?.value??"";const d=await apiSafe(`/api/memory${q?`?q=${encodeURIComponent(q)}`:""}`);if(!d)return;const{entries}=d;$("memory-list").innerHTML=entries.length?entries.slice(0,15).map(e=>{const id=esc(e.id);const title=esc(e.title);return `<div class="kv memory-entry"><span class="memory-title" role="button" tabindex="0" onclick="editMemory('${id}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();editMemory('${id}')}" aria-label="Edit memory entry: ${title}">${title}</span><span class="memory-tags">${(e.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}<button onclick="deleteMemory('${id}')" class="sm" aria-label="Delete memory entry: ${title}">x</button></span></div>`}).join(""):'<div class="empty">No entries</div>'}
 async function editMemory(id){const entry=await apiSafe(`/api/memory/${encodeURIComponent(id)}`);if(!entry)return;$("mem-id").value=entry.id;$("mem-title").value=entry.title;$("mem-content").value=entry.content;$("mem-tags").value=(entry.tags||[]).join(", ");const details=$("mem-title").closest("details");if(details)details.open=true}
 function clearMemoryForm(){$("mem-id").value="";$("mem-title").value="";$("mem-content").value="";$("mem-tags").value=""}
 async function saveMemory(){const id=$("mem-id").value;const title=$("mem-title").value.trim();const content=$("mem-content").value.trim();const tags=$("mem-tags").value.split(",").map(t=>t.trim()).filter(Boolean);if(!title||!content)return;let r;if(id){r=await jsonSafe(`/api/memory/${encodeURIComponent(id)}`,{title,content,tags},"PUT")}else{r=await jsonSafe("/api/memory",{title,content,tags})}if(r)toast('Memory saved','success');else toast('Failed to save','error');clearMemoryForm();await loadMemory()}
@@ -194,7 +194,7 @@ async function refreshGit(){
     el.style.maxHeight=display.length>10?"200px":"";
     el.style.overflowY=display.length>10?"auto":"";
     el.innerHTML=display.length?display.map(e=>`<div style="font-size:11px;font-family:var(--mono)">${esc(e.status)} ${esc(e.filepath)}</div>`).join(""):'<div class="empty">Clean or no repo</div>'
-  }catch{$("git-status-display").innerHTML='<div class="empty">No repo</div>'}
+  }catch{$("git-status-display").innerHTML='<div class="empty">No repo</div>';$("git-log-display").innerHTML="";return}
   // Load recent commits
   try{
     const{entries}=await api(`/session/${currentSession}/git/log?depth=10`);

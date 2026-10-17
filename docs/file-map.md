@@ -6,22 +6,33 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 
 - `src/index.ts` — Worker router (Hono), all HTTP routes, auth middleware, session fork, admin routes
 - `src/auth.ts` — Cloudflare Access JWT verification, user allowlist check, admin guard
-- `src/rpc-api.ts` / `src/rpc-transport.ts` — JSON-RPC API surface and transport
+- `src/rpc.ts` — JSON-RPC API surface
 - `src/share.ts` — session sharing (tokens, permissions, cookies)
 - `src/onboarding.ts` — guided passkey and secrets setup
 
 ## Agent core
 
-- `src/coding-agent.ts` — per-session agent DO (extends Think, chat via Think.chat(), fibers, workspace, git, cron, prompts, snapshots, SSE). **Contains the system prompt.** Also: goal state + `maybeAutoContinue` hook for goal-driven self-continuation.
-- `src/session-goal.ts` — pure helpers + types for session goals (status enum, system-prompt snippet renderer, continue-prompt builder). See `docs/session-goals.md`.
-- `src/pi/engine.ts` — PiEngine: agent loop on `@earendil-works/pi-durable` (Harness on DO SQLite, `pi_` tables), SSE event bridge, transcript view. Opt-in per session; see `docs/adr/0002-pi-durable-foundation.md`
+- `src/coding-agent.ts` — per-session agent DO: prompts + queue, workspace, git, cron, goals, watchdog, attachments, snapshots, SSE/WS. **Contains the system prompt.**
+- `src/agent-base.ts` — `DodoAgentBase extends Agent` (agents SDK): SDK fibers (`startFiber` / `onFiberRecovered`), `_think_config` table, `migrateLegacyFiberTable` for pre-0.28 sessions
+- `src/session-lifecycle.ts` — prompt lifecycle (start, queue, abort, busy handling) driven by fibers
+- `src/pi/engine.ts` — PiEngine: the agent loop on `@earendil-works/pi-durable` (Harness on DO SQLite, `pi_` tables), SSE event bridge, transcript view. See `docs/adr/0002-pi-durable-foundation.md`
 - `src/pi/models.ts` — Dodo gateways as a pi-ai `openai-completions` provider
 - `src/pi/tools.ts` — adapts AI SDK `tool()` objects to durable pi tools; `REPLAY_SAFE_TOOLS`
+- `src/pi/loop-guard.ts` — repeated-tool-call detection as a pi hook
+- `src/think-history.ts` / `src/transcript.ts` — read-only reader for pre-pi (Think-era) history, migrated lazily on the next prompt
+- `src/agentic.ts` — LLM provider construction (`buildProvider`), tool composition (`buildToolsForThink`, name kept for history), git tools, `set_goal_status`
+- `src/tools/workspace-tools.ts` — read / write / edit / grep / find tools on the session workspace
+- `src/tools/execute-tool.ts` — codemode `execute` (sandboxed JS in a Dynamic Worker; `withJsonSafeBytes` for binary data)
+- `src/tools/shell.ts` / `src/tools/shell-patch.ts` — busybox-style shell (just-bash on `@cloudflare/computer`), patched so redirects write raw bytes
+- `src/tools/image-check.ts` / `src/clef.ts` — Clef decision models: `image_check`, image edit-vs-answer routing (ADR 0003)
+- `src/browser/session-browser.ts` — one SDK `Browser` per session + `browser_execute`; Live View
+- `src/browser/web-fetch.ts` — `browser_markdown` / `browser_triage` (fetch first, Browser Run fallback, Clef page checks)
 - `src/tools/kitebuild.ts` — `ci_run`: verify a pushed branch in Kitebuild (enabled by `KITEBUILD_*` config)
-- `src/think-adapter.ts` — Think integration boundary: re-exports, types (DodoConfig, MessageMetadata, SnapshotV2), adapter functions
-- `src/agentic.ts` — LLM provider construction (buildProvider), tool composition (buildToolsForThink), git tools, `set_goal_status` tool
-- `src/executor.ts` — DynamicWorkerExecutor wrapper for sandboxed code execution (direct API route)
+- `src/explore-agent.ts` / `src/task-agent.ts` / `src/subagent-runner.ts` — `explore` and `task` subagents (in-process or facet DOs)
 - `src/typecheck.ts` — in-isolate `tsc --noEmit` tool
+- `src/session-goal.ts` — goal helpers + types. See `docs/session-goals.md`
+- `src/watchdog.ts` — stall detection for long prompts. See `docs/session-watchdog.md`
+- `src/chat-monitor-agent.ts` — polls a Google Chat space and forwards messages into a session
 - `src/presence.ts` — WebSocket presence tracking
 - `src/autopilot.ts` — self-diagnose loop: `buildDiagnoseGoal`, `buildSupervisorGoal`, owner resolution
 - `src/cloudflare-logs.ts` — Workers Observability wrapper for admin self-introspection
@@ -42,9 +53,8 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 
 - `src/git.ts` — git helpers via @cloudflare/shell, multi-host token injection (GitHub + GitLab)
 - `src/repos.ts` — known repository registry for orchestration
-- `src/mcp.ts` — MCP server exposing all Dodo capabilities as tools
+- `src/mcp.ts` — MCP server exposing Dodo as 74 tools
 - `src/mcp-codemode.ts` — code-mode MCP endpoint (2 tools, minimal context)
-- `src/mcp-gatekeeper.ts` — MCP server auth and rate limiting
 - `src/mcp-catalog.ts` — curated catalog of recommended MCP servers
 - `src/outbound.ts` — AllowlistOutbound WorkerEntrypoint for gated sandbox fetch
 - `src/notify.ts` — push notifications via ntfy.sh (per-user topic from encrypted secrets)
@@ -58,7 +68,7 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 
 ## Tests & UI
 
-- `test/dodo.test.ts` — integration tests via vitest-pool-workers
+- `test/` — ~100 test files on vitest-pool-workers (real workerd + Durable Objects); models mocked via `test/helpers/pi-models-mock.ts`
 - `public/index.html` — three-panel web UI (mobile-responsive)
 - `public/docs.html` — architecture documentation page
 - `public/howto.html` — task-oriented how-to guides

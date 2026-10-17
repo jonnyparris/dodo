@@ -1,35 +1,22 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="32" height="32">
   <style>
-    .bg { fill: #f0f0f0; }
-    .eye { fill: #f0f0f0; }
-    .bracket { fill: #6B21A8; }
-    .bracket-soft { fill: #6B21A8; opacity: 0.7; }
+    .bg { fill: #F4F1FB; }
+    .ink { fill: #6D28D9; }
+    .eye { fill: #1F1033; }
+    .beak { fill: #FDE7C0; }
     @media (prefers-color-scheme: dark) {
       .bg { fill: #0D1117; }
+      .ink { fill: #8B5CF6; }
       .eye { fill: #0D1117; }
-      .bracket { fill: #7B2CF5; }
-      .bracket-soft { fill: #7B2CF5; opacity: 0.7; }
     }
   </style>
-  <rect width="32" height="32" rx="6" class="bg"/>
-  <!-- Left bracket -->
-  <path d="M4 16 L10 10 L10 12 L6.5 16 L10 20 L10 22 L4 16Z" class="bracket"/>
-  <!-- Right bracket -->
-  <path d="M28 16 L22 10 L22 12 L25.5 16 L22 20 L22 22 L28 16Z" class="bracket"/>
-  <!-- Bird body -->
-  <ellipse cx="16" cy="17" rx="5.5" ry="4.2" fill="#F5A623"/>
-  <!-- Head -->
-  <circle cx="19" cy="13" r="2.8" fill="#F5A623"/>
-  <!-- Eye -->
-  <circle cx="20" cy="12.3" r="0.7" class="eye"/>
-  <!-- Beak -->
-  <path d="M21.2 13.5 Q23.5 13 23.2 14.2 Q23 15 21.5 14.5Z" class="bracket"/>
-  <!-- Wing -->
-  <path d="M12.5 16 Q14.5 14.5 15.8 16 Q16.8 17.3 14.5 17.8 Q12.5 18 12.5 16Z" fill="#D4891A" opacity="0.9"/>
-  <!-- Tail -->
-  <path d="M10.5 17 L8.8 15.5 L8.5 16.5 L10 17.5 L8.5 19 L8.8 19.5 L10.5 18Z" class="bracket-soft"/>
-  <!-- Blinking cursor -->
-  <rect x="13" y="24" width="6" height="1" rx=".5" class="bracket" opacity="0.8">
-    <animate attributeName="opacity" values="0.8;0.2;0.8" dur="1.2s" repeatCount="indefinite"/>
-  </rect>
+  <rect x="0" y="0" width="200" height="200" rx="44" class="bg"/>
+  <path class="ink" d="M56 56 L14 100 L56 144 L56 128 L30 100 L56 72 Z"/>
+  <path class="ink" d="M144 56 L186 100 L144 144 L144 128 L170 100 L144 72 Z"/>
+  <g transform="translate(100 102) scale(0.8) translate(-112 -100)">
+  <path fill="#F29A1F" d="M64 108 C64 84 86 74 104 80 C110 68 120 60 130 62 C142 66 144 82 138 96 C134 106 134 114 128 122 C118 138 92 140 78 130 C69 124 64 116 64 108 Z"/>
+  <path class="beak" d="M132 68 C144 64 158 68 162 78 C164 86 160 94 152 95 C150 88 146 86 140 86 L134 87 Z"/>
+  <path class="ink" d="M152 70 C162 74 166 84 160 92 C158 95 155 96 152 95 C152 89 149 86 144 85 C147 80 150 75 152 70 Z"/>
+  <circle cx="126" cy="76" r="7" class="eye"/>
+  </g>
 </svg>
