@@ -1498,6 +1498,13 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       // Debug endpoint: run compaction diagnostics without side effects
+      if (request.method === "POST" && url.pathname === "/debug/evict") {
+        log("warn", "debug: evicting session DO", { sessionId: this.sessionId(), activePrompt: this.readMetadata("active_prompt_id") });
+        // Abort after the response is sent; the next request or alarm starts a fresh instance.
+        setTimeout(() => this.ctx.abort("debug evict"), 50);
+        return Response.json({ evicting: true });
+      }
+
       if (request.method === "GET" && url.pathname === "/debug/compaction") {
         if (this.agentEngine() === "pi") {
           // pi compacts on its own (background + blocking + overflow retry); report what it did.

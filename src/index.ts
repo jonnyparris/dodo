@@ -2286,6 +2286,12 @@ app.get("/session/:id/debug/compaction", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/debug/compaction");
 });
 
+// Admin-only: reset the session's Durable Object (ctx.abort), as an eviction
+// would. Proves that in-flight prompts recover (fiber restart + pi reattach).
+app.post("/session/:id/debug/evict", adminGuard as never, async (c) => {
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/debug/evict");
+});
+
 // Per-config MCP connect status from the most recent connectMcpServers() run.
 // Lets the UI explain why an MCP config has no tools (e.g. "Invalid Bearer
 // token format") instead of silently dropping them.
