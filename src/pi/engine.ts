@@ -36,11 +36,33 @@ import {
 } from "@earendil-works/pi-durable";
 import { DurableObjectSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { buildLoopGuardExtension, type LoopVerdict } from "./loop-guard";
+import { DODO_PROVIDER_ID } from "./models";
 
 export const PI_TABLE_PREFIX = "pi_";
 export const DODO_USER_ENTRY = "dodo.user";
+/** An assistant message written without a model run: imported history, generated images. */
+export const DODO_ASSISTANT_ENTRY = "dodo.assistant";
 
 export type PiUserContent = string | Array<TextContent | ImageContent>;
+
+export interface DodoAssistantEntryData {
+  messageId: string;
+  text: string;
+  createdAt: number;
+  [key: string]: string | number | null;
+}
+
+/** One message to write into the transcript as-is (no model call). */
+export interface PiImportedMessage {
+  role: "user" | "assistant";
+  id: string;
+  text: string;
+  authorEmail?: string | null;
+  createdAt?: number;
+  /** Model that produced an assistant message, for the context record. */
+  model?: string;
+}
 
 export interface DodoUserEntryData {
   messageId: string;
@@ -65,6 +87,10 @@ export interface PiEngineHost {
   systemPrompt(): string;
   /** Emit a Dodo SSE/WS event. */
   emit(event: { type: string; data: unknown }): void;
+  /** A compaction finished (`ok` false when it failed). */
+  onCompaction?(ok: boolean): void;
+  /** The loop guard nudged or refused a tool. */
+  onLoopVerdict?(verdict: LoopVerdict): void;
   log(level: "info" | "warn" | "error", message: string, fields?: Record<string, unknown>): void;
 }
 
@@ -82,6 +108,8 @@ export interface PiTurnResult {
   text: string;
   tokenInput: number;
   tokenOutput: number;
+  /** Context size of the last model request (input + cache read/write): the "how full is it" number. */
+  contextTokens: number;
   steps: number;
   toolCalls: string[];
   recovered: boolean;
@@ -111,6 +139,8 @@ interface BridgeState {
   steps: number;
   input: number;
   output: number;
+  /** Context size of the last assistant step. */
+  context: number;
   toolCalls: string[];
   /** Text of the current assistant message already sent as text_delta. */
   streamed: string;
@@ -131,6 +161,7 @@ export class PiEngine {
         sections: [section("dodo", () => this.host.systemPrompt(), { tag: false })],
       }),
     );
+    this.registry.install(buildLoopGuardExtension((v) => this.host.onLoopVerdict?.(v)));
   }
 
   private async db(): Promise<DurableObjectSqliteDatabase> {
@@ -227,7 +258,7 @@ export class PiEngine {
     }
     harness.resume();
 
-    const acc: BridgeState = { steps: 0, input: 0, output: 0, toolCalls: [], streamed: "" };
+    const acc: BridgeState = { steps: 0, input: 0, output: 0, context: 0, toolCalls: [], streamed: "" };
     const stream = await watchEvents(harness, root.id, this.ctx);
     stream.start(async (events) => {
       for (const event of events) this.bridge(event, acc);
@@ -257,6 +288,7 @@ export class PiEngine {
         text: "",
         tokenInput: acc.input,
         tokenOutput: acc.output,
+        contextTokens: acc.context,
         steps: acc.steps,
         toolCalls: acc.toolCalls,
         recovered,
@@ -272,6 +304,7 @@ export class PiEngine {
       text: textOf(message),
       tokenInput: acc.input,
       tokenOutput: acc.output,
+      contextTokens: acc.context,
       steps: acc.steps,
       toolCalls: acc.toolCalls,
       recovered,
@@ -309,6 +342,7 @@ export class PiEngine {
         acc.streamed = "";
         acc.input += m?.usage?.input ?? 0;
         acc.output += m?.usage?.output ?? 0;
+        if (m?.usage) acc.context = (m.usage.input ?? 0) + (m.usage.cacheRead ?? 0) + (m.usage.cacheWrite ?? 0);
         return;
       }
       case "tool_execution_start":
@@ -337,12 +371,50 @@ export class PiEngine {
         return;
       case "compaction_end":
         this.host.log(event.error ? "warn" : "info", "pi: compaction end", { reason: event.reason, error: event.error });
+        this.host.onCompaction?.(!event.error);
         return;
       case "task_failed":
         this.host.log("error", "pi: task failed", { kind: event.kind, message: event.message });
         return;
       default:
         return;
+    }
+  }
+
+  /**
+   * Write messages into the transcript without running the model: imported
+   * history (fork, snapshot) and generated images. They show in the chat and
+   * count as context for later turns.
+   */
+  async append(messages: readonly PiImportedMessage[]): Promise<void> {
+    if (messages.length === 0) return;
+    const harness = await this.open();
+    const root = await this.root();
+    const write = async (entry: Parameters<typeof root.submit>[0]) => {
+      const sub = await root.submit(entry, this.ctx);
+      harness.resume();
+      await sub.wait(this.ctx);
+    };
+    const model = this.host.modelRef();
+    for (const m of messages) {
+      const createdAt = m.createdAt ?? Date.now();
+      if (m.role === "user") {
+        const data: DodoUserEntryData = { messageId: m.id, text: m.text, authorEmail: m.authorEmail ?? null, createdAt };
+        await write({ type: "write", entry: { kind: DODO_USER_ENTRY, data, model: [{ role: "user", content: m.text, timestamp: createdAt }] } });
+      } else {
+        const data: DodoAssistantEntryData = { messageId: m.id, text: m.text, createdAt };
+        const message: AssistantMessage = {
+          role: "assistant",
+          content: [{ type: "text", text: m.text }],
+          api: "openai-completions",
+          provider: DODO_PROVIDER_ID,
+          model: m.model ?? model.modelId,
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: "stop",
+          timestamp: createdAt,
+        };
+        await write({ type: "write", entry: { kind: DODO_ASSISTANT_ENTRY, data, model: [message] } });
+      }
     }
   }
 
@@ -411,6 +483,8 @@ export interface PiMessageView {
   content: string;
   authorEmail: string | null;
   createdAt: number | null;
+  /** Images the user sent inline with this message (data URLs). */
+  images?: Array<{ mediaType: string; url: string }>;
 }
 
 /**
@@ -431,12 +505,29 @@ export function entriesToMessages(entries: readonly EntryRecord[]): PiMessageVie
     if (entry.kind === DODO_USER_ENTRY || entry.kind === "pi.user") {
       flush();
       const data = (entry.data ?? {}) as Partial<DodoUserEntryData>;
-      const text = data.text ?? textOf(entry.model?.[0] as UserMessage | undefined);
+      const user = entry.model?.[0] as UserMessage | undefined;
+      const text = data.text ?? textOf(user);
+      const images = Array.isArray(user?.content)
+        ? user.content
+            .filter((c): c is ImageContent => c.type === "image")
+            .map((c) => ({ mediaType: c.mimeType, url: `data:${c.mimeType};base64,${c.data}` }))
+        : [];
       out.push({
         role: "user",
         id: data.messageId ?? String(entry.id),
         content: text,
         authorEmail: data.authorEmail ?? null,
+        createdAt: data.createdAt ?? null,
+        ...(images.length ? { images } : {}),
+      });
+    } else if (entry.kind === DODO_ASSISTANT_ENTRY) {
+      flush();
+      const data = (entry.data ?? {}) as Partial<DodoAssistantEntryData>;
+      out.push({
+        role: "assistant",
+        id: data.messageId ?? String(entry.id),
+        content: data.text ?? textOf(entry.model?.[0] as AssistantMessage | undefined),
+        authorEmail: null,
         createdAt: data.createdAt ?? null,
       });
     } else if (entry.kind === "pi.assistant") {

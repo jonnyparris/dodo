@@ -21,6 +21,7 @@ vi.mock("@cloudflare/codemode", async (importOriginal) => {
 });
 
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
+vi.mock("../src/pi/models", async () => await import("./helpers/pi-models-mock"));
 
 vi.mock("../src/notify", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/notify")>();

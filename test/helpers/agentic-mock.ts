@@ -69,6 +69,9 @@ async function waitForSlowPrompt(abortSignal?: AbortSignal): Promise<void> {
   throw new Error("waitForSlowPrompt: timed out after 30s — the test forgot to call releaseMockSlowPrompt()");
 }
 
+/** The slow-prompt gate, shared with the pi-engine mock (helpers/pi-models-mock.ts). */
+export const mockSlowPromptWait = (signal?: AbortSignal) => waitForSlowPrompt(signal);
+
 export function releaseMockSlowPrompt(): void {
   released = true;
 }

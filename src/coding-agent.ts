@@ -895,8 +895,8 @@ export class CodingAgent extends CodingAgentBase {
       : undefined;
 
     // Inject bounded workspace summary on first turn only.
-    const workspaceSummary =
-      this.messages.length <= 1 ? this.getWorkspaceSummary() ?? undefined : undefined;
+    const firstTurn = this.agentEngine() === "pi" ? this.listPrompts().length <= 1 : this.messages.length <= 1;
+    const workspaceSummary = firstTurn ? this.getWorkspaceSummary() ?? undefined : undefined;
 
     const config = this.getConfig();
 
@@ -2597,6 +2597,20 @@ export class CodingAgent extends CodingAgentBase {
 
       // Debug endpoint: run compaction diagnostics without side effects
       if (request.method === "GET" && url.pathname === "/debug/compaction") {
+        if (this.agentEngine() === "pi") {
+          // pi compacts on its own (background + blocking + overflow retry); report what it did.
+          const details = this.readSessionDetails();
+          return Response.json({
+            engine: "pi",
+            model: details.model,
+            contextWindow: details.contextWindow,
+            contextBudget: details.contextBudget,
+            contextTokens: Number(this.readMetadata("pi_context_tokens") ?? 0),
+            usagePercent: details.contextUsagePercent,
+            compactionCount: details.compactionCount,
+            ...(await this.piEngine().inspect()),
+          });
+        }
         const thinkSid = this.getCurrentSessionId();
         if (!thinkSid) return Response.json({ error: "no session" });
 
@@ -4144,9 +4158,8 @@ export class CodingAgent extends CodingAgentBase {
       }
     }
 
-    // V2 snapshot: Think messages + sidecar metadata
-    const thinkSessionId = this.getCurrentSessionId();
-    const history = thinkSessionId ? this.sessions.getHistory(thinkSessionId) : [];
+    // V2 snapshot: UIMessages + sidecar metadata, from whichever engine holds them
+    const history = await this.transcriptUIMessages();
     return {
       version: 2,
       title: this.readMetadata("title"),
@@ -4205,21 +4218,7 @@ export class CodingAgent extends CodingAgentBase {
           await this.workspace.writeFile(normalized, file.content);
         }
       }
-      const thinkSessionId = this.getCurrentSessionId();
-      if (thinkSessionId) {
-        for (const entry of v2.messages) {
-          this.sessions.append(thinkSessionId, entry.uiMessage);
-          this.insertMessageMetadata({
-            messageId: entry.uiMessage.id,
-            authorEmail: entry.metadata.authorEmail,
-            model: entry.metadata.model,
-            provider: entry.metadata.provider,
-            tokenInput: entry.metadata.tokenInput,
-            tokenOutput: entry.metadata.tokenOutput,
-          });
-        }
-        this.messages = this.sessions.getHistory(thinkSessionId);
-      }
+      await this.appendTranscript(v2.messages);
 
       return Response.json({ imported: true, version: 2, messages: v2.messages.length, files: v2.files.length });
     }
@@ -4245,23 +4244,12 @@ export class CodingAgent extends CodingAgentBase {
       }
     }
 
-    // Import into Think session
-    const thinkSessionId = this.getCurrentSessionId();
-    if (thinkSessionId) {
-      for (const message of snapshot.messages) {
-        const uiMsg = chatRecordToUIMessage(message);
-        this.sessions.append(thinkSessionId, uiMsg);
-        this.insertMessageMetadata({
-          messageId: uiMsg.id,
-          authorEmail: message.authorEmail,
-          model: message.model,
-          provider: message.provider,
-          tokenInput: message.tokenInput,
-          tokenOutput: message.tokenOutput,
-        });
-      }
-      this.messages = this.sessions.getHistory(thinkSessionId);
-    }
+    await this.appendTranscript(
+      snapshot.messages.map((message) => ({
+        uiMessage: chatRecordToUIMessage(message),
+        metadata: { authorEmail: message.authorEmail, model: message.model, provider: message.provider, tokenInput: message.tokenInput, tokenOutput: message.tokenOutput },
+      })),
+    );
 
     return Response.json({ imported: true, messages: snapshot.messages.length, files: snapshot.files.length });
   }
@@ -4350,7 +4338,9 @@ export class CodingAgent extends CodingAgentBase {
     this.ensureThinkConfig(request);
     await this.readAppConfig();
     try {
-      const result = await this.runThinkChat(input.content, { authorEmail: authorEmail ?? undefined, images: input.images });
+      const result = this.pinAgentEngine() === "pi"
+        ? await this.runPiChat(input.content, { promptId: `sync_${crypto.randomUUID()}`, authorEmail: authorEmail ?? undefined, images: input.images })
+        : await this.runThinkChat(input.content, { authorEmail: authorEmail ?? undefined, images: input.images });
 
       // Guard: treat empty LLM response as a failure (same as runFiberPrompt)
       if (!result.text && !result.assistantMessageId) {
@@ -4526,11 +4516,6 @@ export class CodingAgent extends CodingAgentBase {
       return Response.json({ error: `Prompt exceeds ${REPLICATE_MAX_PROMPT_LENGTH} characters` }, { status: 400 });
     }
 
-    const thinkSessionId = this.getCurrentSessionId();
-    if (!thinkSessionId) {
-      return Response.json({ error: "No Think session" }, { status: 500 });
-    }
-
     const isEdit = !!(opts.images && opts.images.length > 0);
     const model = this.resolveImageModel();
 
@@ -4553,7 +4538,7 @@ export class CodingAgent extends CodingAgentBase {
 
     try {
       // 1. Persist user prompt message
-      const userMsgId = this.persistGenerateUserMessage(thinkSessionId, opts.prompt, opts.authorEmail);
+      const userMsgId = await this.persistGenerateUserMessage(opts.prompt, opts.authorEmail);
 
       // 2. Generate / edit the image via Replicate.
       const result = await runReplicateImage({
@@ -4566,7 +4551,6 @@ export class CodingAgent extends CodingAgentBase {
 
       // 3. Persist assistant message with the generated image
       const assistantResult = await this.persistGeneratedImageMessage({
-        thinkSessionId,
         sessionId: opts.sessionId,
         prompt: opts.prompt,
         imageData,
@@ -4601,22 +4585,14 @@ export class CodingAgent extends CodingAgentBase {
 
   /** Persist the user's /generate prompt as a regular text message and emit a
    *  `message` SSE event so the UI renders it identically to a chat prompt. */
-  private persistGenerateUserMessage(thinkSessionId: string, content: string, authorEmail: string | null): string {
+  private async persistGenerateUserMessage(content: string, authorEmail: string | null): Promise<string> {
     const userMsgId = crypto.randomUUID();
     const userMsg: UIMessage = {
       id: userMsgId,
       role: "user",
       parts: [{ type: "text", text: content }],
     };
-    this.sessions.append(thinkSessionId, userMsg);
-    this.insertMessageMetadata({
-      messageId: userMsgId,
-      authorEmail: authorEmail ?? null,
-      model: null,
-      provider: null,
-      tokenInput: 0,
-      tokenOutput: 0,
-    });
+    await this.appendTranscript([{ uiMessage: userMsg, metadata: { authorEmail: authorEmail ?? null, model: null, provider: null, tokenInput: 0, tokenOutput: 0 } }]);
     const userRecord = uiMessageToChatRecord(userMsg, {
       messageId: userMsgId,
       authorEmail: authorEmail ?? null,
@@ -4635,7 +4611,6 @@ export class CodingAgent extends CodingAgentBase {
    *  URL so the user still sees the image rather than a silent stub — this
    *  matches the design contract in `src/attachments.ts`. */
   private async persistGeneratedImageMessage(opts: {
-    thinkSessionId: string;
     sessionId: string;
     prompt: string;
     imageData: string;
@@ -4681,15 +4656,12 @@ export class CodingAgent extends CodingAgentBase {
       role: "assistant",
       parts: assistantParts,
     };
-    this.sessions.append(opts.thinkSessionId, assistantMsg);
-    this.insertMessageMetadata({
-      messageId: assistantMsgId,
-      authorEmail: null,
-      model: opts.model,
-      provider: opts.provider,
-      tokenInput: 0,
-      tokenOutput: 0,
-    });
+    // pi keeps attachments in message_attachments (inserted below with the
+    // real size), so it gets the caption only; Think keeps the file part.
+    const persisted = this.agentEngine() === "pi" && attachmentRef
+      ? { ...assistantMsg, parts: assistantParts.filter((p) => p.type === "text") }
+      : assistantMsg;
+    await this.appendTranscript([{ uiMessage: persisted, metadata: { authorEmail: null, model: opts.model, provider: opts.provider, tokenInput: 0, tokenOutput: 0 } }]);
 
     if (attachmentRef) {
       this.insertMessageAttachment({
@@ -5315,8 +5287,6 @@ export class CodingAgent extends CodingAgentBase {
    *  input for the next Replicate edit. Returns null if no image found or
    *  R2 unavailable. */
   private async fetchLastAssistantImage(): Promise<{ data: string; mediaType: string } | null> {
-    const thinkSessionId = this.getCurrentSessionId();
-    if (!thinkSessionId) return null;
     const row = (Array.from(this.ctx.storage.sql.exec(
       `SELECT ma.url, ma.media_type FROM message_attachments ma
        JOIN message_metadata mm ON ma.message_id = mm.message_id
@@ -5403,13 +5373,20 @@ export class CodingAgent extends CodingAgentBase {
 
   /**
    * Which agent loop this session runs on. Pinned to session metadata at the
-   * first prompt (history lives in one engine's tables), defaulting to the
-   * `DODO_AGENT_ENGINE` var, else Think.
+   * first prompt (history lives in one engine's tables). New sessions run on
+   * pi unless `DODO_AGENT_ENGINE=think`.
    */
   agentEngine(): "think" | "pi" {
     const stored = this.readMetadata("agent_engine");
     if (stored === "pi" || stored === "think") return stored;
-    return this.env.DODO_AGENT_ENGINE === "pi" ? "pi" : "think";
+    // Sessions that ran before the engine was pinned keep their history in Think.
+    if (this.hasThinkHistory()) return "think";
+    return this.env.DODO_AGENT_ENGINE === "think" ? "think" : "pi";
+  }
+
+  private hasThinkHistory(): boolean {
+    const thinkSessionId = this.getCurrentSessionId();
+    return thinkSessionId ? this.sessions.getMessageCount(thinkSessionId) > 0 : false;
   }
 
   private pinAgentEngine(): "think" | "pi" {
@@ -5436,15 +5413,19 @@ export class CodingAgent extends CodingAgentBase {
     this._piEngine ??= new PiEngine({
       storage: this.ctx.storage,
       configureModels: (models) => {
-        const config = this.getConfig();
-        if (!config) throw new Error("pi engine: session not configured yet");
+        const config = this.piGatewayConfig();
         setDodoProvider(models, [config.model], config, this.env);
       },
       modelRef: () => {
-        const config = this.getConfig();
-        if (!config) throw new Error("pi engine: session not configured yet");
+        const config = this.piGatewayConfig();
         return agentModelRef(config.model, config);
       },
+      onCompaction: (ok) => {
+        if (!ok) return;
+        const n = parseInt(this.readMetadata("pi_compactions") ?? "0", 10) || 0;
+        this.writeMetadata("pi_compactions", String(n + 1));
+      },
+      onLoopVerdict: (verdict) => log("warn", "pi: loop guard", { sessionId: this.sessionId(), ...verdict }),
       systemPrompt: () => this.getSystemPrompt(),
       emit: (event) => {
         if (event.type === "tool_result") {
@@ -5466,6 +5447,96 @@ export class CodingAgent extends CodingAgentBase {
     return this._piEngine;
   }
 
+  /**
+   * Model + gateway for the pi engine. Falls back to the Worker defaults so a
+   * session that hasn't seen a prompt yet (snapshot import, fork) can still
+   * open its transcript; the first prompt reconfigures it.
+   */
+  private piGatewayConfig(): { model: string; activeGateway: "opencode" | "ai-gateway"; opencodeBaseURL: string; aiGatewayBaseURL: string } {
+    const config = this.getConfig();
+    if (config) return config;
+    return {
+      model: this.env.DEFAULT_MODEL ?? "",
+      activeGateway: "opencode",
+      opencodeBaseURL: this.env.OPENCODE_BASE_URL ?? "",
+      aiGatewayBaseURL: this.env.AI_GATEWAY_BASE_URL ?? "",
+    };
+  }
+
+  /** The transcript as UIMessages, whichever engine holds it (snapshot export, fork). */
+  private async transcriptUIMessages(): Promise<UIMessage[]> {
+    if (this.agentEngine() !== "pi") {
+      const thinkSessionId = this.getCurrentSessionId();
+      return thinkSessionId ? this.sessions.getHistory(thinkSessionId) : [];
+    }
+    const views = entriesToMessages(await this.piEngine().entries());
+    const attachments = this.listMessageAttachments(views.map((v) => v.id));
+    return views.map((v) => ({
+      id: v.id,
+      role: v.role,
+      parts: [
+        ...(v.content ? [{ type: "text" as const, text: v.content }] : []),
+        ...(v.images ?? []).map((img) => ({ type: "file" as const, mediaType: img.mediaType, url: img.url })),
+        ...(attachments.get(v.id) ?? []).map((a) => ({ type: "file" as const, mediaType: a.mediaType, url: a.url, ...(a.name ? { filename: a.name } : {}) })),
+      ],
+    })) as UIMessage[];
+  }
+
+  /**
+   * Append finished messages to the transcript without running the model
+   * (snapshot import, fork, /generate). Pins the engine: history now lives in it.
+   */
+  private async appendTranscript(
+    entries: ReadonlyArray<{ uiMessage: UIMessage; metadata: { authorEmail?: string | null; model?: string | null; provider?: string | null; tokenInput?: number; tokenOutput?: number } }>,
+  ): Promise<void> {
+    const engine = this.pinAgentEngine();
+    if (engine === "pi") {
+      const kept = entries.filter((e) => e.uiMessage.role === "user" || e.uiMessage.role === "assistant");
+      await this.piEngine().append(
+        kept.map((e) => ({
+          role: e.uiMessage.role as "user" | "assistant",
+          id: e.uiMessage.id,
+          text: (e.uiMessage.parts ?? [])
+            .filter((p): p is { type: "text"; text: string } => p.type === "text")
+            .map((p) => p.text)
+            .join(""),
+          authorEmail: e.metadata.authorEmail ?? null,
+          model: e.metadata.model ?? undefined,
+        })),
+      );
+      for (const e of kept) {
+        for (const part of e.uiMessage.parts ?? []) {
+          if (part.type !== "file") continue;
+          const file = part as FileUIPart;
+          this.insertMessageAttachment({
+            messageId: e.uiMessage.id,
+            mediaType: file.mediaType,
+            url: file.url,
+            size: 0,
+            source: e.uiMessage.role === "user" ? "user" : "assistant",
+            name: file.filename ?? null,
+          });
+        }
+      }
+      this._piMessageCount += kept.length;
+    } else {
+      const thinkSessionId = this.getCurrentSessionId();
+      if (!thinkSessionId) return;
+      for (const e of entries) this.sessions.append(thinkSessionId, e.uiMessage);
+      this.messages = this.sessions.getHistory(thinkSessionId);
+    }
+    for (const e of entries) {
+      this.insertMessageMetadata({
+        messageId: e.uiMessage.id,
+        authorEmail: e.metadata.authorEmail,
+        model: e.metadata.model,
+        provider: e.metadata.provider,
+        tokenInput: e.metadata.tokenInput,
+        tokenOutput: e.metadata.tokenOutput,
+      });
+    }
+  }
+
   private async listPiMessages(): Promise<ChatMessageRecord[]> {
     const views = entriesToMessages(await this.piEngine().entries());
     this._piMessageCount = views.length;
@@ -5484,10 +5555,12 @@ export class CodingAgent extends CodingAgentBase {
       };
     });
     const attachments = this.listMessageAttachments(records.map((r) => r.id));
-    for (const record of records) {
-      const persisted = attachments.get(record.id);
-      if (persisted?.length) record.attachments = rewriteAttachmentsForClient(persisted) ?? persisted;
-    }
+    records.forEach((record, i) => {
+      // Inline user images live in the pi entry itself; R2-backed ones in message_attachments.
+      const inline = (views[i]?.images ?? []).map((img) => ({ ...img, size: 0, source: "user" as const }));
+      const persisted = [...inline, ...(attachments.get(record.id) ?? [])];
+      if (persisted.length) record.attachments = rewriteAttachmentsForClient(persisted) ?? persisted;
+    });
     return records;
   }
 
@@ -5523,8 +5596,12 @@ export class CodingAgent extends CodingAgentBase {
     if (result.recovered) log("info", "pi: reattached to prompt after restart", { sessionId: this.sessionId(), promptId: options.promptId });
     if (result.status !== "done") {
       if (options.signal?.aborted) return { assistantMessageId: "", tokenInput: 0, tokenOutput: 0, text: "", steps: result.steps, toolCalls: result.toolCalls };
-      throw new Error(`Turn ended without an answer (${result.reason ?? "unknown"})`);
+      // pi already retried the provider; surface what the provider said.
+      const reason = result.reason ?? "unknown";
+      const modelError = /^model_error: "([\s\S]*)"$/.exec(reason)?.[1];
+      throw new Error(modelError ?? `Turn ended without an answer (${reason})`);
     }
+    if (result.contextTokens > 0) this.writeMetadata("pi_context_tokens", String(result.contextTokens));
     const config = this.getConfig();
     this.insertMessageMetadata({
       messageId: result.assistantMessageId,
@@ -6505,14 +6582,20 @@ export class CodingAgent extends CodingAgentBase {
     const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
       "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
     ))[0] as SqlRow | null);
-    const estimatedContext = Number(latestAssistant?.token_input ?? 0);
+    const onPi = this.agentEngine() === "pi";
+    // pi records the last request's context size; Think's best proxy is the latest turn's input tokens.
+    const estimatedContext = onPi
+      ? Number(this.readMetadata("pi_context_tokens") ?? 0)
+      : Number(latestAssistant?.token_input ?? 0);
     const contextUsagePercent = contextBudget > 0
       ? Math.round((estimatedContext / contextBudget) * 100)
       : 0;
 
     // Compaction info
     const thinkSid = this.getCurrentSessionId();
-    const compactionCount = thinkSid ? this.sessions.getCompactions(thinkSid).length : 0;
+    const compactionCount = onPi
+      ? parseInt(this.readMetadata("pi_compactions") ?? "0", 10) || 0
+      : thinkSid ? this.sessions.getCompactions(thinkSid).length : 0;
 
     return {
       activePromptId,
