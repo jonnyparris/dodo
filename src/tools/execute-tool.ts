@@ -32,6 +32,38 @@ export function createExecuteTool(options: ExecuteToolOptions) {
     globalOutbound: options.globalOutbound,
   });
   const providers: ToolProvider[] = [{ tools: options.tools } as ToolProvider, ...(options.providers ?? [])];
-  if (options.state) providers.push(stateToolsFromBackend(options.state) as ToolProvider);
+  if (options.state) providers.push(withJsonSafeBytes(stateToolsFromBackend(options.state) as ToolProvider));
   return createCodeTool({ tools: providers, executor, description: options.description } as never);
+}
+
+/**
+ * Codemode sends sandbox → host calls as JSON, so a Uint8Array arrives as
+ * {"0":137,"1":80,...} (writeFileBytes then failed with "NOT NULL
+ * constraint failed: vfs_nodes.size") and comes back the same way (and
+ * `new Uint8Array(thatObject)` is empty). Rebuild bytes on the way in and
+ * return plain number arrays, which `new Uint8Array(x)` accepts.
+ */
+export function withJsonSafeBytes(provider: ToolProvider): ToolProvider {
+  const tools = { ...(provider.tools as Record<string, { execute: (...a: unknown[]) => unknown }>) };
+  const wrap = (name: string, fn: (orig: (...a: unknown[]) => unknown) => (...a: unknown[]) => unknown) => {
+    const t = tools[name];
+    if (t) tools[name] = { ...t, execute: fn(t.execute) };
+  };
+  wrap("writeFileBytes", (orig) => (path, data, ...rest) => orig(path, toBytes(data), ...rest));
+  wrap("appendFile", (orig) => (path, data, ...rest) => orig(path, typeof data === "string" ? data : toBytes(data), ...rest));
+  wrap("readFileBytes", (orig) => async (...a) => {
+    const out = await orig(...a);
+    return out instanceof Uint8Array ? Array.from(out) : out;
+  });
+  return { ...provider, tools } as ToolProvider;
+}
+
+export function toBytes(data: unknown): Uint8Array {
+  if (data instanceof Uint8Array) return data;
+  if (Array.isArray(data)) return Uint8Array.from(data as number[]);
+  if (data && typeof data === "object") {
+    const keys = Object.keys(data);
+    if (keys.every((k, i) => k === String(i))) return Uint8Array.from(Object.values(data as Record<string, number>));
+  }
+  throw new TypeError("expected bytes: a Uint8Array or an array of numbers");
 }
