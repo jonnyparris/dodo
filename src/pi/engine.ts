@@ -57,8 +57,12 @@ export interface DodoAssistantEntryData {
 export interface PiImportedMessage {
   role: "user" | "assistant";
   id: string;
+  /** What the chat shows. */
   text: string;
+  /** What the model sees, when it differs (e.g. inlined documents). Defaults to `text`. */
+  contextText?: string;
   authorEmail?: string | null;
+  /** Epoch seconds. */
   createdAt?: number;
   /** Model that produced an assistant message, for the context record. */
   model?: string;
@@ -397,21 +401,23 @@ export class PiEngine {
     };
     const model = this.host.modelRef();
     for (const m of messages) {
-      const createdAt = m.createdAt ?? Date.now();
+      // Dodo stores epoch seconds; pi messages carry ms timestamps.
+      const createdAt = m.createdAt ?? Math.floor(Date.now() / 1000);
+      const timestamp = createdAt * 1000;
       if (m.role === "user") {
         const data: DodoUserEntryData = { messageId: m.id, text: m.text, authorEmail: m.authorEmail ?? null, createdAt };
-        await write({ type: "write", entry: { kind: DODO_USER_ENTRY, data, model: [{ role: "user", content: m.text, timestamp: createdAt }] } });
+        await write({ type: "write", entry: { kind: DODO_USER_ENTRY, data, model: [{ role: "user", content: m.contextText ?? m.text, timestamp }] } });
       } else {
         const data: DodoAssistantEntryData = { messageId: m.id, text: m.text, createdAt };
         const message: AssistantMessage = {
           role: "assistant",
-          content: [{ type: "text", text: m.text }],
+          content: [{ type: "text", text: m.contextText ?? m.text }],
           api: "openai-completions",
           provider: DODO_PROVIDER_ID,
           model: m.model ?? model.modelId,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
           stopReason: "stop",
-          timestamp: createdAt,
+          timestamp,
         };
         await write({ type: "write", entry: { kind: DODO_ASSISTANT_ENTRY, data, model: [message] } });
       }

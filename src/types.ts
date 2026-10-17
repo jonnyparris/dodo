@@ -16,8 +16,6 @@ export interface Env {
   CF_ACCESS_AUD?: string;
   CF_ACCESS_TEAM_DOMAIN?: string;
   DEFAULT_MODEL: string;
-  /** Default agent engine for new sessions: "think" (default) or "pi" (pi-durable). */
-  DODO_AGENT_ENGINE?: string;
   /** Kitebuild CI runner base URL (enables the `ci_run` tool with the two Access secrets below). */
   KITEBUILD_URL?: string;
   KITEBUILD_CLIENT_ID?: string;

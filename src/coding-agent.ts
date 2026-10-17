@@ -6,7 +6,7 @@ import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { createMemoryStateBackend, Workspace } from "@cloudflare/shell";
 import { stateToolsFromBackend } from "@cloudflare/shell/workers";
 import { type Agent, type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type SubAgentClass, type SubAgentStub, type WSMessage } from "agents";
-import { type FileUIPart, generateText, type LanguageModel, type ModelMessage, streamText, type ToolSet } from "ai";
+import { type FileUIPart, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 import { buildProvider, buildToolsForThink } from "./agentic";
 import { ARTIFACTS_TOKEN_TTL_SECONDS, type ArtifactsFsCache, buildArtifactsCloneUrl, flushTurnToArtifacts, listArtifactsTree, readArtifactsFile, refreshArtifactsFs } from "./artifacts";
@@ -15,33 +15,14 @@ import type { AttachmentRef } from "./attachments";
 import { attachmentUrlToKey, MAX_READ_ATTACHMENT_CHARS, rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
 import { getUserControlStub, isAdmin } from "./auth";
 import { listBuiltinSkills } from "./builtin-skills";
-import { pickCutoff, shouldCompact } from "./compaction-policy";
 import { bytesToBase64Chunked } from "./crypto";
 import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
-import { type OwnLoopExitReason, STUCK_EXIT_REASONS, shouldRunFinalSummary, stripHarnessNotices } from "./final-summary-policy";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
 import { log } from "./logger";
-import {
-  buildPhaseDigest,
-  decidePostStep,
-  decideStepGate,
-  LOOP_LIMITS,
-  type StepGate,
-  shouldAutoContinue,
-  shouldHardStopBeforeCall,
-  shouldPruneResults,
-  shouldTagStepLimit,
-  shouldTriggerCompaction,
-  trackNoTextStep,
-  trackTextIteration,
-  trackToolCall,
-} from "./loop-policy";
 import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
 import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import { dispatchNotification } from "./notify";
-import { nextRetry } from "./overflow-retry";
-import { pruneOversizedToolResults } from "./own-loop-prune";
 import { entriesToMessages, PiEngine, type PiUserContent } from "./pi/engine";
 import { agentModelRef, setDodoProvider } from "./pi/models";
 import { buildToolsExtension } from "./pi/tools";
@@ -78,17 +59,12 @@ import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
 import type { SnapshotV2 } from "./think-adapter";
 import {
-  type ChatMessageOptions,
   chatRecordToUIMessage,
   type DodoConfig,
   type FiberCompleteContext,
   type FiberRecoveryContext,
   type MessageMetadata,
-  type StreamableResult,
-  type StreamCallback,
   Think,
-
-  truncateToolOutput,
   type UIMessage,
   uiMessageToChatRecord,
 } from "./think-adapter";
@@ -115,24 +91,6 @@ const CONTEXT_WINDOW_TOKENS: Record<string, number> = Object.fromEntries(
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 /** Budget factor — use 80% of context window for messages, leave 20% for response. */
 const CONTEXT_BUDGET_FACTOR = 0.8;
-
-/**
- * Compaction settings.
- * When context usage exceeds COMPACTION_TRIGGER_PERCENT of the budget, older
- * messages are summarized by an LLM call and stored as a compaction record.
- * Think's assembleContext() automatically injects the summary in place of
- * the original messages on subsequent turns.
- */
-const COMPACTION_TRIGGER_PERCENT = 60;
-/** Fraction of messages to compact (from the oldest end). */
-const COMPACTION_MESSAGE_FRACTION = 0.5;
-/** Model to use for generating compaction summaries — cheap and fast. */
-// Use Haiku 4.5 for compaction — fast, cheap ($1/M input, 3x cheaper than Sonnet),
-// and good at structured summarization. Falls back to session model if unavailable.
-const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
-
-/** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
-const CLEARED_MARKER = "[Old tool result content cleared]";
 
 /**
  * Content-aware tokens-per-char ratios derived from Anthropic tokenizer
@@ -538,12 +496,6 @@ export class CodingAgent extends CodingAgentBase {
   override fibers = true;
 
   private readonly clients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
-  /** Captured token usage from the most recent onChatMessage() call. */
-  private _lastUsage: { inputTokens: number; outputTokens: number } | null = null;
-  /** Overflow recovery flag — prevents infinite retry loops on persistent overflow. */
-  private _overflowRecoveryAttempted = false;
-  /** Set by assembleContext() when messages are dropped due to token budget. */
-  private _contextTruncated = false;
   /** Connected MCP gatekeepers, populated by connectMcpServers(). */
   private mcpGatekeepers: McpClient[] = [];
   /**
@@ -647,13 +599,10 @@ export class CodingAgent extends CodingAgentBase {
    */
   private _toolAttachments: Map<string, AttachmentRef[]> = new Map();
 
-  /** Names of tools called during the current turn. Populated by
-   *  runThinkChat from the stream's `tool-input-available` chunks.
-   *  Used by runFiberPrompt's post-completion check (chat-monitor
+  /** Names of tools called during the current turn (pi tool adapter's
+   *  onCall). Used by runFiberPrompt's post-completion check (chat-monitor
    *  brains nudge themselves if they didn't call chat_reply). */
   private _toolCallNames: Set<string> = new Set();
-  /** LLM calls made during the current turn — surfaced as message metadata. */
-  private _llmCallsThisTurn = 0;
   private _piEngine: PiEngine | null = null;
   /** Last known pi transcript length, for the sync messageCount() read. */
   private _piMessageCount = 0;
@@ -1346,720 +1295,6 @@ export class CodingAgent extends CodingAgentBase {
     });
   }
 
-  /**
-   * Override onChatMessage with Dodo's own agentic loop.
-   *
-   * Instead of delegating to AI SDK's internal multi-step loop via
-   * `streamText({ maxSteps: 15 })`, we run a while-loop calling
-   * `streamText({ maxSteps: 1 })` per iteration. This gives us full
-   * control between steps:
-   *
-   * - Reassemble context each iteration (clear old tool results)
-   * - Detect doom loops (same tool+args 3× in a row)
-   * - Enforce token budget thresholds (warn → wrap-up → hard stop)
-   * - Trigger mid-loop compaction when context exceeds threshold
-   * - Abort cleanly on signal
-   *
-   * Returns a custom StreamableResult whose toUIMessageStream() is an
-   * async generator that concatenates chunks from all iterations.
-   */
-  override async onChatMessage(options?: ChatMessageOptions): Promise<StreamableResult> {
-    this._lastUsage = null;
-
-    await this.warmTurnContext();
-
-    const baseTools = this.getTools();
-    const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
-    const model = this.getModel();
-    const system = this.getSystemPrompt();
-    const signal = options?.signal;
-    const maxSteps = this.getMaxSteps();
-    const sessionId = this.sessionId();
-
-    // ─── Token budget thresholds ───
-    const config = this.getConfig();
-    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
-    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
-    const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
-
-    // ─── Loop state (shared across the primary loop and continuation phases) ───
-    // Decisions live in src/loop-policy.ts; this scope only applies effects.
-    const recentToolCalls: string[] = []; // "toolName:argsJSON" for loop detection
-    const recentTextPrefixes: string[] = []; // first ~80 chars of text per iteration for repetition detection
-    let cumulativeInputTokens = 0;
-    let cumulativeOutputTokens = 0;
-    let step = 0;
-    let warnInjected = false;
-    let wrapUpInjected = false;
-    let sameToolNudgeInjected = false;
-    let compactionTriggered = false;
-    let consecutiveNoTextSteps = 0; // Iterations where the model produces tool calls but no text
-    let exitReason: OwnLoopExitReason = "natural";
-    // Running total of plain text emitted across iterations. Used after the
-    // loop to decide whether a forced final-summary turn is needed (only
-    // when the loop ended on a stuck signal and the model never wrote
-    // a real conclusion).
-    let turnText = "";
-
-    // OpenAI/Google/DeepSeek models work silently (tool calls without text narration).
-    // The no-text detector is only useful for Anthropic models where silence means stuck.
-    const noTextDetectionEnabled = modelId.startsWith("anthropic/");
-
-    const self = this;
-
-    // Return a custom StreamableResult. Think's chat() calls toUIMessageStream()
-    // and iterates it, forwarding chunks via the StreamCallback.
-    return {
-      async *toUIMessageStream() {
-        // ─── Assemble context once at the start ───
-        // Think's chat() persists the assistant message only AFTER this entire
-        // generator completes. So this.messages (and thus assembleContext()) is
-        // stale during the loop — it only has messages up to the user message,
-        // not any tool calls/results from previous iterations.
-        //
-        // We assemble once, then accumulate response messages (assistant + tool
-        // results) from each streamText() call so the model sees its own
-        // previous tool results on subsequent iterations.
-        let messages = await self.assembleContext();
-
-        // ─── Capture the original user prompt for phase-transition digests ───
-        // The auto-continuation loop rebuilds `messages` on each phase with
-        // `[firstMsg, summaryInjection, ...recentMsgs]`, where `firstMsg`
-        // defaults to `messages[0]`. If the original user prompt is large
-        // (dispatch prompts often are), preserving it in full on every phase
-        // re-sends the whole prompt to the LLM each turn, inflating input
-        // tokens on every phase transition — the prompt ends up counted N
-        // times for N phases. See issue #34 comment about prompt duplication.
-        //
-        // We capture a short digest of the original prompt here so later
-        // phases can substitute the digest for `firstMsg` instead of the full
-        // prompt.
-        const originalFirstMsg = messages[0];
-        const originalPromptDigest = ((): string => {
-          if (!originalFirstMsg) return "";
-          const content = originalFirstMsg.content;
-          const text = typeof content === "string"
-            ? content
-            : Array.isArray(content)
-              ? content
-                  .map((part) => (part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part ? String(part.text) : ""))
-                  .filter(Boolean)
-                  .join("\n")
-              : "";
-          // Keep the first ~500 chars — enough to carry the goal statement
-          // without dragging the whole prompt forward.
-          return text.length > 500 ? `${text.slice(0, 500)}…[truncated, see phase summary for progress]` : text;
-        })();
-
-        // ─── Compaction helper ───
-        // Shared by the loop-entry guard, mid-loop compaction, pre-step
-        // compaction, and overflow recovery. Forces Think-level compaction,
-        // refreshes persisted history, and re-assembles the local messages
-        // array so it picks up the compaction summary. Returns whether the
-        // pass actually summarised anything — distinguishes "attempted and
-        // summarised" from "attempted but no-op'd because there's nothing
-        // in Think's persisted history yet" (see PR #74).
-        const compactAndReassemble = async (): Promise<"summarised" | "noop"> => {
-          const compactionsBefore = self.getCompactionCount();
-          await self.maybeCompactContext({ force: true });
-          const compactionsAfter = self.getCompactionCount();
-          const thinkSessionId = self.getCurrentSessionId();
-          if (thinkSessionId) {
-            self.messages = self.sessions.getHistory(thinkSessionId);
-          }
-          messages = await self.assembleContext();
-          return compactionsAfter > compactionsBefore ? "summarised" : "noop";
-        };
-
-        // ─── Loop-entry oversized-prompt guard (issue #34, bug 3) ───
-        // When the user prompt itself is large (detailed dispatch prompts, long
-        // pasted logs, etc.) the first streamText() call can exceed the budget
-        // on step 0. The own-loop assumed prompts fit and relied on turn-over-
-        // turn accumulation to trigger safeguards; that gave nothing to trip in
-        // the failure mode the autocompaction feature is designed for.
-        //
-        // If we're already past the compaction threshold before step 0, force a
-        // compaction pass, set compactionTriggered so the mid-loop check doesn't
-        // fire again unnecessarily, and re-assemble.
-        const entryInputTokens = estimateMessagesTokens(messages);
-        const entryUsage = entryInputTokens / tokenBudget;
-        if (entryUsage >= LOOP_LIMITS.MID_LOOP_COMPACTION_THRESHOLD) {
-          compactionTriggered = true;
-          try {
-            const outcome = await compactAndReassemble();
-            log("info", "own-loop: loop-entry compaction attempted", {
-              sessionId,
-              entryInputTokens,
-              tokenBudget,
-              entryUsage: `${Math.round(entryUsage * 100)}%`,
-              outcome,
-            });
-          } catch (err) {
-            log("warn", "own-loop: loop-entry compaction failed", {
-              sessionId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
-
-        // ─── Unified phase runner ───
-        // The primary loop and every continuation phase run through this
-        // one generator. Before this refactor the continuation loop was a
-        // hand-copied subset: it silently missed the same-tool repetition
-        // checks, the cost runaway backstop, projected-token budget gating,
-        // mid-loop compaction, tool-result pruning, and overflow recovery.
-        // One loop, one set of decisions (src/loop-policy.ts) — the runner
-        // only applies effects.
-        const runPhase = async function* (phaseNum: number) {
-          const label = phaseNum === 0 ? "own-loop" : `own-loop: phase ${phaseNum}`;
-          step = 0;
-          while (step < maxSteps) {
-            if (signal?.aborted) { exitReason = "abort"; return; }
-
-            // ─── Newline separator between iterations ───
-            // After a tool call, the model starts a new text response. Without
-            // a separator, the new text gets concatenated directly to the previous
-            // text, creating an unreadable wall of text (e.g. "Let me explore...Let me explore...").
-            if (step > 0) {
-              yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
-            }
-
-            // ─── Pre-step gate: loops, runaway, budget tiers → stop or inject ───
-            // Projected next-call size (messages only; system prompt and tool
-            // defs ride on top). Cumulative input is telemetry — it no longer
-            // gates injections (PR #77), except via the runaway backstop.
-            const projectedNextCallTokens = estimateMessagesTokens(messages);
-            const gate: StepGate = decideStepGate({
-              recentToolCalls,
-              recentTextPrefixes,
-              cumulativeInputTokens,
-              tokenBudget,
-              projectedNextCallTokens,
-              warnInjected,
-              wrapUpInjected,
-              sameToolNudgeInjected,
-            });
-            if (gate.action === "stop") {
-              if (gate.reason === "doom-loop" && !gate.notice) {
-                // Projected hard stop — no notice today, log-only.
-              }
-              if (gate.notice) {
-                yield { type: "text-delta", id: crypto.randomUUID(), delta: gate.notice };
-              }
-              exitReason = gate.reason;
-              return;
-            }
-            warnInjected = warnInjected || !!gate.warnFired;
-            wrapUpInjected = wrapUpInjected || !!gate.wrapUpFired;
-            sameToolNudgeInjected = sameToolNudgeInjected || !!gate.sameToolNudgeFired;
-
-            // Build final messages with injections appended
-            let finalMessages = gate.injections.length > 0
-              ? [...messages, ...gate.injections]
-              : messages;
-
-            // ─── Mid-loop compaction ───
-            // If context usage is above threshold and we haven't compacted yet
-            // this turn, trigger Think's compaction system to summarize older
-            // messages. No `step >= N` guard: a large prompt + aggressive
-            // exploration can burn through the budget in steps 0-2 (issue #34).
-            if (shouldTriggerCompaction(projectedNextCallTokens, tokenBudget, compactionTriggered)) {
-              compactionTriggered = true;
-              try {
-                const outcome = await compactAndReassemble();
-                log("info", `${label}: mid-loop compaction attempted`, {
-                  sessionId,
-                  step,
-                  cumulativeInputTokens,
-                  tokenBudget,
-                  outcome,
-                });
-              } catch (err) {
-                log("warn", `${label}: mid-loop compaction failed`, {
-                  sessionId,
-                  step,
-                  error: err instanceof Error ? err.message : String(err),
-                });
-              }
-            }
-
-            // ─── Pre-step compaction (issue #34, bug 2) ───
-            // cumulativeInputTokens trails the just-finished step, so the
-            // injections above can fire late. If the outgoing messages are
-            // already past the compaction threshold, compact before calling.
-            let projectedInputTokens = estimateMessagesTokens(finalMessages);
-            if (shouldTriggerCompaction(projectedInputTokens, tokenBudget, compactionTriggered)) {
-              compactionTriggered = true;
-              try {
-                const outcome = await compactAndReassemble();
-                finalMessages = gate.injections.length > 0
-                  ? [...messages, ...gate.injections]
-                  : messages;
-                log("info", `${label}: pre-step compaction attempted`, {
-                  sessionId,
-                  step,
-                  projectedInputTokens,
-                  tokenBudget,
-                  projectedUsage: `${Math.round((projectedInputTokens / tokenBudget) * 100)}%`,
-                  outcome,
-                });
-              } catch (err) {
-                log("warn", `${label}: pre-step compaction failed`, {
-                  sessionId,
-                  step,
-                  error: err instanceof Error ? err.message : String(err),
-                });
-              }
-            }
-
-            // ─── In-memory tool-result prune (harness safety net) ───
-            // Think-level compaction operates on persisted history, which is
-            // nearly empty on the first user turn. This is the no-LLM,
-            // no-storage fallback: shorten the largest tool-result payloads
-            // (oldest first, preserving the most recent two) until projected
-            // tokens are back under the mid-loop threshold. Two signals
-            // warrant it independently: the outgoing payload is large, or
-            // the cumulative spend is large even though each step looks
-            // small (the classic silent-grind failure).
-            const projectedAfterCompactionTokens = estimateMessagesTokens(finalMessages);
-            if (shouldPruneResults(projectedAfterCompactionTokens, cumulativeInputTokens, tokenBudget)) {
-              const pruneResult = pruneOversizedToolResults(finalMessages, {
-                targetTokens: Math.floor(tokenBudget * LOOP_LIMITS.MID_LOOP_COMPACTION_THRESHOLD),
-                estimate: estimateMessagesTokens,
-              });
-              if (pruneResult.pruned) {
-                log("info", `${label}: in-memory tool-result prune`, {
-                  sessionId,
-                  step,
-                  partsPruned: pruneResult.partsPruned,
-                  bytesRemoved: pruneResult.bytesRemoved,
-                  tokensBefore: pruneResult.tokensBefore,
-                  tokensAfter: pruneResult.tokensAfter,
-                  trigger: (cumulativeInputTokens / tokenBudget) >= LOOP_LIMITS.MID_LOOP_COMPACTION_THRESHOLD ? "cumulative" : "projected",
-                });
-              }
-            }
-
-            // ─── Hard stop if compaction + prune weren't enough ───
-            // Without this, streamText() is guaranteed to throw a
-            // context-overflow error — better to exit cleanly.
-            const projectedAfterPruneTokens = estimateMessagesTokens(finalMessages);
-            if (shouldHardStopBeforeCall(projectedAfterPruneTokens, tokenBudget)) {
-              log("warn", `${label}: pre-step hard stop — projected tokens exceed budget`, {
-                sessionId,
-                step,
-                projectedInputTokens: projectedAfterPruneTokens,
-                tokenBudget,
-                projectedUsage: `${Math.round((projectedAfterPruneTokens / tokenBudget) * 100)}%`,
-              });
-              yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Stopped: context budget exhausted before next step]\n\n" };
-              exitReason = "budget-limit";
-              return;
-            }
-
-            // ─── Single-step LLM call with overflow recovery ───
-            // Note: Prompt cache retention requires the native @ai-sdk/anthropic
-            // provider. Dodo uses @ai-sdk/openai-compatible which doesn't support
-            // Anthropic-specific providerOptions.
-            let result;
-            // Declared outside try so post-step bookkeeping can access them
-            let iterationText = "";
-            let chunkCount = 0;
-            let hasErrorChunk = false;
-            let errorText = "";
-            try {
-              self._llmCallsThisTurn++;
-              result = streamText({
-                model,
-                system,
-                messages: finalMessages,
-                tools,
-                abortSignal: signal,
-              });
-
-              // Forward all chunks from this iteration to the caller.
-              // Capture text emitted this iteration for repetition detection.
-              for await (const chunk of result.toUIMessageStream()) {
-                yield chunk;
-                chunkCount++;
-                const c = chunk as { type?: string; delta?: string; errorText?: string; error?: string };
-                if (c.type === "text-delta" && c.delta) {
-                  iterationText += c.delta;
-                  turnText += c.delta;
-                } else if (c.type === "error") {
-                  hasErrorChunk = true;
-                  errorText = c.errorText ?? c.error ?? "unknown";
-                }
-              }
-
-              // Log diagnostic info when the stream produced no content
-              if (!iterationText && chunkCount === 0) {
-                log("warn", `${label}: LLM stream produced zero chunks`, {
-                  sessionId,
-                  step,
-                  model: modelId,
-                });
-              } else if (hasErrorChunk) {
-                log("warn", `${label}: LLM stream contained error chunk`, {
-                  sessionId,
-                  step,
-                  model: modelId,
-                  errorText: errorText.slice(0, 500),
-                  chunkCount,
-                });
-                if (!iterationText && errorText) {
-                  throw new Error(errorText);
-                }
-              }
-            } catch (err) {
-              // ─── Overflow recovery ───
-              // Detect context overflow errors and trigger emergency compaction.
-              // Only attempt once per onChatMessage() invocation to prevent
-              // infinite loops.
-              const errMsg = err instanceof Error ? err.message : String(err);
-              const decision = nextRetry({
-                previousAttempts: self._overflowRecoveryAttempted ? 1 : 0,
-                maxAttempts: 1,
-                error: { message: errMsg },
-              });
-
-              if (decision.kind === "retry-with-truncation") {
-                self._overflowRecoveryAttempted = true;
-                log("warn", `${label}: context overflow detected, attempting emergency compaction`, {
-                  sessionId,
-                  step,
-                  error: errMsg.slice(0, 200),
-                });
-
-                try {
-                  await compactAndReassemble();
-                  step++;
-                  continue;
-                } catch (compactionErr) {
-                  log("warn", `${label}: emergency compaction failed, propagating original error`, {
-                    sessionId,
-                    error: compactionErr instanceof Error ? compactionErr.message : String(compactionErr),
-                  });
-                }
-              }
-              // Re-throw if not an overflow or recovery failed
-              throw err;
-            }
-
-            // ─── Post-step bookkeeping ───
-            // Reset overflow recovery flag on successful step
-            self._overflowRecoveryAttempted = false;
-
-            const usage = await (result as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
-            cumulativeInputTokens += usage?.inputTokens ?? 0;
-            cumulativeOutputTokens += usage?.outputTokens ?? 0;
-
-            // ─── Accumulate response messages for the next iteration ───
-            // streamText() returns response messages (assistant + tool results)
-            // that must be appended so the model sees its own tool call
-            // results on subsequent iterations (this.messages is not updated
-            // until Think's chat() finishes).
-            const response = await (result as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
-            if (response?.messages?.length) {
-              messages = [...messages, ...response.messages];
-            }
-
-            // Track tool calls for loop detection
-            const steps = await (result as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
-            const lastStep = steps?.[steps.length - 1];
-            const madeToolCalls = !!lastStep?.toolCalls?.length;
-            if (lastStep?.toolCalls?.length) {
-              for (const tc of lastStep.toolCalls) {
-                trackToolCall(recentToolCalls, tc.toolName, tc.input);
-              }
-            }
-
-            // ─── Text repetition + no-text watchdog ───
-            // Text repetition catches loops where the model emits similar text
-            // each iteration but varies tool arguments. The no-text watchdog
-            // catches diverse tool calls with no narration (Anthropic only —
-            // OpenAI/Google/DeepSeek work silently by design).
-            const { prefix: textPrefix, tracked } = trackTextIteration(recentTextPrefixes, iterationText);
-            consecutiveNoTextSteps = trackNoTextStep(consecutiveNoTextSteps, noTextDetectionEnabled, tracked, madeToolCalls);
-
-            const post = decidePostStep({
-              recentTextPrefixes,
-              consecutiveNoTextSteps,
-              noTextDetectionEnabled,
-              step,
-              madeToolCalls,
-            });
-            if (post.action === "stop") {
-              if (post.reason === "text-loop") {
-                log("warn", `${label}: text repetition loop detected — breaking`, {
-                  sessionId,
-                  step,
-                  repeatedText: textPrefix.slice(0, 60),
-                  repeats: LOOP_LIMITS.DOOM_LOOP_THRESHOLD,
-                });
-              } else {
-                log("warn", `${label}: no-text tool-call loop detected — breaking`, {
-                  sessionId,
-                  step,
-                  consecutiveNoTextSteps,
-                  recentTools: recentToolCalls.slice(-LOOP_LIMITS.NO_TEXT_LOOP_THRESHOLD),
-                });
-              }
-              if (post.notice) {
-                yield { type: "text-delta", id: crypto.randomUUID(), delta: post.notice };
-              }
-              exitReason = post.reason;
-              return;
-            }
-
-            // Check finish reason — if the model didn't make a tool call, it's done
-            const finishReason = await (result as unknown as { finishReason: PromiseLike<string> }).finishReason;
-
-            log("info", `${label}: step complete`, {
-              sessionId,
-              step,
-              finishReason,
-              inputTokens: usage?.inputTokens ?? 0,
-              cumulativeInputTokens,
-              budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
-              toolCalls: lastStep?.toolCalls?.map((tc) => tc.toolName) ?? [],
-              consecutiveNoTextSteps,
-            });
-
-            if (finishReason !== "tool-calls") return;
-
-            step++;
-          }
-
-          // Tag step-limit exit (while condition failed)
-          if (shouldTagStepLimit(step, maxSteps, exitReason)) {
-            exitReason = "step-limit";
-          }
-        };
-
-        // ─── Phase 0: the original turn ───
-        exitReason = "natural";
-        yield* runPhase(0);
-
-        // Use totals across all phases for _lastUsage
-        let totalInputTokens = cumulativeInputTokens;
-        let totalOutputTokens = cumulativeOutputTokens;
-
-        // ─── Final-summary turn (after a stuck-loop exit) ───
-        //
-        // When the loop exits on a stuck signal (doom-loop, no-text-loop,
-        // text-loop), the model often left only the harness's own
-        // "[Stopped: ...]" delta in the user-visible response — no real
-        // conclusion. Run one more single-turn streamText with NO tools and
-        // a strict 'write your conclusion now' system message. The model
-        // has no choice but to emit text. Bounded by a short timeout
-        // so this can't itself loop.
-        //
-        // Guards (inside shouldRunFinalSummary):
-        //   - skipped on abort (the user asked to stop)
-        //   - skipped on `natural` exit (the model already wrapped up)
-        //   - skipped when the turn already produced substantive text
-        //     (>=200 chars of non-stop-notice content)
-        const FINAL_SUMMARY_MIN_EXISTING_TEXT = 200;
-        const FINAL_SUMMARY_TIMEOUT_MS = 30_000;
-        const FINAL_SUMMARY_MAX_OUTPUT_TOKENS = 800;
-
-        const runFinalSummaryTurn = async function* () {
-          const runFinalSummary = shouldRunFinalSummary({
-            exitReason,
-            signalAborted: !!signal?.aborted,
-            turnText,
-            minExistingTextChars: FINAL_SUMMARY_MIN_EXISTING_TEXT,
-          });
-          if (!runFinalSummary) return;
-
-          log("info", "own-loop: final-summary turn starting", {
-            sessionId,
-            exitReason,
-            existingTextChars: stripHarnessNotices(turnText).length,
-            step,
-          });
-
-          // Pure-text system injection appended to the existing messages.
-          // No tools handed to the model — it cannot make another tool
-          // call, only write text. This is the whole point.
-          const summaryInjection: ModelMessage = {
-            role: "system" as const,
-            content: [
-              "[FINAL TURN — NO TOOLS AVAILABLE]",
-              "The session has been stopped by the harness because " +
-                (exitReason === "doom-loop"
-                  ? "you called the same tool too many times in a row"
-                  : exitReason === "no-text-loop"
-                  ? "you made many tool calls without writing any text"
-                  : "your responses started repeating") +
-                ".",
-              "Write your final answer to the user now. Summarise:",
-              "  1. What you were trying to do.",
-              "  2. What you actually found out (the useful information from your tool calls).",
-              "  3. What you would have done next if you'd had more turns.",
-              "Do NOT apologise, do NOT explain that you stopped — the user already knows. Just give the conclusion.",
-            ].join("\n"),
-          };
-
-          const summaryMessages = [...messages, summaryInjection];
-
-          // Bound this turn with a fresh AbortController chained to the
-          // outer signal, so a timeout here doesn't leak the outer
-          // controller. We can't directly time-bound streamText, but
-          // we can race its iterator against a timer.
-          const summaryController = new AbortController();
-          const onOuterAbort = () => summaryController.abort();
-          signal?.addEventListener("abort", onOuterAbort, { once: true });
-          const timeoutHandle = setTimeout(() => {
-            summaryController.abort();
-            log("warn", "own-loop: final-summary turn timed out", {
-              sessionId,
-              timeoutMs: FINAL_SUMMARY_TIMEOUT_MS,
-            });
-          }, FINAL_SUMMARY_TIMEOUT_MS);
-
-          try {
-            const summaryResult = streamText({
-              model,
-              system,
-              messages: summaryMessages,
-              tools: {}, // No tools — the model must write text.
-              maxOutputTokens: FINAL_SUMMARY_MAX_OUTPUT_TOKENS,
-              abortSignal: summaryController.signal,
-            });
-            // Separator so the conclusion is visibly distinct from
-            // any harness stop notice that came before it.
-            yield {
-              type: "text-delta",
-              id: crypto.randomUUID(),
-              delta: "\n\n---\n\n",
-            };
-            for await (const chunk of summaryResult.toUIMessageStream()) {
-              yield chunk;
-            }
-            log("info", "own-loop: final-summary turn complete", {
-              sessionId,
-              exitReason,
-            });
-          } catch (err) {
-            log("warn", "own-loop: final-summary turn failed", {
-              sessionId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-            // Non-fatal — the stop notice already in `turnText` is the
-            // user-visible result; we tried for more and failed.
-          } finally {
-            clearTimeout(timeoutHandle);
-            signal?.removeEventListener("abort", onOuterAbort);
-          }
-        };
-
-        yield* runFinalSummaryTurn();
-
-        // ─── Multi-phase auto-continuation ───
-        // When a loop ends due to resource limits (step or budget), rebuild
-        // context in-memory and start a new phase. Repeats up to MAX_PHASES
-        // times. Does NOT trigger on loop-detection exits (doom loop, text
-        // repetition, no-text loop) — those indicate the model is stuck;
-        // stuck exits get a final-summary turn instead (above, and after
-        // each phase below — previously only the primary exit got one).
-        const MAX_CONTINUATION_PHASES = 5;
-
-        for (let phase = 1; phase <= MAX_CONTINUATION_PHASES; phase++) {
-          if (!shouldAutoContinue(exitReason) || signal?.aborted) break;
-
-          const phaseNum = phase + 1; // phase 1 = original, phase 2+ = continuations
-          log("info", `own-loop: auto-continuation phase ${phaseNum}`, {
-            sessionId,
-            step,
-            exitReason,
-            budgetUsage: `${Math.round((totalInputTokens / tokenBudget) * 100)}%`,
-          });
-
-          yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Compacting context and continuing... (phase ${phaseNum})]\n\n` };
-
-          try {
-            // ─── In-memory context truncation ───
-            // Keep the most recent messages so the model retains context
-            // from the current phase, replace the (potentially huge) original
-            // prompt with a short digest, and summarise everything dropped —
-            // tool calls, discovered files, findings — so the next phase
-            // continues instead of re-exploring (issue #34).
-            const digest = buildPhaseDigest(messages, 12, originalPromptDigest);
-            if (digest) {
-              messages = digest.messages;
-              log("info", `own-loop: phase ${phaseNum} context truncation`, {
-                sessionId,
-                originalCount: digest.messages.length + digest.droppedCount,
-                keptCount: digest.messages.length,
-                droppedTools: digest.droppedToolNames,
-                droppedToolCalls: digest.droppedToolCalls,
-                discoveredFiles: digest.discoveredFiles.length,
-                findingsLength: digest.findingsLength,
-                toolCallDigestLength: digest.toolCallDigestLength,
-              });
-            }
-
-            // Reset budget tracking for the new phase
-            cumulativeInputTokens = 0;
-            cumulativeOutputTokens = 0;
-            warnInjected = false;
-            wrapUpInjected = false;
-            sameToolNudgeInjected = false;
-            compactionTriggered = false;
-            consecutiveNoTextSteps = 0;
-            recentToolCalls.length = 0;
-            recentTextPrefixes.length = 0;
-            exitReason = "natural";
-
-            // Inject continuation prompt — directive to avoid re-exploration
-            const continuationInjection: ModelMessage = {
-              role: "user" as const,
-              content: "[auto-continue] Your previous turn was cut short by context limits. The conversation has been compacted. Do NOT re-explore the codebase — your findings are preserved in the summary above. Start making edits immediately using the file paths and line numbers from the summary and recent context.",
-            };
-            messages = [...messages, continuationInjection];
-
-            // Run the next phase
-            yield* runPhase(phaseNum);
-          } catch (err) {
-            // Accumulate phase tokens into total
-            totalInputTokens += cumulativeInputTokens;
-            totalOutputTokens += cumulativeOutputTokens;
-            log("warn", `own-loop: auto-continuation phase ${phase} failed`, {
-              sessionId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Auto-continuation failed — send 'continue' to resume manually]\n\n" };
-            break;
-          }
-
-          // Accumulate phase tokens into total
-          totalInputTokens += cumulativeInputTokens;
-          totalOutputTokens += cumulativeOutputTokens;
-
-          // A phase that exits stuck gets the same conclusion turn the
-          // primary exit always had — previously phases left the user
-          // with only the harness stop notice.
-          if (STUCK_EXIT_REASONS.has(exitReason)) {
-            yield* runFinalSummaryTurn();
-            break;
-          }
-        }
-
-        // Use totals across all phases for _lastUsage
-        cumulativeInputTokens = totalInputTokens;
-        cumulativeOutputTokens = totalOutputTokens;
-
-        // ─── Store cumulative usage for runThinkChat to read ───
-        self._lastUsage = {
-          inputTokens: cumulativeInputTokens,
-          outputTokens: cumulativeOutputTokens,
-        };
-      },
-    };
-  }
-
   /** Build an AppConfig from Think's per-session config, falling back to env defaults. */
   private getAppConfigFromThink(): AppConfig {
     const config = this.getConfig();
@@ -2090,339 +1325,6 @@ export class CodingAgent extends CodingAgentBase {
       exploreMode: "inprocess",
       taskMode: "inprocess",
     };
-  }
-
-  override getMaxSteps(): number {
-    // High safety net — the token budget thresholds (warn at 70%,
-    // wrap-up at 85%, hard stop at 95%) are the real limiting factor.
-    // This just prevents truly runaway loops if budget tracking fails.
-    return 200;
-  }
-
-  /**
-   * Override assembleContext to apply compaction guardrails:
-   * 1. Per-tool output shaping: apply tool-aware truncation rules to prevent
-   *    context window bloat. Different tools get different response contracts.
-   * 2. Older tool results get aggressively truncated to free budget.
-   * 3. Enforce total token budget — drop oldest messages when the estimated
-   *    token count exceeds 80% of the model's context window.
-   *
-   * Instrumentation: logs per-turn stats (tool count, output bytes before/after,
-   * estimated tokens) for debugging token waste.
-   */
-  override async assembleContext(): Promise<ModelMessage[]> {
-    let messages = await super.assembleContext();
-
-    // ─── Strip unsupported file parts (poison-pill guard) ───
-    // Runs first so all downstream token estimation and shaping operate on the
-    // cleaned messages. Un-wedges sessions poisoned by a legacy PDF `file`
-    // part that gateways reject (HTTP 501 / 400 "Bad Request"). See
-    // stripUnsupportedFileParts for the full rationale.
-    {
-      const modelId = this.getConfig()?.model ?? this.env.DEFAULT_MODEL ?? "";
-      const { messages: cleaned, stripped } = stripUnsupportedFileParts(messages, modelId);
-      if (stripped > 0) {
-        messages = cleaned;
-        log("info", "assembleContext: stripped unsupported file parts from history", {
-          sessionId: this.sessionId(),
-          strippedFileParts: stripped,
-        });
-      }
-    }
-
-    // ─── Inject compaction summary if missing ───
-    // Think's getHistory() is supposed to inject the compaction summary as a
-    // system UIMessage, but due to timing issues (stale this.messages, race
-    // conditions) it may not appear in the ModelMessage array after conversion.
-    // As a safety net, read the latest compaction directly from the DB and
-    // inject it if no system message with the summary marker exists.
-    const COMPACTION_MARKER = "[Previous conversation summary]";
-    const hasCompactionSummary = messages.some((msg) => {
-      if (msg.role !== "system") return false;
-      const text = typeof msg.content === "string" ? msg.content : "";
-      return text.startsWith(COMPACTION_MARKER);
-    });
-
-    if (!hasCompactionSummary) {
-      const thinkSessionId = this.getCurrentSessionId();
-      if (thinkSessionId) {
-        const compactions = this.sessions.getCompactions(thinkSessionId);
-        if (compactions.length > 0) {
-          const latest = compactions[compactions.length - 1];
-          const summaryContent = `${COMPACTION_MARKER}\n${latest.summary}`;
-          messages = [
-            { role: "system" as const, content: summaryContent },
-            ...messages,
-          ];
-          log("info", "assembleContext: injected compaction summary (safety net)", {
-            sessionId: this.sessionId(),
-            summaryChars: latest.summary.length,
-            compactionCount: compactions.length,
-          });
-        }
-      }
-    }
-
-    // ─── Selective message exclusion (Tactic 8) ───
-    // Messages prefixed with "!!" are visible in the UI but excluded from
-    // LLM context. Replace content with a minimal placeholder rather than
-    // filtering entirely — this avoids orphaned assistant responses that
-    // reference a message the model can't see on the current turn.
-    messages = messages.map((msg) => {
-      if (msg.role !== "user") return msg;
-      const content = typeof msg.content === "string"
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("")
-          : "";
-      if (!content.startsWith("!!")) return msg;
-      return { ...msg, content: "[message excluded by user]" };
-    });
-
-    // ─── Per-tool output shaping ───
-    const useShaping = true; // Per-tool output shaping always enabled
-
-    // Max chars per tool result — ~8k chars ≈ ~2k tokens. Enough for most
-    // source files, tight enough to prevent context blowout from large reads.
-    const MAX_TOOL_OUTPUT_CHARS = 8_000;
-    // Older tool results (beyond this message index from the end) get aggressively truncated
-    const RECENT_MESSAGE_WINDOW = 4;
-    // Known large/low-value file patterns get extra-aggressive truncation
-    const LOW_VALUE_PATTERNS = [
-      /package-lock\.json/i,
-      /yarn\.lock/i,
-      /pnpm-lock\.yaml/i,
-      /\.min\.(js|css)$/i,
-      /\.map$/i,
-      /\.git\//,
-    ];
-    const LOW_VALUE_MAX_CHARS = 2_000;
-
-    const totalMessages = messages.length;
-    let toolCallCount = 0;
-    let totalOutputBytesBefore = 0;
-    let totalOutputBytesAfter = 0;
-    let truncatedCount = 0;
-
-    for (let i = 0; i < totalMessages; i++) {
-      const msg = messages[i];
-      if (msg.role !== "tool") continue;
-
-      const isRecent = i >= totalMessages - RECENT_MESSAGE_WINDOW;
-
-      for (const part of msg.content) {
-        if (part.type !== "tool-result" || part.output === undefined) continue;
-        toolCallCount++;
-        const output = part.output as { type?: string; value?: unknown };
-        if (!output || typeof output !== "object") continue;
-
-        const toolResult = part as { toolName?: string; input?: unknown };
-        const toolName = toolResult.toolName ?? "unknown";
-
-        // Serialize the value to measure size
-        const value = output.value;
-        const serialized = typeof value === "string" ? value : JSON.stringify(value);
-        const originalBytes = serialized.length;
-        totalOutputBytesBefore += originalBytes;
-
-        // ─── Per-tool output shaping (Phase 1.2) ───
-        if (useShaping) {
-          // Compact response tools: write, edit, delete, git_add, git_commit
-          // These should return a small status, not file contents.
-          const compactTools = new Set([
-            "write", "edit", "delete",
-            "git_add", "git_commit", "git_init",
-            "git_branch", "git_checkout",
-          ]);
-          if (compactTools.has(toolName) && originalBytes > 1_000) {
-            // These tools shouldn't produce large output — cap at 1KB
-            const capped = truncateToolOutput(serialized, {
-              maxChars: 1_000,
-              strategy: "middle",
-            });
-            if (output.type === "text") {
-              (output as { value: string }).value = capped;
-            } else {
-              (part as { output: unknown }).output = { type: "text", value: capped };
-            }
-            totalOutputBytesAfter += capped.length;
-            if (capped.length < originalBytes) truncatedCount++;
-            continue;
-          }
-          // Per-tool shaping for read/list/grep/find is handled at the tool
-          // level in agentic.ts:capToolOutputs, not here.
-        }
-
-        // ─── General truncation (existing + improved) ───
-        const argsStr = toolResult.input ? JSON.stringify(toolResult.input) : "";
-        const isLowValue = LOW_VALUE_PATTERNS.some((p) =>
-          p.test(argsStr) || p.test(serialized.slice(0, 500)),
-        );
-        // Non-recent tool results: clear entirely with marker (Pattern #3)
-        // Recent results: truncate to cap if oversized
-        if (!isRecent && serialized.length > 200) {
-          // Old results → zero-cost marker (~8 tokens vs ~500-2000 tokens)
-          if (output.type === "text") {
-            (output as { value: string }).value = CLEARED_MARKER;
-          } else {
-            (part as { output: unknown }).output = { type: "text", value: CLEARED_MARKER };
-          }
-          totalOutputBytesAfter += CLEARED_MARKER.length;
-          truncatedCount++;
-          continue;
-        }
-
-        let maxChars: number;
-        if (isLowValue) {
-          maxChars = LOW_VALUE_MAX_CHARS;
-        } else {
-          maxChars = MAX_TOOL_OUTPUT_CHARS;
-        }
-
-        if (serialized.length <= maxChars) {
-          totalOutputBytesAfter += serialized.length;
-          continue;
-        }
-
-        const truncated = truncateToolOutput(serialized, {
-          maxChars,
-          strategy: "middle",
-        });
-        truncatedCount++;
-
-        // Preserve the output shape but replace the value with truncated text
-        if (output.type === "text") {
-          (output as { value: string }).value = truncated;
-        } else {
-          (part as { output: unknown }).output = { type: "text", value: truncated };
-        }
-        totalOutputBytesAfter += truncated.length;
-      }
-    }
-
-    // ─── Token-budget enforcement (hybrid tracking) ───
-    // Anchor on provider-reported cumulative input tokens from the agentic loop,
-    // then only estimate the trailing delta (messages added since last LLM call).
-    // This bounds estimation error to 1-3 messages instead of the full history.
-    const config = this.getConfig();
-    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
-    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
-    const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
-
-    // ─── Protect compaction summaries from being dropped ───
-    // The compaction summary (injected above or by Think's getHistory) MUST survive
-    // token-budget enforcement — it's the compressed representation of older messages.
-    const minProtectedIndex = messages.findIndex((msg) => {
-      if (msg.role !== "system") return false;
-      const text = typeof msg.content === "string" ? msg.content : "";
-      return text.startsWith(COMPACTION_MARKER);
-    });
-    // If a compaction summary exists, the cutoff must not go before it.
-    // Set the floor to the index AFTER the compaction summary so it's always included.
-    const cutoffFloor = minProtectedIndex >= 0 ? minProtectedIndex : 0;
-
-    // Build CutoffMessage array with pre-computed token estimates.
-    const cutoffMessages = messages.map((msg) => ({
-      role: msg.role,
-      tokens: estimateMessageTokens(msg),
-      pinned:
-        msg.role === "system" &&
-        (typeof msg.content === "string" ? msg.content : "").startsWith(COMPACTION_MARKER),
-    }));
-
-    const anchorTokens = this._lastUsage?.inputTokens ?? 0;
-    const cutoffResult = pickCutoff({
-      messages: cutoffMessages,
-      targetTokenBudget: tokenBudget,
-      anchorTokens: anchorTokens > 0 ? anchorTokens : undefined,
-      cutoffFloor,
-    });
-
-    const totalTokens = cutoffMessages
-      .slice(cutoffResult.cutoffIndex)
-      .reduce((sum, m) => sum + m.tokens, 0);
-
-    // Log compaction detection for debugging
-    if (messages.some((m) => m.role === "system")) {
-      log("info", "assembleContext: system messages found", {
-        sessionId: this.sessionId(),
-        totalMessages: messages.length,
-        systemCount: messages.filter((m) => m.role === "system").length,
-        minProtectedIndex,
-        systemPreviews: messages
-          .map((m, i) =>
-            m.role === "system"
-              ? {
-                  i,
-                  preview: (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 80),
-                }
-              : null,
-          )
-          .filter(Boolean),
-      });
-    }
-
-    // ─── Current-turn overshoot check (Phase 1.4) ───
-    // Even after truncation, check if the most recent messages alone exceed budget.
-    // This catches the case where many tool calls in a single turn accumulate.
-    if (messages.length > 0) {
-      const lastMsg = messages[messages.length - 1];
-      const lastMsgTokens = estimateMessageTokens(lastMsg);
-      if (lastMsgTokens > tokenBudget * 0.5) {
-        log("warn", "assembleContext: single message uses >50% of token budget", {
-          sessionId: this.sessionId(),
-          role: lastMsg.role,
-          estimatedTokens: lastMsgTokens,
-          tokenBudget,
-          model: modelId,
-        });
-      }
-    }
-
-    // ─── Instrumentation (Phase 0.1) ───
-    log("info", "assembleContext", {
-      sessionId: this.sessionId(),
-      model: modelId,
-      messageCount: totalMessages,
-      toolCallCount,
-      outputBytesBefore: totalOutputBytesBefore,
-      outputBytesAfter: totalOutputBytesAfter,
-      truncatedToolResults: truncatedCount,
-      estimatedTokens: totalTokens,
-      tokenBudget,
-      contextWindow,
-      dropped: cutoffResult.cutoffIndex,
-    });
-
-    if (cutoffResult.cutoffIndex > 0 && cutoffResult.cutoffIndex < messages.length) {
-      this._contextTruncated = true;
-      const droppedCount = cutoffResult.cutoffIndex;
-      const hasCompactionSummary = minProtectedIndex >= 0 && minProtectedIndex < cutoffResult.cutoffIndex;
-      log("warn", "assembleContext: dropping oldest messages", {
-        sessionId: this.sessionId(),
-        droppedCount,
-        compactionSummaryProtected: minProtectedIndex >= 0,
-        model: modelId,
-        tokenBudget,
-      });
-
-      // If a compaction summary exists within the dropped range, preserve it
-      // at the front of the returned messages. The summary is the compressed
-      // representation of even older messages — losing it means total amnesia.
-      const preserved: ModelMessage[] = [];
-      if (hasCompactionSummary) {
-        preserved.push(messages[minProtectedIndex]);
-      }
-
-      const truncationNote: ModelMessage = {
-        role: "system" as const,
-        content: `[Earlier messages truncated — context window limit reached. ${droppedCount} message(s) dropped to stay within the ${contextWindow}-token context window.]`,
-      };
-
-      return [...preserved, truncationNote, ...messages.slice(cutoffResult.cutoffIndex)];
-    }
-
-    return messages;
   }
 
   /**
@@ -2611,61 +1513,8 @@ export class CodingAgent extends CodingAgentBase {
             ...(await this.piEngine().inspect()),
           });
         }
-        const thinkSid = this.getCurrentSessionId();
-        if (!thinkSid) return Response.json({ error: "no session" });
-
-        const cfg = this.getConfig();
-        const mid = cfg?.model ?? this.env.DEFAULT_MODEL ?? "";
-        const cw = CONTEXT_WINDOW_TOKENS[mid] ?? DEFAULT_CONTEXT_WINDOW;
-        const cb = Math.floor(cw * CONTEXT_BUDGET_FACTOR);
-
-        const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
-          "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-        ))[0] as SqlRow | null);
-        const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
-        const usagePct = cb > 0 ? Math.round((lastInputTokens / cb) * 100) : 0;
-
-        const history = this.sessions.getHistory(thinkSid);
-        const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
-        const compactions = this.sessions.getCompactions(thinkSid);
-
-        const targetCompactCount = Math.max(2, Math.floor(realMessages.length * COMPACTION_MESSAGE_FRACTION));
-        const fromId = realMessages.length > 0 ? realMessages[0].id : null;
-        const toId = realMessages.length >= targetCompactCount ? realMessages[targetCompactCount - 1].id : null;
-
-        const alreadyCompacted = fromId && toId ? compactions.some(
-          (c) => c.from_message_id === fromId || c.to_message_id === toId,
-        ) : false;
-
-        // Check serialization: would we get any content?
-        let serializedCount = 0;
-        for (const msg of realMessages.slice(0, targetCompactCount)) {
-          const textContent = msg.parts
-            ?.filter((p: { type: string }) => p.type === "text")
-            .map((p: { type: string; text?: string }) => (p as { text: string }).text)
-            .join("") ?? "";
-          if (textContent) serializedCount++;
-        }
-
-        return Response.json({
-          thinkSessionId: thinkSid,
-          model: mid,
-          contextWindow: cw,
-          contextBudget: cb,
-          lastInputTokens,
-          usagePercent: usagePct,
-          triggerThreshold: COMPACTION_TRIGGER_PERCENT,
-          wouldTrigger: usagePct >= COMPACTION_TRIGGER_PERCENT,
-          historyLength: history.length,
-          realMessageCount: realMessages.length,
-          compactionCount: compactions.length,
-          targetCompactCount,
-          fromId,
-          toId,
-          alreadyCompacted,
-          serializedCount,
-          historyRoles: history.map(m => `${m.role}:${m.id.slice(0, 8)}`),
-        });
+        // Think-era session not migrated yet: nothing compacts it any more.
+        return Response.json({ engine: "think", note: "history moves to pi on the next prompt; pi compacts from then on" });
       }
 
       if (request.method === "GET" && url.pathname === "/messages") {
@@ -4338,9 +3187,8 @@ export class CodingAgent extends CodingAgentBase {
     this.ensureThinkConfig(request);
     await this.readAppConfig();
     try {
-      const result = this.pinAgentEngine() === "pi"
-        ? await this.runPiChat(input.content, { promptId: `sync_${crypto.randomUUID()}`, authorEmail: authorEmail ?? undefined, images: input.images })
-        : await this.runThinkChat(input.content, { authorEmail: authorEmail ?? undefined, images: input.images });
+      await this.migrateThinkSessionToPi();
+      const result = await this.runPiChat(input.content, { promptId: `sync_${crypto.randomUUID()}`, authorEmail: authorEmail ?? undefined, images: input.images });
 
       // Guard: treat empty LLM response as a failure (same as runFiberPrompt)
       if (!result.text && !result.assistantMessageId) {
@@ -4805,9 +3653,8 @@ export class CodingAgent extends CodingAgentBase {
     this._fiberAbortController = new AbortController();
     const signal = this._fiberAbortController.signal;
     try {
-      const result = this.pinAgentEngine() === "pi"
-        ? await this.runPiChat(content, { promptId, authorEmail, signal, images })
-        : await this.runThinkChat(content, { authorEmail, signal, images });
+      await this.migrateThinkSessionToPi();
+      const result = await this.runPiChat(content, { promptId, authorEmail, signal, images });
 
       // Guard: treat empty LLM response as a failure — UNLESS the prompt
       // was aborted, in which case the empty result is expected and
@@ -5372,16 +4219,14 @@ export class CodingAgent extends CodingAgentBase {
   // ─── pi-durable engine ───
 
   /**
-   * Which agent loop this session runs on. Pinned to session metadata at the
-   * first prompt (history lives in one engine's tables). New sessions run on
-   * pi unless `DODO_AGENT_ENGINE=think`.
+   * Where this session's history lives. Every turn runs on pi; "think" means
+   * a session from before pi whose history hasn't been migrated yet (it moves
+   * on its next prompt, see migrateThinkSessionToPi).
    */
   agentEngine(): "think" | "pi" {
     const stored = this.readMetadata("agent_engine");
     if (stored === "pi" || stored === "think") return stored;
-    // Sessions that ran before the engine was pinned keep their history in Think.
-    if (this.hasThinkHistory()) return "think";
-    return this.env.DODO_AGENT_ENGINE === "think" ? "think" : "pi";
+    return this.hasThinkHistory() ? "think" : "pi";
   }
 
   private hasThinkHistory(): boolean {
@@ -5389,16 +4234,59 @@ export class CodingAgent extends CodingAgentBase {
     return thinkSessionId ? this.sessions.getMessageCount(thinkSessionId) > 0 : false;
   }
 
-  private pinAgentEngine(): "think" | "pi" {
-    const engine = this.agentEngine();
-    if (!this.readMetadata("agent_engine")) this.writeMetadata("agent_engine", engine);
-    return engine;
+  /**
+   * Move a Think session onto pi before its next turn. Copies the visible
+   * history into the pi transcript (same message ids, so message metadata and
+   * attachments still line up), then pins pi. Text only: Think's tool-call
+   * parts don't carry over, the same as a compaction would drop them.
+   * Idempotent: messages already in pi are skipped, and the engine is pinned
+   * only after every message is written.
+   */
+  private async migrateThinkSessionToPi(): Promise<void> {
+    if (this.agentEngine() === "pi") {
+      if (this.readMetadata("agent_engine") !== "pi") this.writeMetadata("agent_engine", "pi");
+      return;
+    }
+    const thinkSessionId = this.getCurrentSessionId();
+    const history = (thinkSessionId ? this.sessions.getHistory(thinkSessionId) : [])
+      .filter((m) => (m.role === "user" || m.role === "assistant") && !m.id.startsWith("compaction_"));
+    const engine = this.piEngine();
+    const have = new Set(entriesToMessages(await engine.entries()).map((m) => m.id));
+    const todo = history.filter((m) => !have.has(m.id));
+    const known = this.listMessageAttachments(todo.map((m) => m.id));
+    const imported = todo.map((m) => {
+      const meta = this.readMessageMetadata(m.id);
+      const record = uiMessageToChatRecord(m, meta ?? {});
+      const contextText = (m.parts ?? [])
+        .filter((p): p is { type: "text"; text: string } => p.type === "text")
+        .map((p) => p.text)
+        .join("");
+      // Attachments Think kept inside the message (uploads, generated images, screenshots).
+      const seen = new Set((known.get(m.id) ?? []).map((a) => a.url));
+      for (const a of record.attachments ?? []) {
+        if (seen.has(a.url)) continue;
+        this.insertMessageAttachment({ messageId: m.id, mediaType: a.mediaType, url: a.url, size: 0, source: m.role === "user" ? "user" : "assistant", name: a.name ?? null });
+      }
+      return {
+        role: m.role as "user" | "assistant",
+        id: m.id,
+        text: record.content,
+        ...(contextText !== record.content ? { contextText } : {}),
+        authorEmail: meta?.authorEmail ?? null,
+        createdAt: meta?.createdAt ?? undefined,
+        model: meta?.model ?? undefined,
+      };
+    });
+    await engine.append(imported);
+    this.writeMetadata("agent_engine", "pi");
+    this._piMessageCount = have.size + imported.length;
+    log("info", "migrated Think session to pi", { sessionId: this.sessionId(), messages: imported.length, alreadyThere: have.size });
   }
 
-  /** Choose the engine for a session that has not run a prompt yet. */
+  /** Kept for API compatibility: pi is the only engine. */
   private handleSetEngine(engine: unknown): Response {
-    if (engine !== "pi" && engine !== "think") {
-      return Response.json({ error: "engine must be 'pi' or 'think'" }, { status: 400 });
+    if (engine !== "pi") {
+      return Response.json({ error: "engine must be 'pi' (the Think engine was removed)" }, { status: 400 });
     }
     const current = this.readMetadata("agent_engine");
     const hasHistory = this.listPrompts().length > 0;
@@ -5484,13 +4372,13 @@ export class CodingAgent extends CodingAgentBase {
 
   /**
    * Append finished messages to the transcript without running the model
-   * (snapshot import, fork, /generate). Pins the engine: history now lives in it.
+   * (snapshot import, fork, /generate). A Think-era session moves to pi first.
    */
   private async appendTranscript(
     entries: ReadonlyArray<{ uiMessage: UIMessage; metadata: { authorEmail?: string | null; model?: string | null; provider?: string | null; tokenInput?: number; tokenOutput?: number } }>,
   ): Promise<void> {
-    const engine = this.pinAgentEngine();
-    if (engine === "pi") {
+    await this.migrateThinkSessionToPi();
+    {
       const kept = entries.filter((e) => e.uiMessage.role === "user" || e.uiMessage.role === "assistant");
       await this.piEngine().append(
         kept.map((e) => ({
@@ -5519,11 +4407,6 @@ export class CodingAgent extends CodingAgentBase {
         }
       }
       this._piMessageCount += kept.length;
-    } else {
-      const thinkSessionId = this.getCurrentSessionId();
-      if (!thinkSessionId) return;
-      for (const e of entries) this.sessions.append(thinkSessionId, e.uiMessage);
-      this.messages = this.sessions.getHistory(thinkSessionId);
     }
     for (const e of entries) {
       this.insertMessageMetadata({
@@ -5591,7 +4474,6 @@ export class CodingAgent extends CodingAgentBase {
         };
       },
     });
-    this._llmCallsThisTurn = result.steps;
     this.flushTurnArtifacts(options.authorEmail);
     if (result.recovered) log("info", "pi: reattached to prompt after restart", { sessionId: this.sessionId(), promptId: options.promptId });
     if (result.status !== "done") {
@@ -5974,579 +4856,6 @@ export class CodingAgent extends CodingAgentBase {
     }
     this.emitEvent({ data: userRecord, type: "message" });
     return { userMsgId, userMsg };
-  }
-
-  /**
-   * Run a chat turn via Think.chat().
-   * Bridges Think streaming events to Dodo's SSE/WS event format.
-   * Returns the assistant message ID and token usage.
-   */
-  private async runThinkChat(
-    userContent: string,
-    options?: { authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }> },
-  ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string; steps: number; toolCalls: string[] }> {
-    // Connect MCP servers before Think calls getTools()
-    await this.connectMcpServers();
-    const { userMsg } = await this.prepareUserTurn(userContent, options);
-
-    // Track assistant response metadata
-    let assistantMessageId = "";
-    let fullText = "";
-    let streamError: string | null = null;
-
-    // Reset per-turn tool attachment cache. The map is keyed by toolCallId and
-    // populated by the onToolAttachments callback in getTools() — clearing here
-    // ensures attachments from a previous prompt don't leak into this turn's
-    // tool_result events.
-    this._toolAttachments.clear();
-    // Reset per-turn tool-call name set so the chat-monitor brain nudge
-    // checks against tools actually called THIS turn.
-    this._toolCallNames.clear();
-    this._llmCallsThisTurn = 0;
-    // Collect assistant-generated images streamed during this turn. Uploaded
-    // to R2 at onDone() once we know the assistant message id.
-    const generatedImages: Array<{ mediaType: string; url: string }> = [];
-
-    const callback: StreamCallback = {
-      onEvent: (json: string) => {
-        try {
-          const chunk = JSON.parse(json);
-          // Bridge Think chunk events to Dodo SSE format. Chunks come from
-          // the AI SDK's `toUIMessageStream()` pipeline — see the ai package
-          // for the full chunk type union.
-          if (chunk.type === "text-delta") {
-            const delta = chunk.delta ?? "";
-            fullText += delta;
-            this.emitEvent({ data: { delta }, type: "text_delta" });
-          } else if (chunk.type === "tool-input-available") {
-            // Tool arguments finalised — show the user that a tool is running.
-            this._toolCallNames.add(String(chunk.toolName));
-            this.emitEvent({
-              data: {
-                toolCallId: chunk.toolCallId,
-                toolName: chunk.toolName,
-                input: chunk.input,
-              },
-              type: "tool_call",
-            });
-          } else if (chunk.type === "tool-output-available") {
-            // Tool finished — emit the result plus any images the tool
-            // produced (streamed earlier via the onToolAttachments callback).
-            const refs = this._toolAttachments.get(chunk.toolCallId) ?? [];
-            this.emitEvent({
-              data: {
-                toolCallId: chunk.toolCallId,
-                output: chunk.output,
-                attachments: rewriteAttachmentsForClient(
-                  refs.map((r) => ({ mediaType: r.mediaType, url: r.url, size: r.size })),
-                ),
-              },
-              type: "tool_result",
-            });
-          } else if (chunk.type === "file") {
-            // Assistant generated an image (Gemini, Gemma vision, etc.).
-            // The AI SDK emits a data URL; we defer the R2 upload to onDone()
-            // so we can key it by the assistant message id.
-            if (typeof chunk.mediaType === "string" && typeof chunk.url === "string") {
-              generatedImages.push({ mediaType: chunk.mediaType, url: chunk.url });
-            }
-          } else if (chunk.type === "error") {
-            // AI SDK emits { type: "error", errorText: "..." } when the gateway
-            // returns an error. Think's applyChunkToParts silently drops these.
-            // Capture so we can throw after the stream ends.
-            streamError = chunk.errorText ?? chunk.error ?? "Unknown LLM error";
-            log("error", "stream error chunk", { sessionId: this.sessionId(), error: streamError });
-          }
-          // Token usage is captured via onChatMessage() override — see _lastUsage.
-        } catch {
-          // Skip unparseable chunks
-        }
-      },
-      onDone: () => {
-        // After chat completes, find the latest assistant message
-        const history = this.getHistory();
-        const lastAssistant = [...history].reverse().find((m) => m.role === "assistant");
-        if (lastAssistant) {
-          assistantMessageId = lastAssistant.id;
-          // Extract text from parts
-          fullText = lastAssistant.parts
-            .filter((p): p is { type: "text"; text: string } => p.type === "text")
-            .map((p) => p.text)
-            .join("");
-        }
-      },
-      onError: (error: string) => {
-        log("error", "think chat error", { sessionId: this.sessionId(), error });
-        streamError = error;
-      },
-    };
-
-    await this.chat(userMsg, callback, { signal: options?.signal });
-
-    // Flush workspace changes to Artifacts. Never blocks the turn.
-    //
-    // This is fully fire-and-forget, INCLUDING acquiring the artifacts
-    // context. getOrCreateArtifactsContext() is a call into the ARTIFACTS
-    // binding, and if that binding hangs, awaiting it here wedges turn
-    // finalization: no assistant token metadata is persisted, runThinkChat
-    // never returns, lifecycle.finish() never clears activePromptId, and the
-    // terminal state/prompt events that stop the client spinner never fire —
-    // so the session appears permanently stuck even though the LLM already
-    // produced its answer. Keep the whole flush off the hot path; a slow or
-    // dead ARTIFACTS binding must only cost us the (best-effort) flush.
-    this.flushTurnArtifacts(options?.authorEmail);
-
-    // If the stream contained an error chunk that Think silently dropped,
-    // throw it so the caller (runFiberPrompt) can surface it properly.
-    if (streamError && !fullText) {
-      throw new Error(streamError);
-    }
-
-    // Get config for provider info
-    const config = this.getConfig();
-    const model = config?.model ?? this.env.DEFAULT_MODEL;
-    const gateway = config?.activeGateway ?? "opencode";
-
-    // Read captured token usage from onChatMessage() override
-    const tokenInput = this._lastUsage?.inputTokens ?? 0;
-    const tokenOutput = this._lastUsage?.outputTokens ?? 0;
-
-    // Insert assistant message metadata
-    if (assistantMessageId) {
-      this.insertMessageMetadata({
-        messageId: assistantMessageId,
-        model,
-        provider: gateway,
-        tokenInput,
-        tokenOutput,
-      });
-
-      // Rebind any tool-produced attachments recorded during this turn from
-      // their tool_call_id buckets to the actual assistant message id. This
-      // is what makes screenshots show up on reload — listMessageAttachments
-      // queries by message_id, and without the rebind the rows would only be
-      // findable via tool_call_id which isn't on the ChatMessageRecord.
-      const toolCallIds = Array.from(this._toolAttachments.keys());
-      if (toolCallIds.length > 0) {
-        this.rebindToolAttachments(toolCallIds, assistantMessageId);
-      }
-    }
-
-    // Persist any assistant-generated images to R2 and emit a message-level
-    // attachments event so the UI can render them. We do this post-stream
-    // because we need the assistant message id (only known after onDone) to
-    // key the R2 object. The inline data URL remains on the UIMessage part;
-    // `uiMessageToChatRecord` handles the transport from data URL → served URL.
-    if (assistantMessageId && generatedImages.length > 0) {
-      const uploaded: AttachmentRef[] = [];
-      for (const img of generatedImages) {
-        const ref = await uploadAttachment(this.env, {
-          sessionId: this.sessionId(),
-          messageId: assistantMessageId,
-          mediaType: img.mediaType,
-          data: img.url, // uploadAttachment strips the data: prefix
-          ownerEmail: options?.authorEmail,
-          source: "assistant",
-        });
-        if (ref) uploaded.push(ref);
-      }
-      if (uploaded.length > 0) {
-        // Persist before emitting — if the client reloads during emission
-        // we still want the image to surface from history.
-        for (const ref of uploaded) {
-          this.insertMessageAttachment({
-            messageId: assistantMessageId,
-            mediaType: ref.mediaType,
-            url: ref.url,
-            size: ref.size,
-            source: "assistant",
-          });
-        }
-        this.emitEvent({
-          data: {
-            messageId: assistantMessageId,
-            attachments: rewriteAttachmentsForClient(
-              uploaded.map((r) => ({ mediaType: r.mediaType, url: r.url, size: r.size })),
-            ),
-          },
-          type: "message_attachments",
-        });
-      }
-    }
-
-    // Check if context compaction is needed.
-    // Awaited (not fire-and-forget) so the compaction completes before the next
-    // request arrives. Without this, there's a race: the next chat() call may
-    // start before addCompaction() finishes, causing getHistory() to return
-    // the old non-compacted messages and the compaction summary to be invisible.
-    try {
-      await this.maybeCompactContext();
-    } catch (err) {
-      log("warn", "post-chat compaction failed", {
-        sessionId: this.sessionId(),
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    return {
-      assistantMessageId,
-      tokenInput,
-      tokenOutput,
-      text: fullText,
-      steps: this._llmCallsThisTurn,
-      toolCalls: Array.from(this._toolCallNames),
-    };
-  }
-
-  /**
-   * Check if context compaction is needed and run it if so.
-   *
-   * Implements several context management tactics from pi-mono:
-   * - Turn-aware cut points: never splits tool-call/result pairs
-   * - Conversation serialization: [Role]: format with 2K tool result cap
-   * - Structured summary format: rigid template with cumulative file tracking
-   * - Iterative summary updates: updates previous summary instead of regenerating
-   *
-   * Triggers when the last turn's input tokens exceed COMPACTION_TRIGGER_PERCENT
-   * of the context budget.
-   */
-  /**
-   * Number of compaction summaries persisted for the current Think session.
-   * Used by the own-loop to decide whether a `maybeCompactContext()` call
-   * actually summarised something or no-op'd (see `outcome: "summarised"`
-   * vs `"noop"` log lines). Returns 0 when there is no active session.
-   */
-  private getCompactionCount(): number {
-    const thinkSessionId = this.getCurrentSessionId();
-    if (!thinkSessionId) return 0;
-    return this.sessions.getCompactions(thinkSessionId).length;
-  }
-
-  private async maybeCompactContext(options?: { force?: boolean }): Promise<void> {
-    const thinkSessionId = this.getCurrentSessionId();
-    if (!thinkSessionId) return;
-
-    // Check if context usage warrants compaction
-    const config = this.getConfig();
-    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
-    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
-
-    // When force=true (overflow recovery) or context was truncated by
-    // assembleContext(), skip the usage threshold check. The truncation flag
-    // catches the Catch-22: assembleContext drops old messages → LLM reports
-    // low usage → compaction threshold not met → messages stay dropped forever.
-    const contextWasTruncated = this._contextTruncated;
-    this._contextTruncated = false; // Reset for next turn
-
-    const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
-      "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-    ))[0] as SqlRow | null);
-    const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
-    if (!options?.force && !contextWasTruncated && lastInputTokens === 0) return;
-
-    const history = this.sessions.getHistory(thinkSessionId);
-    const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
-
-    if (
-      !shouldCompact({
-        messageCount: history.length,
-        realMessageCount: realMessages.length,
-        estimatedTokens: lastInputTokens,
-        modelContextWindow: contextWindow,
-        thresholdRatio: COMPACTION_TRIGGER_PERCENT / 100,
-        force: options?.force,
-        contextWasTruncated,
-      })
-    ) {
-      return;
-    }
-
-    // ─── Turn-aware cut point (Tactic 4) ───
-    // Find the cut point that doesn't split tool-call/result pairs.
-    // A "turn" is: user message → assistant message(s) → tool result(s).
-    // Valid cut points: the boundary BEFORE a user message.
-    const targetCompactCount = Math.max(2, Math.floor(realMessages.length * COMPACTION_MESSAGE_FRACTION));
-    let compactCount = targetCompactCount;
-
-    // Walk forward from the target cut point to find a valid boundary.
-    // A valid boundary is right before a "user" message (never between
-    // an assistant tool-call and its result, or mid-assistant-turn).
-    while (compactCount < realMessages.length - 2) {
-      const nextMsg = realMessages[compactCount];
-      if (nextMsg.role === "user") break; // Valid cut: next message starts a new turn
-      compactCount++; // Skip forward past tool results / mid-turn messages
-    }
-    // If we couldn't find a valid cut point, fall back to the target
-    if (compactCount >= realMessages.length - 2) {
-      compactCount = targetCompactCount;
-    }
-
-    const messagesToCompact = realMessages.slice(0, compactCount);
-    // Guard against the pathological case where realMessages has fewer
-    // entries than targetCompactCount (e.g. force=true on the very first
-    // turn, when Think hasn't persisted the assistant message yet and
-    // realMessages.length === 1). Without this we'd hit
-    // `messagesToCompact[1].id` → TypeError on undefined.
-    if (messagesToCompact.length < 2) {
-      log("info", "compaction: skipped — fewer than 2 real messages to compact", {
-        sessionId: this.sessionId(),
-        realMessageCount: realMessages.length,
-      });
-      return;
-    }
-    const fromMessageId = messagesToCompact[0].id;
-    const toMessageId = messagesToCompact[messagesToCompact.length - 1].id;
-
-    // Check if this range is already compacted
-    const existingCompactions = this.sessions.getCompactions(thinkSessionId);
-    const alreadyCompacted = existingCompactions.some(
-      (c) => c.from_message_id === fromMessageId || c.to_message_id === toMessageId,
-    );
-    if (alreadyCompacted) return;
-
-    // ─── Cumulative file tracking (Tactic 3) ───
-    // Track files read and modified across the messages being compacted.
-    // Also carry forward file lists from previous compactions.
-    const readFiles = new Set<string>();
-    const modifiedFiles = new Set<string>();
-
-    // Carry forward from previous compaction summaries
-    for (const compaction of existingCompactions) {
-      const fileMatch = compaction.summary.match(/<read-files>([\s\S]*?)<\/read-files>/);
-      if (fileMatch) {
-        fileMatch[1].split("\n").map(f => f.trim()).filter(Boolean).forEach(f => readFiles.add(f));
-      }
-      const modMatch = compaction.summary.match(/<modified-files>([\s\S]*?)<\/modified-files>/);
-      if (modMatch) {
-        modMatch[1].split("\n").map(f => f.trim()).filter(Boolean).forEach(f => modifiedFiles.add(f));
-      }
-    }
-
-    // Extract file operations from messages being compacted.
-    // UIMessage tool parts in AI SDK v5 use type "dynamic-tool" (not "tool-invocation"),
-    // field "input" (not "args"), and "output" (not "result").
-    for (const msg of messagesToCompact) {
-      if (msg.role !== "assistant") continue;
-      for (const part of msg.parts) {
-        const p = part as { type: string; toolName?: string; input?: Record<string, unknown> };
-        if (p.type !== "dynamic-tool" || !p.toolName) continue;
-        const path = (p.input?.path as string) ?? "";
-        if (!path) continue;
-        if (p.toolName === "read") readFiles.add(path);
-        else if (p.toolName === "write") modifiedFiles.add(path);
-        else if (p.toolName === "edit") modifiedFiles.add(path);
-      }
-    }
-
-    // Remove modified files from the read set (modified takes precedence)
-    for (const f of modifiedFiles) readFiles.delete(f);
-
-    // ─── Conversation serialization (Tactic 6) ───
-    // Convert messages to flat [Role]: text format with 2K cap on tool results.
-    // This prevents the summarizer from entering "conversation mode".
-    const TOOL_RESULT_CAP = 2_000;
-    const serializedParts: string[] = [];
-    for (const msg of messagesToCompact) {
-      const textContent = msg.parts
-        ?.filter((p: { type: string }) => p.type === "text")
-        .map((p: { type: string; text?: string }) => (p as { text: string }).text)
-        .join("") ?? "";
-
-      if (msg.role === "user" && textContent) {
-        serializedParts.push(`[User]: ${textContent.slice(0, 2_000)}`);
-      } else if (msg.role === "assistant") {
-        // Extract tool calls (AI SDK v5: "dynamic-tool" parts with "input" field)
-        const toolCalls = msg.parts
-          ?.filter((p: { type: string }) => p.type === "dynamic-tool")
-          .map((p: { type: string; toolName?: string; input?: unknown }) => {
-            const tc = p as { toolName: string; input: unknown };
-            return `${tc.toolName}(${JSON.stringify(tc.input ?? {}).slice(0, 500)})`;
-          }) ?? [];
-
-        if (textContent) {
-          serializedParts.push(`[Assistant]: ${textContent.slice(0, 2_000)}`);
-        }
-        if (toolCalls.length > 0) {
-          serializedParts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
-        }
-
-        // Extract tool results embedded in assistant parts
-        // AI SDK v5: "dynamic-tool" parts with "output" field (state === "output-available")
-        for (const part of msg.parts ?? []) {
-          const p = part as { type: string; output?: unknown; toolName?: string; state?: string };
-          if (p.type === "dynamic-tool" && p.output !== undefined) {
-            const resultStr = typeof p.output === "string" ? p.output : JSON.stringify(p.output);
-            const capped = resultStr.length > TOOL_RESULT_CAP
-              ? resultStr.slice(0, TOOL_RESULT_CAP) + `\n\n[... ${resultStr.length - TOOL_RESULT_CAP} more chars truncated]`
-              : resultStr;
-            serializedParts.push(`[Tool result (${p.toolName ?? "unknown"})]: ${capped}`);
-          }
-        }
-      }
-    }
-
-    if (serializedParts.length === 0) return;
-
-    const summaryInput = serializedParts.join("\n\n");
-
-    // ─── Iterative summary update (Tactic 2) ───
-    // If there's a previous compaction, use the "update" prompt to preserve
-    // accumulated context. Otherwise use the "create" prompt.
-    const previousSummary = existingCompactions.length > 0
-      ? existingCompactions[existingCompactions.length - 1].summary
-      : null;
-
-    // ─── Structured summary format (Tactic 3) ───
-    const STRUCTURED_SUMMARY_PROMPT = [
-      "Create a structured context checkpoint summary following this EXACT format:",
-      "",
-      "## Goal",
-      "[What the user is trying to accomplish — 1-2 sentences]",
-      "",
-      "## Constraints & Preferences",
-      "- [Requirements mentioned by user]",
-      "",
-      "## Progress",
-      "### Done",
-      "- [x] [Completed tasks with specific file paths]",
-      "### In Progress",
-      "- [ ] [Current work]",
-      "### Blocked",
-      "- [Issues preventing progress, if any]",
-      "",
-      "## Key Decisions",
-      "- **[Decision]**: [Rationale]",
-      "",
-      "## Next Steps",
-      "1. [What should happen next]",
-      "",
-      "## Critical Context",
-      "- [Specific data, error messages, or configurations needed to continue]",
-      "",
-      "PRESERVE exact file paths, function names, error messages, and technical specifics.",
-      "Be factual and concrete. No vague summaries.",
-    ].join("\n");
-
-    const UPDATE_SUMMARY_PROMPT = [
-      "Update the existing structured summary with new information from the conversation.",
-      "",
-      "Rules:",
-      "- PRESERVE all existing information that is still relevant",
-      "- ADD new progress, decisions, and context",
-      "- Move items from 'In Progress' to 'Done' when completed",
-      "- UPDATE 'Next Steps' based on what was accomplished",
-      "- PRESERVE exact file paths, function names, error messages",
-      "- REMOVE items only if they are clearly no longer relevant",
-      "",
-      "Output the COMPLETE updated summary using the same format:",
-      "",
-      "## Goal",
-      "## Constraints & Preferences",
-      "## Progress (Done / In Progress / Blocked)",
-      "## Key Decisions",
-      "## Next Steps",
-      "## Critical Context",
-    ].join("\n");
-
-    try {
-      // Build a Workers AI provider for compaction. The AI Gateway provides an
-      // OpenAI-compatible endpoint at {base}/workers-ai/v1 that accepts @cf/ model IDs.
-      // Build the user message with conversation + optional previous summary
-      const userParts: string[] = [];
-      userParts.push("<conversation>");
-      userParts.push(summaryInput.slice(0, 30_000));
-      userParts.push("</conversation>");
-
-      if (previousSummary) {
-        userParts.push("");
-        userParts.push("<previous-summary>");
-        userParts.push(previousSummary);
-        userParts.push("</previous-summary>");
-      }
-
-      userParts.push("");
-      userParts.push(previousSummary ? UPDATE_SUMMARY_PROMPT : STRUCTURED_SUMMARY_PROMPT);
-
-      const compactionMessages: Array<{ role: "system" | "user"; content: string }> = [
-        {
-          role: "system",
-          content: "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified. Do NOT continue the conversation. ONLY output the structured summary.",
-        },
-        {
-          role: "user",
-          content: userParts.join("\n"),
-        },
-      ];
-
-      // Use the session's LLM gateway to call the compaction model.
-      // Tries COMPACTION_MODEL first, falls back to the session model if it fails.
-      const appConfig = this.getAppConfigFromThink();
-      const provider = buildProvider(appConfig, this.env);
-      let summary: string | undefined;
-      let compactionModelUsed = COMPACTION_MODEL;
-      try {
-        const compactionLLM = provider.chatModel(COMPACTION_MODEL);
-        const result = await generateText({
-          model: compactionLLM,
-          messages: compactionMessages,
-          maxOutputTokens: 2048,
-        });
-        summary = result.text;
-        if (summary) {
-          log("info", "compaction: summary generated", {
-            sessionId: this.sessionId(),
-            model: COMPACTION_MODEL,
-            summaryChars: summary.length,
-          });
-        }
-      } catch (compactionErr) {
-        compactionModelUsed = modelId;
-        log("warn", "compaction: primary model failed, falling back to session model", {
-          sessionId: this.sessionId(),
-          model: COMPACTION_MODEL,
-          fallback: modelId,
-          error: compactionErr instanceof Error ? compactionErr.message : String(compactionErr),
-        });
-        const fallbackModel = provider.chatModel(modelId);
-        const result = await generateText({
-          model: fallbackModel,
-          messages: compactionMessages,
-          maxOutputTokens: 1500,
-        });
-        summary = result.text;
-      }
-      if (!summary || summary.length < 20) return;
-
-      // Append cumulative file tracking tags
-      const readFileList = [...readFiles].sort();
-      const modFileList = [...modifiedFiles].sort();
-      if (readFileList.length > 0) {
-        summary += `\n\n<read-files>\n${readFileList.join("\n")}\n</read-files>`;
-      }
-      if (modFileList.length > 0) {
-        summary += `\n\n<modified-files>\n${modFileList.join("\n")}\n</modified-files>`;
-      }
-
-      // Tag summary with model used (for diagnostics via debug endpoint)
-      summary += `\n\n<!-- compaction-model: ${compactionModelUsed} -->`;
-
-      this.sessions.addCompaction(thinkSessionId, summary, fromMessageId, toMessageId);
-      log("info", "compaction complete", {
-        sessionId: this.sessionId(),
-        compactedMessages: compactCount,
-        summaryChars: summary.length,
-        model: compactionModelUsed,
-        readFiles: readFileList.length,
-        modifiedFiles: modFileList.length,
-        iterative: !!previousSummary,
-      });
-    } catch (error) {
-      log("warn", "failed to generate compaction summary", {
-        sessionId: this.sessionId(),
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
-      });
-    }
   }
 
   private ensureMetadata(sessionId: string, ownerEmail?: string | null): void {

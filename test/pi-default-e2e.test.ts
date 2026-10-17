@@ -148,17 +148,52 @@ describe("pi is the default engine", () => {
     expect(exported.messages.map((m) => m.uiMessage.id).slice(0, 2)).toEqual(["u1", "a1"]);
   });
 
-  it("a session with Think history and no pinned engine stays on Think", async () => {
+  it("a Think-era session moves to pi on its next prompt, history and context intact", async () => {
     const id = await newSession();
     // Loose signature: CodingAgent's full type makes runInDurableObject's inference blow up (TS2589).
     const inDO = runInDurableObject as unknown as (stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<void>) => Promise<void>;
     await inDO(await agent(id), async (instance, state) => {
-      // Simulate a pre-engine-switch session: Think history, no agent_engine metadata.
+      // A pre-pi session: Think history, no agent_engine metadata.
       const sid = instance.getCurrentSessionId() ?? instance.createSession("default").id;
-      instance.sessions.append(sid, { id: "legacy-1", role: "user", parts: [{ type: "text", text: "from before pi" }] });
+      instance.sessions.append(sid, { id: "legacy-u", role: "user", parts: [{ type: "text", text: "the password is swordfish" }] });
+      instance.sessions.append(sid, {
+        id: "legacy-a",
+        role: "assistant",
+        parts: [
+          { type: "text", text: "Got it." },
+          { type: "tool-read", toolCallId: "t1", state: "output-available", input: {}, output: "ignored" },
+          { type: "file", mediaType: "image/png", url: "data:image/png;base64,AAAA" },
+        ],
+      });
+      state.storage.sql.exec(
+        "INSERT INTO message_metadata (message_id, author_email, model, provider, token_input, token_output, created_at) VALUES ('legacy-a', NULL, 'claude-test', 'opencode', 10, 2, 1700000000)",
+      );
       state.storage.sql.exec("DELETE FROM metadata WHERE key = 'agent_engine'");
     });
     expect(await json(await call(`/session/${id}/engine`))).toEqual({ engine: "think" });
-    expect((await messages(id)).map((m) => m.content)).toContain("from before pi");
+    expect((await messages(id)).map((m) => m.content)).toEqual(["the password is swordfish", "Got it."]);
+
+    const res = await send(`/session/${id}/message`, { content: "what is the password?" });
+    expect(res.status).toBe(200);
+    expect(await json(await call(`/session/${id}/engine`))).toEqual({ engine: "pi" });
+    expect(JSON.stringify(seenContexts.at(-1)!.messages)).toContain("swordfish");
+
+    const after = await messages(id);
+    expect(after.map((m) => [m.id, m.content]).slice(0, 2)).toEqual([
+      ["legacy-u", "the password is swordfish"],
+      ["legacy-a", "Got it."],
+    ]);
+    expect(after.slice(2).map((m) => m.content)).toEqual(["what is the password?", "opencode:what is the password?"]);
+    expect(after[1]!.attachments?.[0]?.mediaType).toBe("image/png");
+
+    // A second prompt doesn't re-import anything.
+    await send(`/session/${id}/message`, { content: "again" });
+    expect((await messages(id)).filter((m) => m.id === "legacy-u")).toHaveLength(1);
+  });
+
+  it("only pi can be chosen", async () => {
+    const id = await newSession();
+    expect((await send(`/session/${id}/engine`, { engine: "think" }, "PUT")).status).toBe(400);
+    expect((await send(`/session/${id}/engine`, { engine: "pi" }, "PUT")).status).toBe(200);
   });
 });

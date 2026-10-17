@@ -43,8 +43,7 @@ blocked, so tool validation works in production Workers.
 | Tools | AI SDK `tool()` | unchanged; adapted by `src/pi/tools.ts` |
 
 Files: `src/pi/{engine,models,tools}.ts`, `CodingAgent.runPiChat`,
-`GET/PUT /session/:id/engine` (`?detail=1` = live tasks + compact transcript),
-`DODO_AGENT_ENGINE` default (unset → `think`).
+`GET/PUT /session/:id/engine` (`?detail=1` = live tasks + compact transcript).
 
 ## Keep / import / delete
 
@@ -81,6 +80,30 @@ of `subagent-runner.ts` + facet DOs, `tool-search` for large MCP tool sets,
    workerd tests only so far.
 
 Then: set `DODO_AGENT_ENGINE=pi`, soak, delete the Think path.
+
+## Phase 2 (shipped): pi is the only loop
+
+Gaps 1–4 closed. Every prompt runs on pi; `DODO_AGENT_ENGINE` is gone and
+`PUT /engine` only accepts `pi`.
+
+- **Think-era sessions migrate on their next prompt** (or import / `/generate`):
+  `migrateThinkSessionToPi` copies visible user/assistant text into the pi
+  transcript under the same message ids, so metadata and attachment rows still
+  line up. Think tool-call parts don't carry over (like a compaction). Reads of
+  an unmigrated session (`/messages`, export, fork) still come from Think.
+- **Doom-loop guard:** `src/pi/loop-guard.ts`. `GenerationTask.beforeRequest`
+  adds the nudge; `ToolTask.beforeTool` refuses the looping tool at the hard bar.
+  Thresholds unchanged (identical 3/5, same tool 6/10, narrated 20).
+- **Deleted (~2,700 lines):** own-loop `onChatMessage`, `assembleContext`,
+  `maybeCompactContext`, `runThinkChat`, `getMaxSteps`; `loop-policy.ts`,
+  `compaction-policy.ts`, `overflow-retry.ts`, `own-loop-prune.ts`,
+  `final-summary-policy.ts` and their tests.
+- **Still on Think (next):** `CodingAgent extends Think` for config storage
+  (`getConfig`/`configure`), fibers (`stashFiber` recovery re-enters
+  `runFiberPrompt`, and pi reattaches by prompt id), and reads of unmigrated
+  history. Dropping the base class needs a config-table migration; do it after a
+  soak, together with `think-adapter.ts` and `@cloudflare/think`.
+- Gap 5 (live eviction proof) is still open.
 
 ## Kitebuild and containers
 
