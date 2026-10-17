@@ -131,3 +131,12 @@ describe("CodingAgent + Clef", () => {
     });
   });
 });
+
+describe("uiPartsToPiContent", () => {
+  it("joins text-only parts into one string (gpt-oss / Qwen reject array content)", async () => {
+    const { uiPartsToPiContent } = await import("../src/coding-agent");
+    expect(uiPartsToPiContent([{ type: "text", text: "what colour?" }, { type: "text", text: "[Image attached: x]" }] as never)).toBe("what colour?\n\n[Image attached: x]");
+    const withImage = uiPartsToPiContent([{ type: "text", text: "hi" }, { type: "file", mediaType: "image/png", url: `data:image/png;base64,${RED}` }] as never);
+    expect(Array.isArray(withImage)).toBe(true);
+  });
+});

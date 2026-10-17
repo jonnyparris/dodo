@@ -6200,6 +6200,9 @@ export function uiPartsToPiContent(parts: UIMessage["parts"]): PiUserContent {
       out.push({ type: "image", data, mimeType: part.mediaType });
     }
   }
-  if (out.length === 1 && out[0]?.type === "text") return out[0].text;
+  // Text only: send one string. Several Workers AI models (gpt-oss, Qwen)
+  // reject array content on user messages, and a turn often has several
+  // text parts (the message plus inlined docs or an image note).
+  if (out.every((p) => p.type === "text")) return out.map((p) => (p as { text: string }).text).join("\n\n");
   return out;
 }
