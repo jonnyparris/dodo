@@ -122,15 +122,8 @@ const ORCHESTRATOR_TOOLS: ToolCatalogEntry[] = [
   // browser config, and admin owner. Listed so users know they exist even
   // when their current session has them off.
   {
-    name: "browser_search",
-    description: "Search Chrome DevTools Protocol command/event specs.",
-    category: "browser",
-    alwaysOn: false,
-    caveat: "Requires browser bindings, session browser config, and admin owner.",
-  },
-  {
     name: "browser_execute",
-    description: "Run Chrome DevTools Protocol commands against a headless browser session.",
+    description: "Drive the session's persistent browser (tabs, cookies and logins carry over) with JavaScript and the Chrome DevTools Protocol.",
     category: "browser",
     alwaysOn: false,
     caveat: "Requires browser bindings, session browser config, and admin owner.",

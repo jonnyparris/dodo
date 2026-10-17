@@ -31,7 +31,6 @@ export const REPLAY_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "read_attachment",
   "browser_markdown",
   "browser_triage",
-  "browser_search",
   "web_search",
   "web_fetch",
   "skill",
@@ -106,6 +105,8 @@ async function jsonSchemaOf(tool: AiTool): Promise<Record<string, unknown>> {
 export interface AdaptOptions {
   /** Called when a tool call starts executing, by name — Dodo's per-turn tool-name set. */
   onCall?: (name: string) => void;
+  /** pi-native registrations to ship in the same extension (e.g. browser_execute). */
+  extra?: ToolRegistration[];
 }
 
 /** Adapt one AI SDK tool. */
@@ -143,6 +144,10 @@ export async function buildToolsExtension(tools: ToolSet, options: AdaptOptions 
   const registrations: ToolRegistration[] = [];
   for (const [name, t] of Object.entries(tools)) {
     registrations.push(await adaptTool(name, t as unknown as AiTool, options));
+  }
+  for (const reg of options.extra ?? []) {
+    const execute = reg.execute.bind(reg);
+    registrations.push({ ...reg, execute: (args, api, context) => (options.onCall?.(reg.name), execute(args, api, context)) } as ToolRegistration);
   }
   return defineExtension({ name: DODO_TOOLS_EXTENSION, tools: registrations });
 }

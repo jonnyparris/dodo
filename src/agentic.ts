@@ -10,7 +10,6 @@ import {
 } from "./agent-profile";
 import type { AttachmentRef } from "./attachments";
 import { MAX_READ_ATTACHMENT_CHARS } from "./attachments";
-import { createBrowserTools } from "./browser/tools";
 import { createWebFetchTools, type JevAi } from "./browser/web-fetch";
 import { chatMonitorIdName, sendChatReaction, sendChatReply } from "./chat-monitor-agent";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
@@ -288,8 +287,7 @@ export const KNOWN_ALWAYS_ON_TOOL_NAMES = [
  */
 export const KNOWN_CONDITIONAL_TOOL_NAMES = [
   "codemode",       // requires env.LOADER
-  "browser_search", // requires browser binding + admin + session config
-  "browser_execute",
+  "browser_execute", // pi-native (CodingAgent.piNativeTools): browser binding + LOADER + admin + session config
   "browser_markdown", // requires browser binding + admin + session config
   "browser_triage",
   "web_search",     // requires admin owner + WEB_SEARCH_GATEWAY_ID + AI.websearch
@@ -1728,24 +1726,8 @@ function buildTools(
     tools.set_goal_status = buildGoalStatusTool(options.parentAgent);
   }
 
-  // Browser tools — full CDP access via code-mode pattern.
-  // Two tools: browser_search (query the ~1.7MB CDP spec server-side) and
-  // browser_execute (run CDP commands against a live headless Chrome session).
-  // Gated on: BROWSER + LOADER bindings exist, session has browser enabled,
-  // AND the session owner is admin. Non-admin users get browser via the MCP
-  // path (which bills to their own Cloudflare account).
-  if (env.BROWSER && env.LOADER && options?.browserEnabled && options?.isAdminUser) {
-    const browserTools = createBrowserTools({
-      browser: env.BROWSER,
-      loader: env.LOADER,
-      timeout: 30_000,
-      env,
-      sessionId: options?.sessionId,
-      ownerEmail: options?.ownerEmail,
-      onAttachments: options?.onToolAttachments,
-    });
-    Object.assign(tools, browserTools);
-  }
+  // browser_execute is a pi-native tool (agents SDK Browser), added by
+  // CodingAgent.piNativeTools, not here.
 
   // Web fetch tools — read-only browsing via Browser Run quick actions with
   // Jev-calibrated verdicts. Same gating as the CDP tools minus LOADER

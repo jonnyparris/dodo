@@ -1107,6 +1107,11 @@
           </label>
           <span style="font-size:12px" id="browser-status">Loading...</span>
         </div>
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <button class="sm" onclick="openLiveBrowser()" title="Watch or take over the session's browser (logins, CAPTCHAs)">Open live browser</button>
+          <button class="sm danger" onclick="closeSessionBrowser()" title="Close the session's browser; the next browser call starts a fresh one">Close browser</button>
+        </div>
+        <span style="font-size:12px" id="browser-live-status"></span>
         <p class="field-help-tight">An admin must enable browser access for your account first. Configure credentials under Browser Rendering in the sidebar, or use the built-in browser (admin only).</p>
       </div>
 

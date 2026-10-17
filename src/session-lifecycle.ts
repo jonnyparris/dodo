@@ -176,11 +176,11 @@ export type AbortOutcome =
 
 /**
  * FiberDriver — the narrow port through which SessionLifecycle drives
- * Think fibers. Production: bound CodingAgent inherited methods. Test:
+ * prompt fibers. Production: CodingAgent over the SDK's startFiber. Test:
  * in-memory fake.
  */
 export interface FiberDriver {
-  spawnFiber(method: string, payload: unknown, opts?: { maxRetries?: number }): string;
+  spawnFiber(method: string, payload: unknown, opts?: { maxRetries?: number }): string | Promise<string>;
   cancelFiber(id: string): void;
   readPromptFiberId(promptId: string): string | null;
   setPromptFiberId(promptId: string, fiberId: string): void;
@@ -322,7 +322,7 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps): SessionLifec
       title,
       images: intent.images,
     };
-    const fiberId = deps.fibers.spawnFiber("runFiberPrompt", payload, {
+    const fiberId = await deps.fibers.spawnFiber("runFiberPrompt", payload, {
       maxRetries: policy.maxRetries,
     });
     deps.fibers.setPromptFiberId(promptId, fiberId);

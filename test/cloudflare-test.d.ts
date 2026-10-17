@@ -10,4 +10,6 @@ declare module "cloudflare:test" {
     callback: (instance: O, state: DurableObjectState) => R | Promise<R>,
   ): Promise<R>;
   export function runDurableObjectAlarm(stub: DurableObjectStub): Promise<boolean>;
+  /** Evict a running Durable Object (vitest-pool-workers >= 0.2x). */
+  export function evictDurableObject(stub: DurableObjectStub, options?: { webSockets?: "close" | "keep" }): Promise<void>;
 }

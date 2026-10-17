@@ -3,7 +3,7 @@
 // persistence, session details, /debug/compaction), and legacy sessions that
 // must stay on Think.
 
-import { createExecutionContext, runDurableObjectAlarm, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, evictDurableObject, runDurableObjectAlarm, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { getAgentByName } from "agents";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -214,13 +214,92 @@ describe("pi is the default engine", () => {
     const res = await send(`/session/${id}/cron`, { type: "delayed", delayInSeconds: 1, description: "probe", prompt: "cron says hi" });
     expect(res.status).toBeLessThan(300);
     await new Promise((r) => setTimeout(r, 1100));
-    expect(await runDurableObjectAlarm(await agent(id))).toBe(true);
+    // Newer miniflare fires due alarms itself; run it by hand in case it hasn't.
+    await runDurableObjectAlarm(await agent(id));
     for (let i = 0; i < 200; i++) {
       const { prompts } = await json<{ prompts: Array<{ content: string; status: string }> }>(await call(`/session/${id}/prompts`));
       if (prompts.some((p) => p.content.includes("cron says hi") && p.status === "completed")) return;
       await new Promise((r) => setTimeout(r, 10));
     }
     throw new Error("cron prompt never ran");
+  });
+
+  it("sessions with agents 0.8.7 fiber rows (experimental/forever schema) still wake and run prompts", async () => {
+    const id = await newSession();
+    const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<T>) => Promise<T>;
+    await inDO(await agent(id), async (_i, state) => {
+      // Replace the new table with the exact 0.8.7 one: a finished fiber and
+      // one cut off mid-prompt by the deploy.
+      state.storage.sql.exec("DROP TABLE cf_agents_fibers");
+      state.storage.sql.exec(`CREATE TABLE cf_agents_fibers (
+        id TEXT PRIMARY KEY NOT NULL, callback TEXT NOT NULL, payload TEXT, snapshot TEXT,
+        status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed', 'interrupted', 'cancelled')),
+        retry_count INTEGER NOT NULL DEFAULT 0, max_retries INTEGER NOT NULL DEFAULT 3, result TEXT, error TEXT,
+        started_at INTEGER, updated_at INTEGER, completed_at INTEGER, created_at INTEGER NOT NULL)`);
+      state.storage.sql.exec("INSERT INTO cf_agents_fibers (id, callback, payload, status, created_at) VALUES ('old-done', 'runFiberPrompt', '{}', 'completed', 1)");
+      state.storage.sql.exec("INSERT INTO cf_agents_fibers (id, callback, payload, status, created_at) VALUES ('old-run', 'runFiberPrompt', '{}', 'running', 2)");
+      state.storage.sql.exec("INSERT INTO prompts (id, session_id, content, status, created_at, updated_at, fiber_id) VALUES ('p-old', 's', 'mid-deploy prompt', 'running', 2, 2, 'old-run')");
+      state.storage.sql.exec("INSERT OR REPLACE INTO metadata (key, value, updated_at) VALUES ('active_prompt_id', 'p-old', 1), ('status', 'running', 1)");
+      // agents 0.8.7 kept its schema version (2) as a cf_agents_state row.
+      state.storage.kv.delete("cf_agents:schema_version");
+      state.storage.sql.exec("INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_schema_version', '2')");
+    });
+    await evictDurableObject(await agent(id));
+    // The prompt the deploy cut off is failed with a clear reason, not stuck "running".
+    const before = await json<{ prompts: Array<{ id: string; status: string; error?: string }> }>(await call(`/session/${id}/prompts`));
+    const old = before.prompts.find((p) => p.id === "p-old");
+    expect(old?.status).toBe("failed");
+    expect(old?.error).toMatch(/upgrade/i);
+    // And the session works: a new prompt runs to completion on the new fibers.
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "after upgrade" }));
+    expect((await waitForPrompt(id, promptId)).status).toBe("completed");
+    await inDO(await agent(id), async (_i, state) => {
+      const cols = Array.from(state.storage.sql.exec("SELECT name FROM pragma_table_info('cf_agents_fibers')")).map((r) => r.name);
+      expect(cols).toContain("fiber_id");
+    });
+  });
+
+  it("crons written by agents 0.8.7 (cf_agents_schedules) survive the upgrade and still fire", async () => {
+    const id = await newSession();
+    const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<T>) => Promise<T>;
+    const due = Math.floor(Date.now() / 1000) + 2;
+    const future = Math.floor(Date.now() / 1000) + 86_400;
+    await inDO(await agent(id), async (_i, state) => {
+      // The exact 0.8.7 schema and row shapes (epoch seconds).
+      state.storage.sql.exec(`CREATE TABLE IF NOT EXISTS cf_agents_schedules (
+        id TEXT PRIMARY KEY NOT NULL DEFAULT (randomblob(9)), callback TEXT, payload TEXT,
+        type TEXT NOT NULL CHECK(type IN ('scheduled', 'delayed', 'cron', 'interval')),
+        time INTEGER, delayInSeconds INTEGER, cron TEXT, intervalSeconds INTEGER, running INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (unixepoch()), execution_started_at INTEGER, retry_options TEXT)`);
+      state.storage.sql.exec("INSERT INTO cf_agents_schedules (id, callback, payload, type, time, delayInSeconds) VALUES ('legacy-1', 'runCronPrompt', ?, 'delayed', ?, 2)",
+        JSON.stringify({ description: "legacy", prompt: "legacy cron hi" }), due);
+      state.storage.sql.exec("INSERT INTO cf_agents_schedules (id, callback, payload, type, time, cron) VALUES ('legacy-2', 'runCronPrompt', ?, 'cron', ?, '0 9 * * *')",
+        JSON.stringify({ description: "daily", prompt: "daily hi" }), future);
+      for (const [sid, d, p] of [["legacy-1", "legacy", "legacy cron hi"], ["legacy-2", "daily", "daily hi"]]) {
+        state.storage.sql.exec("INSERT INTO cron_jobs (schedule_id, description, prompt, created_at) VALUES (?, ?, ?, 1)", sid, d, p);
+      }
+    });
+    // A 0.8.7 object has no schedule schema version yet.
+    await inDO(await agent(id), async (_i, state) => { await state.storage.delete("cf_agents:schedules_schema_version"); });
+    // Evict: the next wake runs Lifecycle startup, which migrates the table.
+    await evictDurableObject(await agent(id));
+    const { jobs } = await json<{ jobs: Array<{ id: string; nextRunAt: string | null; scheduleType: string }> }>(await call(`/session/${id}/cron`));
+    const byId = Object.fromEntries(jobs.map((j) => [j.id, j]));
+    expect(Object.keys(byId).sort()).toEqual(["legacy-1", "legacy-2"]);
+    expect(byId["legacy-2"]!.scheduleType).toBe("cron");
+    // nextRunAt must still be a sane date (ms vs s mixups land in 1970 or year 50000+).
+    expect(Math.abs(Date.parse(byId["legacy-2"]!.nextRunAt!) - future * 1000)).toBeLessThan(60_000);
+    await inDO(await agent(id), async (_i, state) => {
+      expect(Array.from(state.storage.sql.exec("SELECT name FROM sqlite_master WHERE name = 'cf_agents_schedules'"))).toEqual([]);
+    });
+    await new Promise((r) => setTimeout(r, 2100));
+    await runDurableObjectAlarm(await agent(id));
+    for (let i = 0; i < 300; i++) {
+      const { prompts } = await json<{ prompts: Array<{ content: string; status: string }> }>(await call(`/session/${id}/prompts`));
+      if (prompts.some((p) => p.content.includes("legacy cron hi") && p.status === "completed")) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("legacy cron never ran");
   });
 
   it("a one-off cron job due while a prompt runs is queued, then runs", async () => {

@@ -27,6 +27,9 @@ import { dispatchNotification } from "./notify";
 import { entriesToMessages, PiEngine, type PiUserContent } from "./pi/engine";
 import { agentModelRef, setDodoProvider } from "./pi/models";
 import { buildToolsExtension } from "./pi/tools";
+import type { Browser } from "agents/browser";
+import type { ToolRegistration } from "@earendil-works/pi-durable";
+import { BROWSER_TOOL_NAME, createBrowserExecuteTool, createSessionBrowser } from "./browser/session-browser";
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
 import { assembleSystemPrompt } from "./prompt-composer";
@@ -60,7 +63,7 @@ import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
 import { DodoAgentBase } from "./agent-base";
 import { classifyImageIntent } from "./clef";
-import type { FiberCompleteContext, FiberRecoveryContext } from "agents/experimental/forever";
+import type { FiberContext, FiberRecoveryContext, FiberRecoveryResult } from "agents";
 import type { SnapshotV2 } from "./transcript";
 import {
   chatRecordToUIMessage,
@@ -629,8 +632,6 @@ export class CodingAgent extends CodingAgentBase {
             ctx: this.ctx,
             // Byte-safe redirects (upstream adapter drops "binary"); see shell-patch.ts.
             commands: [byteSafeShellModules()],
-            // Test-only: vitest's workerd is older than computer's default date.
-            ...(this.env.SHELL_COMPATIBILITY_DATE ? { compatibilityDate: this.env.SHELL_COMPATIBILITY_DATE } : {}),
           }),
         ],
         sessionId: this.ctx.id.toString(),
@@ -676,7 +677,7 @@ export class CodingAgent extends CodingAgentBase {
    * src/session-lifecycle.ts. Consumes the four stores above plus a
    * FiberDriver adapter over Think's inherited fiber methods.
    */
-  private readonly lifecycle: SessionLifecycle;
+  private readonly sessionLifecycle: SessionLifecycle;
 
   /** The computer Workspace instance backing the single store. */
   private get computerWorkspace(): WorkspaceComputer {
@@ -695,9 +696,20 @@ export class CodingAgent extends CodingAgentBase {
     return ws.stub();
   }
 
+  /**
+   * The session's persistent browser (src/browser/session-browser.ts),
+   * driven by browser_execute. Installed on the agents Lifecycle so its
+   * record lives in this DO's storage.
+   */
+  readonly browser?: Browser;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.initializeSchema();
+    if (env.BROWSER) {
+      this.browser = createSessionBrowser(env.BROWSER as unknown as Fetcher);
+      this.lifecycle.use(this.browser);
+    }
 
     // ─── The ONE workspace store ───
     //
@@ -733,13 +745,13 @@ export class CodingAgent extends CodingAgentBase {
     this.goalStore = createGoalStateStore(this.metadataKv);
     this.watchdogStore = createWatchdogState(this.metadataKv);
 
-    this.lifecycle = createSessionLifecycle({
+    this.sessionLifecycle = createSessionLifecycle({
       control: this.control,
       goal: this.goalStore,
       fibers: {
-        spawnFiber: (method, payload, opts) =>
-          this.spawnFiber(method as never, payload as never, opts),
-        cancelFiber: (id) => this.cancelFiber(id),
+        spawnFiber: (_method, payload, opts) =>
+          this.spawnPromptFiber(payload as FiberPromptPayload, { maxRetries: opts?.maxRetries ?? 0, attempt: 0 }),
+        cancelFiber: (id) => void this.cancelFiber(id, "Prompt aborted"),
         readPromptFiberId: (promptId) => this.readPromptFiberId(promptId),
         setPromptFiberId: (promptId, fiberId) => this.setPromptFiberId(promptId, fiberId),
       },
@@ -797,32 +809,19 @@ export class CodingAgent extends CodingAgentBase {
           "",
           "You have full browser automation via the Chrome DevTools Protocol (CDP).",
           "",
-          "**Four tools:**",
+          "**Three tools:**",
           "- `browser_markdown` — Fetch a page or document (HTML, PDF, Office, JSON) as markdown. Read-only. Plain fetch first, Browser Run only if the site blocks it or needs JavaScript. Long pages are windowed: call again with `offset: nextOffset` to read on. Pass `query` to also get a calibrated `hasAnswer` probability telling you whether the window answers your question.",
           "- `browser_triage` — Rank up to 8 candidate URLs by likely relevance BEFORE fetching anything. Calibrated probabilities, no page loads.",
-          "- `browser_search` — Write JS to query the CDP spec (~1.7MB, stays server-side). Use this to discover available commands, events, and types before executing them.",
-          "- `browser_execute` — Write JS using a `cdp` helper to run CDP commands against a live headless Chrome session. The browser is kept alive ~3 minutes between calls in this session and reused with the page where you left it.",
+          "- `browser_execute` — Drive this session's persistent Chrome with JavaScript and a `cdp` global (its description has the full API). Tabs, cookies and logins carry over between calls; `restarted: true` means the browser was replaced and earlier tabs are gone.",
           "",
           "**Which tool when:**",
-          "Read-only text (docs, articles, search results) → `browser_triage` (if choosing between URLs) → `browser_markdown`. Interactive pages, screenshots, DOM inspection, clicks → `browser_execute`.",
+          "Read-only text (docs, articles, search results) → `browser_triage` (if choosing between URLs) → `browser_markdown`. Interactive pages, screenshots, DOM inspection, clicks, logins → `browser_execute`.",
           "",
-          "**`browser_execute` pattern:**",
-          "If the result starts with \"[Browser reused ...]\" the page from your previous call is still open; continue from it.",
-          "Otherwise a fresh browser with a blank page was launched. Either way the CDP session is already attached to the page,",
-          "so you can send page-scoped commands directly (re-enable CDP domains each call):",
-          '1. Enable domains: `cdp.send("Page.enable")`',
-          '2. Navigate: `cdp.send("Page.navigate", { url: "..." })`',
-          '3. Wait for load, then act: `cdp.send("Page.captureScreenshot", { format: "png" })`',
-          "",
-          "**Common tasks:**",
-          "- Read-only page text: `browser_markdown` — prefer over browser_execute for pure reading",
-          '- Navigate + get text: `Page.navigate` → `Runtime.evaluate` with `document.body.innerText`',
-          '- Screenshot: `Page.captureScreenshot` → returns base64 PNG',
-          '- Click/type: `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`',
-          '- Network: `Network.enable` → intercept/monitor requests',
-          '- DOM inspection: `DOM.getDocument` → `DOM.querySelectorAll`',
-          "",
-          "Always use `browser_search` first if you're unsure which CDP method to use.",
+          "**`browser_execute` notes:**",
+          '- `cdp.send({ method, params, sessionId: "active" })` targets the tab you are working in; it is remembered across calls.',
+          "- To see a screenshot, return `{ type: \"browser_screenshot\", mediaType, data }` as the whole return value of its own call (not nested in another object, where the data is stripped). It is shown in the chat; you see it too if your model accepts images, otherwise check it with `image_check` on the attachment URL or read the page with `Runtime.evaluate`.",
+          "- One `cdp.send` result is capped at 1 MB: capture the viewport or use JPEG, not a full long page.",
+          "- If a login, CAPTCHA or MFA needs a human: leave the page on that step and ask the user to open **Settings → Browser Tools → Open live browser**, act in it, and reply when done. Then continue in the same tab.",
         ].join("\n")
       : undefined;
 
@@ -1248,28 +1247,7 @@ export class CodingAgent extends CodingAgentBase {
       // the same images. Persisted under `message_id = toolCallId` initially;
       // `runThinkChat` rebinds the rows to the assistant message id after
       // the stream completes.
-      onToolAttachments: (toolCallId, attachments) => {
-        this._toolAttachments.set(toolCallId, attachments);
-        for (const a of attachments) {
-          this.insertMessageAttachment({
-            messageId: toolCallId,
-            toolCallId,
-            mediaType: a.mediaType,
-            url: a.url,
-            size: a.size,
-            source: "tool",
-          });
-        }
-        this.emitEvent({
-          data: {
-            toolCallId,
-            attachments: rewriteAttachmentsForClient(
-              attachments.map((a) => ({ mediaType: a.mediaType, url: a.url, size: a.size })),
-            ),
-          },
-          type: "tool_attachments",
-        });
-      },
+      onToolAttachments: (toolCallId, attachments) => this.recordToolAttachments(toolCallId, attachments),
       stateBackend: this.stateBackend,
       shellRuntime: this.computerWorkspace.runtime as unknown as WorkspaceRuntimeClient,
       mcpGatekeepers: this.mcpGatekeepers,
@@ -1362,7 +1340,7 @@ export class CodingAgent extends CodingAgentBase {
     const authorEmail = next.author_email ? String(next.author_email) : null;
     this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", queuedId);
     this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
-    await this.lifecycle.start({ source: "queue", content, authorEmail });
+    await this.sessionLifecycle.start({ source: "queue", content, authorEmail });
   }
 
   async onRequest(request: Request): Promise<Response> {
@@ -1620,6 +1598,14 @@ export class CodingAgent extends CodingAgentBase {
         const enabled = this.browserEnabled();
         const sid = this.sessionId() || request.headers.get("x-dodo-session-id") || "";
         return Response.json({ browserEnabled: enabled, sessionId: sid });
+      }
+
+      if (url.pathname === "/browser/live") {
+        if (!this.browser) return Response.json({ error: "No browser binding" }, { status: 404 });
+        if (request.method === "DELETE") return Response.json({ closed: await this.browser.close() });
+        const view = await this.browser.liveView({ mode: "tab" });
+        if (!view) return Response.json({ error: "No browser running in this session. It starts on the first browser_execute call." }, { status: 404 });
+        return Response.json(view, { headers: { "cache-control": "no-store" } });
       }
 
       if (request.method === "PUT" && url.pathname === "/browser") {
@@ -1925,7 +1911,7 @@ export class CodingAgent extends CodingAgentBase {
           connection.send(JSON.stringify({ type: "error", error: "Session not initialized" }));
           return;
         }
-        const r = await this.lifecycle.start({ source: "user", content, authorEmail: entry?.email });
+        const r = await this.sessionLifecycle.start({ source: "user", content, authorEmail: entry?.email });
         if (r.kind === "rejected") {
           connection.send(JSON.stringify({ type: "error", error: r.message }));
         } else if (r.kind === "queued") {
@@ -1937,7 +1923,7 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       case "abort": {
-        const r = await this.lifecycle.abortActive();
+        const r = await this.sessionLifecycle.abortActive();
         if (r.kind === "noop") {
           connection.send(JSON.stringify({ type: "error", error: "No active prompt" }));
         } else {
@@ -2853,7 +2839,7 @@ export class CodingAgent extends CodingAgentBase {
     if (verdict.recommend === "nudge") {
       const nudge = config.nudgePrompt ?? DEFAULT_NUDGE_PROMPT;
       try {
-        await this.lifecycle.start({ source: "watchdog", content: nudge });
+        await this.sessionLifecycle.start({ source: "watchdog", content: nudge });
       } catch (err) {
         log("warn", "watchdog: nudge dispatch failed", { sessionId, err: err instanceof Error ? err.message : String(err) });
       }
@@ -2892,7 +2878,7 @@ export class CodingAgent extends CodingAgentBase {
     // runs is queued: skipping it would lose it for good. Recurring jobs
     // (cron / interval) still skip a busy tick so they don't pile up.
     const oneOff = schedule?.type === "delayed" || schedule?.type === "scheduled";
-    await this.lifecycle.start({ source: "cron", content: payload.prompt, ...(oneOff ? { onBusy: "queue" as const } : {}) });
+    await this.sessionLifecycle.start({ source: "cron", content: payload.prompt, ...(oneOff ? { onBusy: "queue" as const } : {}) });
   }
 
   private listCronJobs(): CronJobRecord[] {
@@ -3163,7 +3149,7 @@ export class CodingAgent extends CodingAgentBase {
       return this.runImageGeneration({ prompt: input.content, sessionId, authorEmail, ownerEmail, images: editImages });
     }
 
-    const r = await this.lifecycle.start({
+    const r = await this.sessionLifecycle.start({
       source: "user",
       content: input.content,
       authorEmail,
@@ -3249,7 +3235,7 @@ export class CodingAgent extends CodingAgentBase {
     // Start a synchronous prompt via lifecycle. image-gen's policy rejects
     // when busy (matches the pre-refactor 409 behaviour) and uses
     // synchronous=true so no fiber is spawned — we run inline below.
-    const startResult = await this.lifecycle.start({
+    const startResult = await this.sessionLifecycle.start({
       source: "image-gen",
       content: opts.prompt,
       authorEmail: opts.authorEmail,
@@ -3431,7 +3417,7 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   private async handleAbort(): Promise<Response> {
-    const r = await this.lifecycle.abortActive();
+    const r = await this.sessionLifecycle.abortActive();
     if (r.kind === "noop") {
       return Response.json({ error: "No active prompt" }, { status: 409 });
     }
@@ -3443,25 +3429,25 @@ export class CodingAgent extends CodingAgentBase {
   /**
    * Legacy thin wrapper kept so call sites in runFiberPrompt /
    * runImageGeneration / onFiberComplete still compile. New code should
-   * call `this.lifecycle.finish(...)` directly with a typed FinishCause.
+   * call `this.sessionLifecycle.finish(...)` directly with a typed FinishCause.
    */
   private async finishPrompt(
     promptId: string,
     patch: { error?: string; resultMessageId?: string; status: PromptRecord["status"]; text?: string },
   ): Promise<void> {
     if (patch.status === "completed") {
-      await this.lifecycle.finish(promptId, {
+      await this.sessionLifecycle.finish(promptId, {
         kind: "completed",
         resultMessageId: patch.resultMessageId,
         text: patch.text,
       });
     } else if (patch.status === "failed") {
-      await this.lifecycle.finish(promptId, {
+      await this.sessionLifecycle.finish(promptId, {
         kind: "failed",
         error: patch.error ?? "Prompt failed",
       });
     } else {
-      await this.lifecycle.finish(promptId, {
+      await this.sessionLifecycle.finish(promptId, {
         kind: "aborted",
         reason: patch.error,
       });
@@ -3490,12 +3476,30 @@ export class CodingAgent extends CodingAgentBase {
 
   // ─── Fiber-aware prompt execution ───
 
+
   /**
-   * Fiber-aware async prompt. Uses stashFiber() checkpoints so that
-   * if the DO is evicted mid-chat, recovery replays from the top and
-   * skips already-completed work.
+   * Start a prompt fiber. The payload rides in the fiber metadata so
+   * onFiberRecovered can start it again after an eviction (the SDK can't
+   * replay a closure). `resume` carries the interrupted run's checkpoint.
    */
-  async runFiberPrompt(payload: FiberPromptPayload): Promise<void> {
+  private async spawnPromptFiber(
+    payload: FiberPromptPayload,
+    retry: { maxRetries: number; attempt: number },
+    resume?: PromptFiberSnapshot | null,
+  ): Promise<string> {
+    const r = await this.startFiber("runFiberPrompt", (ctx) => this.runFiberPrompt(payload, ctx, resume), {
+      metadata: { promptId: payload.promptId, payload, ...retry },
+    });
+    return r.fiberId;
+  }
+
+  /**
+   * Fiber-aware async prompt. Checkpoints (ctx.stash) after the chat
+   * finishes, so a run recovered after eviction skips straight to
+   * finalization; a run cut off mid-chat re-enters runPiChat, which
+   * reattaches to the same pi prompt id.
+   */
+  async runFiberPrompt(payload: FiberPromptPayload, fiber?: FiberContext, resume?: PromptFiberSnapshot | null): Promise<void> {
     const { promptId, content, images, authorEmail, title } = payload;
 
     // If the prompt was aborted (or otherwise finished) before the fiber
@@ -3515,22 +3519,19 @@ export class CodingAgent extends CodingAgentBase {
     // Refresh the session config from the latest account config before each prompt run.
     await this.readAppConfig();
 
-    // Check fiber snapshot — if chat already completed, skip to finalization
-    const fiberId = this.readPromptFiberId(promptId);
-    if (fiberId) {
-      const fiber = this.getFiber(fiberId);
-      const snapshot = fiber?.snapshot as { chatCompleted?: boolean; assistantMessageId?: string; text?: string; tokenInput?: number; tokenOutput?: number } | null;
-      if (snapshot?.chatCompleted) {
-        // Chat completed before eviction — just finalize
-        await this.finalizePromptFromFiber(promptId, title, snapshot);
-        return;
-      }
+    // Chat completed before an eviction: just finalize.
+    const snapshot = resume ?? (fiber?.snapshot as PromptFiberSnapshot | null | undefined);
+    if (snapshot?.chatCompleted) {
+      await this.finalizePromptFromFiber(promptId, title, snapshot);
+      return;
     }
 
-    // Phase 1: Run chat via Think
-    // Create an AbortController so handleAbort() can interrupt the running LLM call
+    // Phase 1: run the chat. handleAbort() aborts this controller; a
+    // cancelFiber() aborts the fiber signal, which we forward.
     this._fiberAbortController = new AbortController();
     const signal = this._fiberAbortController.signal;
+    const controller = this._fiberAbortController;
+    fiber?.signal.addEventListener("abort", () => controller.abort(), { once: true });
     try {
       await this.migrateThinkSessionToPi();
       const result = await this.runPiChat(content, { promptId, authorEmail, signal, images });
@@ -3565,7 +3566,7 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       // Phase 2: Checkpoint immediately after chat completes
-      this.stashFiber({
+      fiber?.stash({
         chatCompleted: true,
         assistantMessageId: result.assistantMessageId,
         text: result.text,
@@ -3617,7 +3618,7 @@ export class CodingAgent extends CodingAgentBase {
     );
 
     this.emitEvent({ data: assistantRecord, type: "message" });
-    await this.lifecycle.finish(promptId, {
+    await this.sessionLifecycle.finish(promptId, {
       kind: "completed",
       resultMessageId: snapshot.assistantMessageId,
       text,
@@ -3680,7 +3681,7 @@ export class CodingAgent extends CodingAgentBase {
       attempt: prior + 1,
     });
     const ownerEmail = this.readMetadata("owner_email") ?? undefined;
-    await this.lifecycle.start({
+    await this.sessionLifecycle.start({
       source: "user",
       content:
         `[System nudge — not from a human in chat]\n\n` +
@@ -3727,48 +3728,39 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   /**
-   * Called when a fiber recovers after DO eviction.
-   * Updates the prompt status to "recovering" and emits an event.
+   * An eviction interrupted a prompt fiber. Start it again with the last
+   * checkpoint (bounded by the source policy's maxRetries), or fail the
+   * prompt once retries run out.
    */
-  async onFiberRecovered(ctx: FiberRecoveryContext): Promise<void> {
-    // Find the prompt associated with this fiber
-    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM prompts WHERE fiber_id = ?", ctx.id))[0] as SqlRow | null);
-    if (row) {
-      const promptId = String(row.id);
-      this.updatePrompt(promptId, { status: "running" });
-      this.writeMetadata("active_prompt_id", promptId);
-      this.writeMetadata("status", "running");
+  async onFiberRecovered(ctx: FiberRecoveryContext): Promise<void | FiberRecoveryResult> {
+    if (ctx.name !== "runFiberPrompt") return;
+    const meta = (ctx.metadata ?? {}) as { promptId?: string; payload?: FiberPromptPayload; maxRetries?: number; attempt?: number };
+    const promptId = meta.promptId;
+    if (!promptId || !meta.payload) return { status: "error", error: "prompt fiber metadata missing" };
+    const statusRow = Array.from(this.ctx.storage.sql.exec<{ status: string }>("SELECT status FROM prompts WHERE id = ?", promptId))[0];
+    if (!statusRow || (statusRow.status !== "queued" && statusRow.status !== "running")) {
+      return { status: "completed", snapshot: ctx.snapshot };
+    }
+    const attempt = (meta.attempt ?? 0) + 1;
+    if (attempt > (meta.maxRetries ?? 0)) {
+      await this.finishPrompt(promptId, { error: "Prompt interrupted too many times (Durable Object restarts)", status: "failed" });
+      await this.syncSessionIndex({ status: "idle" });
       this.emitEvent({ data: this.listPrompts(), type: "prompt" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      return { status: "error", error: "retries exhausted" };
     }
-
-    // Default behavior: restart the fiber
-    this.restartFiber(ctx.id);
-  }
-
-  /**
-   * Called when a fiber completes (success, failure, or cancellation).
-   */
-  async onFiberComplete(ctx: FiberCompleteContext): Promise<void> {
-    // Find the associated prompt
-    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, status FROM prompts WHERE fiber_id = ?", ctx.id))[0] as SqlRow | null);
-    if (!row) return;
-
-    const promptId = String(row.id);
-    const fiber = this.getFiber(ctx.id);
-
-    if (fiber?.status === "cancelled") {
-      // lifecycle.finish dispatches the prompt-aborted notification per policy
-      await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
-    } else if (fiber?.status === "failed") {
-      const error = fiber.error ?? "Prompt failed after max retries";
-      // lifecycle.finish dispatches the prompt-error notification per policy
-      await this.finishPrompt(promptId, { error, status: "failed" });
-    }
-
-    await this.syncSessionIndex({ status: "idle" });
+    this.updatePrompt(promptId, { status: "running" });
+    this.writeMetadata("active_prompt_id", promptId);
+    this.writeMetadata("status", "running");
     this.emitEvent({ data: this.listPrompts(), type: "prompt" });
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    const fiberId = await this.spawnPromptFiber(
+      meta.payload,
+      { maxRetries: meta.maxRetries ?? 0, attempt },
+      ctx.snapshot as PromptFiberSnapshot | null,
+    );
+    this.setPromptFiberId(promptId, fiberId);
+    return { status: "completed", snapshot: { resumedAs: fiberId } };
   }
 
   // ─── Think chat integration ───
@@ -4400,6 +4392,54 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   /**
+   * Tool-produced attachments (screenshots): remember them for this turn,
+   * persist under the tool call id (runPiChat rebinds them to the answer),
+   * and push them to the chat live.
+   */
+  private recordToolAttachments(toolCallId: string, attachments: AttachmentRef[]): void {
+    this._toolAttachments.set(toolCallId, [...(this._toolAttachments.get(toolCallId) ?? []), ...attachments]);
+    for (const a of attachments) {
+      this.insertMessageAttachment({ messageId: toolCallId, toolCallId, mediaType: a.mediaType, url: a.url, size: a.size, source: "tool" });
+    }
+    this.emitEvent({
+      data: {
+        toolCallId,
+        attachments: rewriteAttachmentsForClient(attachments.map((a) => ({ mediaType: a.mediaType, url: a.url, size: a.size }))),
+      },
+      type: "tool_attachments",
+    });
+  }
+
+  /**
+   * Tools written for pi directly (not adapted from AI SDK tools).
+   * browser_execute: same gating as before (bindings, session browser on,
+   * admin owner; others get browsers via MCP on their own account).
+   */
+  private piNativeTools(): ToolRegistration[] {
+    const ownerEmail = this.readMetadata("owner_email") ?? undefined;
+    if (!this.browser || !this.env.LOADER || !this.browserEnabled() || !isAdmin(ownerEmail ?? null, this.env)) return [];
+    return [
+      createBrowserExecuteTool({
+        ctx: this.ctx,
+        browser: this.browser,
+        loader: this.env.LOADER,
+        onScreenshot: async (callId, image) => {
+          const ref = await uploadAttachment(this.env, {
+            sessionId: this.sessionId(),
+            messageId: `toolcall-${callId}`,
+            mediaType: image.mediaType,
+            data: image.data,
+            ownerEmail,
+            source: "tool",
+            toolName: BROWSER_TOOL_NAME,
+          });
+          if (ref) this.recordToolAttachments(callId, [ref]);
+        },
+      }),
+    ];
+  }
+
+  /**
    * Run a turn on pi-durable. Same contract as runThinkChat. On fiber
    * recovery after an eviction this reattaches to the durable submission
    * for `promptId` — completed steps are not redone, the user turn is not
@@ -4413,7 +4453,10 @@ export class CodingAgent extends CodingAgentBase {
     await this.warmTurnContext();
     this._toolAttachments.clear();
     this._toolCallNames.clear();
-    const tools = await buildToolsExtension(this.getTools(), { onCall: (name) => this._toolCallNames.add(name) });
+    const tools = await buildToolsExtension(this.getTools(), {
+      onCall: (name) => this._toolCallNames.add(name),
+      extra: this.piNativeTools(),
+    });
     const result = await this.piEngine().run({
       promptId: options.promptId,
       tools,
@@ -6193,6 +6236,8 @@ export function stripTokenExpiry(token: string): string {
 }
 
 /** UIMessage parts (Dodo's prepared user turn) → pi user content. */
+type PromptFiberSnapshot = { chatCompleted?: boolean; assistantMessageId?: string; text?: string; tokenInput?: number; tokenOutput?: number };
+
 export function uiPartsToPiContent(parts: UIMessage["parts"]): PiUserContent {
   const out: Exclude<PiUserContent, string> = [];
   for (const part of parts) {

@@ -280,7 +280,7 @@ app.all("/mcp", async (c) => {
 
   const server = createDodoMcpServer(c.env, resolved.email, depth);
   const handler = createMcpHandler(server);
-  return handler(c.req.raw, c.env, c.executionCtx);
+  return handler(c.req.raw, c.env, c.executionCtx as unknown as ExecutionContext<unknown>);
 });
 
 // Code-mode MCP: 2 tools (search + execute) instead of 40+.
@@ -313,7 +313,7 @@ app.all("/mcp/codemode", async (c) => {
   // createMcpHandler defaults route to "/mcp" and rejects anything else with
   // 404 — pass the actual mounted route so POSTs to /mcp/codemode are accepted.
   const handler = createMcpHandler(server, { route: "/mcp/codemode" });
-  return handler(c.req.raw, c.env, c.executionCtx);
+  return handler(c.req.raw, c.env, c.executionCtx as unknown as ExecutionContext<unknown>);
 });
 
 // ─── Health (no auth) ───
@@ -637,7 +637,7 @@ app.delete("/api/admin/errors", adminGuard as never, async (c) => proxyToSharedI
 // ─── Admin: health check (manual trigger) ───
 
 app.post("/api/admin/health-check", adminGuard as never, async (c) => {
-  const report = await runHealthCheck(c.env, c.executionCtx);
+  const report = await runHealthCheck(c.env, c.executionCtx as unknown as ExecutionContext<unknown>);
   return c.json(report);
 });
 
@@ -2665,6 +2665,21 @@ app.put("/session/:id/browser", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser", { "x-owner-email": ownerEmail });
 });
 
+// Live View into the session's persistent browser (agents SDK Browser).
+// The URLs are short-lived bearer credentials for a browser holding this
+// session's cookies: session-admin only, minted on demand, never stored.
+app.get("/session/:id/browser/live", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser/live");
+});
+
+app.delete("/session/:id/browser/live", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser/live");
+});
+
 app.post("/session/:id/cron", async (c) => {
   const denied = requirePermission(c, "write");
   if (denied) return denied;
@@ -2955,3 +2970,6 @@ export default {
     await runHealthCheck(env, ctx);
   },
 };
+
+// browser_execute runs model code in a codemode Durable Object facet.
+export { CodemodeRuntime } from "agents/browser";

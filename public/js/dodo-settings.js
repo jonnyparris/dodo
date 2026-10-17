@@ -590,6 +590,34 @@ async function loadBrowserStatus(){
   }
 }
 
+async function openLiveBrowser(){
+  if(!currentSession)return;
+  const status=$("browser-live-status");
+  // Open the window first (popup blockers allow it inside the click).
+  const win=window.open("about:blank","_blank");
+  try{
+    const view=await api(`/session/${currentSession}/browser/live`);
+    const tabs=(view.targets||[]).filter(t=>t.pageUrl&&!/^(about:|chrome:)/.test(t.pageUrl));
+    const target=tabs[tabs.length-1]||(view.targets||[])[0];
+    if(!target){win&&win.close();status.textContent="Browser has no open tabs.";return;}
+    if(win)win.location.href=target.url;else window.open(target.url,"_blank");
+    status.textContent=`Opened ${target.title||target.pageUrl||"tab"} (link valid ~5 min).`;
+  }catch(e){
+    win&&win.close();
+    status.textContent=(e&&e.message)||"No browser running in this session yet.";
+  }
+}
+
+async function closeSessionBrowser(){
+  if(!currentSession)return;
+  try{
+    const r=await api(`/session/${currentSession}/browser/live`,{method:"DELETE"});
+    $("browser-live-status").textContent=r.closed?"Browser closed.":"No browser was running.";
+  }catch(e){
+    $("browser-live-status").textContent=(e&&e.message)||"Close failed.";
+  }
+}
+
 async function toggleBrowser(){
   if(!currentSession)return;
   const enabled=$("browser-toggle").checked;
