@@ -174,6 +174,14 @@ describe("SessionLifecycle.start", () => {
     expect(h.events.filter((e) => e.type === "state")).toHaveLength(0);
   });
 
+  it("one-off cron (onBusy: queue) queues when busy, labelled cron", async () => {
+    const h = makeLifecycle({ initialKv: { active_prompt_id: "p1", status: "running" } });
+    const r = await h.lifecycle.start({ source: "cron", content: "one-off", onBusy: "queue" });
+    expect(r.kind).toBe("queued");
+    expect(h.promptQueue).toHaveLength(1);
+    expect(h.spawned).toHaveLength(0);
+  });
+
   it("cron: skips silently when busy", async () => {
     const h = makeLifecycle({ initialKv: { active_prompt_id: "p1", status: "running" } });
     const r = await h.lifecycle.start({ source: "cron", content: "cron body" });

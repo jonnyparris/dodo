@@ -222,6 +222,23 @@ describe("pi is the default engine", () => {
     throw new Error("cron prompt never ran");
   });
 
+  it("a one-off cron job due while a prompt runs is queued, then runs", async () => {
+    const id = await newSession();
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "slow async prompt" }));
+    await send(`/session/${id}/cron`, { type: "delayed", delayInSeconds: 1, description: "probe", prompt: "queued cron hi" });
+    await new Promise((r) => setTimeout(r, 1100));
+    await runDurableObjectAlarm(await agent(id));
+    const queue = await json<{ queue?: unknown[]; items?: unknown[] }>(await call(`/session/${id}/queue`)).catch(() => null);
+    releaseMockSlowPrompt();
+    expect((await waitForPrompt(id, promptId)).status).toBe("completed");
+    for (let i = 0; i < 300; i++) {
+      const { prompts } = await json<{ prompts: Array<{ content: string; status: string }> }>(await call(`/session/${id}/prompts`));
+      if (prompts.some((p) => p.content.includes("queued cron hi") && p.status === "completed")) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`queued cron never ran (queue: ${JSON.stringify(queue)})`);
+  });
+
   it("while an async prompt runs, the alarm stays a 30s heartbeat (so an evicted run wakes and recovers)", async () => {
     const id = await newSession();
     const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<T>) => Promise<T>;

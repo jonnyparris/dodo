@@ -147,6 +147,8 @@ export interface StartIntent {
   images?: Array<{ data: string; mediaType: string; name?: string }>;
   /** Override the title derivation; used by snapshot-import paths. */
   titleHint?: string;
+  /** Override the source's onBusy policy (one-off cron jobs queue). */
+  onBusy?: SourcePolicy["onBusy"];
 }
 
 export type StartOutcome =
@@ -337,11 +339,11 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps): SessionLifec
     const busy = !!current.activePromptId;
 
     if (busy) {
-      switch (policy.onBusy) {
+      switch (intent.onBusy ?? policy.onBusy) {
         case "queue": {
           const { promptId, position } = deps.prompts.enqueue(
             intent.content,
-            intent.authorEmail ?? null,
+            intent.authorEmail ?? policy.authorEmailLabel ?? null,
           );
           return { kind: "queued", promptId, position };
         }

@@ -2874,14 +2874,18 @@ export class CodingAgent extends CodingAgentBase {
     });
   }
 
-  async runCronPrompt(payload: { description: string; prompt: string }): Promise<void> {
+  async runCronPrompt(payload: { description: string; prompt: string }, schedule?: { type?: string }): Promise<void> {
     // Pre-derive title from description when no title is set yet — cron
     // is invoked from a schedule callback, not a user, so we want the
     // schedule's description in the UI rather than a content-derived snippet.
     if (!this.control.readTitle()) {
       this.control.setTitle(payload.description);
     }
-    await this.lifecycle.start({ source: "cron", content: payload.prompt });
+    // A one-off job (delayed / at a date) that comes due while another prompt
+    // runs is queued: skipping it would lose it for good. Recurring jobs
+    // (cron / interval) still skip a busy tick so they don't pile up.
+    const oneOff = schedule?.type === "delayed" || schedule?.type === "scheduled";
+    await this.lifecycle.start({ source: "cron", content: payload.prompt, ...(oneOff ? { onBusy: "queue" as const } : {}) });
   }
 
   private listCronJobs(): CronJobRecord[] {
