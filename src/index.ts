@@ -2292,6 +2292,11 @@ app.post("/session/:id/debug/evict", adminGuard as never, async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/debug/evict");
 });
 
+// Admin-only: compact a pi session now (proves summary + continue in prod).
+app.post("/session/:id/debug/compact", adminGuard as never, async (c) => {
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/debug/compact");
+});
+
 // Per-config MCP connect status from the most recent connectMcpServers() run.
 // Lets the UI explain why an MCP config has no tools (e.g. "Invalid Bearer
 // token format") instead of silently dropping them.

@@ -98,8 +98,6 @@ export interface PiEngineHost {
   systemPrompt(): string;
   /** Emit a Dodo SSE/WS event. */
   emit(event: { type: string; data: unknown }): void;
-  /** A compaction finished (`ok` false when it failed). */
-  onCompaction?(ok: boolean): void;
   /** The loop guard nudged or refused a tool. */
   onLoopVerdict?(verdict: LoopVerdict): void;
   log(level: "info" | "warn" | "error", message: string, fields?: Record<string, unknown>): void;
@@ -382,7 +380,6 @@ export class PiEngine {
         return;
       case "compaction_end":
         this.host.log(event.error ? "warn" : "info", "pi: compaction end", { reason: event.reason, error: event.error });
-        this.host.onCompaction?.(!event.error);
         return;
       case "task_failed":
         this.host.log("error", "pi: task failed", { kind: event.kind, message: event.message });
@@ -433,6 +430,19 @@ export class PiEngine {
         await write({ type: "write", entry: { kind: DODO_ASSISTANT_ENTRY, data, model: [message] } });
       }
     }
+  }
+
+  /**
+   * Compact now (summarize the old part of the context, keep the recent part)
+   * and wait for it. For the admin debug route; pi compacts on its own at
+   * thresholds and on overflow.
+   */
+  async compact(instructions?: string): Promise<unknown> {
+    const harness = await this.open();
+    const root = await this.root();
+    const task = await root.compact(instructions, this.ctx);
+    harness.resume();
+    return harness.waitForTask(task, this.ctx);
   }
 
   /** Abort the running turn, if any. */

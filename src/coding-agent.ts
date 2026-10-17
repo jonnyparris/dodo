@@ -1500,6 +1500,13 @@ export class CodingAgent extends CodingAgentBase {
         return Response.json({ evicting: true });
       }
 
+      if (request.method === "POST" && url.pathname === "/debug/compact") {
+        if (this.agentEngine() !== "pi") return Response.json({ error: "session is not on pi yet" }, { status: 409 });
+        const before = Number(this.readMetadata("pi_context_tokens") ?? 0);
+        const settled = await this.piEngine().compact();
+        return Response.json({ before, settled, compactionCount: await this.refreshPiCompactionCount() });
+      }
+
       if (request.method === "GET" && url.pathname === "/debug/compaction") {
         if (this.agentEngine() === "pi") {
           // pi compacts on its own (background + blocking + overflow retry); report what it did.
@@ -4319,11 +4326,6 @@ export class CodingAgent extends CodingAgentBase {
         const config = this.piGatewayConfig();
         return agentModelRef(config.model, config);
       },
-      onCompaction: (ok) => {
-        if (!ok) return;
-        const n = parseInt(this.readMetadata("pi_compactions") ?? "0", 10) || 0;
-        this.writeMetadata("pi_compactions", String(n + 1));
-      },
       onLoopVerdict: (verdict) => log("warn", "pi: loop guard", { sessionId: this.sessionId(), ...verdict }),
       systemPrompt: () => this.getSystemPrompt(),
       emit: (event) => {
@@ -4463,6 +4465,17 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   /**
+   * Cache the number of compaction summaries in the transcript for the sync
+   * session-details read. Counted from entries, not compaction events: a
+   * background compaction can finish after the turn stops listening.
+   */
+  private async refreshPiCompactionCount(): Promise<number> {
+    const n = (await this.piEngine().entries()).filter((e) => e.kind === "pi.compaction").length;
+    this.writeMetadata("pi_compactions", String(n));
+    return n;
+  }
+
+  /**
    * Run a turn on pi-durable. Same contract as runThinkChat. On fiber
    * recovery after an eviction this reattaches to the durable submission
    * for `promptId` — completed steps are not redone, the user turn is not
@@ -4499,6 +4512,7 @@ export class CodingAgent extends CodingAgentBase {
       throw new Error(modelError ?? `Turn ended without an answer (${reason})`);
     }
     if (result.contextTokens > 0) this.writeMetadata("pi_context_tokens", String(result.contextTokens));
+    await this.refreshPiCompactionCount();
     const config = this.getConfig();
     this.insertMessageMetadata({
       messageId: result.assistantMessageId,

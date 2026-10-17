@@ -253,6 +253,22 @@ describe("pi is the default engine", () => {
     expect((await messages(again.id))[1]!.attachments).toEqual(src[1]!.attachments);
   });
 
+  it("admin debug compact summarizes and the session keeps going", async () => {
+    const id = await newSession();
+    for (let i = 0; i < 6; i++) await send(`/session/${id}/message`, { content: `turn ${i} ${"lorem ipsum ".repeat(2500)}` });
+    const asAdmin = { ...typedEnv, ADMIN_EMAIL: "dev@dodo.local" } as Env;
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(new Request(`${BASE}/session/${id}/debug/compact`, { method: "POST" }), asAdmin, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(200);
+    expect((await json<{ compactionCount: number }>(res)).compactionCount).toBeGreaterThanOrEqual(1);
+    const details = await json<{ compactionCount?: number }>(await call(`/session/${id}`));
+    expect(details.compactionCount).toBeGreaterThanOrEqual(1);
+    const after = await send(`/session/${id}/message`, { content: "still there?" });
+    expect(after.status).toBe(200);
+    expect(JSON.stringify(seenContexts.at(-1)!.messages)).toContain("still there?");
+  });
+
   it("only pi can be chosen", async () => {
     const id = await newSession();
     expect((await send(`/session/${id}/engine`, { engine: "think" }, "PUT")).status).toBe(400);

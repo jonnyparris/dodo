@@ -74,6 +74,10 @@ const VISION_CAPABLE_MODEL_PATTERNS = [
   /^anthropic\//,
   /^google\//,
   /^@cf\/meta\/llama-4-/,
+  // Workers AI models whose catalog entry has `vision: true` (checked 2026-10-17).
+  /^@cf\/zai-org\/glm-5\.3-flash$/,
+  /^@cf\/moonshotai\/kimi-k2\.6$/,
+  /^@cf\/google\/gemma-4-/,
 ];
 
 export function modelSupportsVision(modelId: string): boolean {
