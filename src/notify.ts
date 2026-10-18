@@ -23,6 +23,7 @@ export type NotificationKind =
   | "prompt-error"
   | "prompt-aborted"
   | "watchdog-stalled"
+  | "needs-input"
   | "run-done"
   | "run-failed"
   | "autopilot";

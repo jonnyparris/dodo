@@ -30,6 +30,16 @@ import { buildToolsExtension } from "./pi/tools";
 import type { Browser } from "agents/browser";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { BROWSER_TOOL_NAME, createBrowserExecuteTool, createSessionBrowser } from "./browser/session-browser";
+import { checkCallbackUrl, postCompletionWebhook } from "./completion-webhook";
+import type { InputKind, NeedsInput, SessionToolHost } from "./tools/session-tools";
+
+/** Metadata keys for the human handoff and completion doorbell. */
+const NEEDS_INPUT_KEY = "needs_input";
+const COMPLETION_WEBHOOK_KEY = "completion_webhook";
+/** While a person is needed, poke the browser this often (Browser Run idle keep_alive is 180 s). */
+const BROWSER_WARM_INTERVAL_SECONDS = 120;
+/** ~20 minutes of keeping the browser alive for a handoff. */
+const BROWSER_WARM_TICKS = 10;
 import { normalizePath } from "./paths";
 import { PresenceTracker } from "./presence";
 import { assembleSystemPrompt } from "./prompt-composer";
@@ -348,6 +358,8 @@ const promptAttachmentSchema = z.object({
 const sendMessageSchema = z.object({
   content: z.string().trim().min(1),
   images: z.array(promptAttachmentSchema).max(MAX_IMAGES_PER_MESSAGE).optional(),
+  /** https URL POSTed (no content, ids + status only) whenever a prompt in this session finishes. Kept for later prompts. */
+  callbackUrl: z.string().max(2048).optional(),
 }).strict();
 /** /generate schema — text-to-image via Replicate. */
 const generateImageSchema = z.object({
@@ -797,6 +809,8 @@ export class CodingAgent extends CodingAgentBase {
       },
       readAppConfig: () => this.readAppConfig(),
       log: (level, message, fields) => log(level, message, fields ?? {}),
+      onPromptStart: () => this.clearNeedsInput(),
+      onPromptFinished: (promptId, cause) => this.ringCompletionWebhook(promptId, cause.kind),
     });
   }
 
@@ -821,7 +835,7 @@ export class CodingAgent extends CodingAgentBase {
           '- `cdp.send({ method, params, sessionId: "active" })` targets the tab you are working in; it is remembered across calls.',
           "- To see a screenshot, return `{ type: \"browser_screenshot\", mediaType, data }` as the whole return value of its own call (not nested in another object, where the data is stripped). It is shown in the chat; you see it too if your model accepts images, otherwise check it with `image_check` on the attachment URL or read the page with `Runtime.evaluate`.",
           "- One `cdp.send` result is capped at 1 MB: capture the viewport or use JPEG, not a full long page.",
-          "- If a login, CAPTCHA or MFA needs a human: leave the page on that step and ask the user to open **Settings → Browser Tools → Open live browser**, act in it, and reply when done. Then continue in the same tab.",
+          "- If a login, CAPTCHA or MFA needs a human: leave the page on that step, call `request_user_input` (kind login/captcha), then end your turn with one line saying what to do. The person gets a Live View link (or uses **Settings → Browser Tools → Open live browser**) and replies when done. Then continue in the same tab.",
         ].join("\n")
       : undefined;
 
@@ -1254,6 +1268,7 @@ export class CodingAgent extends CodingAgentBase {
       todoStore: this.todoStore(),
       readAttachment: (i: { id: string; offset?: number; limit?: number }) => this.readSessionDocument(i),
       resolveImage: (ref: string) => this.resolveImageRef(ref),
+      sessionTools: this.sessionToolHost(),
     });
   }
 
@@ -1436,7 +1451,7 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       if (request.method === "GET" && url.pathname === "/prompts") {
-        return Response.json({ prompts: this.listPrompts() });
+        return Response.json({ prompts: this.listPrompts(), needsInput: this.readNeedsInput() });
       }
 
       if (request.method === "GET" && url.pathname === "/todos") {
@@ -2714,6 +2729,10 @@ export class CodingAgent extends CodingAgentBase {
 
   private async handleCreateCron(request: Request): Promise<Response> {
     const body = cronCreateSchema.parse(await request.json());
+    return Response.json(await this.createCronJob(body), { status: 201 });
+  }
+
+  private async createCronJob(body: z.infer<typeof cronCreateSchema>): Promise<CronJobRecord> {
     let scheduled;
     if (body.type === "delayed") {
       scheduled = await this.schedule(body.delayInSeconds, "runCronPrompt", { description: body.description, prompt: body.prompt });
@@ -2732,15 +2751,109 @@ export class CodingAgent extends CodingAgentBase {
       body.prompt,
       nowEpoch(),
     );
-
-    return Response.json(this.toCronJobRecord(scheduled, body.description, body.prompt), { status: 201 });
+    this.emitEvent({ type: "cron_update", data: { jobs: this.listCronJobs() } });
+    return this.toCronJobRecord(scheduled, body.description, body.prompt);
   }
 
   private async handleDeleteCron(scheduleId: string): Promise<Response> {
     const id = decodeURIComponent(scheduleId);
-    await this.cancelSchedule(id);
-    this.ctx.storage.sql.exec("DELETE FROM cron_jobs WHERE schedule_id = ?", id);
+    await this.deleteCronJob(id);
     return Response.json({ deleted: true, id });
+  }
+
+  private async deleteCronJob(id: string): Promise<boolean> {
+    const cancelled = await this.cancelSchedule(id);
+    this.ctx.storage.sql.exec("DELETE FROM cron_jobs WHERE schedule_id = ?", id);
+    this.emitEvent({ type: "cron_update", data: { jobs: this.listCronJobs() } });
+    return cancelled;
+  }
+
+  // ─── Agent session tools (schedule_prompt, request_user_input) ───────
+
+  private sessionToolHost(): SessionToolHost {
+    const toRecord = (j: CronJobRecord) => ({ id: j.id, description: j.description, prompt: j.payload, scheduleType: j.scheduleType, nextRunAt: j.nextRunAt });
+    return {
+      createSchedule: async ({ description, prompt, ...spec }) => toRecord(await this.createCronJob({ description, prompt, ...spec } as z.infer<typeof cronCreateSchema>)),
+      listSchedules: () => this.listCronJobs().map(toRecord),
+      cancelSchedule: (id) => this.deleteCronJob(id),
+      requestUserInput: (input) => this.requestUserInput(input),
+    };
+  }
+
+  readNeedsInput(): NeedsInput | null {
+    const raw = this.readMetadata(NEEDS_INPUT_KEY);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as NeedsInput;
+    } catch {
+      return null;
+    }
+  }
+
+  private clearNeedsInput(): void {
+    if (this.readMetadata(NEEDS_INPUT_KEY) === null) return;
+    this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", NEEDS_INPUT_KEY);
+    this.emitEvent({ type: "needs_input", data: null });
+  }
+
+  private async requestUserInput(input: { kind: InputKind; reason: string }): Promise<NeedsInput> {
+    let liveView = false;
+    if (this.browser) {
+      try {
+        liveView = !!(await this.browser.liveView({ mode: "tab" }))?.targets.length;
+      } catch (err) {
+        log("warn", "request_user_input: live view check failed", { sessionId: this.sessionId(), error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    const state: NeedsInput = { kind: input.kind, reason: input.reason, liveView, at: new Date().toISOString() };
+    this.writeMetadata(NEEDS_INPUT_KEY, JSON.stringify(state));
+    this.emitEvent({ type: "needs_input", data: state });
+    dispatchNotification(this.env, this.ctx, {
+      kind: "needs-input",
+      title: `Dodo needs you: ${this.control.read().title ?? this.sessionId()}`,
+      body: input.reason.slice(0, 200),
+      tags: "raising_hand,robot",
+      priority: "high",
+      ownerEmail: this.readMetadata("owner_email") ?? undefined,
+    });
+    // Keep the browser (and the page the person must act on) alive past
+    // Browser Run's idle keep_alive while we wait for them.
+    if (liveView) await this.schedule(BROWSER_WARM_INTERVAL_SECONDS, "keepBrowserWarm", { left: BROWSER_WARM_TICKS });
+    return state;
+  }
+
+  /** Schedule callback: one CDP command so Browser Run doesn't reclaim the browser while a person is needed. */
+  async keepBrowserWarm(payload: { left: number }): Promise<void> {
+    if (!this.browser || !this.readNeedsInput()?.liveView) return;
+    try {
+      const view = await this.browser.liveView({ mode: "tab" });
+      if (!view) return; // gone already: don't create a new one
+      const conn = await this.browser.connect();
+      try {
+        await conn.cdp.send("Browser.getVersion");
+      } finally {
+        conn.cdp.close();
+      }
+    } catch (err) {
+      log("warn", "keepBrowserWarm failed", { sessionId: this.sessionId(), error: err instanceof Error ? err.message : String(err) });
+    }
+    if (payload.left > 1) await this.schedule(BROWSER_WARM_INTERVAL_SECONDS, "keepBrowserWarm", { left: payload.left - 1 });
+  }
+
+  /** POST the session's completion webhook (a doorbell: ids + status, no content). */
+  private ringCompletionWebhook(promptId: string, status: "completed" | "failed" | "aborted"): void {
+    const url = this.readMetadata(COMPLETION_WEBHOOK_KEY);
+    if (!url) return;
+    const body = JSON.stringify({
+      event: "prompt.finished",
+      sessionId: this.sessionId(),
+      promptId,
+      status,
+      needsInput: this.readNeedsInput() !== null,
+    });
+    this.ctx.waitUntil(postCompletionWebhook(url, body).catch((err) => {
+      log("warn", "completion webhook failed", { sessionId: this.sessionId(), promptId, error: err instanceof Error ? err.message : String(err) });
+    }));
   }
 
   // ─── Session watchdog ──────────────────────────────────────────────
@@ -2882,10 +2995,18 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   private listCronJobs(): CronJobRecord[] {
-    return Array.from(this.ctx.storage.sql.exec("SELECT schedule_id, description, prompt, created_at FROM cron_jobs ORDER BY created_at DESC")).map((row) => {
+    const jobs: CronJobRecord[] = [];
+    for (const row of Array.from(this.ctx.storage.sql.exec("SELECT schedule_id, description, prompt, created_at FROM cron_jobs ORDER BY created_at DESC"))) {
       const schedule = this.getSchedule<{ description: string; prompt: string }>(String(row.schedule_id));
-      return this.toCronJobRecord(schedule, String(row.description), String(row.prompt), Number(row.created_at));
-    });
+      // A one-off that already fired has no schedule left: drop its row
+      // (it used to linger in the list with id "missing").
+      if (!schedule) {
+        this.ctx.storage.sql.exec("DELETE FROM cron_jobs WHERE schedule_id = ?", String(row.schedule_id));
+        continue;
+      }
+      jobs.push(this.toCronJobRecord(schedule, String(row.description), String(row.prompt), Number(row.created_at)));
+    }
+    return jobs;
   }
 
   private toCronJobRecord(
@@ -3127,6 +3248,11 @@ export class CodingAgent extends CodingAgentBase {
     this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
     this.ensureMetadata(sessionId, ownerEmail);
     this.ensureThinkConfig(request);
+    if (input.callbackUrl !== undefined) {
+      const bad = checkCallbackUrl(input.callbackUrl);
+      if (bad) return Response.json({ error: bad }, { status: 400 });
+      this.writeMetadata(COMPLETION_WEBHOOK_KEY, input.callbackUrl);
+    }
 
     // Server-side slash routing — /generate works the same whether it comes
     // from the browser UI, an MCP `send_prompt` call, a webhook, etc. Image

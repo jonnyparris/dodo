@@ -200,6 +200,9 @@
     .msg.tool_call{align-self:flex-start;background:var(--recessed);border:1px solid var(--ring);border-radius:var(--radius);font-family:var(--mono);font-size:12px;max-width:90%}
     .msg.tool_call summary{cursor:pointer;color:var(--text-info);font-weight:600;padding:4px 0}
     .msg.thinking{align-self:flex-start;background:var(--brand-tint);border:1px dashed var(--brand);color:var(--text-info);font-style:italic}
+    .needs-input-bar{display:flex;align-items:center;gap:8px;margin:0 12px 6px;padding:8px 12px;border:1px solid var(--brand);border-radius:10px;background:var(--brand-tint);font-size:13px}
+    .needs-input-bar[hidden]{display:none}
+    .needs-input-bar span{flex:1;min-width:0;overflow-wrap:anywhere}
     .msg.error{align-self:flex-start;background:var(--danger-tint);border:1px solid var(--danger);color:var(--text-danger);font-size:13px}
     .thinking-dots::after{content:'';animation:dots 1.5s steps(4,end) infinite}
 
@@ -821,6 +824,11 @@
       <button class="scroll-bottom-btn" id="scroll-bottom-btn" onclick="scrollChatToBottom()" title="Scroll to bottom">&darr;</button>
       <div id="typing-indicator" class="typing-indicator" style="display:none"></div>
       <div id="image-preview-bar" class="image-preview-bar"></div>
+      <div id="needs-input-bar" class="needs-input-bar" role="status" hidden>
+        <i class="ph ph-hand-waving" aria-hidden="true"></i>
+        <span id="needs-input-text"></span>
+        <button type="button" id="needs-input-live" class="sm" onclick="openLiveBrowser()">Open live browser</button>
+      </div>
       <div class="input-bar">
         <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash command suggestions" hidden></div>
         <textarea id="msg-input" rows="1" placeholder="Ask Dodo to build something..." onkeydown="handleInputKeydown(event)" oninput="autoResizeInput(this);sendTypingStart();updateSlashMenu()" onpaste="handleImagePaste(event)" onfocus="setTimeout(()=>this.scrollIntoView({block:'nearest',behavior:'smooth'}),300)" onblur="setTimeout(hideSlashMenu,150)" aria-label="Message input" aria-autocomplete="list" aria-controls="slash-menu"></textarea>

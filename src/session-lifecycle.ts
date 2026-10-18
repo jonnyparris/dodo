@@ -266,6 +266,10 @@ export interface SessionLifecycleDeps {
    * spawn, matching pre-refactor `readAppConfig()` calls.
    */
   readAppConfig: () => Promise<unknown>;
+  /** A prompt became active (after beginPrompt). Clears per-turn state such as "needs input". */
+  onPromptStart?: (promptId: string) => void;
+  /** A prompt reached a terminal state (row written, session idle). Rings completion webhooks. */
+  onPromptFinished?: (promptId: string, cause: FinishCause) => void;
 }
 
 export interface SessionLifecycle {
@@ -293,6 +297,7 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps): SessionLifec
     title: string,
   ): Promise<{ fiberId: string | null }> {
     deps.control.beginPrompt(promptId, title);
+    deps.onPromptStart?.(promptId);
     deps.prompts.insert({
       promptId,
       content: intent.content,
@@ -406,6 +411,13 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps): SessionLifec
 
     // 3. Sync session index — always (covers both completed and aborted paths)
     await deps.syncIndex({ status: "idle", title }).catch(() => {});
+
+    // 3b. Tell the host (completion webhooks). Never lets a hook break finish.
+    try {
+      deps.onPromptFinished?.(promptId, cause);
+    } catch (err) {
+      log("warn", "lifecycle.finish: onPromptFinished threw", { promptId, error: err instanceof Error ? err.message : String(err) });
+    }
 
     // 4. Dispatch notification per policy + cause
     if (cause.kind === "completed" && policy.notifyOnComplete) {

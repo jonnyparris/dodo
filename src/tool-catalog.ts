@@ -118,6 +118,11 @@ const ORCHESTRATOR_TOOLS: ToolCatalogEntry[] = [
     alwaysOn: false,
     caveat: "Requires the Workers AI binding.",
   },
+  // Session tools — present in top-level session turns (not subagents).
+  { name: "schedule_prompt", description: "Schedule a prompt to run later in this session (once, cron or interval).", category: "planning", alwaysOn: false, caveat: "Top-level session turns only (not subagents)." },
+  { name: "list_schedules", description: "List this session's scheduled prompts.", category: "planning", alwaysOn: false, caveat: "Top-level session turns only (not subagents)." },
+  { name: "cancel_schedule", description: "Cancel a scheduled prompt by id.", category: "planning", alwaysOn: false, caveat: "Top-level session turns only (not subagents)." },
+  { name: "request_user_input", description: "Mark the session 'needs input' (login, CAPTCHA, decision) and hand the person Live View.", category: "planning", alwaysOn: false, caveat: "Top-level session turns only (not subagents)." },
   // Browser tools — gated on BROWSER + LOADER bindings, session-enabled
   // browser config, and admin owner. Listed so users know they exist even
   // when their current session has them off.

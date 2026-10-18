@@ -27,6 +27,7 @@ import {
 import { createExecuteTool } from "./tools/execute-tool";
 import { createWorkspaceTools } from "./tools/workspace-tools";
 import { createImageCheckTool, type ResolveImage } from "./tools/image-check";
+import { buildSessionTools, type SessionToolHost } from "./tools/session-tools";
 import { sanitizeToolJsonSchema } from "./tool-schema";
 import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";
@@ -107,6 +108,11 @@ interface BuildToolsOptions {
    * to a data URL. Backs `image_check` (Clef questions about images).
    */
   resolveImage?: ResolveImage;
+  /**
+   * The session itself, for schedule_prompt / list_schedules /
+   * cancel_schedule / request_user_input. Top-level turns only.
+   */
+  sessionTools?: SessionToolHost;
   /**
    * Computer workspace runtime for the `shell` tool. When provided,
    * commands are executed via `ws.runtime.exec()` instead of the legacy
@@ -292,6 +298,10 @@ export const KNOWN_CONDITIONAL_TOOL_NAMES = [
   "browser_triage",
   "web_search",     // requires admin owner + WEB_SEARCH_GATEWAY_ID + AI.websearch
   "image_check",    // requires env.AI (Clef)
+  "schedule_prompt", // top-level session turns (options.sessionTools)
+  "list_schedules",
+  "cancel_schedule",
+  "request_user_input",
 ] as const;
 
 export function capCodemodeResult(result: unknown, maxBytes: number): unknown {
@@ -1717,6 +1727,11 @@ function buildTools(
   // models check uploads and keeps screenshots out of context for all models.
   if (options?.resolveImage && env.AI) {
     tools.image_check = createImageCheckTool({ ai: env.AI, resolveImage: options.resolveImage });
+  }
+
+  // Scheduling + human handoff on the session itself (top-level turns only).
+  if (options?.sessionTools) {
+    Object.assign(tools, buildSessionTools(options.sessionTools));
   }
 
   // Goal status tool — only present when the parent agent exposes the

@@ -254,6 +254,8 @@ function connectSSE(id){
   eventSource.addEventListener("error_message",(e)=>{hideThinking();setProcessing(false);const{message}=JSON.parse(e.data);const el=document.createElement("div");el.className="msg error";el.textContent=message||"Something went wrong";$("chat").appendChild(el);_smoothScrollToBottom()});
   eventSource.addEventListener("presence",(e)=>{const data=JSON.parse(e.data);presenceUsers=data.users||[];renderPresence()});
 
+  eventSource.addEventListener("needs_input",(e)=>{let d=null;try{d=JSON.parse(e.data)}catch{}renderNeedsInput(d)});
+  eventSource.addEventListener("cron_update",()=>{if(typeof loadCron==='function')loadCron()});
   eventSource.addEventListener("queue_update",(e)=>{
     const{queue}=JSON.parse(e.data);
     // Remove any queued bubbles that are no longer in the queue
@@ -787,3 +789,17 @@ window.addEventListener('load',()=>{
   const btn=$("context-warning-dismiss");
   if(btn)btn.addEventListener('click',hideContextWarning);
 });
+
+/** "Dodo needs you" bar above the input (request_user_input). null hides it. */
+function renderNeedsInput(state){
+  const bar=$("needs-input-bar");if(!bar)return;
+  if(!state){bar.hidden=true;return}
+  $("needs-input-text").textContent=`Dodo needs you: ${state.reason||"see the last message"}`;
+  $("needs-input-live").hidden=!state.liveView;
+  bar.hidden=false;
+}
+async function loadNeedsInput(){
+  if(!currentSession){renderNeedsInput(null);return}
+  const r=await apiSafe(`/session/${currentSession}/prompts`);
+  renderNeedsInput(r&&r.needsInput||null);
+}

@@ -1126,10 +1126,14 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     });
   });
 
-  server.tool("send_prompt", "Send an async message to the Dodo coding agent (returns immediately, runs in background). Use get_prompts to check status.", {
+  server.tool("send_prompt", "Send an async message to the Dodo coding agent (returns immediately, runs in background). Use get_prompts to check status. Pass callbackUrl to be told when it finishes instead of polling.", {
     sessionId: z.string().describe("Session ID"),
     content: z.string().describe("Prompt content"),
-  }, async ({ sessionId, content }) => {
+    callbackUrl: z.string().max(2048).optional().describe(
+      "https URL Dodo POSTs { event: 'prompt.finished', sessionId, promptId, status, needsInput } to whenever a prompt in this session finishes. " +
+      "No output is included: fetch it with get_messages. Kept for later prompts in the session; pass an empty string to remove it.",
+    ),
+  }, async ({ sessionId, content, callbackUrl }) => {
     const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
     if (!access.ok) return access.result;
     const limited = checkPromptBudget(mcpUserEmail(env, userEmail));
@@ -1137,8 +1141,18 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     return jsonFetch(env, "agent", "/prompt", {
       sessionId,
       depth,
-      init: { body: JSON.stringify({ content }), headers: { "content-type": "application/json" }, method: "POST" },
+      init: { body: JSON.stringify({ content, ...(callbackUrl !== undefined ? { callbackUrl } : {}) }), headers: { "content-type": "application/json" }, method: "POST" },
     });
+  });
+
+  server.tool("get_live_view", "Mint Live View URLs for the session's open browser tabs, so a person can act in that browser (sign in, solve a CAPTCHA). " +
+    "The URLs are bearer credentials that must be opened within ~5 minutes: hand them to the person, never to a model, and don't store them. " +
+    "Fails when no browser is open. get_prompts reports needsInput when the agent is waiting for a person.", {
+    sessionId: z.string().describe("Session ID"),
+  }, async ({ sessionId }) => {
+    const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
+    if (!access.ok) return access.result;
+    return jsonFetch(env, "agent", "/browser/live", { sessionId, depth });
   });
 
   server.tool("generate_image", "Generate an image with Workers AI FLUX-1-schnell and post it to the session. Bypasses the chat LLM — routes straight to the image model.", {
@@ -1172,7 +1186,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     return jsonFetch(env, "agent", "/messages", { sessionId, depth });
   });
 
-  server.tool("get_prompts", "Get prompt history for a session", {
+  server.tool("get_prompts", "Get prompt history for a session. `needsInput` is set when the agent stopped for a person (login, CAPTCHA, decision): { kind, reason, liveView, at }.", {
     sessionId: z.string().describe("Session ID"),
   }, async ({ sessionId }) => {
     const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");

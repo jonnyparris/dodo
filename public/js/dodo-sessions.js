@@ -230,6 +230,7 @@ async function selectSession(id){
     apiSafe(`/session/${id}`),
     apiSafe(`/session/${id}/messages`),
     loadFiles("/"),loadCron(),refreshGit(),
+    typeof loadNeedsInput==='function'?loadNeedsInput():Promise.resolve(),
     typeof loadWatchdog==='function'?loadWatchdog():Promise.resolve(),
     typeof loadSessionTodos==='function'?loadSessionTodos():Promise.resolve()
   ]);
