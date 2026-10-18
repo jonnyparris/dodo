@@ -53,7 +53,9 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 
 - `src/git.ts` — git helpers via @cloudflare/shell, multi-host token injection (GitHub + GitLab)
 - `src/repos.ts` — known repository registry for orchestration
-- `src/mcp.ts` — MCP server exposing Dodo as 74 tools
+- `src/tools/session-tools.ts` — agent tools on its own session: `schedule_prompt` / `list_schedules` / `cancel_schedule` (cron jobs) and `request_user_input` (needs-input handoff)
+- `src/completion-webhook.ts` — `callbackUrl` doorbell POSTed when a prompt finishes
+- `src/mcp.ts` — MCP server exposing Dodo as 75 tools
 - `src/mcp-codemode.ts` — code-mode MCP endpoint (2 tools, minimal context)
 - `src/mcp-catalog.ts` — curated catalog of recommended MCP servers
 - `src/outbound.ts` — AllowlistOutbound WorkerEntrypoint for gated sandbox fetch

@@ -71,6 +71,10 @@ These tools are available to the agent at runtime (built in `src/agentic.ts`):
 **Clef** (`src/clef.ts`):
 - `image_check` — yes/no, choice or score questions about an image, for models without vision
 
+**Session** (`src/tools/session-tools.ts`, top-level turns only):
+- `schedule_prompt` / `list_schedules` / `cancel_schedule` — run a prompt later in this session (once, at a time, cron, interval)
+- `request_user_input` — stop for a person (login, CAPTCHA, decision): sets `needsInput`, keeps the browser alive, then the turn ends
+
 **Git tools** (built in `buildGitTools()`):
 - **Top-level (hot path):** `git_status`, `git_add`, `git_commit`, `git_diff`
 - **Inside codemode only (call as `git.<name>`):** `git_clone_known`, `git_clone`, `git_push`, `git_push_checked`, `git_pull`, `git_branch`, `git_checkout`, `git_log`, `git_verify_remote_branch`, `pr_create`

@@ -64,7 +64,16 @@ Go to github.com/login. At the sign-in form, stop and ask me to sign in through
 the live browser, then list my five most recently updated repos.
 ```
 
-The agent stops at the form. Open **Settings → Browser Tools → Open live browser**, sign in (2FA included), and reply "done". It carries on in the same tab. Your password never passes through the model.
+The agent stops at the form and calls `request_user_input`. A "Dodo needs you" bar appears above the input with **Open live browser**. Sign in there (2FA included) and reply "done", and it carries on in the same tab. Your password never passes through the model. While it waits, Dodo keeps the browser alive for about 20 minutes (normally it closes after 3 idle minutes). MCP clients see `needsInput` on `get_prompts` and can mint a link with `get_live_view`.
+
+### Schedule it instead of waiting
+
+```text
+In 2 minutes, check https://news.ycombinator.com and tell me the title of the top story.
+Also every weekday at 07:30 UTC give me a one-line HN digest.
+```
+
+The agent calls `schedule_prompt` twice: a one-off and a weekday cron. Both show up in the Cron panel, and each runs later as a new message in the same session.
 
 ### Read the web, with receipts
 
@@ -132,7 +141,9 @@ The session keeps going until the model calls `set_goal_status` with `done`, `bl
 | 🌐 **Persistent session browser** | Agents SDK 0.28 `Browser` + `browserTool`. One Chrome per session, kept between messages. Screenshots go to chat. Live View lets a human take over for logins, CAPTCHAs and MFA. |
 | 🎯 **Clef decision models** | Small Cloudflare models answer yes/no, choice and score questions in about 300 ms: `image_check`, image edit-vs-reply routing, and page checks in `browser_markdown` / `browser_triage`. ([ADR 0003](docs/adr/0003-clef-decision-models.md)) |
 | 🐚 **Binary-safe shell** | `base64 -d > file.png`, `>>` and pipes write real bytes. Codemode can pass `Uint8Array`s to the host. |
-| ⏰ **Busy-safe schedules** | A one-off scheduled prompt that fires while the session is busy waits in the queue instead of being dropped. Recurring jobs still skip a busy tick. |
+| ⏰ **The agent schedules its own work** | `schedule_prompt`, `list_schedules` and `cancel_schedule` replace "sleep and check again". A one-off that comes due while the session is busy waits in the queue. Recurring jobs skip a busy tick. |
+| 🙋 **Human handoff** | `request_user_input` marks the session as needing a person (login, CAPTCHA, a decision) and keeps its browser alive while it waits. The UI, ntfy and MCP (`needsInput`, `get_live_view`) all see it. |
+| 🔔 **Completion webhook** | Pass `callbackUrl` with `send_prompt`. Dodo POSTs `{ sessionId, promptId, status, needsInput }` when each prompt in the session finishes, so callers don't need to poll. The body contains no output. |
 | 🔁 **Upgrade-safe sessions** | Sessions from older versions carry on. History, compaction summaries, attachments and cron jobs all migrate. A prompt cut off by an upgrade fails clearly: *"Interrupted by a Dodo upgrade. Send it again."* |
 
 ---
@@ -245,7 +256,7 @@ pi-durable writes each model response and each tool call to the session's SQLite
 ### Goals, schedules and the watchdog
 
 - **Goals.** The session prompts itself to continue until it's done, blocked, needs you, or runs out of turns (default 50, max 200). [`docs/session-goals.md`](docs/session-goals.md)
-- **Schedules.** Delayed, at-a-time, cron and interval prompts, from the UI Cron panel or `POST /session/:id/cron`. One-offs wait in the queue if the session is busy. [`docs/scheduled-sessions.md`](docs/scheduled-sessions.md)
+- **Schedules.** Delayed, at-a-time, cron and interval prompts, from the agent (`schedule_prompt`), the UI Cron panel or `POST /session/:id/cron`. One-offs wait in the queue if the session is busy. [`docs/scheduled-sessions.md`](docs/scheduled-sessions.md)
 - **Watchdog.** Spots a prompt that has stalled and notifies you, nudges it, or aborts it. [`docs/session-watchdog.md`](docs/session-watchdog.md)
 
 ### Orchestration and autopilot
@@ -275,7 +286,7 @@ Every session gets a git repo on [Cloudflare Artifacts](https://developers.cloud
 
 | Endpoint | Tools | For |
 |---|---|---|
-| `/mcp` | 74 | **Orchestrators**: sessions, prompts, files, git, dispatch, memory, skills, tasks, config |
+| `/mcp` | 75 | **Orchestrators**: sessions, prompts, files, git, dispatch, memory, skills, tasks, config |
 | `/mcp/codemode` | 2 | **Coding agents**: `search` + `execute` in about 1k tokens of context |
 
 ```json
@@ -290,7 +301,7 @@ Every session gets a git repo on [Cloudflare Artifacts](https://developers.cloud
 }
 ```
 
-Other agents use this to hand off long jobs. [Signal Agent](https://github.com/jonnyparris/signal-agent), for example, passes multi-minute browser tasks to Dodo and posts the result back into the chat.
+Other agents use this to hand off long jobs. [Signal Agent](https://github.com/jonnyparris/signal-agent), for example, passes multi-minute browser tasks to Dodo with a `callbackUrl`. It posts the result back into the chat as soon as the doorbell rings. When Dodo stops for a login, it sends the user the Live View link in Signal and resumes the session when they reply "done".
 
 ---
 

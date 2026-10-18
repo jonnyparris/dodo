@@ -392,7 +392,7 @@
 
     <!-- ─── Cron ─── -->
     <h2 id="cron">Cron Jobs</h2>
-    <p>Schedule prompts that run automatically. Each cron job sends a prompt to its session after a delay.</p>
+    <p>Schedule prompts that run automatically. Each cron job sends a prompt to its session when it comes due. The agent can create them itself with <code>schedule_prompt</code>, <code>list_schedules</code> and <code>cancel_schedule</code>.</p>
     <table>
       <tr><th>Type</th><th>Field</th><th>Description</th></tr>
       <tr><td><strong>delayed</strong></td><td><code>delayInSeconds</code></td><td>Fire once after a delay (in seconds).</td></tr>
@@ -490,7 +490,7 @@
       <tr><td>*</td><td><code>/api/secrets</code></td><td>Encrypted secrets CRUD</td></tr>
       <tr><td>*</td><td><code>/api/mcp-configs</code></td><td>Integration (MCP server) CRUD</td></tr>
       <tr><td>*</td><td><code>/api/passkey</code></td><td>Init, change passkey</td></tr>
-      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth) — 74 tools for orchestration</td></tr>
+      <tr><td>ALL</td><td><code>/mcp</code></td><td>MCP server endpoint (Bearer auth) — 75 tools for orchestration</td></tr>
       <tr><td>ALL</td><td><code>/mcp/codemode</code></td><td>Code-mode MCP endpoint — 2 tools (<code>search</code> + <code>execute</code>), ~1k tokens context. Ideal for coding agents.</td></tr>
     </table>
 
