@@ -42,7 +42,7 @@ interface Credentials { url: string; clientId: string; clientSecret: string }
 interface MessageEntry { id: string; role: string; content: string; author?: string | null; model?: string | null; sessionId: string }
 interface ToolEntry { name: string; input: string; output: string; ms: number }
 interface NoteEntry { level: "info" | "warning" | "error"; text: string }
-interface AttachEntry { id: string; title?: string | null }
+interface AttachEntry { id: string; title?: string | null; fresh?: boolean }
 
 const KEYCHAIN_SERVICE = "dodo-pi-client";
 const HISTORY_ON_ATTACH = 6;
@@ -239,6 +239,7 @@ export default function dodo(pi: ExtensionAPI) {
   let pendingTools = new Map<string, { name: string; input: string; started: number }>();
   let ticker: ReturnType<typeof setInterval> | undefined;
   let attachGen = 0;
+  let loading = 0;
 
   const client = (): DodoApi => {
     if (api) return api;
@@ -402,7 +403,6 @@ export default function dodo(pi: ExtensionAPI) {
         if (err instanceof FatalStreamError) {
           note("error", `Dodo stream stopped: ${err.message}. Detached.`);
           notify(`Dodo stream stopped: ${err.message}. Detached.`, "error");
-          attachGen++;
           detachQuiet();
           pi.appendEntry("dodo-detach", {});
           return;
@@ -422,6 +422,15 @@ export default function dodo(pi: ExtensionAPI) {
     // Each attach takes a generation; an older attach that resumes after a
     // newer one started gives up instead of overwriting it.
     const gen = ++attachGen;
+    loading++;
+    try {
+      return await attachInner(gen, id, title, opts);
+    } finally {
+      loading--;
+    }
+  }
+
+  async function attachInner(gen: number, id: string, title: string | null, opts: { history?: number; record?: boolean; fresh?: boolean }): Promise<boolean> {
     const [s, config] = await Promise.all([
       client().request<SessionState>(`/session/${id}`),
       client().request<{ model?: string }>("/api/config").catch(() => ({ model: undefined })),
@@ -438,7 +447,7 @@ export default function dodo(pi: ExtensionAPI) {
     attached = { id, title };
     state = s;
     defaultModel = config.model;
-    if (opts.record !== false) pi.appendEntry<AttachEntry>("dodo-attach", { id, title });
+    if (opts.record !== false) pi.appendEntry<AttachEntry>("dodo-attach", { id, title, ...(opts.fresh ? { fresh: true } : {}) });
     updateStatus();
     try {
       await catchUp(id, opts.history ?? HISTORY_ON_ATTACH);
@@ -464,7 +473,9 @@ export default function dodo(pi: ExtensionAPI) {
 
   async function listSessions(): Promise<SessionSummary[]> {
     const { sessions } = await client().request<{ sessions: SessionSummary[] }>("/session");
-    return sessions.filter((s) => s.status !== "deleted" && (s.kind ?? "user") === "user");
+    return sessions
+      .filter((s) => s.status !== "deleted" && (s.kind ?? "user") === "user")
+      .map((s) => ({ ...s, title: s.title ? clean(s.title) : null }));
   }
 
   async function resolveSession(prefix: string): Promise<SessionSummary> {
@@ -495,7 +506,10 @@ export default function dodo(pi: ExtensionAPI) {
   async function newSession(prompt: string): Promise<void> {
     const { id } = await client().request<{ id: string }>("/session", { method: "POST" });
     const ok = await attach(id, prompt ? oneLine(prompt, 60) : null, { history: 0, fresh: true });
-    if (ok && prompt && attached?.id === id) await sendPrompt(prompt);
+    if (!prompt) return;
+    if (ok && attached?.id === id) return sendPrompt(prompt);
+    notify(`Created session ${short(id)}, but another attach took over, so the prompt was not sent. It is back in the editor.`, "warning");
+    ui()?.setEditorText(prompt);
   }
 
   async function sendPrompt(content: string, images?: Array<{ data: string; mimeType: string }>): Promise<void> {
@@ -524,7 +538,7 @@ export default function dodo(pi: ExtensionAPI) {
     const r = await client().request<{ modelOverride: SessionState["modelOverride"] }>(`/session/${attached.id}/model-override`, { method: "PUT", body: { model } });
     if (state) state = { ...state, modelOverride: r.modelOverride };
     updateStatus();
-    const running = state?.status === "running" ? " The running prompt keeps its current models." : "";
+    const running = state?.status === "running" ? " The running prompt keeps its main model." : "";
     notify(model ? `Session model → ${model}.${running}` : `Session model → your default.${running}`);
   }
 
@@ -618,7 +632,7 @@ export default function dodo(pi: ExtensionAPI) {
           }
           case "detach":
             attachGen++; // also cancels an attach that is still loading
-            if (!attached) return notify("Not attached.");
+            if (!attached) return notify(loading > 0 ? "Cancelled the attach that was loading." : "Not attached.");
             detachQuiet();
             pi.appendEntry("dodo-detach", {});
             return notify("Detached. Input goes to the local model again; the Dodo session keeps running.");
@@ -678,7 +692,7 @@ export default function dodo(pi: ExtensionAPI) {
     }
     if (!last) return;
     try {
-      await attach(last.id, last.title ?? null, { record: false });
+      await attach(last.id, last.title ?? null, { record: false, fresh: last.fresh });
     } catch (err) {
       const msg = (err as Error).message;
       ctx.ui.notify(`Dodo: could not re-attach to ${short(last.id)}: ${msg}`, "warning");
