@@ -133,6 +133,75 @@ describe("createDodoPageSource", () => {
     await expect(source.fetch({ url: "https://e.com/" })).rejects.toMatchObject({ code: "web_fetch_blocked" });
   });
 
+  it("reports blocked when the plain fetch got a 4xx and Browser Run was refused, whatever the page says", async () => {
+    // A bot wall whose text no challenge pattern knows.
+    const wall = "# Request denied\n\nYour request looks automated. Reference 8f2c.";
+    expect(isChallengePage(wall)).toBe(false);
+    const cache = new PageCache();
+    const source = createDodoPageSource({
+      ai: stubAi(wall) as unknown as Ai,
+      cache,
+      fetch: stubFetch("<html>denied</html>", { status: 403, ...html }),
+      browser: async (_url, errors) => {
+        errors.push("quickAction /markdown: site answered HTTP 403, so the result is a block page, not the content");
+        return { blocked: "site answered HTTP 403", via: "quickAction" };
+      },
+    });
+    const failure = source.fetch({ url: "https://wall.e.com/" });
+    await expect(failure).rejects.toMatchObject({ code: "web_fetch_blocked" });
+    await expect(failure).rejects.toThrow(/plain fetch got HTTP 403.*Browser Run \(quickAction\) was refused too: site answered HTTP 403/);
+    expect(cache.get("auto https://wall.e.com/")).toBeNull();
+  });
+
+  it("reports blocked when the plain fetch got a 4xx and Browser Run rendered an interstitial", async () => {
+    const source = createDodoPageSource({
+      ai: stubAi("# Request denied\n\nLooks automated.") as unknown as Ai,
+      cache: new PageCache(),
+      fetch: stubFetch("<html>denied</html>", { status: 429, ...html }),
+      browser: async () => ({ markdown: CF_INTERSTITIAL, via: "cdp" }),
+    });
+    await expect(source.fetch({ url: "https://e.com/" })).rejects.toMatchObject({ code: "web_fetch_blocked" });
+  });
+
+  it("still returns a plain-fetch 4xx body with a note when Browser Run failed without seeing the site", async () => {
+    const source = createDodoPageSource({
+      ai: stubAi("# Members only\n\nSign in to read this.") as unknown as Ai,
+      cache: new PageCache(),
+      fetch: stubFetch("<html>members</html>", { status: 403, ...html }),
+      browser: browserStub(null),
+    });
+    const page = await source.fetch({ url: "https://e.com/" });
+    expect(page.content).toContain("Members only");
+    const notes = (page as { notes?: string[] }).notes ?? [];
+    expect(notes[0]).toContain("may be incomplete");
+    expect(notes).toContain("quickAction: down");
+  });
+
+  it("still returns a plain-fetch 5xx body with a note when Browser Run was refused", async () => {
+    // A 5xx is a broken origin, not a refusal of the plain fetch: keep the body.
+    const source = createDodoPageSource({
+      ai: stubAi("# Service unavailable\n\nTry again later.") as unknown as Ai,
+      cache: new PageCache(),
+      fetch: stubFetch("<html>down</html>", { status: 503, ...html }),
+      browser: async () => ({ blocked: "site answered HTTP 403", via: "quickAction" }),
+    });
+    const page = await source.fetch({ url: "https://e.com/" });
+    expect(page.status).toBe(503);
+    expect((page as { notes?: string[] }).notes?.[0]).toContain("may be incomplete");
+  });
+
+  it("keeps a thin 200 shell with a note when Browser Run was refused", async () => {
+    const source = createDodoPageSource({
+      ai: stubAi("Loading...") as unknown as Ai,
+      cache: new PageCache(),
+      fetch: stubFetch("<div id=app></div>", html),
+      browser: async () => ({ blocked: "site answered HTTP 403", via: "cdp" }),
+    });
+    const page = await source.fetch({ url: "https://spa3.e.com/" });
+    expect(page.content).toBe("Loading...");
+    expect((page as { notes?: string[] }).notes).toContain("browser: Browser Run (cdp) was refused too: site answered HTTP 403");
+  });
+
   it("sends a 200 challenge page to the browser", async () => {
     const source = createDodoPageSource({
       ai: stubAi(CF_INTERSTITIAL) as unknown as Ai,
@@ -238,6 +307,8 @@ describe("isChallengePage", () => {
     ["Turnstile", "Verify you are human by completing the action below."],
     ["PerimeterX", "# Access to this page has been denied\n\nPress & Hold to confirm you are a human (and not a bot)."],
     ["DataDome", "Please enable JS and disable any ad blocker\n\n![](https://geo.captcha-delivery.com/captcha/?initialCid=x)"],
+    // Live plain fetch of g2.com / etsy.com, 2026-10-21: toMarkdown keeps only this line.
+    ["DataDome (text only)", "Please enable JS and disable any ad blocker"],
     ["Imperva", "Request unsuccessful. Incapsula incident ID: 123-456"],
     ["Akamai", "# Access Denied\n\nYou don't have permission to access \"http://e.com/\" on this server.\n\nReference #18.abc"],
   ])("spots %s", (_name, markdown) => {
@@ -332,6 +403,43 @@ describe("browser_markdown (agents/webfetch/ai-sdk)", () => {
     const rendered = tool.toModelOutput({ output });
     expect(rendered.value).toContain("browser_execute");
     expect(rendered.value).not.toContain("title: g2.com");
+  });
+
+  it("reports blocked with the reasons when the plain fetch and the quick action both got a 403 page", async () => {
+    // The leak this guards: plain 403 with a readable body + quick action meta.status 403
+    // used to return the plain body as content, "may be incomplete".
+    const browser = {
+      quickAction: async () =>
+        new Response(JSON.stringify({ result: "---\ntitle: wall.e.com\n---", meta: { status: 403 } }), {
+          headers: { "content-type": "application/json" },
+        }),
+      fetch: async () => new Response("no cdp", { status: 500 }),
+    } as unknown as Fetcher;
+    const ai = stubAi("# Request denied\n\nYour request looks automated. Reference 8f2c.");
+    const tool = toolFor(ai, stubFetch("<html>denied</html>", { status: 403, ...html }), browser);
+    const output = await tool.execute({ url: "https://wall.e.com/page" });
+    expect(output).toMatchObject({ code: "web_fetch_blocked" });
+    const text = tool.toModelOutput({ output }).value;
+    expect(text).toContain("Why: plain fetch got HTTP 403");
+    expect(text).toContain("Browser Run (quickAction) was refused too: site answered HTTP 403");
+    expect(text).toContain("browser_execute");
+    expect(text).not.toContain("Request denied");
+    expect(text).not.toContain("All fetch paths failed");
+  });
+
+  it("does not treat a quick action 5xx as a refusal", async () => {
+    const browser = {
+      quickAction: async () =>
+        new Response(JSON.stringify({ result: "oops", meta: { status: 502 } }), {
+          headers: { "content-type": "application/json" },
+        }),
+      fetch: async () => new Response("no cdp", { status: 500 }),
+    } as unknown as Fetcher;
+    const ai = stubAi("# Members only\n\nSign in to read this.");
+    const tool = toolFor(ai, stubFetch("<html>members</html>", { status: 403, ...html }), browser);
+    const output = await tool.execute({ url: "https://e.com/members" });
+    expect(output).toMatchObject({ content: expect.stringContaining("Members only") });
+    expect(tool.toModelOutput({ output }).value).toContain("may be incomplete");
   });
 
   it("treats a quick action whose meta has cf-mitigated as blocked", async () => {

@@ -491,6 +491,15 @@ function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
 
+/**
+ * AI Gateway log metadata for one Dodo request. Lets bench/model-ab.ts (and
+ * anyone reading the gateway logs) split cost by session and by main model vs
+ * subagent, even when two sessions run the same model at the same time.
+ */
+export function aigMetadataHeader(sessionId: string | undefined, role: "main" | "subagent"): Record<string, string> {
+  return sessionId ? { "cf-aig-metadata": JSON.stringify({ dodo_session: sessionId, dodo_role: role }) } : {};
+}
+
 export function resolveWireModelId(modelId: string, _activeGateway: "opencode" | "ai-gateway"): string {
   // Workers AI models (@cf/…) must be wire-prefixed with `workers-ai/` on
   // BOTH gateways. The AI Gateway and the OpenCode gateway both proxy these
@@ -534,6 +543,8 @@ export function buildProviderForModel(
         // affinity key, consecutive steps of one conversation land on
         // different replicas and re-pay full prefill every step.
         ...(sessionAffinity ? { "x-session-affinity": sessionAffinity } : {}),
+        // sessionAffinity is the parent session id: tag the gateway log with it.
+        ...aigMetadataHeader(sessionAffinity, "subagent"),
       };
 
   const provider = createOpenAICompatible({

@@ -31,6 +31,7 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `src/tools/kitebuild.ts` — `ci_run`: verify a pushed branch in Kitebuild (enabled by `KITEBUILD_*` config)
 - `src/explore-agent.ts` / `src/task-agent.ts` / `src/subagent-runner.ts` — `explore` and `task` subagents (in-process or facet DOs)
 - `src/typecheck.ts` — in-isolate `tsc --noEmit` tool
+- `src/session-model-override.ts` — per-session `model` / `exploreModel` / `taskModel` override (prompt body → metadata → session + facet config)
 - `src/session-goal.ts` — goal helpers + types. See `docs/session-goals.md`
 - `src/watchdog.ts` — stall detection for long prompts. See `docs/session-watchdog.md`
 - `src/chat-monitor-agent.ts` — polls a Google Chat space and forwards messages into a session
