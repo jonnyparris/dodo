@@ -248,7 +248,8 @@ interface GatewayLog {
   tokens_out: number | null;
   status_code?: number;
   success: boolean;
-  metadata?: string;
+  /** The API returns an object; older responses used a JSON string. */
+  metadata?: string | Record<string, string>;
 }
 
 async function gatewayStats(sessionId: string, gateway: string): Promise<GatewayStats | undefined> {
@@ -270,9 +271,11 @@ async function gatewayStats(sessionId: string, gateway: string): Promise<Gateway
   const stats: GatewayStats = { requests: 0, errors: 0, tokensIn: 0, tokensOut: 0, cost: 0, byRole: {} };
   for (const l of logs) {
     let meta: { dodo_session?: string; dodo_role?: string } = {};
-    try {
-      meta = JSON.parse(l.metadata ?? "{}");
-    } catch {}
+    if (typeof l.metadata === "string") {
+      try {
+        meta = JSON.parse(l.metadata);
+      } catch {}
+    } else if (l.metadata) meta = l.metadata;
     // `search` is free text; keep only exact matches.
     if (meta.dodo_session !== sessionId) continue;
     const role = meta.dodo_role ?? "unknown";
@@ -346,7 +349,7 @@ async function main() {
     writeFileSync(join(outDir, "results.json"), JSON.stringify(results, null, 1));
   }
 
-  if (gateway && process.env.CLOUDFLARE_API_TOKEN) {
+  if (gateway && process.env.CLOUDFLARE_API_TOKEN && process.env.CLOUDFLARE_ACCOUNT_ID) {
     log("Pulling AI Gateway logs (waiting 60s for them to land)…");
     await sleep(60_000);
     for (const r of results) {
