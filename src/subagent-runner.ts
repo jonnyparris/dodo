@@ -338,6 +338,20 @@ export function addAnthropicCacheMarkers(body: Record<string, unknown>): Record<
 
 // ─── Gateway / provider helpers ───
 
+/**
+ * Retry budget for one subagent model call.
+ *
+ * Workers AI enforces a per-account, per-model requests-per-minute cap.
+ * An explore fan-out on @cf/deepseek-ai/deepseek-v4.1-flash-1017 alone
+ * pushed ~40-80 requests into one minute and got 429 on ~25% of calls
+ * (jp-gw, 2026-10-21). The AI SDK default of 2 retries (2s + 4s backoff)
+ * can run out inside that window. 5 retries (2+4+8+16+32s) outlasts a
+ * full minute. Hosted third-party models keep the SDK default.
+ */
+export function subagentMaxRetries(modelId: string): number {
+  return modelId.startsWith("@cf/") ? 5 : 2;
+}
+
 function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
@@ -605,6 +619,7 @@ async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentRes
       tools: input.toolset,
       stopWhen: stepCountIs(input.profile.maxSteps),
       maxOutputTokens: 4000,
+      maxRetries: subagentMaxRetries(input.model),
       prepareStep: input.prepareStep ?? subagentPrepareStep(),
       abortSignal: input.signal ?? (input.timeoutMs ? AbortSignal.timeout(input.timeoutMs) : undefined),
     });

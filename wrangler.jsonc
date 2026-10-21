@@ -131,26 +131,27 @@
     "DEFAULT_REPLICATE_IMAGE_MODEL": "google/nano-banana-2",
     // Default model for the `explore` / `task` subagents.
     //
-    // Initially set to Kimi K2.6 based on the main-model comparison, but
-    // the 2026-04-24 demo verification runs showed Kimi as an EXPLORE
-    // model keeps grep/read-ing and never synthesizes a final summary on
-    // repos this size — it burned 176k tokens across 12 steps in demo
-    // 4ffee77a and returned empty output. Haiku 4.5 completes the same
-    // query in 1 call with ~2k output tokens (demo 03c51aff: 76k total
-    // parent tokens vs 132k for the Kimi run).
+    // History: Kimi K2.6 (2026-04) never synthesised a summary as an
+    // explore model; Haiku 4.5 replaced it. Haiku then turned out to be the
+    // most expensive part of a run: on AI Gateway's /compat endpoint its
+    // cache_control markers are stripped, so every call paid full input
+    // price ($2.68 across 6 explore+bugfix bench runs, 0 cached tokens).
     //
-    // Conclusion: Kimi is great as a main model for investigate-and-report,
-    // but explore's success criterion (short synthesized summary from tool
-    // traces) suits an instruction-follower better. Haiku is cheap
-    // ($0.80/M in, $4/M out), fast, and converges reliably.
+    // DeepSeek V4.1 Flash 1017 on Workers AI, same 6 runs with only the
+    // subagent model changed (2026-10-21): $0.35 for subagents (-87%),
+    // 76% of subagent input tokens served from the prefix cache. Explore
+    // answers were correct in 3/3 and bug fixes passed the hidden test in 3/3,
+    // the same as with Haiku.
+    // Caveat: Workers AI has a per-model requests-per-minute cap. Explore
+    // fan-out hits 429 on ~25% of calls, which subagentMaxRetries() absorbs.
+    // A session whose MAIN model is also 1017 shares that cap.
     //
     // Overrides: PUT /config exploreModel=..., or pass model=... per call.
-    // Auto-routed via AI Gateway for @cf/* models — see
-    // buildProviderForModel in src/agentic.ts.
-    "DEFAULT_EXPLORE_MODEL": "anthropic/claude-haiku-4-5",
-    // Default `task` subagent model. Same choice for the same reason —
-    // task needs to edit files then summarize; Haiku does both well.
-    "DEFAULT_TASK_MODEL": "anthropic/claude-haiku-4-5",
+    // @cf/* ids are wire-prefixed with workers-ai/ — see
+    // resolveWireModelId in src/subagent-runner.ts.
+    "DEFAULT_EXPLORE_MODEL": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+    // Default `task` subagent model. Same choice for the same reason.
+    "DEFAULT_TASK_MODEL": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
     "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
     // AI Gateway unified API base URL — include /{account_id}/{gateway_id}/compat
     // so the OpenAI-compatible SDK hits /chat/completions correctly.

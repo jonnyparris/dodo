@@ -1795,9 +1795,8 @@ export class UserControl extends DurableObject<Env> {
       opencodeBaseURL: get("opencodeBaseURL") ?? this.env.OPENCODE_BASE_URL,
       systemPromptPrefix: get("systemPromptPrefix"),
       // Fall back to the env defaults, then undefined (heuristic path).
-      // DEFAULT_EXPLORE_MODEL ships as Kimi K2.6 in wrangler.jsonc —
-      // investigate/search work is the subagent's primary use case, and
-      // Kimi is the best-value fit per the 2026-04-24 model comparison.
+      // DEFAULT_EXPLORE_MODEL / DEFAULT_TASK_MODEL ship as DeepSeek V4.1
+      // Flash 1017 in wrangler.jsonc. See the comment there for the bench.
       exploreModel: get("exploreModel") ?? this.env.DEFAULT_EXPLORE_MODEL,
       taskModel: get("taskModel") ?? this.env.DEFAULT_TASK_MODEL,
       // Replicate image model — env default, then the hardcoded nano-banana-2.

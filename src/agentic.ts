@@ -1221,7 +1221,7 @@ function buildTaskTool(
         "Optional directory to scope the task to (e.g. 'src/'). Hint only — the subagent can still read outside this path.",
       ),
       model: z.string().optional().describe(
-        "Optional model override for this call (e.g. 'anthropic/claude-haiku-4-5', '@cf/moonshotai/kimi-k2.6'). Leave unset to use the session default (configured via PUT /config taskModel, defaults to Haiku 4.5).",
+        "Optional model override for this call (e.g. 'anthropic/claude-haiku-4-5', '@cf/moonshotai/kimi-k2.6'). Leave unset to use the session default (configured via PUT /config taskModel, defaults to DeepSeek V4.1 Flash 1017).",
       ),
       resultSchemaName: z.enum(["task-summary", "verify-run-summary", "dispatch-decision"]).optional().describe(
         "Optional structured-result schema. When set, the subagent's free-form output is coerced into the named schema and returned in a ```json block alongside the narrative. 'task-summary' is the most common choice for delegated work; 'verify-run-summary' for typecheck/test-style runs; 'dispatch-decision' for supervisor-style fan-out planning.",
