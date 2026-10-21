@@ -1,37 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { CLOUDFLARE_AI_GATEWAY_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-ai-gateway.models";
-import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
+import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
+import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { FALLBACK_MODELS } from "../src/model-catalog";
 
-type PiCost = { input: number; output: number };
-type PiCatalog = Record<string, { cost: PiCost }>;
+type PiCatalog = Record<string, { cost: { input: number; output: number } }>;
 
-// Dodo ids are `vendor/model`. The AI Gateway catalog keys Anthropic models
-// by the bare id and OpenAI models by the prefixed id; Google and DeepSeek
-// come from their own provider catalogs.
-function piCost(id: string): PiCost | undefined {
-  const bare = id.slice(id.indexOf("/") + 1);
-  const catalogs: PiCatalog[] = [CLOUDFLARE_AI_GATEWAY_MODELS, GOOGLE_MODELS, DEEPSEEK_MODELS] as unknown as PiCatalog[];
-  for (const catalog of catalogs) {
-    const model = catalog[id] ?? catalog[bare];
-    if (model) return model.cost;
-  }
-  return undefined;
+// Dodo ids are `vendor/model`; each vendor's pi-ai catalog keys by the bare id.
+const CATALOG_BY_VENDOR: Record<string, PiCatalog> = {
+  anthropic: ANTHROPIC_MODELS as unknown as PiCatalog,
+  openai: OPENAI_MODELS as unknown as PiCatalog,
+  google: GOOGLE_MODELS as unknown as PiCatalog,
+};
+
+// Not in pi-ai's bundled catalog (it lists deepseek-flash / deepseek-v4-pro),
+// so these prices are unchecked. Anything else must resolve.
+const UNCHECKED = new Set(["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]);
+
+function piModel(id: string) {
+  const slash = id.indexOf("/");
+  return CATALOG_BY_VENDOR[id.slice(0, slash)]?.[id.slice(slash + 1)];
 }
 
 describe("FALLBACK_MODELS prices", () => {
-  it.each(FALLBACK_MODELS.filter((m) => piCost(m.id)).map((m) => [m.id, m] as const))(
-    "%s matches pi-ai's bundled catalog",
-    (_id, model) => {
-      const cost = piCost(model.id)!;
-      expect({ input: model.costInput, output: model.costOutput }).toEqual({ input: cost.input, output: cost.output });
+  it.each(FALLBACK_MODELS.filter((m) => !UNCHECKED.has(m.id)).map((m) => [m.id, m] as const))(
+    "%s matches pi-ai's bundled catalog (USD per 1M tokens, base tier)",
+    (id, model) => {
+      const pi = piModel(id);
+      expect(pi, `${id} is missing from pi-ai's catalog: fix the id or add it to UNCHECKED`).toBeDefined();
+      expect({ input: model.costInput, output: model.costOutput }).toEqual({ input: pi!.cost.input, output: pi!.cost.output });
     },
   );
 
-  it("checks the Anthropic models (the ones that drifted)", () => {
-    for (const id of ["anthropic/claude-haiku-4-5", "anthropic/claude-opus-4-6", "anthropic/claude-sonnet-4-6"]) {
-      expect(piCost(id), id).toBeDefined();
-    }
+  it("UNCHECKED only lists catalog entries", () => {
+    const ids = new Set(FALLBACK_MODELS.map((m) => m.id));
+    for (const id of UNCHECKED) expect(ids.has(id), id).toBe(true);
   });
 });

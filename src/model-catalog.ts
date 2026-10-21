@@ -14,9 +14,11 @@ export function extractGeneratePrompt(content: string): string | null {
   return prompt.length > 0 ? prompt : null;
 }
 
-/** Prices are USD per million tokens (base tier). Entries that pi-ai also
- *  knows must match its bundled catalog: test/model-catalog-prices-unit.test.ts
- *  fails when they drift (2026-10: Haiku, Opus, GPT-5.4 and Gemini Flash had). */
+/** costInput/costOutput are USD per million tokens, base tier only (GPT-5.4
+ *  and Gemini 2.5 Pro cost more above 272k/200k input tokens). They must match
+ *  pi-ai's bundled vendor catalogs: test/model-catalog-prices-unit.test.ts
+ *  fails on drift (2026-10: Haiku, Opus, GPT-5.4 and Gemini Flash had drifted).
+ *  Context windows are not checked. */
 export const FALLBACK_MODELS = [
   { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "OpenAI", costInput: 2.5, costOutput: 15, contextWindow: 1_000_000 },
   { id: "openai/gpt-4.1", name: "GPT-4.1", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_000_000 },
