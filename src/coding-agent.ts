@@ -366,6 +366,12 @@ const sendMessageSchema = z.object({
   exploreModel: modelOverrideValueSchema.optional(),
   taskModel: modelOverrideValueSchema.optional(),
 }).strict();
+/** PUT /model-override body. */
+const modelOverrideBodySchema = z.object({
+  model: modelOverrideValueSchema.optional(),
+  exploreModel: modelOverrideValueSchema.optional(),
+  taskModel: modelOverrideValueSchema.optional(),
+}).strict();
 /** /generate schema — text-to-image via Replicate. */
 const generateImageSchema = z.object({
   content: z.string().trim().min(1).max(REPLICATE_MAX_PROMPT_LENGTH),
@@ -1825,6 +1831,10 @@ export class CodingAgent extends CodingAgentBase {
 
       if (request.method === "POST" && url.pathname === "/abort") {
         return await this.handleAbort();
+      }
+
+      if (request.method === "PUT" && url.pathname === "/model-override") {
+        return await this.handleModelOverride(request);
       }
 
       return new Response("Not Found", { status: 404 });
@@ -5931,6 +5941,22 @@ export class CodingAgent extends CodingAgentBase {
     }
     this.modelOverride.apply(patch);
     return null;
+  }
+
+  /**
+   * PUT /model-override: set or clear the session model override without
+   * sending a prompt (pi client `/dodo model`, UI). Same rules as the prompt
+   * body fields: owner only, "" clears. Takes effect on the next prompt; a
+   * running prompt keeps its model.
+   */
+  private async handleModelOverride(request: Request): Promise<Response> {
+    const parsed = modelOverrideBodySchema.safeParse(await request.json().catch(() => null));
+    if (!parsed.success) return Response.json({ error: parsed.error.issues[0]?.message ?? "Invalid body" }, { status: 400 });
+    this.ensureMetadata(this.requireSessionId(request), request.headers.get("x-owner-email"));
+    const denied = this.applyModelOverride(parsed.data, request.headers.get("x-author-email"));
+    if (denied) return denied;
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    return Response.json({ modelOverride: this.modelOverride.read() });
   }
 
   /**
