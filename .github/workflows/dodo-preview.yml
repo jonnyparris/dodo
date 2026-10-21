@@ -30,6 +30,13 @@ jobs:
   deploy-preview:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The repo's default workflow token is read-only, so the "Comment preview
+    # URL on PR" step needs an explicit grant to reach the issues REST
+    # endpoints (REST issue comments cover pull requests too).
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
