@@ -19,6 +19,7 @@ import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
+import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
@@ -57,6 +58,7 @@ const VENDOR_CATALOGS: Record<string, Record<string, { cost?: ModelCost } | unde
   anthropic: ANTHROPIC_MODELS,
   openai: OPENAI_MODELS,
   google: GOOGLE_MODELS,
+  deepseek: DEEPSEEK_MODELS,
 };
 
 /**

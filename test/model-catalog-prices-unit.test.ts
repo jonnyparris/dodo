@@ -1,4 +1,5 @@
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
+import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { describe, expect, it } from "vitest";
@@ -11,11 +12,12 @@ const CATALOG_BY_VENDOR: Record<string, PiCatalog> = {
   anthropic: ANTHROPIC_MODELS as unknown as PiCatalog,
   openai: OPENAI_MODELS as unknown as PiCatalog,
   google: GOOGLE_MODELS as unknown as PiCatalog,
+  deepseek: DEEPSEEK_MODELS as unknown as PiCatalog,
 };
 
-// Not in pi-ai's bundled catalog (it lists deepseek-flash / deepseek-v4-pro),
-// so these prices are unchecked. Anything else must resolve.
-const UNCHECKED = new Set(["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]);
+// Ids missing from pi-ai's bundled catalog, so their prices go unchecked.
+// Anything else must resolve.
+const UNCHECKED = new Set<string>();
 
 function piModel(id: string) {
   const slash = id.indexOf("/");

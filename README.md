@@ -283,6 +283,12 @@ Every session gets a git repo on [Cloudflare Artifacts](https://developers.cloud
 
 ---
 
+## Use it from pi
+
+[`clients/pi`](clients/pi/README.md) is a [pi](https://github.com/earendil-works/pi) extension that attaches your terminal to a Dodo session. Type in pi, and Dodo runs the prompt and streams back replies and tool calls. Close the laptop and the session keeps going; `/dodo` on any machine attaches to it again. `/dodo model` switches the model for that one session.
+
+---
+
 ## Connect via MCP
 
 | Endpoint | Tools | For |
