@@ -7,8 +7,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { entriesToMessages, PiEngine, type PiEngineHost } from "../src/pi/engine";
 import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "../src/pi/tools";
-import { agentModelRef, anthropicGatewayBaseUrl, anthropicGatewayStreams, dodoModel, gatewayHeaders, setDodoProvider } from "../src/pi/models";
-import { createModels } from "@earendil-works/pi-ai/models";
+import { agentModelRef, anthropicGatewayBaseUrl, anthropicGatewayStreams, dodoModel, gatewayHeaders, modelCost, setDodoProvider } from "../src/pi/models";
+import { calculateCost, createModels } from "@earendil-works/pi-ai/models";
 import type { StreamOptions } from "@earendil-works/pi-ai";
 
 function host(storage: DurableObjectStorage, faux: ReturnType<typeof fauxProvider>, events: Array<{ type: string; data: unknown }>): PiEngineHost {
@@ -189,8 +189,12 @@ describe("pi adapters", () => {
   it("maps gateway config to an openai-completions model with Anthropic cache markers", () => {
     const m = dodoModel("anthropic/claude-sonnet-4-6", { activeGateway: "ai-gateway", opencodeBaseURL: "", aiGatewayBaseURL: "https://gw/v1/" }, { AI_GATEWAY_KEY: "k" } as never);
     expect(m.baseUrl).toBe("https://gw/v1");
-    expect(m.contextWindow).toBe(200_000);
+    expect(m.contextWindow).toBe(1_000_000);
     expect(m.api).toBe("openai-completions");
+    // Cache prices come from pi-ai's catalog on the OpenAI-compatible path too
+    // (were 0). Writes only apply if the gateway reports cache_write_tokens.
+    expect(m.cost.cacheRead).toBeCloseTo(0.3);
+    expect(m.cost.cacheWrite).toBeCloseTo(3.75);
     expect((m.compat as { cacheControlFormat?: string } | undefined)?.cacheControlFormat).toBe("anthropic");
     const h = gatewayHeaders({ activeGateway: "ai-gateway", opencodeBaseURL: "", aiGatewayBaseURL: "" }, { AI_GATEWAY_KEY: "k" } as never);
     expect(h["cf-aig-authorization"]).toBe("Bearer k");
@@ -198,6 +202,29 @@ describe("pi adapters", () => {
     const w = dodoModel("@cf/moonshotai/kimi-k2.6", { activeGateway: "ai-gateway", opencodeBaseURL: "", aiGatewayBaseURL: "https://gw/v1" }, {} as never);
     expect(w.id).toBe("workers-ai/@cf/moonshotai/kimi-k2.6");
     expect((w.compat as { cacheControlFormat?: string } | undefined)?.cacheControlFormat).toBeUndefined();
+  });
+
+  it("prices cache reads and long-context tiers from pi-ai's vendor catalog", () => {
+    const config = { activeGateway: "ai-gateway" as const, opencodeBaseURL: "", aiGatewayBaseURL: "https://gw/v1" };
+    const gpt = dodoModel("openai/gpt-5.4", config, {} as never);
+    expect(gpt.cost).toMatchObject({ input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 });
+    expect(gpt.cost.tiers).toEqual([expect.objectContaining({ inputTokensAbove: 272_000, input: 5, output: 22.5 })]);
+    expect(dodoModel("google/gemini-2.5-pro", config, {} as never).cost.tiers?.[0]?.inputTokensAbove).toBe(200_000);
+    // Not in pi-ai's catalog: Dodo's prices, no cache price.
+    expect(modelCost("deepseek/deepseek-chat")).toEqual({ input: 0.27, output: 1.1, cacheRead: 0, cacheWrite: 0 });
+    expect(modelCost("@cf/zai-org/glm-5.3-flash")).toEqual({ input: 0.15, output: 0.5, cacheRead: 0, cacheWrite: 0 });
+    // Callers get a copy, not pi-ai's shared catalog object.
+    modelCost("openai/gpt-5.4").input = 999;
+    expect(modelCost("openai/gpt-5.4").input).toBe(2.5);
+  });
+
+  it("charges the long-context tier past 272k input tokens on GPT-5.4", () => {
+    const m = dodoModel("openai/gpt-5.4", { activeGateway: "ai-gateway", opencodeBaseURL: "", aiGatewayBaseURL: "https://gw/v1" }, {} as never);
+    const usage = (input: number, cacheRead: number) => ({ input, output: 1000, cacheRead, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
+    const short = calculateCost(m, usage(100_000, 100_000));
+    expect(short.total).toBeCloseTo((100_000 * 2.5 + 1000 * 15 + 100_000 * 0.25) / 1e6);
+    const long = calculateCost(m, usage(100_000, 200_000));
+    expect(long.total).toBeCloseTo((100_000 * 5 + 1000 * 22.5 + 200_000 * 0.5) / 1e6);
   });
 
   it("sends Anthropic models on an AI Gateway /compat URL to the native /anthropic endpoint", () => {
