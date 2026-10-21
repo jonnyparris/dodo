@@ -160,4 +160,113 @@ describe("Idle session auto-cleanup", () => {
 
     expect(await getSessionStatus(sessionId)).toBe("idle");
   });
+  async function runSweep(): Promise<void> {
+    const stub = getUserControlStub();
+    await runInDurableObject(stub, async (_, state) => {
+      state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+    });
+    await runDurableObjectAlarm(stub);
+  }
+
+  it("keeps a session that has been forked from, even with no prompts", async () => {
+    const baseId = await createSession();
+    const forkRes = await fetchJson(`/session/${baseId}/fork`, { method: "POST" });
+    expect(forkRes.status).toBe(201);
+    const forkId = ((await forkRes.json()) as { id: string }).id;
+
+    await backdateSession(baseId, 11 * 60);
+    await backdateSession(forkId, 11 * 60);
+    await runSweep();
+
+    // The base is a fork source and survives; the empty fork itself does not.
+    expect(await getSessionStatus(baseId)).toBe("idle");
+    expect(await getSessionStatus(forkId)).toBe("deleted");
+
+    // And it can still be forked after the sweep.
+    const again = await fetchJson(`/session/${baseId}/fork`, { method: "POST" });
+    expect(again.status).toBe(201);
+  });
+
+  it("keeps the source session of a fork schedule", async () => {
+    const baseId = await createSession();
+    const schedRes = await fetchJson("/api/scheduled-sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        description: "nightly from base",
+        prompt: "run",
+        type: "delayed",
+        delayInSeconds: 3600,
+        source: "fork",
+        sourceSessionId: baseId,
+      }),
+    });
+    expect(schedRes.status).toBe(201);
+
+    await backdateSession(baseId, 11 * 60);
+    await runSweep();
+
+    expect(await getSessionStatus(baseId)).toBe("idle");
+  });
+  it("keeps the source after a one-shot fork schedule has fired and its row is gone", async () => {
+    const baseId = await createSession();
+    const schedRes = await fetchJson("/api/scheduled-sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        description: "one-shot from base",
+        prompt: "run",
+        type: "delayed",
+        delayInSeconds: 1,
+        source: "fork",
+        sourceSessionId: baseId,
+      }),
+    });
+    expect(schedRes.status).toBe(201);
+    const schedId = ((await schedRes.json()) as { id: string }).id;
+
+    // Fire the schedule.
+    const stub = getUserControlStub();
+    await runInDurableObject(stub, async (_, state) => {
+      state.storage.sql.exec("UPDATE scheduled_sessions SET next_run_epoch = 1 WHERE id = ?", schedId);
+      state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+    });
+    await runDurableObjectAlarm(stub);
+    expect((await fetchJson(`/api/scheduled-sessions/${schedId}`)).status).toBe(404);
+
+    await backdateSession(baseId, 11 * 60);
+    await runSweep();
+
+    expect(await getSessionStatus(baseId)).toBe("idle");
+  });
+
+  it("fork-source mark flags a live session and 404s for unknown or deleted ones", async () => {
+    const stub = getUserControlStub();
+    const liveId = await createSession();
+    const ok = await stub.fetch(`https://user-control/sessions/${liveId}/fork-source`, { method: "POST" });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ marked: true, sessionId: liveId });
+    const flag = await runInDurableObject(stub, async (_, state) =>
+      (state.storage.sql.exec("SELECT fork_source FROM sessions WHERE id = ?", liveId).toArray()[0] as { fork_source: number }).fork_source);
+    expect(flag).toBe(1);
+
+    const unknown = await stub.fetch("https://user-control/sessions/does-not-exist/fork-source", { method: "POST" });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toEqual({ error: "Session 'does-not-exist' not found" });
+
+    const deadId = await createSession();
+    await backdateSession(deadId, 11 * 60);
+    await runSweep();
+    const dead = await stub.fetch(`https://user-control/sessions/${deadId}/fork-source`, { method: "POST" });
+    expect(dead.status).toBe(404);
+  });
+  it("refuses to fork a soft-deleted source", async () => {
+    const baseId = await createSession();
+    await backdateSession(baseId, 11 * 60);
+    await runSweep();
+    expect(await getSessionStatus(baseId)).toBe("deleted");
+
+    const res = await fetchJson(`/session/${baseId}/fork`, { method: "POST" });
+    expect(res.status).toBe(404);
+  });
 });
