@@ -26,7 +26,8 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `src/tools/shell.ts` / `src/tools/shell-patch.ts` — busybox-style shell (just-bash on `@cloudflare/computer`), patched so redirects write raw bytes
 - `src/tools/image-check.ts` / `src/clef.ts` — Clef decision models: `image_check`, image edit-vs-answer routing (ADR 0003)
 - `src/browser/session-browser.ts` — one SDK `Browser` per session + `browser_execute`; Live View
-- `src/browser/web-fetch.ts` — `browser_markdown` / `browser_triage` (fetch first, Browser Run fallback, Clef page checks)
+- `src/browser/web-fetch.ts` — `browser_markdown` / `browser_triage` (SDK `web_fetch` tool from `agents/webfetch/ai-sdk`, Clef page checks)
+- `src/browser/page-source.ts` — the `browser_markdown` page source: SDK direct fetch, page cache, Browser Run fallback when blocked or JS-rendered
 - `src/tools/kitebuild.ts` — `ci_run`: verify a pushed branch in Kitebuild (enabled by `KITEBUILD_*` config)
 - `src/explore-agent.ts` / `src/task-agent.ts` / `src/subagent-runner.ts` — `explore` and `task` subagents (in-process or facet DOs)
 - `src/typecheck.ts` — in-isolate `tsc --noEmit` tool

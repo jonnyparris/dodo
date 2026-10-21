@@ -3,7 +3,6 @@ import {
   extractJevChoice,
   extractJevNoul,
   triageUrls,
-  validateTargetUrl,
   type JevAi,
 } from "../src/browser/web-fetch";
 
@@ -43,27 +42,6 @@ describe("extractJevChoice", () => {
     expect(
       extractJevChoice({ answers: { best_source: { choice: "1" } } }, "best_source"),
     ).toBeNull();
-  });
-});
-
-describe("validateTargetUrl", () => {
-  it("accepts https URLs", () => {
-    const result = validateTargetUrl("https://example.com/page");
-    expect("url" in result && result.url.hostname).toBe("example.com");
-  });
-
-  it("rejects non-http protocols and private hosts", () => {
-    for (const bad of [
-      "ftp://example.com",
-      "file:///etc/passwd",
-      "http://localhost:3000",
-      "http://127.0.0.1",
-      "http://192.168.1.4",
-      "http://nas.local",
-      "http://172.16.0.9",
-    ]) {
-      expect("error" in validateTargetUrl(bad), `expected rejection: ${bad}`).toBe(true);
-    }
   });
 });
 
