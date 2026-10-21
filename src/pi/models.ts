@@ -17,11 +17,15 @@ import type { Model, ProviderStreams, StreamOptions } from "@earendil-works/pi-a
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
+import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
+import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
+import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, anthropicGatewayBaseUrl, resolveWireModelId } from "../subagent-runner";
+import type { Env } from "../types";
 
 export { anthropicGatewayBaseUrl };
-import type { Env } from "../types";
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -47,6 +51,43 @@ function trim(url: string): string {
 const ANTHROPIC_CACHE_READ_MULTIPLIER = 0.1;
 const ANTHROPIC_CACHE_WRITE_MULTIPLIER = 1.25;
 
+type ModelCost = Model<"openai-completions">["cost"];
+
+// pi-ai's bundled vendor catalogs, keyed by the bare model id. Dodo ids are
+// `vendor/model`, so `openai/gpt-5.4` → OPENAI_MODELS["gpt-5.4"].
+const VENDOR_CATALOGS: Record<string, Record<string, { cost?: ModelCost } | undefined>> = {
+  anthropic: ANTHROPIC_MODELS,
+  openai: OPENAI_MODELS,
+  google: GOOGLE_MODELS,
+  deepseek: DEEPSEEK_MODELS,
+};
+
+/**
+ * Per-turn prices for a Dodo model id. pi-ai's vendor catalog wins when it
+ * lists the model: it carries cache-read/write prices and long-context tiers
+ * (GPT-5.4 above 272k, Gemini 2.5 Pro above 200k input tokens) that Dodo's
+ * catalog doesn't. Otherwise Dodo's catalog, with Anthropic's standard cache
+ * multipliers for Anthropic ids and no cache price for the rest (unknown).
+ * Input/output agree either way: test/model-catalog-prices-unit.test.ts.
+ * On the openai-completions path a cache write is only billed as one when the
+ * gateway reports `prompt_tokens_details.cache_write_tokens`; otherwise pi-ai
+ * counts those tokens as plain input.
+ */
+export function modelCost(modelId: string): ModelCost {
+  const slash = modelId.indexOf("/");
+  const vendor = slash > 0 ? VENDOR_CATALOGS[modelId.slice(0, slash)]?.[modelId.slice(slash + 1)] : undefined;
+  if (vendor?.cost) return structuredClone(vendor.cost);
+  const entry = CATALOG.get(modelId);
+  const input = entry?.costInput ?? 0;
+  const anthropic = modelId.startsWith("anthropic/");
+  return {
+    input,
+    output: entry?.costOutput ?? 0,
+    cacheRead: anthropic ? input * ANTHROPIC_CACHE_READ_MULTIPLIER : 0,
+    cacheWrite: anthropic ? input * ANTHROPIC_CACHE_WRITE_MULTIPLIER : 0,
+  };
+}
+
 /** The pi-ai model for one Dodo model id on the configured gateway. */
 export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> | Model<"anthropic-messages"> {
   const isOpencode = config.activeGateway === "opencode";
@@ -54,7 +95,6 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
   const anthropic = modelId.startsWith("anthropic/");
   const nativeAnthropicUrl = anthropic ? anthropicGatewayBaseUrl(config) : undefined;
   if (nativeAnthropicUrl) {
-    const input = entry?.costInput ?? 0;
     return {
       // Keep the Dodo id: it is the model ref (agentModelRef) and the usage
       // key. The wire id (`claude-…`) is set in anthropicGatewayStreams.
@@ -65,12 +105,7 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
       baseUrl: nativeAnthropicUrl,
       reasoning: false,
       input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
-      cost: {
-        input,
-        output: entry?.costOutput ?? 0,
-        cacheRead: input * ANTHROPIC_CACHE_READ_MULTIPLIER,
-        cacheWrite: input * ANTHROPIC_CACHE_WRITE_MULTIPLIER,
-      },
+      cost: modelCost(modelId),
       contextWindow: entry?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
       maxTokens: DEFAULT_MAX_TOKENS,
     };
@@ -83,12 +118,7 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
     baseUrl: trim(isOpencode ? config.opencodeBaseURL : config.aiGatewayBaseURL),
     reasoning: false,
     input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
-    cost: {
-      input: entry?.costInput ?? 0,
-      output: entry?.costOutput ?? 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-    },
+    cost: modelCost(modelId),
     contextWindow: entry?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: DEFAULT_MAX_TOKENS,
     compat: {
