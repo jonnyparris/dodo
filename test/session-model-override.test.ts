@@ -129,6 +129,45 @@ describe("per-session model override", () => {
   });
 });
 
+describe("PUT /session/:id/model-override", () => {
+  it("sets and clears the override without a prompt, and the next prompt uses it", async () => {
+    const config = await json<{ model: string }>(await call("/api/config"));
+    const id = await newSession();
+
+    const set = await send(`/session/${id}/model-override`, { model: "@cf/test/put-b" }, "PUT");
+    expect(set.status).toBe(200);
+    expect(await json(set)).toEqual({ modelOverride: { model: "@cf/test/put-b" } });
+    expect((await json<Session>(await call(`/session/${id}`))).modelOverride).toEqual({ model: "@cf/test/put-b" });
+
+    const p = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "hi" }));
+    await waitForPrompt(id, p.promptId);
+    expect((await json<Session>(await call(`/session/${id}`))).model).toBe("@cf/test/put-b");
+
+    const cleared = await send(`/session/${id}/model-override`, { model: "" }, "PUT");
+    expect(await json(cleared)).toEqual({ modelOverride: {} });
+    const p2 = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "again" }));
+    await waitForPrompt(id, p2.promptId);
+    expect((await json<Session>(await call(`/session/${id}`))).model).toBe(config.model);
+  });
+
+  it("rejects bad bodies and guests", async () => {
+    const id = await newSession();
+    expect((await send(`/session/${id}/model-override`, { model: "bad id" }, "PUT")).status).toBe(400);
+    expect((await send(`/session/${id}/model-override`, { content: "nope" }, "PUT")).status).toBe(400);
+
+    const ok = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "owner" }));
+    await waitForPrompt(id, ok.promptId);
+    const stub = await getAgentByName(typedEnv.CODING_AGENT as never, id);
+    const owner = await inDO<string>(stub, async (agent) => agent.readMetadata("owner_email"));
+    const guest = await (stub as unknown as { fetch(r: Request): Promise<Response> }).fetch(new Request("https://coding-agent/model-override", {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-dodo-session-id": id, "x-owner-email": owner, "x-author-email": "guest@example.com" },
+      body: JSON.stringify({ model: "@cf/test/pricey" }),
+    }));
+    expect(guest.status).toBe(403);
+  });
+});
+
 describe("session-model-override helpers", () => {
   it("store sets, keeps and clears fields", () => {
     const rows = new Map<string, string>();
