@@ -10,7 +10,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
-import { resolveWireModelId } from "../subagent-runner";
+import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
@@ -21,6 +21,8 @@ export interface GatewayConfig {
   activeGateway: "opencode" | "ai-gateway";
   opencodeBaseURL: string;
   aiGatewayBaseURL: string;
+  /** Tags AI Gateway logs with the session (cf-aig-metadata), so cost can be pulled per session. */
+  sessionId?: string;
 }
 
 const CATALOG = new Map<string, { contextWindow: number; costInput: number | null; costOutput: number | null }>(
@@ -81,6 +83,7 @@ export function gatewayHeaders(config: GatewayConfig, env: Env): Record<string, 
     : {
         "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
         "x-api-key": env.AI_GATEWAY_KEY ?? "",
+        ...aigMetadataHeader(config.sessionId, "main"),
         Authorization: null,
       };
 }

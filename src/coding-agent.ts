@@ -20,6 +20,7 @@ import { bytesToBase64Chunked } from "./crypto";
 import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
 import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
 import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
+import { createModelOverrideStore, type ModelOverrideStore, modelOverridePatch, modelOverrideValueSchema, withModelOverride } from "./session-model-override";
 import { log } from "./logger";
 import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
 import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
@@ -360,6 +361,10 @@ const sendMessageSchema = z.object({
   images: z.array(promptAttachmentSchema).max(MAX_IMAGES_PER_MESSAGE).optional(),
   /** https URL POSTed (no content, ids + status only) whenever a prompt in this session finishes. Kept for later prompts. */
   callbackUrl: z.string().max(2048).optional(),
+  /** Per-session model override (see src/session-model-override.ts). Kept for later prompts; "" clears. */
+  model: modelOverrideValueSchema.optional(),
+  exploreModel: modelOverrideValueSchema.optional(),
+  taskModel: modelOverrideValueSchema.optional(),
 }).strict();
 /** /generate schema — text-to-image via Replicate. */
 const generateImageSchema = z.object({
@@ -684,6 +689,7 @@ export class CodingAgent extends CodingAgentBase {
   private readonly control: SessionControlPlane;
   private readonly goalStore: GoalStateStore;
   private readonly watchdogStore: WatchdogState;
+  private readonly modelOverride: ModelOverrideStore;
   /**
    * The single front door for prompt transitions. See ADR-0001 and
    * src/session-lifecycle.ts. Consumes the four stores above plus a
@@ -756,6 +762,7 @@ export class CodingAgent extends CodingAgentBase {
     this.control = createSessionControlPlane(this.metadataKv);
     this.goalStore = createGoalStateStore(this.metadataKv);
     this.watchdogStore = createWatchdogState(this.metadataKv);
+    this.modelOverride = createModelOverrideStore(this.metadataKv);
 
     this.sessionLifecycle = createSessionLifecycle({
       control: this.control,
@@ -3157,6 +3164,8 @@ export class CodingAgent extends CodingAgentBase {
     const ownerEmail = request.headers.get("x-owner-email");
     this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
     this.ensureMetadata(sessionId, ownerEmail);
+    const overrideDenied = this.applyModelOverride(input, authorEmail);
+    if (overrideDenied) return overrideDenied;
 
     // Server-side slash command routing so /generate works from every entry
     // point (browser UI, MCP tools, webhooks) — not just the client JS. We do
@@ -3247,6 +3256,8 @@ export class CodingAgent extends CodingAgentBase {
     const ownerEmail = request.headers.get("x-owner-email");
     this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
     this.ensureMetadata(sessionId, ownerEmail);
+    const overrideDenied = this.applyModelOverride(input, authorEmail);
+    if (overrideDenied) return overrideDenied;
     this.ensureThinkConfig(request);
     if (input.callbackUrl !== undefined) {
       const bad = checkCallbackUrl(input.callbackUrl);
@@ -3897,7 +3908,9 @@ export class CodingAgent extends CodingAgentBase {
    * the model/gateway if they've changed (e.g. user changed model in settings).
    */
   private ensureThinkConfig(request: Request): void {
-    const incomingModel = request.headers.get("x-dodo-model") ?? this.env.DEFAULT_MODEL;
+    // A session model override wins over the owner's model, which every
+    // route sends as x-dodo-model.
+    const incomingModel = this.modelOverride.read().model ?? request.headers.get("x-dodo-model") ?? this.env.DEFAULT_MODEL;
     const incomingGateway = request.headers.get("x-dodo-gateway") === "ai-gateway" ? "ai-gateway" as const : "opencode" as const;
     const incomingImageModel = request.headers.get("x-dodo-image-model") ?? undefined;
     const existing = this.getConfig();
@@ -5046,6 +5059,7 @@ export class CodingAgent extends CodingAgentBase {
     const compactionCount = onPi
       ? parseInt(this.readMetadata("pi_compactions") ?? "0", 10) || 0
       : thinkSid ? this.sessions.compactionCount(thinkSid) : 0;
+    const modelOverride = this.modelOverride.read();
 
     return {
       activePromptId,
@@ -5063,6 +5077,9 @@ export class CodingAgent extends CodingAgentBase {
       totalTokenInput,
       totalTokenOutput,
       updatedAt,
+      ...(config?.exploreModel ? { exploreModel: config.exploreModel } : {}),
+      ...(config?.taskModel ? { taskModel: config.taskModel } : {}),
+      ...(Object.keys(modelOverride).length > 0 ? { modelOverride } : {}),
     };
   }
 
@@ -5869,6 +5886,7 @@ export class CodingAgent extends CodingAgentBase {
     const appConfig = (await response.json()) as AppConfig;
 
     const existing = this.getConfig();
+    const override = this.modelOverride.read();
     const dodoConfig: DodoConfig = {
       sessionId: this.sessionId(),
       ownerEmail,
@@ -5877,16 +5895,17 @@ export class CodingAgent extends CodingAgentBase {
       activeGateway: existing?.activeGateway ?? appConfig.activeGateway,
       gitAuthorEmail: appConfig.gitAuthorEmail,
       gitAuthorName: appConfig.gitAuthorName,
-      model: existing?.model ?? appConfig.model,
+      model: override.model ?? existing?.model ?? appConfig.model,
       opencodeBaseURL: existing?.opencodeBaseURL ?? appConfig.opencodeBaseURL,
       aiGatewayBaseURL: existing?.aiGatewayBaseURL ?? appConfig.aiGatewayBaseURL,
       // Always pull the latest prefix from UserControl so config changes
       // take effect on the next prompt without requiring a session restart.
       systemPromptPrefix: appConfig.systemPromptPrefix,
       // Same for subagent models — changes at the user level propagate to
-      // the next prompt without needing a session recreate.
-      exploreModel: appConfig.exploreModel,
-      taskModel: appConfig.taskModel,
+      // the next prompt without needing a session recreate. A session
+      // override wins.
+      exploreModel: override.exploreModel ?? appConfig.exploreModel,
+      taskModel: override.taskModel ?? appConfig.taskModel,
       // Dispatch-mode flags propagate via DodoConfig so getTools() sees
       // the latest value on the next prompt without a session restart.
       exploreMode: appConfig.exploreMode ?? "inprocess",
@@ -5895,6 +5914,36 @@ export class CodingAgent extends CodingAgentBase {
     this.configure(dodoConfig);
 
     return appConfig;
+  }
+
+  /**
+   * Store the per-session model override from a prompt body. Only the session
+   * owner may set it: a guest with write access must not be able to move the
+   * owner's session (and bill) to another model. Returns a 403 response when
+   * refused, otherwise null.
+   */
+  private applyModelOverride(input: { model?: string; exploreModel?: string; taskModel?: string }, authorEmail: string | null): Response | null {
+    const patch = modelOverridePatch(input);
+    if (Object.keys(patch).length === 0) return null;
+    const owner = this.readMetadata("owner_email");
+    if (authorEmail && owner && authorEmail.toLowerCase() !== owner.toLowerCase()) {
+      return Response.json({ error: "Only the session owner can change the session's model" }, { status: 403 });
+    }
+    this.modelOverride.apply(patch);
+    return null;
+  }
+
+  /**
+   * Config handed to explore/task facets. The owner's live config, but with
+   * this session's main model and any session model override on top, so a
+   * session pinned to other models keeps its subagents on them too.
+   */
+  private async facetParentConfig(): Promise<AppConfig> {
+    const appConfig = await this.readAppConfig();
+    return withModelOverride(
+      { ...appConfig, model: this.getConfig()?.model ?? appConfig.model },
+      this.modelOverride.read(),
+    );
   }
 
   private async syncSessionIndex(patch: { status?: string; title?: string | null }): Promise<void> {
@@ -5971,7 +6020,7 @@ export class CodingAgent extends CodingAgentBase {
   async runExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
     const stub = await this.subAgentStallSafe(ExploreAgent, name);
     const parentSessionId = opts.parentSessionId ?? this.sessionId();
-    const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
+    const parentConfig = opts.parentConfig ?? (await this.facetParentConfig());
 
     const runId = this.insertFacetRun({
       facetType: "explore",
@@ -6066,7 +6115,7 @@ export class CodingAgent extends CodingAgentBase {
   async runTaskFacet(name: string, opts: TaskInvokeOpts): Promise<TaskInvokeResult> {
     const stub = await this.subAgentStallSafe(TaskAgent, name);
     const parentSessionId = opts.parentSessionId ?? this.sessionId();
-    const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
+    const parentConfig = opts.parentConfig ?? (await this.facetParentConfig());
 
     const runId = this.insertFacetRun({
       facetType: "task",

@@ -4,3 +4,6 @@ node_modules
 coverage/
 dist/
 public/version.json
+
+# bench/model-ab.ts run output
+bench/out
