@@ -47,6 +47,14 @@ interface AttachEntry { id: string; title?: string | null }
 const KEYCHAIN_SERVICE = "dodo-pi-client";
 const HISTORY_ON_ATTACH = 6;
 const LIVE_LINES = 10;
+const IDLE_MS = 75_000;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Strip terminal control characters (ESC/OSC/C1) from remote text before it
+ * reaches the terminal: tool output and shared-session messages are untrusted.
+ */
+const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 
 // ─── Credentials ───
 
@@ -63,12 +71,20 @@ function keychain(account: string): string | undefined {
 }
 
 function loadCredentials(): Credentials | string {
-  const url = process.env.DODO_URL ?? keychain("url");
-  const clientId = process.env.DODO_ACCESS_CLIENT_ID ?? keychain("client_id");
-  const clientSecret = process.env.DODO_ACCESS_CLIENT_SECRET ?? keychain("client_secret");
+  const url = process.env.DODO_URL || keychain("url");
+  const clientId = process.env.DODO_ACCESS_CLIENT_ID || keychain("client_id");
+  const clientSecret = process.env.DODO_ACCESS_CLIENT_SECRET || keychain("client_secret");
   if (!url || !clientId || !clientSecret) {
     return `Dodo client not configured. Set DODO_URL, DODO_ACCESS_CLIENT_ID, DODO_ACCESS_CLIENT_SECRET, or add them to the keychain service "${KEYCHAIN_SERVICE}" (accounts url, client_id, client_secret). See clients/pi/README.md in the Dodo repo.`;
   }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return `DODO_URL is not a URL: ${url}`;
+  }
+  const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+  if (parsed.protocol !== "https:" && !local) return `DODO_URL must be https (the Access secret is sent on every request): ${url}`;
   return { url: url.replace(/\/+$/, ""), clientId, clientSecret };
 }
 
@@ -101,40 +117,64 @@ class DodoApi {
     return data as T;
   }
 
-  /** Stream SSE events until the signal aborts or the server closes. */
+  /**
+   * Stream SSE events until the signal aborts or the server closes. The server
+   * sends a heartbeat every 30s; after IDLE_MS of silence (laptop sleep, dead
+   * NAT) the connection is treated as lost so the caller reconnects.
+   */
   async events(sessionId: string, signal: AbortSignal, onEvent: (type: string, data: unknown) => void): Promise<void> {
-    const res = await fetch(`${this.creds.url}/session/${sessionId}/events`, {
-      headers: this.headers({ accept: "text/event-stream" }),
-      redirect: "manual",
-      signal,
-    });
-    if (!res.ok || !res.body) throw new Error(`events: HTTP ${res.status}`);
-    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) return;
-      buf += value;
-      let sep: number;
-      while ((sep = buf.indexOf("\n\n")) >= 0) {
-        const block = buf.slice(0, sep);
-        buf = buf.slice(sep + 2);
-        let type = "message";
-        const data: string[] = [];
-        for (const line of block.split("\n")) {
-          if (line.startsWith("event:")) type = line.slice(6).trim();
-          else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
-        }
-        if (data.length === 0) continue;
-        try {
-          onEvent(type, JSON.parse(data.join("\n")));
-        } catch {
-          // Ignore malformed frames; the next ready/state event resyncs.
+    const idle = new AbortController();
+    const onAbort = () => idle.abort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    let timer = setTimeout(() => idle.abort(), IDLE_MS);
+    const bump = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => idle.abort(), IDLE_MS);
+    };
+    try {
+      const res = await fetch(`${this.creds.url}/session/${sessionId}/events`, {
+        headers: this.headers({ accept: "text/event-stream" }),
+        redirect: "manual",
+        signal: idle.signal,
+      });
+      if (res.status >= 300 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+        throw new FatalStreamError(res.status >= 300 && res.status < 400 ? "Cloudflare Access refused the service token" : `HTTP ${res.status}`);
+      }
+      if (!res.ok || !res.body) throw new Error(`events: HTTP ${res.status}`);
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        bump();
+        buf += value;
+        let sep: number;
+        while ((sep = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          let type = "message";
+          const data: string[] = [];
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) type = line.slice(6).trim();
+            else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+          }
+          if (data.length === 0) continue;
+          try {
+            onEvent(type, JSON.parse(data.join("\n")));
+          } catch {
+            // Ignore malformed frames; the next ready/state event resyncs.
+          }
         }
       }
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
     }
   }
 }
+
+/** The stream can't succeed by retrying (auth refused, session gone). */
+class FatalStreamError extends Error {}
 
 // ─── Helpers ───
 
@@ -198,6 +238,7 @@ export default function dodo(pi: ExtensionAPI) {
   let liveShown = false;
   let pendingTools = new Map<string, { name: string; input: string; started: number }>();
   let ticker: ReturnType<typeof setInterval> | undefined;
+  let attachGen = 0;
 
   const client = (): DodoApi => {
     if (api) return api;
@@ -246,19 +287,20 @@ export default function dodo(pi: ExtensionAPI) {
 
   function flushLiveText(): void {
     const text = live.text.trim();
-    if (text) pi.appendEntry<{ content: string }>("dodo-text", { content: text });
+    if (text) pi.appendEntry<{ content: string }>("dodo-text", { content: clean(text) });
     live.text = "";
   }
 
   function renderMessage(m: ChatMessage, sessionId: string): void {
     if (seen.has(m.id) || (m.role !== "user" && m.role !== "assistant")) return;
     seen.add(m.id);
-    pi.appendEntry<MessageEntry>("dodo-message", { id: m.id, role: m.role, content: m.content, author: m.authorEmail, model: m.model, sessionId });
+    pi.appendEntry<MessageEntry>("dodo-message", { id: m.id, role: m.role, content: clean(m.content ?? ""), author: m.authorEmail, model: m.model, sessionId });
   }
 
   /** Render any messages the client missed (reconnect, or pi was closed). */
   async function catchUp(sessionId: string, limit?: number): Promise<void> {
     const { messages } = await client().request<{ messages: ChatMessage[] }>(`/session/${sessionId}/messages`);
+    if (attached?.id !== sessionId) return;
     const fresh = messages.filter((m) => !seen.has(m.id) && (m.role === "user" || m.role === "assistant"));
     const skipped = limit !== undefined ? Math.max(0, fresh.length - limit) : 0;
     if (skipped > 0) {
@@ -273,7 +315,10 @@ export default function dodo(pi: ExtensionAPI) {
     switch (type) {
       case "ready":
       case "state": {
-        state = { ...state, ...(data as SessionState) };
+        // Full session details (have `model`) replace the state, so a cleared
+        // override disappears; the lifecycle's control snapshot only patches it.
+        const frame = data as Partial<SessionState>;
+        state = "model" in frame ? (frame as SessionState) : ({ ...state, ...frame } as SessionState);
         updateStatus();
         if (state.status === "running") showLive(true);
         else {
@@ -286,7 +331,7 @@ export default function dodo(pi: ExtensionAPI) {
         return;
       }
       case "text_delta": {
-        live.text += (data as { delta: string }).delta;
+        live.text += clean((data as { delta: string }).delta);
         showLive(true);
         live.refresh();
         return;
@@ -294,7 +339,7 @@ export default function dodo(pi: ExtensionAPI) {
       case "tool_call": {
         const d = data as { toolCallId: string; toolName: string; input: unknown };
         flushLiveText();
-        const t = { name: d.toolName, input: summariseInput(d.input), started: Date.now() };
+        const t = { name: clean(d.toolName), input: clean(summariseInput(d.input)), started: Date.now() };
         pendingTools.set(d.toolCallId, t);
         live.tool = t;
         showLive(true);
@@ -306,7 +351,7 @@ export default function dodo(pi: ExtensionAPI) {
         const t = pendingTools.get(d.toolCallId);
         pendingTools.delete(d.toolCallId);
         if (!t) return;
-        pi.appendEntry<ToolEntry>("dodo-tool", { name: t.name, input: t.input, output: (d.output ?? "").slice(0, 4000), ms: Date.now() - t.started });
+        pi.appendEntry<ToolEntry>("dodo-tool", { name: t.name, input: t.input, output: clean((d.output ?? "").slice(0, 4000)), ms: Date.now() - t.started });
         live.tool = [...pendingTools.values()].at(-1);
         live.refresh();
         return;
@@ -318,12 +363,12 @@ export default function dodo(pi: ExtensionAPI) {
         return;
       }
       case "error_message":
-        note("error", (data as { message: string }).message);
+        note("error", clean((data as { message: string }).message ?? ""));
         return;
       case "needs_input": {
         const d = data as { reason?: string; liveView?: string } | null;
         if (!d) return;
-        const text = `Dodo needs you: ${d.reason ?? "input required"}${d.liveView ? `\nLive view: ${d.liveView}` : ""}`;
+        const text = clean(`Dodo needs you: ${d.reason ?? "input required"}${d.liveView ? `\nLive view: ${d.liveView}` : ""}`);
         note("warning", text);
         notify(text, "warning");
         return;
@@ -334,6 +379,7 @@ export default function dodo(pi: ExtensionAPI) {
   }
 
   async function connect(sessionId: string): Promise<void> {
+    if (attached?.id !== sessionId) return;
     stream?.abort();
     const ctl = new AbortController();
     stream = ctl;
@@ -346,6 +392,12 @@ export default function dodo(pi: ExtensionAPI) {
         });
       } catch (err) {
         if (ctl.signal.aborted) return;
+        if (err instanceof FatalStreamError) {
+          note("error", `Dodo stream stopped: ${err.message}. Detached.`);
+          notify(`Dodo stream stopped: ${err.message}. Detached.`, "error");
+          detachQuiet();
+          return;
+        }
         if (backoff >= 8000) notify(`Dodo stream: ${(err as Error).message}. Retrying…`, "warning");
       }
       if (ctl.signal.aborted) return;
@@ -355,17 +407,31 @@ export default function dodo(pi: ExtensionAPI) {
   }
 
   async function attach(id: string, title: string | null, opts: { history?: number; record?: boolean } = {}): Promise<void> {
-    detachQuiet();
-    attached = { id, title };
-    if (opts.record !== false) pi.appendEntry<AttachEntry>("dodo-attach", { id, title });
+    // Each attach takes a generation; an older attach that resumes after a
+    // newer one started gives up instead of overwriting it.
+    const gen = ++attachGen;
     const [s, config] = await Promise.all([
       client().request<SessionState>(`/session/${id}`),
       client().request<{ model?: string }>("/api/config").catch(() => ({ model: undefined })),
     ]);
+    if (gen !== attachGen) return;
+    // Any id answers 200 (with an empty sessionId) for the admin, so check it
+    // is real: a prompted session reports its id; a fresh one reports "" until
+    // its first prompt but is in my session list.
+    if (s.sessionId !== id && !(await listSessions()).some((x) => x.id === id)) throw new Error(`No Dodo session ${short(id)}.`);
+    if (gen !== attachGen) return;
+    detachQuiet();
+    attached = { id, title };
     state = s;
     defaultModel = config.model;
+    if (opts.record !== false) pi.appendEntry<AttachEntry>("dodo-attach", { id, title });
     updateStatus();
-    await catchUp(id, opts.history ?? HISTORY_ON_ATTACH);
+    try {
+      await catchUp(id, opts.history ?? HISTORY_ON_ATTACH);
+    } catch (err) {
+      if (gen === attachGen) note("warning", `Could not load history: ${(err as Error).message}`);
+    }
+    if (gen !== attachGen) return;
     void connect(id);
     notify(`Attached to Dodo session ${short(id)}. Your input now goes to Dodo. /dodo detach to stop.`);
   }
@@ -391,9 +457,10 @@ export default function dodo(pi: ExtensionAPI) {
     const hits = sessions.filter((s) => s.id.startsWith(prefix));
     if (hits.length === 1) return hits[0]!;
     if (hits.length === 0) {
-      // Not in my list (shared with me, or a full id): try it directly.
-      await client().request(`/session/${prefix}`);
-      return { id: prefix, title: null, status: "idle", updatedAt: new Date().toISOString() };
+      // Not in my list: only a full id (e.g. a session shared with me) is
+      // worth a direct lookup; attach() checks it really exists.
+      if (!UUID.test(prefix)) throw new Error(`No Dodo session matches "${prefix}".`);
+      return { id: prefix.toLowerCase(), title: null, status: "idle", updatedAt: new Date().toISOString() };
     }
     throw new Error(`"${prefix}" matches ${hits.length} sessions; use more characters.`);
   }
@@ -429,7 +496,7 @@ export default function dodo(pi: ExtensionAPI) {
     if (!model) {
       const config = await client().request<{ model: string; activeGateway?: string }>("/api/config");
       defaultModel = config.model;
-      const { models } = await client().request<{ models: Array<{ id: string; name?: string }> }>(`/api/models?gateway=${config.activeGateway ?? ""}`);
+      const { models } = await client().request<{ models: Array<{ id: string; name?: string }> }>(`/api/models?gateway=${encodeURIComponent(config.activeGateway ?? "")}`);
       const DEFAULT = `(my default: ${config.model})`;
       const labels = models.map((m) => (m.name && m.name !== m.id ? `${m.id}  ·  ${m.name}` : m.id));
       const choice = await ctx.ui.select(`Model for ${short(attached.id)} (now ${modelOf(state)})`, [DEFAULT, ...labels]);
@@ -441,7 +508,7 @@ export default function dodo(pi: ExtensionAPI) {
     const r = await client().request<{ modelOverride: SessionState["modelOverride"] }>(`/session/${attached.id}/model-override`, { method: "PUT", body: { model } });
     if (state) state = { ...state, modelOverride: r.modelOverride };
     updateStatus();
-    const running = state?.status === "running" ? " A running prompt keeps its current model." : "";
+    const running = state?.status === "running" ? " The running prompt keeps its main model; subagents it starts from now on use the new one." : "";
     notify(model ? `Session model → ${model}.${running}` : `Session model → your default.${running}`);
   }
 
@@ -534,6 +601,7 @@ export default function dodo(pi: ExtensionAPI) {
           }
           case "detach":
             if (!attached) return notify("Not attached.");
+            attachGen++;
             detachQuiet();
             pi.appendEntry("dodo-detach", {});
             return notify("Detached. Input goes to the local model again; the Dodo session keeps running.");
@@ -561,7 +629,10 @@ export default function dodo(pi: ExtensionAPI) {
           case "open": {
             const id = attached?.id ?? rest[0];
             const url = `${client().creds.url}/${id ? `#session=${id}` : ""}`;
-            spawn(process.platform === "darwin" ? "open" : "xdg-open", [url], { detached: true, stdio: "ignore" }).unref();
+            const [cmd, ...cmdArgs] = process.platform === "darwin" ? ["open", url] : process.platform === "win32" ? ["cmd", "/c", "start", "", url] : ["xdg-open", url];
+            const child = spawn(cmd!, cmdArgs, { detached: true, stdio: "ignore" });
+            child.on("error", () => notify(`Open ${url}`, "info"));
+            child.unref();
             return;
           }
           default:
@@ -592,11 +663,15 @@ export default function dodo(pi: ExtensionAPI) {
     try {
       await attach(last.id, last.title ?? null, { record: false });
     } catch (err) {
-      ctx.ui.notify(`Dodo: could not re-attach to ${short(last.id)}: ${(err as Error).message}`, "warning");
+      const msg = (err as Error).message;
+      ctx.ui.notify(`Dodo: could not re-attach to ${short(last.id)}: ${msg}`, "warning");
+      // The session is gone or no longer ours: stop trying on every start.
+      if (/^No Dodo session|^Dodo (403|404)/.test(msg)) pi.appendEntry("dodo-detach", {});
     }
   });
 
   pi.on("session_shutdown", async () => {
+    attachGen++;
     detachQuiet();
     ctxRef = undefined;
   });

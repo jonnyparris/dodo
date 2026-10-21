@@ -166,6 +166,7 @@ describe("PUT /session/:id/model-override", () => {
     }));
     expect(guest.status).toBe(403);
   });
+
 });
 
 describe("session-model-override helpers", () => {
