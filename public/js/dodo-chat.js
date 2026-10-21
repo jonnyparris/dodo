@@ -796,6 +796,8 @@ function renderNeedsInput(state){
   if(!state){bar.hidden=true;return}
   $("needs-input-text").textContent=`Dodo needs you: ${state.reason||"see the last message"}`;
   $("needs-input-live").hidden=!state.liveView;
+  const auth=$("needs-input-auth");
+  if(auth){const u=/^https?:\/\//i.test(state.authUrl||"")?state.authUrl:"";auth.hidden=!u;auth.onclick=u?()=>window.open(u,"_blank","noopener"):null}
   bar.hidden=false;
 }
 async function loadNeedsInput(){

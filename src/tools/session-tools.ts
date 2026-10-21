@@ -41,13 +41,15 @@ export interface NeedsInput {
   /** True when the session browser was open: the person can use Live View. */
   liveView: boolean;
   at: string;
+  /** OAuth approval link (MCP re-authorization, see src/mcp-step-up.ts). */
+  authUrl?: string;
 }
 
 export interface SessionToolHost {
   createSchedule(input: { description: string; prompt: string } & ScheduleSpec): Promise<ScheduleRecord>;
   listSchedules(): ScheduleRecord[];
   cancelSchedule(id: string): Promise<boolean>;
-  requestUserInput(input: { kind: InputKind; reason: string }): Promise<NeedsInput>;
+  requestUserInput(input: { kind: InputKind; reason: string; authUrl?: string }): Promise<NeedsInput>;
 }
 
 const CRON_RE = /^\s*(\S+\s+){4}\S+\s*$/;

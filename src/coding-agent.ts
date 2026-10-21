@@ -32,6 +32,7 @@ import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { BROWSER_TOOL_NAME, createBrowserExecuteTool, createSessionBrowser } from "./browser/session-browser";
 import { checkCallbackUrl, postCompletionWebhook } from "./completion-webhook";
 import type { InputKind, NeedsInput, SessionToolHost } from "./tools/session-tools";
+import { detectOAuthStepUp, OAUTH_STEP_UP_KEY } from "./mcp-step-up";
 
 /** Metadata keys for the human handoff and completion doorbell. */
 const NEEDS_INPUT_KEY = "needs_input";
@@ -2796,7 +2797,7 @@ export class CodingAgent extends CodingAgentBase {
     this.emitEvent({ type: "needs_input", data: null });
   }
 
-  private async requestUserInput(input: { kind: InputKind; reason: string }): Promise<NeedsInput> {
+  private async requestUserInput(input: { kind: InputKind; reason: string; authUrl?: string }): Promise<NeedsInput> {
     let liveView = false;
     if (this.browser) {
       try {
@@ -2805,7 +2806,7 @@ export class CodingAgent extends CodingAgentBase {
         log("warn", "request_user_input: live view check failed", { sessionId: this.sessionId(), error: err instanceof Error ? err.message : String(err) });
       }
     }
-    const state: NeedsInput = { kind: input.kind, reason: input.reason, liveView, at: new Date().toISOString() };
+    const state: NeedsInput = { kind: input.kind, reason: input.reason, liveView, at: new Date().toISOString(), ...(input.authUrl ? { authUrl: input.authUrl } : {}) };
     this.writeMetadata(NEEDS_INPUT_KEY, JSON.stringify(state));
     this.emitEvent({ type: "needs_input", data: state });
     dispatchNotification(this.env, this.ctx, {
@@ -5526,7 +5527,33 @@ export class CodingAgent extends CodingAgentBase {
    * credentials (which live only in the per-user hub DO) are applied.
    */
   async callOAuthTool(serverId: string, toolName: string, args: unknown): Promise<unknown> {
-    return this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
+    type StepUpConn = {
+      connectionState: string;
+      options: { transport: { authProvider?: { authUrl?: string } } };
+    };
+    const conn = (this.mcp.mcpConnections as Record<string, StepUpConn | undefined>)[serverId];
+    const authUrlBefore = conn?.options.transport.authProvider?.authUrl;
+    try {
+      return await this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
+    } catch (error) {
+      // Mid-session step-up (403 insufficient_scope) or failed refresh: the
+      // transport stored a fresh authorize URL and threw. See src/mcp-step-up.ts.
+      const server = (this.getMcpServers().servers as Record<string, { name?: string } | undefined>)[serverId];
+      const stepUp = detectOAuthStepUp({
+        serverId,
+        serverName: server?.name,
+        error,
+        authUrlBefore,
+        authUrlAfter: conn?.options.transport.authProvider?.authUrl,
+      });
+      if (!conn || !stepUp) throw error;
+      // Put the connection where the SDK's callback route expects it, so the
+      // code is exchanged (and new scopes saved) instead of dropped as stale.
+      conn.connectionState = "authenticating";
+      (this.mcp as unknown as { persistAuthContinuation(id: string, c: unknown): unknown }).persistAuthContinuation(serverId, conn);
+      log("info", "oauth mcp needs re-authorization", { serverId, scope: stepUp.scope ?? null });
+      return { [OAUTH_STEP_UP_KEY]: stepUp };
+    }
   }
 
   /**

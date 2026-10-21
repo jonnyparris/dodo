@@ -58,6 +58,7 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `src/mcp.ts` — MCP server exposing Dodo as 75 tools
 - `src/mcp-codemode.ts` — code-mode MCP endpoint (2 tools, minimal context)
 - `src/mcp-catalog.ts` — curated catalog of recommended MCP servers
+- `src/mcp-step-up.ts` — mid-session OAuth re-authorization for OAuth MCP servers (403 `insufficient_scope` step-up, failed refresh): hub parks the connection in `authenticating` so the callback keeps the code; session raises a needs-input card with an **Approve access** link
 - `src/outbound.ts` — AllowlistOutbound WorkerEntrypoint for gated sandbox fetch
 - `src/notify.ts` — push notifications via ntfy.sh (per-user topic from encrypted secrets)
 
