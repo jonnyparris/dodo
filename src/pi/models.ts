@@ -10,7 +10,9 @@
 // API against the gateway's provider-native `/anthropic` endpoint. The
 // unified `/compat` endpoint strips every `cache_control` marker (measured
 // 2026-10-21, PR #110), so on `/compat` every Anthropic turn paid full input
-// price for the whole prefix.
+// price for the whole prefix. This covers the main session only: explore/task
+// subagents (src/subagent-runner.ts, AI SDK) still call `/compat`, so their
+// Anthropic markers are still stripped.
 
 import type { Model, ProviderStreams, StreamOptions } from "@earendil-works/pi-ai";
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
@@ -48,13 +50,21 @@ const ANTHROPIC_CACHE_WRITE_MULTIPLIER = 1.25;
  * Native Anthropic base URL for an AI Gateway unified base URL, e.g.
  * `.../v1/{account}/{gateway}/compat` → `.../v1/{account}/{gateway}/anthropic`
  * (the Anthropic SDK appends `/v1/messages`). Undefined off AI Gateway or
- * when the URL isn't a `/compat` endpoint (custom proxies keep `/compat`).
+ * when the path isn't AI Gateway's `/v1/{account}/{gateway}/compat` shape,
+ * so a custom proxy that happens to end in `/compat` keeps the
+ * OpenAI-compatible path.
  */
 export function anthropicGatewayBaseUrl(config: GatewayConfig): string | undefined {
   if (config.activeGateway !== "ai-gateway" || !config.aiGatewayBaseURL) return undefined;
-  const base = trim(config.aiGatewayBaseURL);
-  if (!base.endsWith("/compat")) return undefined;
-  return `${base.slice(0, -"/compat".length)}/anthropic`;
+  let url: URL;
+  try {
+    url = new URL(config.aiGatewayBaseURL);
+  } catch {
+    return undefined;
+  }
+  const path = trim(url.pathname);
+  if (!/^\/v1\/[^/]+\/[^/]+\/compat$/.test(path)) return undefined;
+  return `${url.origin}${path.slice(0, -"/compat".length)}/anthropic${url.search}`;
 }
 
 /** The pi-ai model for one Dodo model id on the configured gateway. */
@@ -111,8 +121,10 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
       // conversation's steps on one replica (was a hand-set header).
       sendSessionAffinityHeaders: true,
       sessionAffinityFormat: "openai-nosession",
-      // Anthropic via OpenAI-compat needs explicit cache_control markers
-      // (was addAnthropicCacheMarkers).
+      // Anthropic via OpenAI-compat (OpenCode, or an AI Gateway URL that isn't
+      // `/compat`) gets explicit cache_control markers (was
+      // addAnthropicCacheMarkers). AI Gateway `/compat` strips them, which is
+      // why Anthropic there goes native instead; not verified on OpenCode.
       ...(anthropic ? { cacheControlFormat: "anthropic" as const } : {}),
     },
   };
@@ -195,5 +207,7 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
 }
 
 export function agentModelRef(modelId: string, config: GatewayConfig): { provider: string; modelId: string } {
-  return { provider: DODO_PROVIDER_ID, modelId: resolveWireModelId(modelId, config.activeGateway) };
+  // Must match the id dodoModel() registers: native Anthropic keeps the Dodo id.
+  const native = modelId.startsWith("anthropic/") && anthropicGatewayBaseUrl(config) !== undefined;
+  return { provider: DODO_PROVIDER_ID, modelId: native ? modelId : resolveWireModelId(modelId, config.activeGateway) };
 }

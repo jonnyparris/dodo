@@ -7,8 +7,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { entriesToMessages, PiEngine, type PiEngineHost } from "../src/pi/engine";
 import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "../src/pi/tools";
-import { agentModelRef, anthropicGatewayBaseUrl, dodoModel, gatewayHeaders, setDodoProvider } from "../src/pi/models";
+import { agentModelRef, anthropicGatewayBaseUrl, anthropicGatewayStreams, dodoModel, gatewayHeaders, setDodoProvider } from "../src/pi/models";
 import { createModels } from "@earendil-works/pi-ai/models";
+import type { StreamOptions } from "@earendil-works/pi-ai";
 
 function host(storage: DurableObjectStorage, faux: ReturnType<typeof fauxProvider>, events: Array<{ type: string; data: unknown }>): PiEngineHost {
   return {
@@ -213,6 +214,26 @@ describe("pi adapters", () => {
     expect(dodoModel("anthropic/claude-sonnet-4-6", { ...config, activeGateway: "opencode", opencodeBaseURL: "https://oc/compat" }, {} as never).api).toBe("openai-completions");
     // A custom proxy URL that isn't /compat stays on the OpenAI-compatible path.
     expect(anthropicGatewayBaseUrl({ ...config, aiGatewayBaseURL: "https://proxy.example/v1" })).toBeUndefined();
+    // So does a custom proxy that merely ends in /compat.
+    expect(anthropicGatewayBaseUrl({ ...config, aiGatewayBaseURL: "https://proxy.example/compat" })).toBeUndefined();
+    expect(dodoModel("anthropic/claude-sonnet-4-6", { ...config, aiGatewayBaseURL: "https://proxy.example/compat" }, {} as never).api).toBe("openai-completions");
+    // The model ref matches the registered id on both paths.
+    expect(agentModelRef("anthropic/claude-sonnet-4-6", config).modelId).toBe(m.id);
+  });
+
+  it("keeps a caller's onPayload result and rewrites the model id after it", async () => {
+    let sent: Record<string, unknown> | undefined;
+    const fake = {
+      stream: (async () => undefined) as never,
+      streamSimple: (async (_m: unknown, _c: unknown, options?: StreamOptions) => {
+        sent = (await options!.onPayload!({ model: "anthropic/claude-sonnet-4-6", max_tokens: 1 }, {} as never)) as Record<string, unknown>;
+      }) as never,
+    };
+    const streams = anthropicGatewayStreams(fake);
+    await streams.streamSimple({} as never, {} as never, {
+      onPayload: (p: unknown) => ({ ...(p as object), metadata: { user_id: "s1" } }),
+    } as never);
+    expect(sent).toEqual({ model: "claude-sonnet-4-6", max_tokens: 1, metadata: { user_id: "s1" } });
   });
 });
 
