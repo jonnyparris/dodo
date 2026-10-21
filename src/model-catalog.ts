@@ -14,23 +14,26 @@ export function extractGeneratePrompt(content: string): string | null {
   return prompt.length > 0 ? prompt : null;
 }
 
-/** costInput/costOutput are USD per million tokens, base tier only (GPT-5.4
- *  and Gemini 2.5 Pro cost more above 272k/200k input tokens). They must match
- *  pi-ai's bundled vendor catalogs: test/model-catalog-prices-unit.test.ts
+/** costInput/costOutput are USD per million tokens, base tier only. They must
+ *  match pi-ai's bundled vendor catalogs: test/model-catalog-prices-unit.test.ts
  *  fails on drift (2026-10: Haiku, Opus, GPT-5.4 and Gemini Flash had drifted).
- *  Not checked: context windows and cache prices. DeepSeek prices are the peak
- *  rate (off-peak is half). deepseek-chat/-reasoner were retired 2026-07-24. */
+ *  Per-turn cost in the agent loop takes cache prices and long-context tiers
+ *  (GPT-5.4 >272k, Gemini 2.5 Pro >200k) from pi-ai directly: src/pi/models.ts
+ *  modelCost(). contextWindow drives compaction and the token budget; the same
+ *  test checks it against pi-ai, except GPT-5.4 (pi-ai lists the 272k pricing
+ *  threshold; the API window is 1.05M). DeepSeek prices are the peak rate
+ *  (off-peak is half). deepseek-chat/-reasoner were retired 2026-07-24. */
 export const FALLBACK_MODELS = [
   { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "OpenAI", costInput: 2.5, costOutput: 15, contextWindow: 1_000_000 },
-  { id: "openai/gpt-4.1", name: "GPT-4.1", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_000_000 },
-  { id: "openai/gpt-4.1-mini", name: "GPT-4.1 Mini", provider: "OpenAI", costInput: 0.4, costOutput: 1.6, contextWindow: 1_000_000 },
-  { id: "anthropic/claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "Anthropic", costInput: 3, costOutput: 15, contextWindow: 200_000 },
-  { id: "anthropic/claude-opus-4-6", name: "Claude Opus 4.6", provider: "Anthropic", costInput: 5, costOutput: 25, contextWindow: 200_000 },
+  { id: "openai/gpt-4.1", name: "GPT-4.1", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_047_576 },
+  { id: "openai/gpt-4.1-mini", name: "GPT-4.1 Mini", provider: "OpenAI", costInput: 0.4, costOutput: 1.6, contextWindow: 1_047_576 },
+  { id: "anthropic/claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "Anthropic", costInput: 3, costOutput: 15, contextWindow: 1_000_000 },
+  { id: "anthropic/claude-opus-4-6", name: "Claude Opus 4.6", provider: "Anthropic", costInput: 5, costOutput: 25, contextWindow: 1_000_000 },
   { id: "anthropic/claude-haiku-4-5", name: "Claude Haiku 4.5", provider: "Anthropic", costInput: 1, costOutput: 5, contextWindow: 200_000 },
   { id: "openai/o3-mini", name: "o3-mini", provider: "OpenAI", costInput: 1.1, costOutput: 4.4, contextWindow: 200_000 },
   { id: "openai/o4-mini", name: "o4-mini", provider: "OpenAI", costInput: 1.1, costOutput: 4.4, contextWindow: 200_000 },
-  { id: "google/gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "Google", costInput: 1.25, costOutput: 10, contextWindow: 1_000_000 },
-  { id: "google/gemini-2.5-flash", name: "Gemini 2.5 Flash", provider: "Google", costInput: 0.3, costOutput: 2.5, contextWindow: 1_000_000 },
+  { id: "google/gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "Google", costInput: 1.25, costOutput: 10, contextWindow: 1_048_576 },
+  { id: "google/gemini-2.5-flash", name: "Gemini 2.5 Flash", provider: "Google", costInput: 0.3, costOutput: 2.5, contextWindow: 1_048_576 },
   { id: "deepseek/deepseek-flash", name: "DeepSeek V4.1 Flash", provider: "DeepSeek", costInput: 0.3, costOutput: 1.2, contextWindow: 1_000_000 },
   { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", provider: "DeepSeek", costInput: 1.32, costOutput: 3.96, contextWindow: 1_000_000 },
 ];
