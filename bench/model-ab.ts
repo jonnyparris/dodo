@@ -18,7 +18,9 @@
  * a hidden test). Exit code 0 = pass.
  *
  * Run (Node 24 strips the types itself):
- *   node bench/model-ab.ts bench/model-ab.example.json [--base https://dodo.example.com] [--tasks explore,refactor] [--keep] [--out bench/out]
+ *   node bench/model-ab.ts bench/model-ab.example.json [--base https://dodo.example.com] [--tasks explore,refactor] [--keep] [--out bench/out | --run-dir dir]
+ *
+ * Unattended, on every new Workers AI model: bench/model-watch.ts.
  *
  * Auth to Dodo: Access service token from DODO_ACCESS_CLIENT_ID +
  * DODO_ACCESS_CLIENT_SECRET, or the macOS keychain item "dodo-smoke-access"
@@ -90,7 +92,7 @@ interface RunResult {
 // ─── CLI ───
 
 function parseArgs(argv: string[]) {
-  const args = { spec: "", base: "", tasks: [] as string[], arms: [] as string[], keep: false, out: "bench/out" };
+  const args = { spec: "", base: "", tasks: [] as string[], arms: [] as string[], keep: false, out: "bench/out", runDir: "" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--base") args.base = argv[++i]!;
@@ -98,10 +100,11 @@ function parseArgs(argv: string[]) {
     else if (a === "--arms") args.arms = argv[++i]!.split(",");
     else if (a === "--keep") args.keep = true;
     else if (a === "--out") args.out = argv[++i]!;
+    else if (a === "--run-dir") args.runDir = argv[++i]!;
     else if (!args.spec) args.spec = a;
   }
   if (!args.spec) {
-    console.error("usage: node bench/model-ab.ts <spec.json> [--base URL] [--tasks a,b] [--arms x,y] [--keep] [--out dir]");
+    console.error("usage: node bench/model-ab.ts <spec.json> [--base URL] [--tasks a,b] [--arms x,y] [--keep] [--out dir | --run-dir dir]");
     process.exit(2);
   }
   return args;
@@ -335,7 +338,8 @@ async function main() {
   const gateway = spec.gateway ?? process.env.AI_GATEWAY_ID ?? "";
   const armNames = args.arms.length ? args.arms : Object.keys(spec.arms);
   const tasks = args.tasks.length ? spec.tasks.filter((t) => args.tasks.includes(t.id)) : spec.tasks;
-  const outDir = join(args.out, new Date().toISOString().replace(/[:.]/g, "-"));
+  // --run-dir: write exactly here (bench/model-watch.ts uses it). --out: a new timestamped dir under it.
+  const outDir = args.runDir || join(args.out, new Date().toISOString().replace(/[:.]/g, "-"));
   mkdirSync(outDir, { recursive: true });
   const dodo = makeDodo(base);
   log(`${base}: ${tasks.length} task(s) × ${armNames.length} arm(s) → ${outDir}`);
