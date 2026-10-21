@@ -198,42 +198,63 @@ function capText(text: string, maxLines: number, maxBytes: number): string {
 
 const SUBAGENT_MSG_WINDOW = 4;
 
-function makePruneMarker(droppedCount: number): ModelMessage {
-  return {
-    role: "user",
-    content: `[system: ${droppedCount} earlier assistant/tool messages were pruned to keep your input token count bounded. If you need information from those steps, call the relevant tool again — don't try to reconstruct the content.]`,
-  };
+/**
+ * Constant on purpose: the marker sits right after the first user message,
+ * so any per-step change here (e.g. a dropped-message count) would break
+ * the provider's prompt-cache prefix on every step.
+ */
+const PRUNE_MARKER: ModelMessage = {
+  role: "user",
+  content:
+    "[system: earlier assistant/tool messages were pruned to keep your input token count bounded. If you need information from those steps, call the relevant tool again — don't try to reconstruct the content.]",
+};
+
+/**
+ * Number of leading groups to drop when `groupCount` assistant+tool groups
+ * follow the first user message. Drops in whole chunks of `windowSize`, so
+ * the cut point (and with it the prompt prefix) only moves once every
+ * `windowSize` steps. Kept groups range from `windowSize` to
+ * `2 * windowSize - 1`.
+ */
+function groupsToDrop(groupCount: number, windowSize: number): number {
+  if (windowSize <= 0) return groupCount > 1 ? groupCount - 1 : 0;
+  if (groupCount < 2 * windowSize) return 0;
+  return Math.floor((groupCount - windowSize) / windowSize) * windowSize;
 }
 
+/**
+ * Keep the first user message (goal anchor) and the most recent
+ * assistant+tool groups; replace the rest with a constant marker.
+ *
+ * Cache-friendly: the AI SDK passes the full, unpruned history to
+ * `prepareStep` on every step, so the cut point is a pure function of the
+ * group count. It jumps by `windowSize` groups at a time instead of
+ * sliding by one, so `[system, tools, user, marker, kept groups…]` stays a
+ * stable prefix for `windowSize` steps and prompt caching (Anthropic
+ * breakpoints, Workers AI prefix caching) can reuse it.
+ */
 export function pruneSubagentHistory(
   messages: Array<ModelMessage>,
   windowSize: number = SUBAGENT_MSG_WINDOW,
 ): Array<ModelMessage> {
-  if (messages.length <= windowSize + 1) return messages;
-
   const firstUserIdx = messages.findIndex((m) => m.role === "user");
   if (firstUserIdx < 0) return messages;
 
-  const groups: Array<{ start: number; end: number }> = [];
-  let cursor = messages.length;
-  while (cursor > firstUserIdx + 1 && groups.length < windowSize) {
-    const end = cursor;
-    let start = cursor - 1;
-    while (start > firstUserIdx + 1 && messages[start].role !== "assistant") {
-      start--;
-    }
-    groups.unshift({ start, end });
-    cursor = start;
+  // Group starts: every assistant message after the first user message.
+  // Anything between the first user message and the first assistant
+  // message belongs to the first group.
+  const starts: number[] = [];
+  for (let i = firstUserIdx + 1; i < messages.length; i++) {
+    if (messages[i].role === "assistant") starts.push(i);
   }
+  if (starts.length > 0 && starts[0] !== firstUserIdx + 1) starts[0] = firstUserIdx + 1;
 
-  if (groups.length === 0) return messages;
+  const drop = groupsToDrop(starts.length, windowSize);
+  if (drop <= 0) return messages;
 
   const head = messages.slice(0, firstUserIdx + 1);
-  const tailStart = groups[0].start;
-  const dropped = tailStart - (firstUserIdx + 1);
-  if (dropped <= 0) return messages;
-  const tail = messages.slice(tailStart);
-  return [...head, makePruneMarker(dropped), ...tail];
+  const tail = messages.slice(starts[drop]);
+  return [...head, PRUNE_MARKER, ...tail];
 }
 
 export function subagentPrepareStep(options?: { windowSize?: number }) {

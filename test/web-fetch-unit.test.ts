@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   extractJevChoice,
   extractJevNoul,
+  quickActionBlockReason,
   triageUrls,
   type JevAi,
 } from "../src/browser/web-fetch";
@@ -82,5 +83,25 @@ describe("triageUrls", () => {
     expect(result?.picked).toBe("https://b.com");
     expect(result?.ranking[0].probability).toBe(0.75);
     expect(result?.ranking[1].url).toBe("https://a.com");
+  });
+});
+
+describe("quickActionBlockReason", () => {
+  it("flags a 4xx/5xx target status", () => {
+    expect(quickActionBlockReason({ status: 403, headers: {} })).toBe("site answered HTTP 403");
+    expect(quickActionBlockReason({ status: 503 })).toBe("site answered HTTP 503");
+  });
+
+  it("flags cf-mitigated in any case, ahead of the status", () => {
+    expect(quickActionBlockReason({ status: 403, headers: { "cf-mitigated": "challenge" } })).toBe("cf-mitigated: challenge");
+    expect(quickActionBlockReason({ status: 200, headers: { "CF-Mitigated": "challenge" } })).toBe("cf-mitigated: challenge");
+  });
+
+  it("passes a 2xx/3xx status and missing or malformed meta", () => {
+    expect(quickActionBlockReason({ status: 200, headers: { server: "cloudflare" } })).toBeNull();
+    expect(quickActionBlockReason({ status: 304 })).toBeNull();
+    expect(quickActionBlockReason(undefined)).toBeNull();
+    expect(quickActionBlockReason("nope")).toBeNull();
+    expect(quickActionBlockReason({ status: "403", headers: null })).toBeNull();
   });
 });
