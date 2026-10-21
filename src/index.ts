@@ -120,6 +120,20 @@ async function readConfig(env: Env, email: string): Promise<AppConfig> {
 }
 
 /**
+ * x-dodo-* gateway headers derived from the session owner's config, forwarded
+ * to the agent DO so the owner's model/gateway choices win over anything the
+ * calling user (or a guest) might set.
+ */
+function agentGatewayHeaders(config: AppConfig): Record<string, string> {
+  return {
+    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+    "x-dodo-gateway": config.activeGateway,
+    "x-dodo-model": config.model,
+    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+  };
+}
+
+/**
  * Determine the effective permission level for a user on a session.
  * - Session owner → "admin"
  * - Admin user → "admin"
@@ -820,10 +834,7 @@ app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
       "x-dodo-session-id": sessionId,
       "x-owner-email": owner,
       "x-author-email": owner,
-      "x-dodo-ai-base-url": ownerConfigRes.aiGatewayBaseURL,
-      "x-dodo-gateway": ownerConfigRes.activeGateway,
-      "x-dodo-model": ownerConfigRes.model,
-      "x-dodo-opencode-base-url": ownerConfigRes.opencodeBaseURL,
+      ...agentGatewayHeaders(ownerConfigRes),
     },
     method: "POST",
   });
@@ -1333,10 +1344,7 @@ app.post("/api/tasks/batch-dispatch", async (c) => {
         body: JSON.stringify({ content: lines.join("\n") }),
       });
       await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
-        "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-        "x-dodo-gateway": config.activeGateway,
-        "x-dodo-model": config.model,
-        "x-dodo-opencode-base-url": config.opencodeBaseURL,
+        ...agentGatewayHeaders(config),
         "x-author-email": email,
         "x-owner-email": email,
       });
@@ -1447,10 +1455,7 @@ app.post("/api/tasks/:id/dispatch", async (c) => {
     body: JSON.stringify({ content: lines.join("\n") }),
   });
   await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
-    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-    "x-dodo-gateway": config.activeGateway,
-    "x-dodo-model": config.model,
-    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    ...agentGatewayHeaders(config),
     "x-author-email": email,
     "x-owner-email": email,
   });
@@ -2542,10 +2547,7 @@ app.post("/session/:id/message", async (c) => {
   const ownerEmail = c.get("sessionOwnerEmail") || email;
   const config = await readConfig(c.env, ownerEmail);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/message", {
-    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-    "x-dodo-gateway": config.activeGateway,
-    "x-dodo-model": config.model,
-    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    ...agentGatewayHeaders(config),
     "x-author-email": email,
     "x-owner-email": ownerEmail,
   });
@@ -2561,11 +2563,8 @@ app.post("/session/:id/prompt", async (c) => {
   const ownerEmail = c.get("sessionOwnerEmail") || email;
   const config = await readConfig(c.env, ownerEmail);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompt", {
-    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-    "x-dodo-gateway": config.activeGateway,
-    "x-dodo-model": config.model,
+    ...agentGatewayHeaders(config),
     "x-dodo-image-model": config.replicateImageModel ?? "",
-    "x-dodo-opencode-base-url": config.opencodeBaseURL,
     "x-author-email": email,
     "x-owner-email": ownerEmail,
   });
