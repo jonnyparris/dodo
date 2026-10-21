@@ -251,11 +251,18 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
   return result;
 }
 
+/** The environment minus credentials: verify runs tests the model under test wrote. */
+function verifyEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const k of ["CLOUDFLARE_API_TOKEN", "DODO_ACCESS_CLIENT_ID", "DODO_ACCESS_CLIENT_SECRET"]) delete env[k];
+  return env;
+}
+
 function runVerify(task: Task, result: RunResult, outDir: string) {
   const runDir = join(outDir, `${task.id}-${result.arm}`);
   const v = spawnSync("sh", ["-c", task.verify!], {
     encoding: "utf8",
-    env: { ...process.env, BENCH_TASK: task.id, BENCH_ARM: result.arm, BENCH_SESSION: result.sessionId, BENCH_OUT: resolve(runDir), BENCH_ANSWER: resolve(runDir, "answer.md") },
+    env: { ...verifyEnv(), BENCH_TASK: task.id, BENCH_ARM: result.arm, BENCH_SESSION: result.sessionId, BENCH_OUT: resolve(runDir), BENCH_ANSWER: resolve(runDir, "answer.md") },
     timeout: 15 * 60_000,
   });
   const output = `${v.stdout ?? ""}${v.stderr ?? ""}`;

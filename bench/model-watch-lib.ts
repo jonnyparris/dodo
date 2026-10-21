@@ -48,6 +48,11 @@ export interface WatchState {
 
 export const MAX_ATTEMPTS = 3;
 
+/** A failed bench is retried on the next run, unless it was a --model run (the user asked for one run) or it is out of attempts. */
+export function canRetry(run: WatchState["runs"][string]): boolean {
+  return !run.ok && !run.forced && run.attempts < MAX_ATTEMPTS;
+}
+
 function prop(m: CatalogModel, id: string): unknown {
   return m.properties?.find((p) => p.property_id === id)?.value;
 }
@@ -117,8 +122,7 @@ export function plan(catalog: Candidate[], state: WatchState, f: Filter, opts: {
     if (firstRun) continue;
     const run = state.runs[c.id];
     const wasRejected = !isNew && !run && state.rejected?.[c.id] !== undefined;
-    // A failed --model re-run is not retried automatically: the user asked for one run.
-    const retry = !isNew && run && !run.ok && !run.forced && run.attempts < MAX_ATTEMPTS;
+    const retry = !isNew && run !== undefined && canRetry(run);
     if (!isNew && !wasRejected && !retry) continue;
     const reason = rejectReason(c, f);
     if (reason) {

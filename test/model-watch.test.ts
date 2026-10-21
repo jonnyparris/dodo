@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyPlan, armName, benchOk, lastPage, buildSpec, type Candidate, type CatalogModel, DEFAULT_FILTER, MAX_ATTEMPTS, plan, rejectReason, toCandidate, type WatchState } from "../bench/model-watch-lib";
+import { applyPlan, armName, benchOk, canRetry, lastPage, buildSpec, type Candidate, type CatalogModel, DEFAULT_FILTER, MAX_ATTEMPTS, plan, rejectReason, toCandidate, type WatchState } from "../bench/model-watch-lib";
 
 function model(name: string, props: Record<string, unknown> = {}, created = "2026-10-01 00:00:00"): CatalogModel {
   const base = {
@@ -131,6 +131,15 @@ describe("applyPlan edge cases", () => {
     applyPlan(fresh, plan([cand("@cf/a/old")], fresh, DEFAULT_FILTER, { max: 1, force: ["@cf/a/old"] }), "now", ["@cf/a/old"]);
     expect(fresh.runs["@cf/a/old"]).toMatchObject({ ok: false, forced: true });
     expect(plan([cand("@cf/a/old")], fresh, DEFAULT_FILTER, { max: 1 }).bench).toHaveLength(0);
+  });
+});
+
+describe("canRetry", () => {
+  it("retries failed, unforced runs under MAX_ATTEMPTS only", () => {
+    expect(canRetry({ at: "x", ok: false, attempts: 1 })).toBe(true);
+    expect(canRetry({ at: "x", ok: true, attempts: 1 })).toBe(false);
+    expect(canRetry({ at: "x", ok: false, attempts: 1, forced: true })).toBe(false);
+    expect(canRetry({ at: "x", ok: false, attempts: MAX_ATTEMPTS })).toBe(false);
   });
 });
 

@@ -42,6 +42,7 @@ import {
   armName,
   benchOk,
   buildSpec,
+  canRetry,
   type Candidate,
   type CatalogModel,
   DEFAULT_FILTER,
@@ -311,8 +312,7 @@ async function watch(args: ReturnType<typeof parseArgs>, account: string, token:
     log(`${c.id}: ${res.ok ? "done" : `FAILED (${res.error})`}${res.report ? ` → ${res.report}` : ""}`);
     // Machine-readable line for wrappers.
     const run = state.runs[c.id]!;
-    const willRetry = !run.ok && !run.forced && run.attempts < MAX_ATTEMPTS;
-    console.log(`MODEL_WATCH_RESULT ${JSON.stringify({ model: c.id, ok: res.ok, runDir: res.runDir, report: res.report, error: res.error, attempts: run.attempts, willRetry })}`);
+    console.log(`MODEL_WATCH_RESULT ${JSON.stringify({ model: c.id, ok: res.ok, runDir: res.runDir, report: res.report, error: res.error, attempts: run.attempts, maxAttempts: MAX_ATTEMPTS, willRetry: canRetry(run) })}`);
   }
   if (failed) process.exitCode = 1;
 }
