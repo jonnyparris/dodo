@@ -311,6 +311,57 @@ describe("browser_markdown (agents/webfetch/ai-sdk)", () => {
     expect(rendered.value).not.toContain("Performing security verification");
   });
 
+  it("treats a quick action whose meta says 403 as blocked, even with title-only Markdown", async () => {
+    // Live /markdown for g2.com (DataDome), 2026-10-21: the quick action answers 200,
+    // meta.status is 403 and result is just frontmatter, which no text pattern catches.
+    const browser = {
+      quickAction: async () =>
+        new Response(
+          JSON.stringify({
+            success: true,
+            result: "---\ntitle: g2.com\n---",
+            meta: { status: 403, title: "g2.com", headers: { server: "cloudflare", "x-datadome": "protected" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      fetch: async () => new Response("no cdp", { status: 500 }),
+    } as unknown as Fetcher;
+    const tool = toolFor(stubAi(""), stubFetch("", { status: 403 }), browser);
+    const output = await tool.execute({ url: "https://www.g2.com/products/slack/reviews" });
+    expect(output).toMatchObject({ code: "web_fetch_blocked" });
+    const rendered = tool.toModelOutput({ output });
+    expect(rendered.value).toContain("browser_execute");
+    expect(rendered.value).not.toContain("title: g2.com");
+  });
+
+  it("treats a quick action whose meta has cf-mitigated as blocked", async () => {
+    const browser = {
+      quickAction: async () =>
+        new Response(
+          JSON.stringify({ result: "# Some page", meta: { status: 200, headers: { "CF-Mitigated": "challenge" } } }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      fetch: async () => new Response("no cdp", { status: 500 }),
+    } as unknown as Fetcher;
+    const tool = toolFor(stubAi(""), stubFetch("", { status: 403 }), browser);
+    const output = await tool.execute({ url: "https://e.com/mitigated" });
+    expect(output).toMatchObject({ code: "web_fetch_blocked" });
+    expect(tool.toModelOutput({ output }).value).not.toContain("# Some page");
+  });
+
+  it("returns quick action content when meta.status is 200", async () => {
+    const browser = {
+      quickAction: async () =>
+        new Response(
+          JSON.stringify({ result: "# Example Domain", meta: { status: 200, headers: { server: "cloudflare" } } }),
+          { headers: { "content-type": "application/json" } },
+        ),
+    } as unknown as Fetcher;
+    const tool = toolFor(stubAi(""), stubFetch("", { status: 429 }), browser);
+    const output = await tool.execute({ url: "https://e.com/ok" });
+    expect(output).toMatchObject({ via: "rendered", content: "# Example Domain" });
+  });
+
   it("uses the Browser Run quick action when blocked and says so", async () => {
     const browser = {
       quickAction: async () =>

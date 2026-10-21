@@ -118,6 +118,37 @@ function quickActionBinding(browser: Fetcher): BrowserQuickActionBinding | null 
     : null;
 }
 
+/**
+ * The `meta` Browser Run's /markdown quick action returns next to `result`:
+ * the target's own HTTP status and response headers. The quick action itself
+ * answers 200 even when the site blocked the browser, so this is the only
+ * place a block shows up before the page text.
+ */
+interface QuickActionMeta {
+  status?: unknown;
+  headers?: unknown;
+}
+
+/**
+ * Why a /markdown result is a block page, from its `meta`, or null when meta
+ * looks fine (or is missing). Bot walls (Cloudflare WAF, DataDome) answer
+ * 403 and some render title-only Markdown (`title: g2.com`) that no text
+ * pattern can recognise, so the status is checked before the text.
+ */
+export function quickActionBlockReason(meta: unknown): string | null {
+  if (typeof meta !== "object" || meta === null) return null;
+  const { status, headers } = meta as QuickActionMeta;
+  if (typeof headers === "object" && headers !== null) {
+    for (const [name, value] of Object.entries(headers)) {
+      if (name.toLowerCase() === "cf-mitigated" && typeof value === "string" && value) {
+        return `cf-mitigated: ${value}`;
+      }
+    }
+  }
+  if (typeof status === "number" && status >= 400) return `site answered HTTP ${status}`;
+  return null;
+}
+
 const MARKDOWN_STATE_CHAR_LIMIT = 18000;
 
 /**
@@ -255,10 +286,17 @@ async function fetchMarkdownViaCdp(
     await session.send("Page.navigate", { url });
     await new Promise((r) => setTimeout(r, CDP_SETTLE_MS));
     const evalResult = (await session.send("Runtime.evaluate", {
-      expression: "document.documentElement.outerHTML",
+      // responseStatus: the main document's HTTP status (Chrome 109+), so a
+      // 403 bot wall isn't converted and returned as the page.
+      expression:
+        "({ html: document.documentElement.outerHTML, status: performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0 })",
       returnByValue: true,
-    })) as { result?: { value?: unknown } };
-    const html = evalResult.result?.value;
+    })) as { result?: { value?: { html?: unknown; status?: unknown } } };
+    const status = evalResult.result?.value?.status;
+    if (typeof status === "number" && status >= 400) {
+      throw new Error(`site answered HTTP ${status} (blocked or unavailable)`);
+    }
+    const html = evalResult.result?.value?.html;
     if (typeof html !== "string" || !html.trim()) {
       throw new Error("page rendered no HTML (client-rendered SPA or load failure)");
     }
@@ -297,13 +335,18 @@ async function fetchMarkdownViaBrowser(
       } else {
         const contentType = response.headers.get("content-type") ?? "";
         let markdown: string;
+        let blocked: string | null = null;
         if (contentType.includes("application/json")) {
-          const data = (await response.json()) as { result?: unknown };
+          const data = (await response.json()) as { result?: unknown; meta?: unknown };
           markdown = typeof data.result === "string" ? data.result : "";
+          blocked = quickActionBlockReason(data.meta);
         } else {
           markdown = await response.text();
         }
-        if (isChallengePage(markdown)) {
+        if (blocked) {
+          // Same as a challenge page: CDP gets one more try, then it's reported as blocked.
+          errors.push(`quickAction /markdown: ${blocked}, so the result is a block page, not the content`);
+        } else if (isChallengePage(markdown)) {
           // Try CDP before giving up: a full browser session sometimes clears a challenge the quick action doesn't.
           errors.push("quickAction /markdown: got a bot-challenge page");
         } else if (markdown.trim()) return { markdown, via: "quickAction" };
