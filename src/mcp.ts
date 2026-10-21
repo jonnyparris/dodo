@@ -1133,15 +1133,24 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
       "https URL Dodo POSTs { event: 'prompt.finished', sessionId, promptId, status, needsInput } to whenever a prompt in this session finishes. " +
       "No output is included: fetch it with get_messages. Kept for later prompts in the session; pass an empty string to remove it.",
     ),
-  }, async ({ sessionId, content, callbackUrl }) => {
+    model: z.string().max(200).optional().describe(
+      "Run this session on this model instead of the user's configured model (e.g. '@cf/zai-org/glm-5.3-flash'). " +
+      "Kept for later prompts in the session; pass an empty string to go back to the user's model. Does not change the user's config.",
+    ),
+    exploreModel: z.string().max(200).optional().describe("Same as model, for this session's explore subagents."),
+    taskModel: z.string().max(200).optional().describe("Same as model, for this session's task subagents."),
+  }, async ({ sessionId, content, callbackUrl, model, exploreModel, taskModel }) => {
     const access = await ensureSessionAccess(env, userEmail, sessionId, "write");
     if (!access.ok) return access.result;
     const limited = checkPromptBudget(mcpUserEmail(env, userEmail));
     if (limited) return limited;
+    const extras = Object.fromEntries(
+      Object.entries({ callbackUrl, model, exploreModel, taskModel }).filter(([, v]) => v !== undefined),
+    );
     return jsonFetch(env, "agent", "/prompt", {
       sessionId,
       depth,
-      init: { body: JSON.stringify({ content, ...(callbackUrl !== undefined ? { callbackUrl } : {}) }), headers: { "content-type": "application/json" }, method: "POST" },
+      init: { body: JSON.stringify({ content, ...extras }), headers: { "content-type": "application/json" }, method: "POST" },
     });
   });
 

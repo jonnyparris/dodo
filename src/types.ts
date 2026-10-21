@@ -194,6 +194,11 @@ export interface SessionState {
   totalTokenInput: number;
   totalTokenOutput: number;
   updatedAt: string;
+  /** Effective subagent models for this session (owner config, or the session override). */
+  exploreModel?: string;
+  taskModel?: string;
+  /** Set when this session is pinned to models other than the owner's config. */
+  modelOverride?: { model?: string; exploreModel?: string; taskModel?: string };
 }
 
 export interface ChatMessageRecord {

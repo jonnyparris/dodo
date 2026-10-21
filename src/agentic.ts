@@ -813,6 +813,8 @@ function buildSubagentTool(spec: {
   env: Env;
   /** Per-session default for this subagent's model (from AppConfig). */
   sessionDefaultModel: string | undefined;
+  /** Parent session id: prefix-cache affinity + AI Gateway log metadata, as facets do. */
+  sessionId?: string;
 }): AnyTool {
   return tool({
     description: spec.description,
@@ -840,6 +842,7 @@ function buildSubagentTool(spec: {
           toolset: spec.getTools(),
           env: spec.env,
           resultSchemaName,
+          sessionAffinity: spec.sessionId,
         });
 
         const usageLine = result.tokenInput > 0 || result.tokenOutput > 0
@@ -899,6 +902,7 @@ function buildExploreTool(
   config: AppConfig,
   env: Env,
   parentAgent?: BuildToolsOptions["parentAgent"],
+  sessionId?: string,
 ): AnyTool {
   // Branch on `config.exploreMode`:
   //
@@ -1042,6 +1046,7 @@ function buildExploreTool(
     config,
     env,
     sessionDefaultModel: config.exploreModel,
+    sessionId,
   });
 
   const singleExec = (singleQueryTool as AnyTool).execute as (args: Record<string, unknown>) => Promise<unknown>;
@@ -1127,6 +1132,7 @@ function buildTaskTool(
   config: AppConfig,
   env: Env,
   parentAgent?: BuildToolsOptions["parentAgent"],
+  sessionId?: string,
 ): AnyTool {
   // Facet branch — delegate to the parent's runTaskFacet which spins up
   // a TaskAgent facet DO. Supports a new `workspaceMode` arg that the
@@ -1236,6 +1242,7 @@ function buildTaskTool(
     config,
     env,
     sessionDefaultModel: config.taskModel,
+    sessionId,
   });
 }
 
@@ -1683,13 +1690,13 @@ function buildTools(
   // Explore tool — search subagent for token-efficient codebase discovery.
   // When `config.exploreMode === "facet"`, the tool delegates to an
   // ExploreAgent facet DO; see `buildExploreTool` for the branch.
-  tools.explore = buildExploreTool(workspace, config, env, options?.parentAgent);
+  tools.explore = buildExploreTool(workspace, config, env, options?.parentAgent, options?.sessionId);
 
   // Task tool — generic subagent for bounded sub-tasks. Keeps the main
   // conversation's step budget free when a chunk of work can be safely
   // delegated to a fresh context window. When `config.taskMode === "facet"`,
   // delegates to a TaskAgent facet DO and unlocks scratch-workspace mode.
-  tools.task = buildTaskTool(workspace, config, env, options?.parentAgent);
+  tools.task = buildTaskTool(workspace, config, env, options?.parentAgent, options?.sessionId);
 
   // Skill tool — loads a SKILL.md body on demand. The <available_skills>
   // manifest in the system prompt lists name + description per skill;
