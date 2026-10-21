@@ -240,9 +240,25 @@ describe("Idle session auto-cleanup", () => {
     expect(await getSessionStatus(baseId)).toBe("idle");
   });
 
-  it("fork-source mark returns 404 for an unknown session", async () => {
-    const res = await getUserControlStub().fetch("https://user-control/sessions/does-not-exist/fork-source", { method: "POST" });
-    expect(res.status).toBe(404);
+  it("fork-source mark flags a live session and 404s for unknown or deleted ones", async () => {
+    const stub = getUserControlStub();
+    const liveId = await createSession();
+    const ok = await stub.fetch(`https://user-control/sessions/${liveId}/fork-source`, { method: "POST" });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ marked: true, sessionId: liveId });
+    const flag = await runInDurableObject(stub, async (_, state) =>
+      (state.storage.sql.exec("SELECT fork_source FROM sessions WHERE id = ?", liveId).toArray()[0] as { fork_source: number }).fork_source);
+    expect(flag).toBe(1);
+
+    const unknown = await stub.fetch("https://user-control/sessions/does-not-exist/fork-source", { method: "POST" });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toEqual({ error: "Session 'does-not-exist' not found" });
+
+    const deadId = await createSession();
+    await backdateSession(deadId, 11 * 60);
+    await runSweep();
+    const dead = await stub.fetch(`https://user-control/sessions/${deadId}/fork-source`, { method: "POST" });
+    expect(dead.status).toBe(404);
   });
   it("refuses to fork a soft-deleted source", async () => {
     const baseId = await createSession();

@@ -77,10 +77,15 @@ SharedIndex grant, or a valid share cookie.
 **Fork sources survive the idle sweep.** The sweep soft-deletes sessions
 idle for 10+ minutes with no prompts. It skips any session named as a
 schedule's `sourceSessionId`, and any session that has ever been forked
-from (`sessions.fork_source = 1`, set by both the fork endpoint and
-scheduled forks, in the source owner's DO). The flag never clears; delete
-the session by hand when it is no longer needed. Sessions forked before
-this flag existed are not backfilled: fork them once to protect them.
+from (`sessions.fork_source = 1`, set by every fork path: HTTP, MCP
+`fork_session`, seed forks and scheduled forks). The flag lives in the
+source owner's DO, so a user with write access who forks a shared session
+sets it on the owner's copy. It is set before the snapshot, so a failed
+fork attempt also sets it. The flag never clears and is not shown in the
+UI; delete the session by hand when it is no longer needed. Sessions
+forked before this flag existed are not backfilled: fork them once to
+protect them. A fork (scheduled or not) from a soft-deleted source fails
+with `source_session_missing` / 404.
 
 **Cap:** 50 scheduled sessions per user. Returns 400 with a clear message
 when exceeded.
