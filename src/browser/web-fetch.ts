@@ -108,9 +108,13 @@ interface BrowserQuickActionBinding {
 }
 
 function quickActionBinding(browser: Fetcher): BrowserQuickActionBinding | null {
-  const candidate = browser as Partial<BrowserQuickActionBinding>;
+  const candidate = browser as unknown as BrowserQuickActionBinding;
+  // The binding is an RPC stub: every property is a callable proxy, so
+  // `typeof` is always "function" and `.bind()` becomes a remote call to a
+  // method named "bind" ("The RPC receiver does not implement the method
+  // 'bind'"). Call it as a method instead.
   return typeof candidate.quickAction === "function"
-    ? { quickAction: candidate.quickAction.bind(browser) }
+    ? { quickAction: (action, params) => candidate.quickAction(action, params) }
     : null;
 }
 
@@ -238,7 +242,7 @@ const CDP_SETTLE_MS = 3000;
  * Fallback markdown fetch via the CDP binding path: launch a browser,
  * navigate, grab the rendered HTML, convert with AI.toMarkdown(). Works on
  * any compatibility date — used when the quickAction() binding method is
- * unavailable (it needs compatibility date >= 2026-03-24).
+ * unavailable or the /markdown quick action fails.
  */
 async function fetchMarkdownViaCdp(
   browser: Fetcher,
@@ -310,7 +314,7 @@ async function fetchMarkdownViaBrowser(
     }
   } else {
     errors.push(
-      "quickAction: browser binding does not expose the method (compatibility date < 2026-03-24)",
+      "quickAction: browser binding does not expose the method",
     );
   }
 

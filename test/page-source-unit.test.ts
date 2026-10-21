@@ -174,6 +174,22 @@ describe("createDodoPageSource", () => {
     expect(notes).toContain("quickAction: down");
   });
 
+  it("keeps the quick-action error in the notes when CDP rescues the page", async () => {
+    const source = createDodoPageSource({
+      ai: stubAi("Loading...") as unknown as Ai,
+      cache: new PageCache(),
+      fetch: stubFetch("<div id=app></div>", html),
+      browser: async (_url, errors) => {
+        errors.push("quickAction: boom");
+        return { markdown: LONG_MD, via: "cdp" };
+      },
+    });
+    const page = await source.fetch({ url: "https://spa2.e.com/" });
+    const notes = (page as { notes?: string[] }).notes ?? [];
+    expect(notes[0]).toContain("Rendered with Browser Run (cdp)");
+    expect(notes).toContain("quickAction: boom");
+  });
+
   it("ignores frontmatter when spotting a thin shell", async () => {
     const shell = `---\ntitle: Free, collaborative whiteboard\ndescription: ${"An app. ".repeat(30)}\n---\n\nLoading`;
     const source = createDodoPageSource({
@@ -306,5 +322,28 @@ describe("browser_markdown (agents/webfetch/ai-sdk)", () => {
     const text = renderBrowserMarkdown(output as Parameters<typeof renderBrowserMarkdown>[0]);
     expect(text).toContain("→ rendered markdown");
     expect(text).toContain("note: Rendered with Browser Run (quickAction)");
+  });
+
+  it("calls quickAction as a method on an RPC-stub-like binding (no .bind)", async () => {
+    // Real bindings are RPC stubs: property access on a method returns another
+    // remote stub, so quickAction.bind(...) calls a remote "bind" and throws.
+    const quickAction = new Proxy(
+      async () =>
+        new Response(JSON.stringify({ result: "# From stub" }), { headers: { "content-type": "application/json" } }),
+      {
+        get(target, prop) {
+          if (prop === "bind" || prop === "call" || prop === "apply") {
+            return () => {
+              throw new TypeError(`The RPC receiver does not implement the method "${String(prop)}".`);
+            };
+          }
+          return Reflect.get(target, prop);
+        },
+      },
+    );
+    const browser = { quickAction } as unknown as Fetcher;
+    const tool = toolFor(stubAi(""), stubFetch("", { status: 429 }), browser);
+    const output = await tool.execute({ url: "https://e.com/stub" });
+    expect(output).toMatchObject({ via: "rendered", content: "# From stub" });
   });
 });

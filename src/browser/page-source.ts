@@ -191,7 +191,9 @@ export function createDodoPageSource(options: DodoPageSourceOptions): WebFetchSo
             headers: {},
             bytes: new TextEncoder().encode(rendered.markdown).byteLength,
             redirects: page?.redirects ?? [],
-            notes: [`Rendered with Browser Run (${rendered.via}) because the ${reason}.`],
+            // Keep earlier fallback errors (e.g. a failed /markdown quick action
+            // before CDP succeeded) so the slower path is explainable.
+            notes: [`Rendered with Browser Run (${rendered.via}) because the ${reason}.`, ...errors],
           };
           cache.set(key, result);
           return result;
