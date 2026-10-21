@@ -87,6 +87,17 @@ describe("addAnthropicMessagesCacheMarkers", () => {
     // 3 existing + system = 4; tools and the last message stay unmarked.
     expect((out.system as Array<Record<string, unknown>>)[0].cache_control).toEqual(CC);
     expect((out.tools as Array<Record<string, unknown>>)[0].cache_control).toBeUndefined();
+    const messages = out.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(messages[1].content[0].cache_control).toBeUndefined();
+    expect(JSON.stringify(out).split('"cache_control"').length - 1).toBe(4);
+  });
+
+  it("does not double-mark a last tool_result whose inner content is already marked", () => {
+    const out = addAnthropicMessagesCacheMarkers({
+      messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "x", cache_control: CC }] }] }],
+    });
+    const block = (out.messages as Array<{ content: Array<Record<string, unknown>> }>)[0].content[0];
+    expect(block.cache_control).toBeUndefined();
   });
 
   it("never exceeds 4 breakpoints and leaves existing markers alone", () => {

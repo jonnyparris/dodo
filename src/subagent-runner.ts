@@ -354,6 +354,13 @@ function hasCacheControl(value: unknown): boolean {
   return !!value && typeof value === "object" && "cache_control" in (value as object);
 }
 
+/** A message block carries a marker itself or, for tool_result, in its own content. */
+function blockHasCacheControl(block: unknown): boolean {
+  if (hasCacheControl(block)) return true;
+  const inner = (block as { content?: unknown } | null)?.content;
+  return Array.isArray(inner) && inner.some(hasCacheControl);
+}
+
 function countCacheMarkers(body: Record<string, unknown>): number {
   let n = 0;
   if (Array.isArray(body.system)) n += body.system.filter(hasCacheControl).length;
@@ -403,9 +410,9 @@ export function addAnthropicMessagesCacheMarkers(body: Record<string, unknown>):
   }
 
   // Pruned histories get this breakpoint too: pruneSubagentHistory moves its
-  // cut only once every SUBAGENT_MSG_WINDOW steps, so the pruned prefix is
-  // stable and the next step reads it. Only the step where the cut moves
-  // pays a cache write that is never read.
+  // cut only once per prune window, so the pruned prefix is stable and the
+  // next step reads it. Only the step just before each cut move pays a cache
+  // write that is never read.
   if (budget > 0 && Array.isArray(out.messages) && out.messages.length > 0) {
     const messages = out.messages as Array<Record<string, unknown>>;
     const idx = messages.length - 1;
@@ -414,7 +421,7 @@ export function addAnthropicMessagesCacheMarkers(body: Record<string, unknown>):
     if (typeof content === "string" && content.length > 0) {
       content = [{ type: "text", text: content }];
     }
-    if (Array.isArray(content) && !content.some(hasCacheControl)) {
+    if (Array.isArray(content) && !content.some(blockHasCacheControl)) {
       // Thinking blocks can't carry cache_control; mark the last block that can.
       for (let i = content.length - 1; i >= 0; i--) {
         const block = content[i] as Record<string, unknown> | undefined;
