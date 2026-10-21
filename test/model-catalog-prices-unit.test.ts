@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
+import { describe, expect, it } from "vitest";
 import { FALLBACK_MODELS } from "../src/model-catalog";
 
 type PiCatalog = Record<string, { cost: { input: number; output: number } }>;
