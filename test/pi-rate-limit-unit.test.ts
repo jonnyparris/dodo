@@ -105,6 +105,7 @@ describe("rateLimitFetch", () => {
     const { waits, sleep } = recordingSleep();
     expect((await rateLimitFetch(base, { sleep })("https://gw", { method: "POST", body: "{}" })).status).toBe(200);
     expect(calls).toHaveLength(31);
+    expect(waits.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(60_000);
   });
 
   it("uses retry-after-ms for the wait", async () => {
