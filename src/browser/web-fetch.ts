@@ -3,7 +3,7 @@ import { WebFetchError, webFetchTool, type WebFetchToolOutput } from "agents/web
 import { renderWebFetchPage } from "agents/webfetch";
 import { z } from "zod";
 import { connectBrowser } from "./cdp-session";
-import { createDodoPageSource, isChallengePage, type PageCache } from "./page-source";
+import { createDodoPageSource, isChallengePage, type BrowserMarkdownResult, type PageCache } from "./page-source";
 
 /**
  * Read-only web tools: the Agents SDK `web_fetch` tool with a Browser Run
@@ -147,6 +147,25 @@ export function quickActionBlockReason(meta: unknown): string | null {
   }
   if (typeof status === "number" && status >= 400) return `site answered HTTP ${status}`;
   return null;
+}
+
+/** True when `meta` shows the site refused Browser Run (4xx or cf-mitigated), not a broken origin (5xx). */
+function quickActionRefused(meta: unknown): boolean {
+  if (typeof meta !== "object" || meta === null) return false;
+  const { status, headers } = meta as QuickActionMeta;
+  if (typeof status === "number" && status >= 400 && status < 500) return true;
+  return (
+    typeof headers === "object" &&
+    headers !== null &&
+    Object.keys(headers).some((name) => name.toLowerCase() === "cf-mitigated")
+  );
+}
+
+/** CDP loaded the page and the site answered with an error status. */
+class BrowserHttpStatusError extends Error {
+  constructor(readonly status: number) {
+    super(`site answered HTTP ${status} (blocked or unavailable)`);
+  }
 }
 
 const MARKDOWN_STATE_CHAR_LIMIT = 18000;
@@ -294,7 +313,7 @@ async function fetchMarkdownViaCdp(
     })) as { result?: { value?: { html?: unknown; status?: unknown } } };
     const status = evalResult.result?.value?.status;
     if (typeof status === "number" && status >= 400) {
-      throw new Error(`site answered HTTP ${status} (blocked or unavailable)`);
+      throw new BrowserHttpStatusError(status);
     }
     const html = evalResult.result?.value?.html;
     if (typeof html !== "string" || !html.trim()) {
@@ -320,7 +339,9 @@ async function fetchMarkdownViaBrowser(
   ai: JevAi,
   href: string,
   errors: string[],
-): Promise<{ markdown: string; via: "quickAction" | "cdp" } | null> {
+): Promise<BrowserMarkdownResult | null> {
+  // First refusal seen (4xx / cf-mitigated), returned if no path gets the page.
+  let refused: { blocked: string; via: "quickAction" | "cdp" } | null = null;
   const binding = quickActionBinding(browser);
   if (binding) {
     try {
@@ -340,6 +361,7 @@ async function fetchMarkdownViaBrowser(
           const data = (await response.json()) as { result?: unknown; meta?: unknown };
           markdown = typeof data.result === "string" ? data.result : "";
           blocked = quickActionBlockReason(data.meta);
+          if (blocked && quickActionRefused(data.meta)) refused = { blocked, via: "quickAction" };
         } else {
           markdown = await response.text();
         }
@@ -371,8 +393,11 @@ async function fetchMarkdownViaBrowser(
     errors.push("cdp: empty result");
   } catch (error) {
     errors.push(`cdp: ${error instanceof Error ? error.message : String(error)}`);
+    if (!refused && error instanceof BrowserHttpStatusError && error.status < 500) {
+      refused = { blocked: `site answered HTTP ${error.status}`, via: "cdp" };
+    }
   }
-  return null;
+  return refused;
 }
 
 /**
@@ -405,9 +430,26 @@ export interface WebFetchToolsOptions {
 /** Plain fetch (15 s) + Browser Run /markdown (45 s) + CDP (45 s), with headroom. */
 export const BROWSER_MARKDOWN_TIMEOUT_MS = 120_000;
 
+/** Longest per-path reason appended to a browser_markdown error. */
+const MAX_REASON_CHARS = 400;
+
+/**
+ * Dodo's per-path reasons for a failure ("plain fetch got HTTP 403; browser:
+ * ..."). The SDK swaps the message for a generic model-facing one and keeps
+ * Dodo's error as `cause`, so the reasons are read back from there. Only our
+ * own strings: never page text.
+ */
+export function failureReason(error: WebFetchError): string | null {
+  const cause = error.cause;
+  if (!(cause instanceof Error) || cause === error || !cause.message) return null;
+  const reason = cause.message.replace(/^All fetch paths failed for \S+: /, "").replace(/\.$/, "").trim();
+  if (!reason || error.message.includes(reason)) return null;
+  return reason.length > MAX_REASON_CHARS ? `${reason.slice(0, MAX_REASON_CHARS - 1)}…` : reason;
+}
+
 /** Appended to web_fetch_blocked: Browser Run already tried, so name the remaining routes. */
 const BLOCKED_HINT =
-  "browser_markdown already tried Browser Run and got the challenge page too. Try `browser_execute` (an interactive session; it may hit the same challenge), or get the information from another source (search results, the project's repository, a registry or API endpoint).";
+  "browser_markdown already tried Browser Run and was blocked too. Try `browser_execute` (an interactive session; it may hit the same challenge), or get the information from another source (search results, the project's repository, a registry or API endpoint).";
 
 const MARKDOWN_DESCRIPTION = `Fetch a webpage or document (HTML, PDF, Office, JSON) as markdown. Read-only.
 
@@ -505,8 +547,11 @@ export function createWebFetchTools(
           // The SDK's message is written for the model (what failed, retry or not).
           if (error instanceof WebFetchError) {
             console.error("browser_markdown failed for", url, error.code, error.cause);
-            const hint = error.code === "web_fetch_blocked" && browser && (format ?? "auto") === "auto" ? ` ${BLOCKED_HINT}` : "";
-            return { error: error.message + hint, code: error.code };
+            const blocked = error.code === "web_fetch_blocked";
+            const reason = blocked ? failureReason(error) : null;
+            const why = reason ? ` Why: ${reason}.` : "";
+            const hint = blocked && browser && (format ?? "auto") === "auto" ? ` ${BLOCKED_HINT}` : "";
+            return { error: error.message + why + hint, code: error.code };
           }
           throw error;
         }

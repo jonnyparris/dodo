@@ -5,7 +5,7 @@
  * The SDK does the fetching: `Accept: text/markdown` first (Markdown for
  * Agents), Workers AI `toMarkdown` for HTML and documents, pretty JSON,
  * redirects followed by hand with every hop checked against its private-host
- * policy, a streamed size cap. Dodo adds two things on top:
+ * policy, a streamed size cap. Dodo adds these on top:
  *   1. Browser Run fallback when a plain fetch can't get the page: a bot
  *      challenge, 401/403/429/5xx, or HTML that converts to almost nothing
  *      (a client-rendered shell).
@@ -16,6 +16,10 @@
  *      or the interstitial a headless browser renders, is caught by its text
  *      (`isChallengePage`) and reported as `web_fetch_blocked`, never as the
  *      page's content.
+ *   4. Status-based blocking. When the plain fetch got a 4xx and Browser Run
+ *      was refused too (4xx, `cf-mitigated`, or an interstitial), the result
+ *      is `web_fetch_blocked` whatever the page text says, so a bot wall no
+ *      pattern knows yet doesn't leak through as content.
  */
 
 import {
@@ -33,11 +37,18 @@ export type DodoWebFetchPage = WebFetchPage & {
   notes?: string[];
 };
 
-/** Fetches a URL in a real browser and returns Markdown, or null with reasons pushed to `errors`. */
-export type BrowserMarkdownFetcher = (
-  url: string,
-  errors: string[],
-) => Promise<{ markdown: string; via: string } | null>;
+/**
+ * What the Browser Run fallback got: the page as Markdown, or `blocked` when
+ * Browser Run reached the site and the site refused it (an HTTP 4xx or a
+ * `cf-mitigated` header). `blocked` is structured on purpose: a bot wall
+ * whose page text no challenge pattern knows is still caught by its status.
+ */
+export type BrowserMarkdownResult =
+  | { markdown: string; via: string }
+  | { blocked: string; via: string };
+
+/** Fetches a URL in a real browser, or returns null with reasons pushed to `errors`. */
+export type BrowserMarkdownFetcher = (url: string, errors: string[]) => Promise<BrowserMarkdownResult | null>;
 
 export interface DodoPageSourceOptions {
   /** Workers AI binding, for `toMarkdown`. */
@@ -56,6 +67,11 @@ export const DIRECT_FETCH_TIMEOUT_MS = 15_000;
 /** Below this many chars of converted HTML, assume a JS-rendered shell. */
 export const THIN_MARKDOWN_CHARS = 200;
 const USER_AGENT = "Dodo/1.0 (read-only web fetch; +https://github.com/jonnyparris/dodo)";
+
+/** A refusal rather than a broken origin: the site answered, and said no. */
+function isRefusal(status: number): boolean {
+  return status >= 400 && status < 500;
+}
 
 /** Statuses a real browser may get past: auth walls, bot blocks, rate limits, flaky origins. */
 function browserMayHelp(status: number): boolean {
@@ -173,13 +189,21 @@ export function createDodoPageSource(options: DodoPageSourceOptions): WebFetchSo
       }
 
       const errors: string[] = [];
+      // Set when Browser Run reached the site and was refused too (HTTP 4xx,
+      // cf-mitigated, or the challenge interstitial).
+      let browserRefused: string | null = null;
       if (options.browser && format === "auto") {
-        let rendered = await options.browser(page?.finalUrl ?? request.url.trim(), errors);
-        if (rendered && isChallengePage(rendered.markdown)) {
+        const result = await options.browser(page?.finalUrl ?? request.url.trim(), errors);
+        let rendered: { markdown: string; via: string } | null = null;
+        if (result && "blocked" in result) {
+          browserRefused = `Browser Run (${result.via}) was refused too: ${result.blocked}`;
+        } else if (result && isChallengePage(result.markdown)) {
           // The headless browser got the interstitial too. Never hand it back as the page.
-          errors.push(`browser: Browser Run (${rendered.via}) got a bot-challenge page, not the content`);
-          rendered = null;
+          browserRefused = `Browser Run (${result.via}) got a bot-challenge page, not the content`;
+        } else {
+          rendered = result;
         }
+        if (browserRefused) errors.push(`browser: ${browserRefused}`);
         if (rendered) {
           const url = request.url.trim();
           const result: DodoWebFetchPage = {
@@ -204,13 +228,17 @@ export function createDodoPageSource(options: DodoPageSourceOptions): WebFetchSo
         errors.push(options.browser ? `browser: not used for format "${format}"` : "browser: no Browser Run binding available");
       }
 
-      if (page && !isChallengePage(page.content)) {
+      // Both paths were refused: the plain body is the site's error or bot-wall
+      // page, whatever its text says. Blocked, not content. (A thin 200 shell
+      // stays: it may be the real page, just not rendered.)
+      const bothRefused = page !== null && isRefusal(page.status) && browserRefused !== null;
+      if (page && !bothRefused && !isChallengePage(page.content)) {
         return {
           ...page,
           notes: [`The ${reason} and the browser fallback failed; content may be incomplete.`, ...errors],
         };
       }
-      // Includes a plain-fetch challenge page the browser couldn't get past: blocked, not content.
+      // Includes a plain-fetch challenge page the browser couldn't get past.
       throw new WebFetchError(`All fetch paths failed for ${request.url}: ${reason}; ${errors.join("; ")}`, {
         status: 502,
         code: "web_fetch_blocked",
