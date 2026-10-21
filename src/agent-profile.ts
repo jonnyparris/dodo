@@ -35,7 +35,7 @@ export const SUBAGENT_FAMILY_MODELS: Record<string, string> = {
   "anthropic/": "anthropic/claude-haiku-4-5",
   "openai/": "openai/gpt-4.1-mini",
   "google/": "google/gemini-2.5-flash",
-  "deepseek/": "deepseek/deepseek-chat",
+  "deepseek/": "deepseek/deepseek-flash",
 };
 
 /**
