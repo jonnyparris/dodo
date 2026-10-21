@@ -91,6 +91,8 @@ describe("anthropicNativeBaseURL", () => {
   it("is undefined off AI Gateway or for non-/compat URLs", () => {
     expect(anthropicNativeBaseURL({ activeGateway: "opencode", aiGatewayBaseURL: "https://x/v1/a/g/compat" })).toBeUndefined();
     expect(anthropicNativeBaseURL({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://proxy.example/v1" })).toBeUndefined();
+    // A custom proxy that happens to end in /compat stays on the OpenAI-compatible path.
+    expect(anthropicNativeBaseURL({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://proxy.example/compat" })).toBeUndefined();
   });
 });
 
@@ -121,7 +123,7 @@ describe("buildProviderForModel routing", () => {
       content: [{ type: "text", text: "ok" }], stop_reason: "end_turn",
       usage: { input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 4000 },
     });
-    const provider = buildProviderForModel("anthropic/claude-haiku-4-5", config, env);
+    const provider = buildProviderForModel("anthropic/claude-haiku-4-5", config, env, "sess-1");
     await generateText({ model: provider.chatModel("anthropic/claude-haiku-4-5"), system: "SYS", prompt: "hi", tools });
 
     expect(calls).toHaveLength(1);
@@ -129,6 +131,7 @@ describe("buildProviderForModel routing", () => {
     expect(c.url).toBe("https://gateway.ai.cloudflare.com/v1/acc/gw/anthropic/v1/messages");
     expect(c.headers.get("cf-aig-authorization")).toBe("Bearer aig-key");
     expect(c.headers.has("x-api-key")).toBe(false);
+    expect(JSON.parse(c.headers.get("cf-aig-metadata") ?? "{}")).toEqual({ dodo_session: "sess-1", dodo_role: "subagent" });
     expect(c.body.model).toBe("claude-haiku-4-5");
     expect((c.body.system as Array<Record<string, unknown>>).at(-1)?.cache_control).toEqual(CC);
     expect((c.body.tools as Array<Record<string, unknown>>).at(-1)?.cache_control).toEqual(CC);

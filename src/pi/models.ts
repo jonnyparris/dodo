@@ -10,16 +10,17 @@
 // API against the gateway's provider-native `/anthropic` endpoint. The
 // unified `/compat` endpoint strips every `cache_control` marker (measured
 // 2026-10-21, PR #110), so on `/compat` every Anthropic turn paid full input
-// price for the whole prefix. This covers the main session only: explore/task
-// subagents (src/subagent-runner.ts, AI SDK) still call `/compat`, so their
-// Anthropic markers are still stripped.
+// price for the whole prefix. Explore/task subagents (src/subagent-runner.ts,
+// AI SDK) do the same through `@ai-sdk/anthropic`, using the same URL helper.
 
 import type { Model, ProviderStreams, StreamOptions } from "@earendil-works/pi-ai";
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
-import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
+import { aigMetadataHeader, anthropicGatewayBaseUrl, resolveWireModelId } from "../subagent-runner";
+
+export { anthropicGatewayBaseUrl };
 import type { Env } from "../types";
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
@@ -45,27 +46,6 @@ function trim(url: string): string {
 /** Anthropic prices cache reads at 0.1x and 5-minute cache writes at 1.25x base input. */
 const ANTHROPIC_CACHE_READ_MULTIPLIER = 0.1;
 const ANTHROPIC_CACHE_WRITE_MULTIPLIER = 1.25;
-
-/**
- * Native Anthropic base URL for an AI Gateway unified base URL, e.g.
- * `.../v1/{account}/{gateway}/compat` → `.../v1/{account}/{gateway}/anthropic`
- * (the Anthropic SDK appends `/v1/messages`). Undefined off AI Gateway or
- * when the path isn't AI Gateway's `/v1/{account}/{gateway}/compat` shape,
- * so a custom proxy that happens to end in `/compat` keeps the
- * OpenAI-compatible path.
- */
-export function anthropicGatewayBaseUrl(config: GatewayConfig): string | undefined {
-  if (config.activeGateway !== "ai-gateway" || !config.aiGatewayBaseURL) return undefined;
-  let url: URL;
-  try {
-    url = new URL(config.aiGatewayBaseURL);
-  } catch {
-    return undefined;
-  }
-  const path = trim(url.pathname);
-  if (!/^\/v1\/[^/]+\/[^/]+\/compat$/.test(path)) return undefined;
-  return `${url.origin}${path.slice(0, -"/compat".length)}/anthropic${url.search}`;
-}
 
 /** The pi-ai model for one Dodo model id on the configured gateway. */
 export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> | Model<"anthropic-messages"> {

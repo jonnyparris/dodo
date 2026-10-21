@@ -438,16 +438,41 @@ export function addAnthropicMessagesCacheMarkers(body: Record<string, unknown>):
 }
 
 /**
- * Native Anthropic base URL for an AI Gateway unified (`/compat`) base URL,
- * e.g. `.../v1/{account}/{gateway}/compat` → `.../v1/{account}/{gateway}/anthropic/v1`.
- * Undefined when the session isn't on AI Gateway or the URL isn't a
- * `/compat` endpoint (the OpenCode gateway, custom proxies).
+ * Native Anthropic base URL for an AI Gateway unified base URL, e.g.
+ * `.../v1/{account}/{gateway}/compat` → `.../v1/{account}/{gateway}/anthropic`
+ * (pi-ai's Anthropic SDK appends `/v1/messages`). Undefined off AI Gateway or
+ * when the path isn't AI Gateway's `/v1/{account}/{gateway}/compat` shape,
+ * so a custom proxy that happens to end in `/compat` keeps the
+ * OpenAI-compatible path. Shared by the main session (src/pi/models.ts) and
+ * explore/task subagents so both route Anthropic the same way.
+ */
+export function anthropicGatewayBaseUrl(config: Pick<AppConfig, "activeGateway" | "aiGatewayBaseURL">): string | undefined {
+  const parts = anthropicGatewayUrlParts(config);
+  return parts ? `${parts.prefix}${parts.search}` : undefined;
+}
+
+/**
+ * Same as {@link anthropicGatewayBaseUrl} but with the `/v1` the AI SDK's
+ * `@ai-sdk/anthropic` expects in its baseURL (it appends `/messages`).
  */
 export function anthropicNativeBaseURL(config: Pick<AppConfig, "activeGateway" | "aiGatewayBaseURL">): string | undefined {
+  const parts = anthropicGatewayUrlParts(config);
+  return parts ? `${parts.prefix}/v1${parts.search}` : undefined;
+}
+
+function anthropicGatewayUrlParts(
+  config: Pick<AppConfig, "activeGateway" | "aiGatewayBaseURL">,
+): { prefix: string; search: string } | undefined {
   if (config.activeGateway !== "ai-gateway" || !config.aiGatewayBaseURL) return undefined;
-  const base = trimBaseUrl(config.aiGatewayBaseURL);
-  if (!base.endsWith("/compat")) return undefined;
-  return `${base.slice(0, -"/compat".length)}/anthropic/v1`;
+  let url: URL;
+  try {
+    url = new URL(config.aiGatewayBaseURL);
+  } catch {
+    return undefined;
+  }
+  const path = trimBaseUrl(url.pathname);
+  if (!/^\/v1\/[^/]+\/[^/]+\/compat$/.test(path)) return undefined;
+  return { prefix: `${url.origin}${path.slice(0, -"/compat".length)}/anthropic`, search: url.search };
 }
 
 /**
@@ -470,11 +495,15 @@ export const anthropicGatewayFetch: typeof fetch = async (input, init) => {
   return fetch(input, { ...init, headers, body });
 };
 
-function buildAnthropicNativeProvider(baseURL: string, env: Env) {
+function buildAnthropicNativeProvider(baseURL: string, env: Env, sessionAffinity?: string) {
   const anthropic = createAnthropic({
     baseURL,
     apiKey: "unused",
-    headers: { "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}` },
+    headers: {
+      "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
+      // sessionAffinity is the parent session id: tag the gateway log with it.
+      ...aigMetadataHeader(sessionAffinity, "subagent"),
+    },
     fetch: anthropicGatewayFetch,
   });
   // Dodo ids are `anthropic/claude-…`; the native endpoint wants `claude-…`.
@@ -526,7 +555,7 @@ export function buildProviderForModel(
   sessionAffinity?: string,
 ) {
   const nativeAnthropic = modelId.startsWith("anthropic/") ? anthropicNativeBaseURL(config) : undefined;
-  if (nativeAnthropic) return buildAnthropicNativeProvider(nativeAnthropic, env);
+  if (nativeAnthropic) return buildAnthropicNativeProvider(nativeAnthropic, env, sessionAffinity);
 
   const effectiveGateway = resolveGatewayForModel(modelId, config.activeGateway);
   const isOpencode = effectiveGateway === "opencode";
