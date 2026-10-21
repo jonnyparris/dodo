@@ -198,8 +198,6 @@ function capText(text: string, maxLines: number, maxBytes: number): string {
 // ─── Subagent message-history pruning ───
 
 const SUBAGENT_MSG_WINDOW = 4;
-/** Fixed part of the prune marker text; the cache transform looks for it. */
-export const PRUNE_MARKER_TAG = "were pruned to keep your input token count bounded";
 
 /**
  * Constant on purpose: the marker sits right after the first user message,
@@ -209,7 +207,7 @@ export const PRUNE_MARKER_TAG = "were pruned to keep your input token count boun
 const PRUNE_MARKER: ModelMessage = {
   role: "user",
   content:
-    `[system: earlier assistant/tool messages ${PRUNE_MARKER_TAG}. If you need information from those steps, call the relevant tool again — don't try to reconstruct the content.]`,
+    "[system: earlier assistant/tool messages were pruned to keep your input token count bounded. If you need information from those steps, call the relevant tool again — don't try to reconstruct the content.]",
 };
 
 /**
@@ -362,20 +360,15 @@ function countCacheMarkers(body: Record<string, unknown>): number {
   if (Array.isArray(body.tools)) n += body.tools.filter(hasCacheControl).length;
   if (Array.isArray(body.messages)) {
     for (const msg of body.messages as Array<Record<string, unknown>>) {
-      if (Array.isArray(msg?.content)) n += msg.content.filter(hasCacheControl).length;
+      if (!Array.isArray(msg?.content)) continue;
+      for (const block of msg.content as Array<Record<string, unknown>>) {
+        if (hasCacheControl(block)) n++;
+        // tool_result blocks can carry their own marked content blocks.
+        if (Array.isArray(block?.content)) n += block.content.filter(hasCacheControl).length;
+      }
     }
   }
   return n;
-}
-
-function isPrunedHistory(messages: unknown[]): boolean {
-  return messages.some((m) => {
-    const content = (m as { content?: unknown })?.content;
-    if (typeof content === "string") return content.includes(PRUNE_MARKER_TAG);
-    return Array.isArray(content) && content.some(
-      (b) => typeof (b as { text?: unknown })?.text === "string" && (b as { text: string }).text.includes(PRUNE_MARKER_TAG),
-    );
-  });
 }
 
 /**
@@ -409,10 +402,11 @@ export function addAnthropicMessagesCacheMarkers(body: Record<string, unknown>):
     }
   }
 
-  // Once the subagent history is pruned, every step drops a different slice
-  // after the first user message, so a breakpoint on the last message is
-  // written (at 1.25x input price) and never read. Skip it then.
-  if (budget > 0 && Array.isArray(out.messages) && out.messages.length > 0 && !isPrunedHistory(out.messages)) {
+  // Pruned histories get this breakpoint too: pruneSubagentHistory moves its
+  // cut only once every SUBAGENT_MSG_WINDOW steps, so the pruned prefix is
+  // stable and the next step reads it. Only the step where the cut moves
+  // pays a cache write that is never read.
+  if (budget > 0 && Array.isArray(out.messages) && out.messages.length > 0) {
     const messages = out.messages as Array<Record<string, unknown>>;
     const idx = messages.length - 1;
     const msg = messages[idx];

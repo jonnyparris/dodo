@@ -4,7 +4,9 @@
  * These tests pin the routing, the auth headers and the cache breakpoints.
  */
 import { generateText, jsonSchema, tool } from "ai";
+import { generateStructured } from "../src/structured-output";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import {
   addAnthropicMessagesCacheMarkers,
   anthropicNativeBaseURL,
@@ -54,19 +56,37 @@ describe("addAnthropicMessagesCacheMarkers", () => {
     expect(blocks[1].cache_control).toBeUndefined();
   });
 
-  it("skips the last-message breakpoint once history is pruned (it would never be read)", () => {
-    const history = [
+  it("keeps the last-message breakpoint on pruned history, whose prefix is stable between cut moves", () => {
+    const history = (steps: number) => [
       { role: "user" as const, content: "find X" },
-      ...Array.from({ length: 6 }, (_, i) => [
+      ...Array.from({ length: steps }, (_, i) => [
         { role: "assistant" as const, content: `step ${i}` },
         { role: "user" as const, content: `result ${i}` },
       ]).flat(),
     ];
-    const pruned = pruneSubagentHistory(history, 2);
-    expect(pruned.length).toBeLessThan(history.length);
-    const out = addAnthropicMessagesCacheMarkers({ system: "SYS", messages: pruned });
+    // window 2: 4 and 5 groups both drop 2, so step 5 extends step 4's prompt.
+    const step4 = pruneSubagentHistory(history(4), 2);
+    const step5 = pruneSubagentHistory(history(5), 2);
+    expect(step4.length).toBeLessThan(history(4).length);
+    expect(step5.slice(0, step4.length)).toEqual(step4);
+    const out = addAnthropicMessagesCacheMarkers({ system: "SYS", messages: step4 });
+    const last = (out.messages as Array<{ content: Array<Record<string, unknown>> }>).at(-1);
+    expect(last?.content.at(-1)?.cache_control).toEqual(CC);
+  });
+
+  it("counts markers nested in tool_result content toward the 4-breakpoint limit", () => {
+    const marked = { type: "text", text: "x", cache_control: CC };
+    const out = addAnthropicMessagesCacheMarkers({
+      system: "SYS",
+      tools: [{ name: "grep" }],
+      messages: [
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [marked, marked] }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: [marked] }] },
+      ],
+    });
+    // 3 existing + system = 4; tools and the last message stay unmarked.
     expect((out.system as Array<Record<string, unknown>>)[0].cache_control).toEqual(CC);
-    expect(JSON.stringify(out.messages)).not.toContain("cache_control");
+    expect((out.tools as Array<Record<string, unknown>>)[0].cache_control).toBeUndefined();
   });
 
   it("never exceeds 4 breakpoints and leaves existing markers alone", () => {
@@ -153,5 +173,39 @@ describe("buildProviderForModel routing", () => {
     const oc = { ...config, activeGateway: "opencode" } as AppConfig;
     await generateText({ model: buildProviderForModel("anthropic/claude-haiku-4-5", oc, env).chatModel("anthropic/claude-haiku-4-5"), prompt: "hi" });
     expect(calls[0].url).toBe("https://opencode.example/v1/chat/completions");
+  });
+
+  it("runs the structured coercion pass through the native endpoint", async () => {
+    const calls: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", async (url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      calls.push({ url: String(url), headers: new Headers(init?.headers), body });
+      // @ai-sdk/anthropic either asks for native JSON output or forces a `json` tool.
+      const tools = (body.tools as Array<{ name: string }> | undefined) ?? [];
+      const content = tools.some((t) => t.name === "json")
+        ? [{ type: "tool_use", id: "t1", name: "json", input: { answer: "42" } }]
+        : [{ type: "text", text: JSON.stringify({ answer: "42" }) }];
+      return new Response(
+        JSON.stringify({
+          id: "msg_1", type: "message", role: "assistant", model: "claude-haiku-4-5", content,
+          stop_reason: content[0].type === "tool_use" ? "tool_use" : "end_turn",
+          usage: { input_tokens: 5, output_tokens: 3 },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    });
+    const provider = buildProviderForModel("anthropic/claude-haiku-4-5", config, env, "sess-1");
+    const out = await generateStructured<{ answer: string }>({
+      modelId: "anthropic/claude-haiku-4-5",
+      model: provider.chatModel("anthropic/claude-haiku-4-5"),
+      schema: z.object({ answer: z.string() }),
+      prompt: "distill",
+      maxRetries: 0,
+    });
+    expect(out).toMatchObject({ ok: true, data: { answer: "42" } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://gateway.ai.cloudflare.com/v1/acc/gw/anthropic/v1/messages");
+    expect(calls[0].headers.has("x-api-key")).toBe(false);
+    expect(calls[0].headers.get("cf-aig-authorization")).toBe("Bearer aig-key");
   });
 });
