@@ -11,6 +11,11 @@
  *      (a client-rendered shell).
  *   2. A small cache, so reading window 2..n of a long page doesn't fetch it
  *      again (or spend Browser Run time again).
+ *   3. Challenge-page detection. The SDK only spots a challenge by its
+ *      `cf-mitigated` header; a challenge page served with a plain 200/403,
+ *      or the interstitial a headless browser renders, is caught by its text
+ *      (`isChallengePage`) and reported as `web_fetch_blocked`, never as the
+ *      page's content.
  */
 
 import {
@@ -70,6 +75,43 @@ function isThinHtml(page: WebFetchPage): boolean {
   );
 }
 
+/** Interstitials are short; a real page that mentions these phrases is not. */
+export const CHALLENGE_MAX_BODY_CHARS = 2_000;
+
+/**
+ * Phrases bot-protection interstitials put on the page in place of the
+ * content: Cloudflare (managed/JS challenge, Turnstile, block page), DataDome,
+ * PerimeterX/HUMAN, Imperva/Incapsula, Akamai, Distil, generic captcha walls.
+ */
+const CHALLENGE_PATTERNS: RegExp[] = [
+  /performing security verification/i,
+  /verif(?:y|ying) (?:that )?you are (?:a )?human/i,
+  /checking (?:if the site connection is secure|your browser before accessing)/i,
+  /needs to review the security of your connection/i,
+  /enable javascript and cookies to continue/i,
+  /this website uses a security service to protect/i,
+  /attention required!? \| cloudflare/i,
+  /(?:^|\n)\s*(?:#+\s*|title:\s*["']?)just a moment\.\.\./i,
+  /sorry, you have been blocked/i,
+  /press (?:&|and) hold to confirm you are a human/i,
+  /access to this page has been denied/i,
+  /captcha-delivery\.com/i,
+  /incapsula incident id/i,
+  /pardon our interruption/i,
+  /you don't have permission to access .{0,200} on this server/i,
+  /please (?:complete the security check|verify you are (?:a )?human)/i,
+];
+
+/**
+ * True when `markdown` is a bot-challenge interstitial rather than the page:
+ * a short body plus a phrase only those pages use. Frontmatter (the page
+ * title, e.g. "Just a moment...") counts toward the match, not the length.
+ */
+export function isChallengePage(markdown: string): boolean {
+  if (bodyText(markdown).length > CHALLENGE_MAX_BODY_CHARS) return false;
+  return CHALLENGE_PATTERNS.some((pattern) => pattern.test(markdown));
+}
+
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -101,6 +143,7 @@ export function createDodoPageSource(options: DodoPageSourceOptions): WebFetchSo
       try {
         page = await direct.fetch(request, { signal });
         if (browserMayHelp(page.status)) reason = `plain fetch got HTTP ${page.status}`;
+        else if (isChallengePage(page.content)) reason = `plain fetch got a bot-challenge page (HTTP ${page.status})`;
         else if (isThinHtml(page)) {
           reason = `HTML converted to only ${bodyText(page.content).length} chars of body text (likely client-rendered)`;
         } else {
@@ -129,7 +172,12 @@ export function createDodoPageSource(options: DodoPageSourceOptions): WebFetchSo
 
       const errors: string[] = [];
       if (options.browser && format === "auto") {
-        const rendered = await options.browser(page?.finalUrl ?? request.url.trim(), errors);
+        let rendered = await options.browser(page?.finalUrl ?? request.url.trim(), errors);
+        if (rendered && isChallengePage(rendered.markdown)) {
+          // The headless browser got the interstitial too. Never hand it back as the page.
+          errors.push(`browser: Browser Run (${rendered.via}) got a bot-challenge page, not the content`);
+          rendered = null;
+        }
         if (rendered) {
           const url = request.url.trim();
           const result: DodoWebFetchPage = {
@@ -152,12 +200,13 @@ export function createDodoPageSource(options: DodoPageSourceOptions): WebFetchSo
         errors.push(options.browser ? `browser: not used for format "${format}"` : "browser: no Browser Run binding available");
       }
 
-      if (page) {
+      if (page && !isChallengePage(page.content)) {
         return {
           ...page,
           notes: [`The ${reason} and the browser fallback failed; content may be incomplete.`, ...errors],
         };
       }
+      // Includes a plain-fetch challenge page the browser couldn't get past: blocked, not content.
       throw new WebFetchError(`All fetch paths failed for ${request.url}: ${reason}; ${errors.join("; ")}`, {
         status: 502,
         code: "web_fetch_blocked",

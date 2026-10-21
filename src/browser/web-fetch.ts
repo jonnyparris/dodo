@@ -3,7 +3,7 @@ import { WebFetchError, webFetchTool, type WebFetchToolOutput } from "agents/web
 import { renderWebFetchPage } from "agents/webfetch";
 import { z } from "zod";
 import { connectBrowser } from "./cdp-session";
-import { createDodoPageSource, type PageCache } from "./page-source";
+import { createDodoPageSource, isChallengePage, type PageCache } from "./page-source";
 
 /**
  * Read-only web tools: the Agents SDK `web_fetch` tool with a Browser Run
@@ -299,8 +299,11 @@ async function fetchMarkdownViaBrowser(
         } else {
           markdown = await response.text();
         }
-        if (markdown.trim()) return { markdown, via: "quickAction" };
-        errors.push("quickAction /markdown: empty result");
+        if (isChallengePage(markdown)) {
+          // Try CDP before giving up: a full browser session sometimes clears a challenge the quick action doesn't.
+          errors.push("quickAction /markdown: got a bot-challenge page");
+        } else if (markdown.trim()) return { markdown, via: "quickAction" };
+        else errors.push("quickAction /markdown: empty result");
       }
     } catch (error) {
       errors.push(`quickAction: ${error instanceof Error ? error.message : String(error)}`);
@@ -354,6 +357,10 @@ export interface WebFetchToolsOptions {
 
 /** Plain fetch (15 s) + Browser Run /markdown (45 s) + CDP (45 s), with headroom. */
 export const BROWSER_MARKDOWN_TIMEOUT_MS = 120_000;
+
+/** Appended to web_fetch_blocked: Browser Run already tried, so name the remaining routes. */
+const BLOCKED_HINT =
+  "browser_markdown already tried Browser Run and got the challenge page too. Try `browser_execute` (an interactive session; it may hit the same challenge), or get the information from another source (search results, the project's repository, a registry or API endpoint).";
 
 const MARKDOWN_DESCRIPTION = `Fetch a webpage or document (HTML, PDF, Office, JSON) as markdown. Read-only.
 
@@ -451,7 +458,8 @@ export function createWebFetchTools(
           // The SDK's message is written for the model (what failed, retry or not).
           if (error instanceof WebFetchError) {
             console.error("browser_markdown failed for", url, error.code, error.cause);
-            return { error: error.message, code: error.code };
+            const hint = error.code === "web_fetch_blocked" && browser && (format ?? "auto") === "auto" ? ` ${BLOCKED_HINT}` : "";
+            return { error: error.message + hint, code: error.code };
           }
           throw error;
         }

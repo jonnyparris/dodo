@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { WebFetchError } from "agents/webfetch";
-import { createDodoPageSource, PageCache, type BrowserMarkdownFetcher } from "../src/browser/page-source";
+import { createDodoPageSource, isChallengePage, PageCache, type BrowserMarkdownFetcher } from "../src/browser/page-source";
 import { createWebFetchTools, renderBrowserMarkdown, type JevAi } from "../src/browser/web-fetch";
 
 function stubFetch(
@@ -24,6 +24,21 @@ function stubAi(data: string, noul = 0.9, calls: string[] = []): JevAi {
     run: async () => ({ answers: { has_answer: { type: "noul", noul } } }),
   } as unknown as JevAi;
 }
+
+/** What Browser Run CDP returned for www.npmjs.com/package/agents on preview, 10-21 (shape, not byte-exact). */
+const CF_INTERSTITIAL = `---
+title: Just a moment...
+---
+
+# www.npmjs.com
+
+## Performing security verification
+
+This website uses a security service to protect against malicious bots. This page is displayed while the website verifies you are not a bot.
+
+Ray ID: 9a1b2c3d4e5f6789
+
+Performance and Security by Cloudflare`;
 
 const LONG_MD = `# Title\n\n${"Some real content here. ".repeat(20)}`;
 const html = { headers: { "content-type": "text/html; charset=utf-8" } };
@@ -92,6 +107,42 @@ describe("createDodoPageSource", () => {
     });
     const page = await source.fetch({ url: "https://e.com/" });
     expect(page.content).toBe("# Past the challenge");
+  });
+
+  it("reports blocked when Browser Run renders the challenge interstitial", async () => {
+    const cache = new PageCache();
+    const source = createDodoPageSource({
+      ai: stubAi(LONG_MD) as unknown as Ai,
+      cache,
+      fetch: stubFetch("challenge", { status: 403, headers: { "cf-mitigated": "challenge" } }),
+      browser: async () => ({ markdown: CF_INTERSTITIAL, via: "cdp" }),
+    });
+    const failure = source.fetch({ url: "https://www.npmjs.com/package/agents" });
+    await expect(failure).rejects.toMatchObject({ code: "web_fetch_blocked" });
+    await expect(failure).rejects.toThrow(/Browser Run \(cdp\) got a bot-challenge page/);
+    expect(cache.get("auto https://www.npmjs.com/package/agents")).toBeNull();
+  });
+
+  it("does not return a plain-fetch challenge page as content when the browser fails", async () => {
+    const source = createDodoPageSource({
+      ai: stubAi(CF_INTERSTITIAL) as unknown as Ai,
+      cache: new PageCache(),
+      fetch: stubFetch("<html>challenge</html>", { status: 403, ...html }),
+      browser: browserStub(null),
+    });
+    await expect(source.fetch({ url: "https://e.com/" })).rejects.toMatchObject({ code: "web_fetch_blocked" });
+  });
+
+  it("sends a 200 challenge page to the browser", async () => {
+    const source = createDodoPageSource({
+      ai: stubAi(CF_INTERSTITIAL) as unknown as Ai,
+      cache: new PageCache(),
+      fetch: stubFetch("<html>challenge</html>", html),
+      browser: browserStub("# The real page"),
+    });
+    const page = await source.fetch({ url: "https://e.com/" });
+    expect(page.content).toBe("# The real page");
+    expect((page as { notes?: string[] }).notes?.[0]).toContain("bot-challenge page");
   });
 
   it("does not use the browser for a 404", async () => {
@@ -163,6 +214,28 @@ describe("createDodoPageSource", () => {
   });
 });
 
+describe("isChallengePage", () => {
+  it.each([
+    ["Cloudflare managed challenge", CF_INTERSTITIAL],
+    ["Cloudflare JS challenge", "# Just a moment...\n\nChecking if the site connection is secure\n\nexample.com needs to review the security of your connection before proceeding."],
+    ["Cloudflare block page", "# Attention Required! | Cloudflare\n\nSorry, you have been blocked"],
+    ["Turnstile", "Verify you are human by completing the action below."],
+    ["PerimeterX", "# Access to this page has been denied\n\nPress & Hold to confirm you are a human (and not a bot)."],
+    ["DataDome", "Please enable JS and disable any ad blocker\n\n![](https://geo.captcha-delivery.com/captcha/?initialCid=x)"],
+    ["Imperva", "Request unsuccessful. Incapsula incident ID: 123-456"],
+    ["Akamai", "# Access Denied\n\nYou don't have permission to access \"http://e.com/\" on this server.\n\nReference #18.abc"],
+  ])("spots %s", (_name, markdown) => {
+    expect(isChallengePage(markdown)).toBe(true);
+  });
+
+  it("leaves real pages alone, including long ones that discuss challenges", () => {
+    expect(isChallengePage(LONG_MD)).toBe(false);
+    expect(isChallengePage("# Just a moment in time\n\nA short story.")).toBe(false);
+    const article = `# How Cloudflare's challenge works\n\nThe page says "Performing security verification" while it runs.\n\n${"Detail. ".repeat(400)}`;
+    expect(isChallengePage(article)).toBe(false);
+  });
+});
+
 describe("browser_markdown (agents/webfetch/ai-sdk)", () => {
   type Tool = {
     execute: (input: Record<string, unknown>, options?: object) => Promise<unknown>;
@@ -203,6 +276,23 @@ describe("browser_markdown (agents/webfetch/ai-sdk)", () => {
     const rendered = tool.toModelOutput({ output });
     expect(rendered.type).toBe("error-text");
     expect(rendered.value).toContain("HTTP 404");
+  });
+
+  it("tries CDP after a challenged quick action, then reports blocked with a browser_execute hint", async () => {
+    const browser = {
+      quickAction: async () =>
+        new Response(JSON.stringify({ result: CF_INTERSTITIAL }), { headers: { "content-type": "application/json" } }),
+      // No CDP in unit tests: the connect attempt fails, which is the "CDP also failed" case.
+      fetch: async () => new Response("no cdp", { status: 500 }),
+    } as unknown as Fetcher;
+    const tool = toolFor(stubAi(""), stubFetch("", { status: 403, headers: { "cf-mitigated": "challenge" } }), browser);
+    const output = await tool.execute({ url: "https://www.npmjs.com/package/agents" });
+    expect(output).toMatchObject({ code: "web_fetch_blocked" });
+    const rendered = tool.toModelOutput({ output });
+    expect(rendered.type).toBe("error-text");
+    expect(rendered.value).toContain("bot challenge");
+    expect(rendered.value).toContain("browser_execute");
+    expect(rendered.value).not.toContain("Performing security verification");
   });
 
   it("uses the Browser Run quick action when blocked and says so", async () => {
