@@ -1,5 +1,6 @@
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { generateText, stepCountIs, type ModelMessage, type ToolSet } from "ai";
+import { generateText, stepCountIs, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import type { AgentProfile } from "./agent-profile";
 import {
   EXPLORE_PROFILE,
@@ -197,6 +198,8 @@ function capText(text: string, maxLines: number, maxBytes: number): string {
 // ─── Subagent message-history pruning ───
 
 const SUBAGENT_MSG_WINDOW = 4;
+/** Fixed part of the prune marker text; the cache transform looks for it. */
+export const PRUNE_MARKER_TAG = "were pruned to keep your input token count bounded";
 
 /**
  * Constant on purpose: the marker sits right after the first user message,
@@ -206,7 +209,7 @@ const SUBAGENT_MSG_WINDOW = 4;
 const PRUNE_MARKER: ModelMessage = {
   role: "user",
   content:
-    "[system: earlier assistant/tool messages were pruned to keep your input token count bounded. If you need information from those steps, call the relevant tool again — don't try to reconstruct the content.]",
+    `[system: earlier assistant/tool messages ${PRUNE_MARKER_TAG}. If you need information from those steps, call the relevant tool again — don't try to reconstruct the content.]`,
 };
 
 /**
@@ -336,6 +339,152 @@ export function addAnthropicCacheMarkers(body: Record<string, unknown>): Record<
   return out;
 }
 
+// ─── Anthropic prompt caching, native Messages API ───
+//
+// AI Gateway's unified `/compat/chat/completions` endpoint drops every
+// `cache_control` marker before the request reaches Anthropic (system,
+// tool and message markers alike; measured 2026-10-21: identical 17k-token
+// prefixes billed at full input price with no cache fields in usage).
+// The provider-native `/anthropic/v1/messages` endpoint keeps them: the same
+// prefix read back from cache at ~10% of the price. So Anthropic subagent
+// calls on AI Gateway go native, and this transform adds the markers.
+
+const ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4;
+const EPHEMERAL = { type: "ephemeral" } as const;
+
+function hasCacheControl(value: unknown): boolean {
+  return !!value && typeof value === "object" && "cache_control" in (value as object);
+}
+
+function countCacheMarkers(body: Record<string, unknown>): number {
+  let n = 0;
+  if (Array.isArray(body.system)) n += body.system.filter(hasCacheControl).length;
+  if (Array.isArray(body.tools)) n += body.tools.filter(hasCacheControl).length;
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages as Array<Record<string, unknown>>) {
+      if (Array.isArray(msg?.content)) n += msg.content.filter(hasCacheControl).length;
+    }
+  }
+  return n;
+}
+
+function isPrunedHistory(messages: unknown[]): boolean {
+  return messages.some((m) => {
+    const content = (m as { content?: unknown })?.content;
+    if (typeof content === "string") return content.includes(PRUNE_MARKER_TAG);
+    return Array.isArray(content) && content.some(
+      (b) => typeof (b as { text?: unknown })?.text === "string" && (b as { text: string }).text.includes(PRUNE_MARKER_TAG),
+    );
+  });
+}
+
+/**
+ * Add Anthropic cache breakpoints to a native Messages API body: end of
+ * system, last tool, and the last cacheable block of the last message.
+ * Marking the last message means each step of a tool loop reads the
+ * previous step's prefix from cache instead of re-paying for it.
+ * Never exceeds Anthropic's limit of 4 breakpoints per request.
+ */
+export function addAnthropicMessagesCacheMarkers(body: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...body };
+  let budget = ANTHROPIC_MAX_CACHE_BREAKPOINTS - countCacheMarkers(body);
+
+  if (budget > 0 && typeof out.system === "string" && out.system.length > 0) {
+    out.system = [{ type: "text", text: out.system, cache_control: EPHEMERAL }];
+    budget--;
+  } else if (budget > 0 && Array.isArray(out.system) && out.system.length > 0 && !out.system.some(hasCacheControl)) {
+    const last = out.system[out.system.length - 1];
+    if (last && typeof last === "object") {
+      out.system = [...out.system.slice(0, -1), { ...(last as object), cache_control: EPHEMERAL }];
+      budget--;
+    }
+  }
+
+  if (budget > 0 && Array.isArray(out.tools) && out.tools.length > 0 && !out.tools.some(hasCacheControl)) {
+    const tools = out.tools as unknown[];
+    const last = tools[tools.length - 1];
+    if (last && typeof last === "object") {
+      out.tools = [...tools.slice(0, -1), { ...(last as object), cache_control: EPHEMERAL }];
+      budget--;
+    }
+  }
+
+  // Once the subagent history is pruned, every step drops a different slice
+  // after the first user message, so a breakpoint on the last message is
+  // written (at 1.25x input price) and never read. Skip it then.
+  if (budget > 0 && Array.isArray(out.messages) && out.messages.length > 0 && !isPrunedHistory(out.messages)) {
+    const messages = out.messages as Array<Record<string, unknown>>;
+    const idx = messages.length - 1;
+    const msg = messages[idx];
+    let content: unknown = msg?.content;
+    if (typeof content === "string" && content.length > 0) {
+      content = [{ type: "text", text: content }];
+    }
+    if (Array.isArray(content) && !content.some(hasCacheControl)) {
+      // Thinking blocks can't carry cache_control; mark the last block that can.
+      for (let i = content.length - 1; i >= 0; i--) {
+        const block = content[i] as Record<string, unknown> | undefined;
+        if (!block || typeof block !== "object") continue;
+        if (block.type === "thinking" || block.type === "redacted_thinking") continue;
+        const marked = [...content];
+        marked[i] = { ...block, cache_control: EPHEMERAL };
+        out.messages = [...messages.slice(0, idx), { ...msg, content: marked }];
+        break;
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Native Anthropic base URL for an AI Gateway unified (`/compat`) base URL,
+ * e.g. `.../v1/{account}/{gateway}/compat` → `.../v1/{account}/{gateway}/anthropic/v1`.
+ * Undefined when the session isn't on AI Gateway or the URL isn't a
+ * `/compat` endpoint (the OpenCode gateway, custom proxies).
+ */
+export function anthropicNativeBaseURL(config: Pick<AppConfig, "activeGateway" | "aiGatewayBaseURL">): string | undefined {
+  if (config.activeGateway !== "ai-gateway" || !config.aiGatewayBaseURL) return undefined;
+  const base = trimBaseUrl(config.aiGatewayBaseURL);
+  if (!base.endsWith("/compat")) return undefined;
+  return `${base.slice(0, -"/compat".length)}/anthropic/v1`;
+}
+
+/**
+ * fetch for the native Anthropic route. Drops `x-api-key`: the AI SDK always
+ * sends one, and AI Gateway forwards a key it doesn't recognise to Anthropic
+ * as bring-your-own-key, which fails. Auth is `cf-aig-authorization` only.
+ * Adds cache breakpoints to the JSON body.
+ */
+export const anthropicGatewayFetch: typeof fetch = async (input, init) => {
+  const headers = new Headers(init?.headers);
+  headers.delete("x-api-key");
+  let body = init?.body;
+  if (typeof body === "string") {
+    try {
+      body = JSON.stringify(addAnthropicMessagesCacheMarkers(JSON.parse(body)));
+    } catch {
+      // Not JSON: send it untouched.
+    }
+  }
+  return fetch(input, { ...init, headers, body });
+};
+
+function buildAnthropicNativeProvider(baseURL: string, env: Env) {
+  const anthropic = createAnthropic({
+    baseURL,
+    apiKey: "unused",
+    headers: { "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}` },
+    fetch: anthropicGatewayFetch,
+  });
+  // Dodo ids are `anthropic/claude-…`; the native endpoint wants `claude-…`.
+  const model = (modelId: string): LanguageModel => anthropic.languageModel(modelId.replace(/^anthropic\//, ""));
+  return Object.assign((modelId: string) => model(modelId), {
+    chatModel: model,
+    languageModel: (modelId: string, _cfg?: unknown) => model(modelId),
+  });
+}
+
 // ─── Gateway / provider helpers ───
 
 function trimBaseUrl(url: string): string {
@@ -367,6 +516,9 @@ export function buildProviderForModel(
   env: Env,
   sessionAffinity?: string,
 ) {
+  const nativeAnthropic = modelId.startsWith("anthropic/") ? anthropicNativeBaseURL(config) : undefined;
+  if (nativeAnthropic) return buildAnthropicNativeProvider(nativeAnthropic, env);
+
   const effectiveGateway = resolveGatewayForModel(modelId, config.activeGateway);
   const isOpencode = effectiveGateway === "opencode";
   const baseURL = isOpencode
