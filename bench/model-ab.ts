@@ -191,6 +191,13 @@ async function waitForPrompt(dodo: Dodo, sessionId: string, promptId: string, ti
       if (++failures >= 6) throw err;
     }
   }
+  // One last look before aborting: the deadline may have passed while this
+  // process was suspended (laptop asleep) and the prompt finished meanwhile.
+  try {
+    const { prompts } = await dodo.get<{ prompts: Array<{ id: string; status: string }> }>(`/session/${sessionId}/prompts`);
+    const p = prompts.find((x) => x.id === promptId);
+    if (p && !["queued", "running"].includes(p.status)) return p.status;
+  } catch {}
   await dodo.post(`/session/${sessionId}/abort`).catch(() => {});
   return "timeout";
 }

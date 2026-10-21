@@ -45,6 +45,7 @@ import {
   type Candidate,
   type CatalogModel,
   DEFAULT_FILTER,
+  MAX_ATTEMPTS,
   plan,
   type SpecArm,
   summaryHeader,
@@ -309,7 +310,9 @@ async function watch(args: ReturnType<typeof parseArgs>, account: string, token:
     if (!res.ok) failed++;
     log(`${c.id}: ${res.ok ? "done" : `FAILED (${res.error})`}${res.report ? ` → ${res.report}` : ""}`);
     // Machine-readable line for wrappers.
-    console.log(`MODEL_WATCH_RESULT ${JSON.stringify({ model: c.id, ok: res.ok, runDir: res.runDir, report: res.report, error: res.error })}`);
+    const run = state.runs[c.id]!;
+    const willRetry = !run.ok && !run.forced && run.attempts < MAX_ATTEMPTS;
+    console.log(`MODEL_WATCH_RESULT ${JSON.stringify({ model: c.id, ok: res.ok, runDir: res.runDir, report: res.report, error: res.error, attempts: run.attempts, willRetry })}`);
   }
   if (failed) process.exitCode = 1;
 }
