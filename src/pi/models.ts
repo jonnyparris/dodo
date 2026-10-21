@@ -5,9 +5,18 @@
 // `openai-completions` API does both through `compat` (cacheControlFormat,
 // sessionAffinityFormat), driven by the conversation's persisted provider
 // session id.
+//
+// Exception: Anthropic models on AI Gateway use pi-ai's `anthropic-messages`
+// API against the gateway's provider-native `/anthropic` endpoint. The
+// unified `/compat` endpoint strips every `cache_control` marker (measured
+// 2026-10-21, PR #110), so on `/compat` every Anthropic turn paid full input
+// price for the whole prefix. This covers the main session only: explore/task
+// subagents (src/subagent-runner.ts, AI SDK) still call `/compat`, so their
+// Anthropic markers are still stripped.
 
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, ProviderStreams, StreamOptions } from "@earendil-works/pi-ai";
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
+import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
@@ -33,11 +42,59 @@ function trim(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
 
+/** Anthropic prices cache reads at 0.1x and 5-minute cache writes at 1.25x base input. */
+const ANTHROPIC_CACHE_READ_MULTIPLIER = 0.1;
+const ANTHROPIC_CACHE_WRITE_MULTIPLIER = 1.25;
+
+/**
+ * Native Anthropic base URL for an AI Gateway unified base URL, e.g.
+ * `.../v1/{account}/{gateway}/compat` → `.../v1/{account}/{gateway}/anthropic`
+ * (the Anthropic SDK appends `/v1/messages`). Undefined off AI Gateway or
+ * when the path isn't AI Gateway's `/v1/{account}/{gateway}/compat` shape,
+ * so a custom proxy that happens to end in `/compat` keeps the
+ * OpenAI-compatible path.
+ */
+export function anthropicGatewayBaseUrl(config: GatewayConfig): string | undefined {
+  if (config.activeGateway !== "ai-gateway" || !config.aiGatewayBaseURL) return undefined;
+  let url: URL;
+  try {
+    url = new URL(config.aiGatewayBaseURL);
+  } catch {
+    return undefined;
+  }
+  const path = trim(url.pathname);
+  if (!/^\/v1\/[^/]+\/[^/]+\/compat$/.test(path)) return undefined;
+  return `${url.origin}${path.slice(0, -"/compat".length)}/anthropic${url.search}`;
+}
+
 /** The pi-ai model for one Dodo model id on the configured gateway. */
-export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> {
+export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> | Model<"anthropic-messages"> {
   const isOpencode = config.activeGateway === "opencode";
   const entry = CATALOG.get(modelId);
   const anthropic = modelId.startsWith("anthropic/");
+  const nativeAnthropicUrl = anthropic ? anthropicGatewayBaseUrl(config) : undefined;
+  if (nativeAnthropicUrl) {
+    const input = entry?.costInput ?? 0;
+    return {
+      // Keep the Dodo id: it is the model ref (agentModelRef) and the usage
+      // key. The wire id (`claude-…`) is set in anthropicGatewayStreams.
+      id: modelId,
+      name: modelId,
+      api: "anthropic-messages",
+      provider: DODO_PROVIDER_ID,
+      baseUrl: nativeAnthropicUrl,
+      reasoning: false,
+      input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
+      cost: {
+        input,
+        output: entry?.costOutput ?? 0,
+        cacheRead: input * ANTHROPIC_CACHE_READ_MULTIPLIER,
+        cacheWrite: input * ANTHROPIC_CACHE_WRITE_MULTIPLIER,
+      },
+      contextWindow: entry?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+      maxTokens: DEFAULT_MAX_TOKENS,
+    };
+  }
   return {
     id: resolveWireModelId(modelId, config.activeGateway),
     name: modelId,
@@ -64,8 +121,10 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
       // conversation's steps on one replica (was a hand-set header).
       sendSessionAffinityHeaders: true,
       sessionAffinityFormat: "openai-nosession",
-      // Anthropic via OpenAI-compat needs explicit cache_control markers
-      // (was addAnthropicCacheMarkers).
+      // Anthropic via OpenAI-compat (OpenCode, or an AI Gateway URL that isn't
+      // `/compat`) gets explicit cache_control markers (was
+      // addAnthropicCacheMarkers). AI Gateway `/compat` strips them, which is
+      // why Anthropic there goes native instead; not verified on OpenCode.
       ...(anthropic ? { cacheControlFormat: "anthropic" as const } : {}),
     },
   };
@@ -88,6 +147,38 @@ export function gatewayHeaders(config: GatewayConfig, env: Env): Record<string, 
       };
 }
 
+/** Dodo's `anthropic/claude-…` id → the id Anthropic's Messages API expects. */
+export function nativeAnthropicModelId(modelId: string): string {
+  return modelId.replace(/^anthropic\//, "");
+}
+
+/**
+ * pi-ai's anthropic-messages API, adapted to AI Gateway's native endpoint:
+ * - Auth is `cf-aig-authorization` only. The provider's placeholder API key
+ *   would go out as `x-api-key`, and the gateway forwards a key it doesn't
+ *   recognise to Anthropic as bring-your-own-key, which 401s.
+ * - The request carries the native model id (`claude-…`), while the pi-ai
+ *   model (and so the transcript and usage keys) keeps Dodo's id.
+ * pi-ai adds the cache breakpoints itself (system, last tool, last user
+ * message; cacheRetention defaults to "short").
+ */
+export function anthropicGatewayStreams(api: ProviderStreams = anthropicMessagesApi()): ProviderStreams {
+  const adapt = <T extends StreamOptions | undefined>(options: T): T => ({
+    ...options,
+    apiKey: undefined,
+    headers: { ...options?.headers, "x-api-key": null, Authorization: null },
+    onPayload: async (payload: unknown, model: Model<"anthropic-messages">) => {
+      const replaced = await options?.onPayload?.(payload, model as never);
+      const params = (replaced ?? payload) as { model?: unknown };
+      return typeof params.model === "string" ? { ...params, model: nativeAnthropicModelId(params.model) } : params;
+    },
+  }) as T;
+  return {
+    stream: (model, context, options) => api.stream(model, context, adapt(options)),
+    streamSimple: (model, context, options) => api.streamSimple(model, context, adapt(options)),
+  };
+}
+
 /** Install (or replace) the Dodo gateway provider with exactly these models. */
 export function setDodoProvider(models: MutableModels, modelIds: readonly string[], config: GatewayConfig, env: Env): MutableModels {
   const unique = [...new Set(modelIds.filter(Boolean))];
@@ -105,12 +196,18 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
         },
       },
       models: list,
-      api: openAICompletionsApi(),
+      // Keyed by model.api: Anthropic on AI Gateway goes native (see top).
+      api: {
+        "openai-completions": openAICompletionsApi(),
+        "anthropic-messages": anthropicGatewayStreams(),
+      },
     }),
   );
   return models;
 }
 
 export function agentModelRef(modelId: string, config: GatewayConfig): { provider: string; modelId: string } {
-  return { provider: DODO_PROVIDER_ID, modelId: resolveWireModelId(modelId, config.activeGateway) };
+  // Must match the id dodoModel() registers: native Anthropic keeps the Dodo id.
+  const native = modelId.startsWith("anthropic/") && anthropicGatewayBaseUrl(config) !== undefined;
+  return { provider: DODO_PROVIDER_ID, modelId: native ? modelId : resolveWireModelId(modelId, config.activeGateway) };
 }
