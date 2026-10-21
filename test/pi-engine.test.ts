@@ -1,6 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/types";
 import { env } from "cloudflare:workers";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { tool, zodSchema } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -148,6 +149,55 @@ describe("PiEngine", () => {
       controller.abort();
       const result = await running;
       expect(result.status).toBe("unanswered");
+      await engine.close();
+    });
+  });
+
+  // Regression: prompt caching reports the cached prefix in cacheRead/cacheWrite,
+  // leaving usage.input as only the uncached remainder. Counting input alone
+  // reported a ~29k prompt as "145 in" and under-reported usage stats and the
+  // session summary by the whole cached prefix.
+  it("counts cached prompt tokens in the turn's input total", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-usage"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const usage = (input: number, cacheRead: number, cacheWrite: number): AssistantMessage["usage"] => ({
+        input,
+        output: 7,
+        cacheRead,
+        cacheWrite,
+        totalTokens: input + 7 + cacheRead + cacheWrite,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      });
+      // Spread so the override survives even if faux hands back a frozen message.
+      const withUsage = (m: ReturnType<typeof fauxAssistantMessage>, u: AssistantMessage["usage"]) => ({ ...m, usage: u });
+      const faux = fauxProvider();
+      faux.setResponses([
+        // Step 1: cache miss — the ~28k prefix is written to the cache.
+        withUsage(fauxAssistantMessage([fauxToolCall("noop", {}, { id: "c1" })], { stopReason: "toolUse" }), usage(145, 0, 28_400)),
+        // Step 2: cache hit — the prefix comes back as cacheRead.
+        withUsage(fauxAssistantMessage([fauxText("done")]), usage(180, 28_400, 512)),
+      ]);
+      const tools = {
+        noop: tool({
+          description: "noop",
+          inputSchema: zodSchema(z.object({})),
+          execute: async () => "ok",
+        }),
+      };
+      const engine = new PiEngine(host(state.storage, faux, []));
+      const result = await engine.run({
+        promptId: "p1",
+        prepare: async () => ({ content: "go", entry: entry("go") }),
+        tools: await buildToolsExtension(tools),
+      });
+      expect(result.status).toBe("done");
+      // Every prompt token the model received, cached prefix included.
+      expect(result.tokenInput).toBe(145 + 28_400 + 180 + 28_400 + 512);
+      // The old accounting: uncached remainders only.
+      expect(result.tokenInput).not.toBe(145 + 180);
+      expect(result.tokenOutput).toBe(14);
+      // Context size is the last request's prompt, cache included.
+      expect(result.contextTokens).toBe(180 + 28_400 + 512);
       await engine.close();
     });
   });

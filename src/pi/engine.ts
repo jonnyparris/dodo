@@ -115,6 +115,7 @@ export interface PiTurnInput {
 export interface PiTurnResult {
   assistantMessageId: string;
   text: string;
+  /** Total prompt tokens across the turn's steps, cached prefix included. */
   tokenInput: number;
   tokenOutput: number;
   /** Context size of the last model request (input + cache read/write): the "how full is it" number. */
@@ -133,6 +134,20 @@ const SETTINGS: HarnessSettings = {
   progress: { partialIntervalMs: 250, outputIntervalMs: 250 },
   toolExecution: "parallel",
 };
+
+/**
+ * Prompt tokens the model actually received for one step.
+ *
+ * With prompt caching the provider bills the cached prefix separately:
+ * `input` holds only the *uncached* remainder, while the cached prefix lands in
+ * `cacheRead` (cache hit) / `cacheWrite` (cache miss, written for next time).
+ * Summing `input` alone reports a ~29k prompt as "145 in". The same sum is the
+ * request's context size, so both numbers come from one place.
+ */
+function promptTokens(usage: AssistantMessage["usage"] | undefined): number {
+  if (!usage) return 0;
+  return (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+}
 
 function textOf(message: AssistantMessage | UserMessage | undefined): string {
   if (!message) return "";
@@ -349,9 +364,9 @@ export class PiEngine {
         const m = event.entry.model?.[0] as AssistantMessage | undefined;
         if (m?.stopReason !== "aborted" && m?.stopReason !== "error") emitText(textOf(m));
         acc.streamed = "";
-        acc.input += m?.usage?.input ?? 0;
+        acc.input += promptTokens(m?.usage);
         acc.output += m?.usage?.output ?? 0;
-        if (m?.usage) acc.context = (m.usage.input ?? 0) + (m.usage.cacheRead ?? 0) + (m.usage.cacheWrite ?? 0);
+        if (m?.usage) acc.context = promptTokens(m.usage);
         return;
       }
       case "tool_execution_start":
