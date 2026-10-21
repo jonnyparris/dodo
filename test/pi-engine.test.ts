@@ -74,6 +74,55 @@ describe("PiEngine", () => {
     });
   });
 
+  it("counts cached prompt tokens in tokenInput", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-cached-tokens"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const faux = fauxProvider();
+      faux.setResponses([
+        fauxAssistantMessage([fauxText("Checking. "), fauxToolCall("git_status", {}, { id: "c1" })], { stopReason: "toolUse" }),
+        fauxAssistantMessage([fauxText("Clean tree.")]),
+      ]);
+      const tools = {
+        git_status: tool({
+          description: "status",
+          inputSchema: zodSchema(z.object({})),
+          execute: async () => ({ clean: true }),
+        }),
+      };
+      const engine = new PiEngine(host(state.storage, faux, []));
+      const result = await engine.run({
+        promptId: "p1",
+        prepare: async () => ({ content: "status?", entry: entry("status?") }),
+        tools: await buildToolsExtension(tools),
+      });
+      expect(result.status).toBe("done");
+
+      // Collect the usage of every model request in the turn. pi-ai's
+      // Usage.input is the uncached portion only (prompt tokens minus cache
+      // read/write); the faux provider simulates caching across steps of a
+      // turn (pi-durable always passes a sessionId), so step 2 has
+      // cacheRead > 0 and a shrunken bare input.
+      type Usage = { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number };
+      const usages = (await engine.entries())
+        .filter((e) => e.kind === "pi.assistant")
+        .map((e) => (e.model?.[0] as { usage?: Usage } | undefined)?.usage)
+        .filter((u): u is Usage => u !== undefined);
+      expect(usages.length).toBe(2);
+      const uncached = usages.reduce((sum, u) => sum + u.input, 0);
+      const cacheRead = usages.reduce((sum, u) => sum + u.cacheRead, 0);
+      const cacheWrite = usages.reduce((sum, u) => sum + u.cacheWrite, 0);
+      expect(cacheRead).toBeGreaterThan(0); // the faux caches step 1's prompt into step 2
+      // tokenInput is what the model actually received per request, summed:
+      // uncached + cache read + cache write (= provider totalTokens - output).
+      expect(result.tokenInput).toBe(uncached + cacheRead + cacheWrite);
+      expect(result.tokenInput).toBe(usages.reduce((sum, u) => sum + u.totalTokens - u.output, 0));
+      // Regression: the old code summed only the uncached input, which
+      // under-reports the turn the moment any step hits the prompt cache.
+      expect(result.tokenInput).toBeGreaterThan(uncached);
+      await engine.close();
+    });
+  });
+
   it("re-running the same prompt after a restart reattaches instead of resubmitting", async () => {
     const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-2"));
     await runInDurableObject(stub, async (_i, state) => {

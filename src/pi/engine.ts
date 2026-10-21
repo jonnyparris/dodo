@@ -349,7 +349,12 @@ export class PiEngine {
         const m = event.entry.model?.[0] as AssistantMessage | undefined;
         if (m?.stopReason !== "aborted" && m?.stopReason !== "error") emitText(textOf(m));
         acc.streamed = "";
-        acc.input += m?.usage?.input ?? 0;
+        // pi-ai's Usage.input is the *uncached* prompt tokens only (prompt
+        // tokens minus cache read/write), so summing it alone reports just
+        // the small uncached remainder on cache-heavy turns ("145 in" for a
+        // ~29k-token prompt). Dodo's tokenInput is what the model actually
+        // received: uncached + cache read + cache write per request.
+        acc.input += (m?.usage?.input ?? 0) + (m?.usage?.cacheRead ?? 0) + (m?.usage?.cacheWrite ?? 0);
         acc.output += m?.usage?.output ?? 0;
         if (m?.usage) acc.context = (m.usage.input ?? 0) + (m.usage.cacheRead ?? 0) + (m.usage.cacheWrite ?? 0);
         return;
