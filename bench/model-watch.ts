@@ -136,7 +136,13 @@ function lock(path: string): () => void {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
     if (lockHeld(path)) throw new Error(`another model-watch is running (lock ${path})`);
-    rmSync(path, { force: true }); // stale
+    // Stale. Rename (atomic, only one process wins) rather than rm, so a racing
+    // process can't delete a lock someone else has just taken.
+    const stale = `${path}.stale.${process.pid}`;
+    try {
+      renameSync(path, stale);
+      rmSync(stale, { force: true });
+    } catch {}
   }
   throw new Error(`could not take lock ${path}`);
 }
@@ -276,7 +282,7 @@ async function watch(args: ReturnType<typeof parseArgs>, account: string, token:
   if (args.dryRun) return;
 
   // Pending attempts are written before anything can fail, so a crash still counts toward MAX_ATTEMPTS.
-  const before = structuredClone(state.runs);
+  const before = structuredClone(state);
   writeState(args.state, applyPlan(state, p, new Date().toISOString(), args.force));
   if (!p.bench.length) return;
 
@@ -284,13 +290,8 @@ async function watch(args: ReturnType<typeof parseArgs>, account: string, token:
   try {
     fixture = spec.checkout ? prepareCheckout(args.checkout, spec.checkout) : undefined;
   } catch (err) {
-    // Not the model's fault: give the attempt back.
-    for (const c of p.bench) {
-      const prev = before[c.id];
-      if (prev) state.runs[c.id] = prev;
-      else delete state.runs[c.id];
-    }
-    writeState(args.state, state);
+    // Not the model's fault: undo the whole plan (seen, rejected, attempts) so the next run tries again.
+    writeState(args.state, before);
     throw err;
   }
   const dodo = await dodoCommit(spec.base ?? "");
@@ -302,7 +303,7 @@ async function watch(args: ReturnType<typeof parseArgs>, account: string, token:
     } catch (err) {
       res = { ok: false, runDir: "", error: err instanceof Error ? err.message : String(err) };
     }
-    const keepOld = !res.ok && args.force.includes(c.id) && before[c.id]?.ok;
+    const keepOld = !res.ok && args.force.includes(c.id) && before.runs[c.id]?.ok;
     if (!keepOld) state.runs[c.id] = { ...state.runs[c.id]!, at: new Date().toISOString(), ok: res.ok, runDir: res.runDir || undefined, error: res.error };
     writeState(args.state, state);
     if (!res.ok) failed++;

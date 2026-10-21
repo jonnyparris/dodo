@@ -140,8 +140,10 @@ function makeDodo(base: string) {
         if (!res.ok) throw new Error(`${method} ${path} → ${res.status}: ${text.slice(0, 300)}`);
         return (text ? JSON.parse(text) : {}) as T;
       } catch (err) {
-        // Retry network blips, not HTTP errors.
-        if (attempt >= 3 || (err instanceof Error && /→ \d{3}/.test(err.message))) throw err;
+        // Retry network blips, not HTTP errors. Never re-send a POST that timed
+        // out: it may have landed (a second prompt run, billed twice).
+        const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+        if (attempt >= 3 || (err instanceof Error && /→ \d{3}/.test(err.message)) || (timedOut && method === "POST")) throw err;
         await sleep(3000);
       }
     }
@@ -258,6 +260,7 @@ function runVerify(task: Task, result: RunResult, outDir: string) {
 // ─── AI Gateway cost ───
 
 interface GatewayLog {
+  id?: string;
   model: string;
   cost?: number;
   tokens_in: number | null;
@@ -281,9 +284,11 @@ async function gatewayStats(sessionId: string, gateway: string): Promise<Gateway
     const res = await fetch(url, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000) });
     if (!res.ok) throw new Error(`AI Gateway logs → ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const body = (await res.json()) as { result: GatewayLog[]; result_info?: { total_count?: number } };
-    logs.push(...body.result);
+    const before = logs.length;
+    for (const l of body.result) if (!l.id || !logs.some((x) => x.id === l.id)) logs.push(l);
     const total = body.result_info?.total_count;
-    if (body.result.length === 0 || (total !== undefined ? logs.length >= total : body.result.length < 50)) break;
+    // Stop on an empty page, a page with nothing new (pages shifting or `page` ignored), total reached, or a short page.
+    if (body.result.length === 0 || logs.length === before || (total !== undefined ? logs.length >= total : body.result.length < 50)) break;
     if (page === 99) log(`AI Gateway logs for ${sessionId}: stopped at 99 pages, cost is a lower bound`);
   }
   const stats: GatewayStats = { requests: 0, errors: 0, tokensIn: 0, tokensOut: 0, cost: 0, byRole: {} };
