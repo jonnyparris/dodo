@@ -10,6 +10,7 @@ import { CodingAgent } from "./coding-agent";
 import { ExploreAgent } from "./explore-agent";
 import { runHealthCheck } from "./health-check";
 import { log } from "./logger";
+import { resolveMcpCallbackHost } from "./mcp-callback";
 import { createDodoMcpServer } from "./mcp";
 import { MCP_CATALOG } from "./mcp-catalog";
 import { createDodoCodeModeMcpServer } from "./mcp-codemode";
@@ -1746,11 +1747,7 @@ app.post("/api/mcp/start-auth", async (c) => {
     // The previous hard-coded WORKER_URL ("http://localhost:8787") would
     // silently break OAuth on every fresh deploy that didn't override it.
     // (audit finding M12)
-    const reqUrl = new URL(c.req.raw.url);
-    const inferredHost = `${reqUrl.protocol}//${reqUrl.host}`;
-    const callbackHost = c.env.WORKER_URL && c.env.WORKER_URL !== "http://localhost:8787"
-      ? c.env.WORKER_URL
-      : inferredHost;
+    const callbackHost = resolveMcpCallbackHost(c.env.WORKER_URL, c.req.raw.url);
     // callbackPath follows the Agents-SDK convention used by Seal et al:
     // `/agents/<kebab-class-name>/<instance-name>/callback`. The trailing
     // /callback segment matters — some OAuth providers reject redirect
@@ -1837,7 +1834,7 @@ app.post("/api/mcp/refresh-state", async (c) => {
   // See /api/mcp/start-auth above for why getAgentByName instead of idFromName.
   const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
     getMcpServers: () => { servers: Record<string, unknown> };
-    refreshMcpState: (id: string) => Promise<void>;
+    refreshMcpState: (id: string, callbackHost: string) => Promise<void>;
   };
 
   const servers = await stub.getMcpServers();
@@ -1846,7 +1843,12 @@ app.post("/api/mcp/refresh-state", async (c) => {
   }
 
   try {
-    await stub.refreshMcpState(mcpId);
+    // refreshMcpState re-registers the OAuth redirect URI, so it needs the
+    // same request-derived callback host as /api/mcp/start-auth. Without it
+    // the hub DO would fall back to the development WORKER_URL and register
+    // a loopback redirect_uri no provider delivers to.
+    const callbackHost = resolveMcpCallbackHost(c.env.WORKER_URL, c.req.raw.url);
+    await stub.refreshMcpState(mcpId, callbackHost);
     return c.json({ ok: true });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

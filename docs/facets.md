@@ -227,7 +227,7 @@ prod.
 | `TASK_MAX_STEPS` | 20 | Same in both modes. Raised from 15 alongside EXPLORE_MAX_STEPS. |
 | `TASK_TIMEOUT_MS` | 180_000 | In-process timeout. |
 | `TASK_FACET_TIMEOUT_MS` | 600_000 | Facet-mode task gets 10 minutes — escapes the parent's turn budget. |
-| `SUBAGENT_MSG_WINDOW` | 4 | Number of trailing assistant+tool message groups kept between steps (see "Message pruning" below). |
+| `SUBAGENT_MSG_WINDOW` | 4 | Pruning chunk size: once history reaches 2× this many assistant+tool groups, the oldest are dropped in whole chunks of this size (see "Message pruning" below). |
 
 ## Token efficiency
 
@@ -252,9 +252,11 @@ Tool caps bound any single tool result, but a 16-step explore still accumulates 
 `subagentPrepareStep` (wired into every `generateText` call site — in-process and facet) is a `prepareStep` callback that keeps:
 
 - The original user query (goal anchor)
-- The most recent `SUBAGENT_MSG_WINDOW` assistant+tool_result groups
+- The most recent 4–7 assistant+tool_result groups (`SUBAGENT_MSG_WINDOW` to `2 × SUBAGENT_MSG_WINDOW - 1`)
 
-…and replaces the dropped middle with a single marker message so the model knows history was compacted, not corrupted. This gives the model roughly two working tool-call cycles of memory plus the current turn — enough to chain reasoning, not enough to let history balloon.
+…and replaces the dropped middle with a single marker message so the model knows history was compacted, not corrupted.
+
+**Pruning is chunked so the prompt prefix stays cacheable.** History is left alone until it reaches `2 × SUBAGENT_MSG_WINDOW` groups (8). Then the oldest groups are dropped in whole chunks of `SUBAGENT_MSG_WINDOW`, so the model keeps 4–7 recent groups. The marker text is constant (no dropped-message count). The AI SDK hands `prepareStep` the full history every step, so the cut point is a pure function of the group count and only moves every 4 steps. Between moves, each request is the previous request plus one group, so Anthropic cache breakpoints and Workers AI prefix caching can reuse it. A one-group sliding window with a counted marker changed the bytes right after the user prompt on every step: over 20 steps that broke the cached prefix 15 times; chunking breaks it 3 times. The trade is ~10% more raw input tokens for a much larger cached share.
 
 Tests in `test/subagent-prune-unit.test.ts` lock in the contract.
 

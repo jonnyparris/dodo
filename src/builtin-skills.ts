@@ -97,7 +97,7 @@ const BUILTIN_SKILLS: Array<Pick<Skill, "name" | "description" | "body">> = [
       "Three browser tools:",
       "",
       "- **`browser_triage`** — rank candidate URLs before fetching anything. No browser.",
-      "- **`browser_markdown`** — read a page or document as markdown (windowed via `offset`/`nextOffset`, optional `query` verdict). Prefer it for pure reading.",
+      "- **`browser_markdown`** — read a page or document as markdown (windowed: the header line gives the next `offset`; optional `query` verdict). Prefer it for pure reading.",
       "- **`browser_execute`** — drive this session's **persistent** Chrome with JS and a `cdp` global (agents SDK browser tool). Its tool description lists the full `cdp` API; read it.",
       "",
       "## Session model",

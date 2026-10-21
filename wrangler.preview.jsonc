@@ -16,7 +16,7 @@
   "account_id": "4b430e167a301330d13a9bb42f3986a2",
   "main": "src/index.ts",
   "routes": [{ "pattern": "dodo-preview.jonnyparris.club", "custom_domain": true }],
-  "compatibility_date": "2026-03-10",
+  "compatibility_date": "2026-03-24",
   "compatibility_flags": ["nodejs_compat", "experimental"],
   // Allow `*.wasm` imports to resolve to `WebAssembly.Module` at deploy
   // time. Required by `src/tools/shell.ts` which static-imports
@@ -60,10 +60,10 @@
       "new_sqlite_classes": ["ChatMonitorAgent"]
     }
   ],
-  "r2_buckets": [
-    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" },
-    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-fork-snapshots" }
-  ],
+  // No r2_buckets on purpose: the preview worker must never be bound to the
+  // production buckets (dodo-workspaces / dodo-fork-snapshots). Every branch
+  // deployed here runs unreviewed code, so it gets no production storage.
+  // See .github/workflows/dodo-preview.yml, which refuses such a deploy.
   "browser": {
     "binding": "BROWSER"
   },
@@ -80,8 +80,11 @@
       "enabled": true
     }
   },
+  // Explicitly empty: omitting `triggers` leaves the last deployed cron in
+  // place, so the preview worker kept firing scheduled work (fork-snapshot
+  // cleanup and friends). An empty list clears it on deploy.
   "triggers": {
-    "crons": ["0 */6 * * *"]
+    "crons": []
   },
   "build": {
     "command": "npm run build"

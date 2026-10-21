@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   extractJevChoice,
   extractJevNoul,
+  quickActionBlockReason,
   triageUrls,
-  validateTargetUrl,
   type JevAi,
 } from "../src/browser/web-fetch";
 
@@ -46,27 +46,6 @@ describe("extractJevChoice", () => {
   });
 });
 
-describe("validateTargetUrl", () => {
-  it("accepts https URLs", () => {
-    const result = validateTargetUrl("https://example.com/page");
-    expect("url" in result && result.url.hostname).toBe("example.com");
-  });
-
-  it("rejects non-http protocols and private hosts", () => {
-    for (const bad of [
-      "ftp://example.com",
-      "file:///etc/passwd",
-      "http://localhost:3000",
-      "http://127.0.0.1",
-      "http://192.168.1.4",
-      "http://nas.local",
-      "http://172.16.0.9",
-    ]) {
-      expect("error" in validateTargetUrl(bad), `expected rejection: ${bad}`).toBe(true);
-    }
-  });
-});
-
 describe("triageUrls", () => {
   const failingAi = {
     run: () => {
@@ -104,5 +83,25 @@ describe("triageUrls", () => {
     expect(result?.picked).toBe("https://b.com");
     expect(result?.ranking[0].probability).toBe(0.75);
     expect(result?.ranking[1].url).toBe("https://a.com");
+  });
+});
+
+describe("quickActionBlockReason", () => {
+  it("flags a 4xx/5xx target status", () => {
+    expect(quickActionBlockReason({ status: 403, headers: {} })).toBe("site answered HTTP 403");
+    expect(quickActionBlockReason({ status: 503 })).toBe("site answered HTTP 503");
+  });
+
+  it("flags cf-mitigated in any case, ahead of the status", () => {
+    expect(quickActionBlockReason({ status: 403, headers: { "cf-mitigated": "challenge" } })).toBe("cf-mitigated: challenge");
+    expect(quickActionBlockReason({ status: 200, headers: { "CF-Mitigated": "challenge" } })).toBe("cf-mitigated: challenge");
+  });
+
+  it("passes a 2xx/3xx status and missing or malformed meta", () => {
+    expect(quickActionBlockReason({ status: 200, headers: { server: "cloudflare" } })).toBeNull();
+    expect(quickActionBlockReason({ status: 304 })).toBeNull();
+    expect(quickActionBlockReason(undefined)).toBeNull();
+    expect(quickActionBlockReason("nope")).toBeNull();
+    expect(quickActionBlockReason({ status: "403", headers: null })).toBeNull();
   });
 });

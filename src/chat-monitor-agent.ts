@@ -59,8 +59,6 @@ const DEFAULT_POLL_INTERVAL_SECONDS = 15;
 const MAX_MESSAGES_PER_TICK = 5;
 /** Emoji added to a message while the brain is processing a reply. */
 const LOADING_EMOJI = ":loading-loading-forever:";
-/** Emoji added to a message after the brain has replied. */
-const DONE_EMOJI = ":b-yes-check:";
 /** How long a brain prompt may run before runTick treats it as hung and
  *  aborts it. gemma-4 has been observed to chew on complex multi-tool
  *  queries indefinitely; this cap keeps the monitor from spinning
@@ -665,14 +663,6 @@ export class ChatMonitorAgent extends DurableObject<Env> {
       "DELETE FROM pending_reactions WHERE message_name = ?",
       messageName,
     );
-  }
-
-  private listPendingReactions(): string[] {
-    this.ensureMigrations();
-    const rows = Array.from(
-      this.ctx.storage.sql.exec("SELECT message_name FROM pending_reactions ORDER BY added_at DESC"),
-    );
-    return rows.map((r) => String((r as unknown as Record<string, unknown>).message_name ?? ""));
   }
 
   private async appendForwardLog(entry: Omit<ForwardLogEntry, "ts">): Promise<void> {

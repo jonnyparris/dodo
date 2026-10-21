@@ -144,6 +144,7 @@ The session keeps going until the model calls `set_goal_status` with `done`, `bl
 | ⏰ **The agent schedules its own work** | `schedule_prompt`, `list_schedules` and `cancel_schedule` replace "sleep and check again". A one-off that comes due while the session is busy waits in the queue. Recurring jobs skip a busy tick. |
 | 🙋 **Human handoff** | `request_user_input` marks the session as needing a person (login, CAPTCHA, a decision) and keeps its browser alive while it waits. The UI, ntfy and MCP (`needsInput`, `get_live_view`) all see it. |
 | 🔔 **Completion webhook** | Pass `callbackUrl` with `send_prompt`. Dodo POSTs `{ sessionId, promptId, status, needsInput }` when each prompt in the session finishes, so callers don't need to poll. The body contains no output. |
+| 🎛️ **Per-session models** | Pass `model` (and `exploreModel` / `taskModel`) with `send_prompt` or `POST /session/:id/prompt` to run one session, subagents included, on other models. The user's saved config doesn't change. The setting stays for later prompts; an empty string removes it. Only the session owner can set it. `bench/model-ab.ts` uses it to A/B models side by side, with cost per session from AI Gateway logs. |
 | 🔁 **Upgrade-safe sessions** | Sessions from older versions carry on. History, compaction summaries, attachments and cron jobs all migrate. A prompt cut off by an upgrade fails clearly: *"Interrupted by a Dodo upgrade. Send it again."* |
 
 ---

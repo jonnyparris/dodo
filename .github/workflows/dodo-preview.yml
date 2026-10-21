@@ -30,16 +30,44 @@ jobs:
   deploy-preview:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The repo's default workflow token is read-only, so the "Comment preview
+    # URL on PR" step needs an explicit grant to reach the issues REST
+    # endpoints (REST issue comments cover pull requests too).
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha }}
           fetch-depth: 0
+      - name: Guard against production bindings
+        run: |
+          set -euo pipefail
+          cfg=wrangler.preview.jsonc
+          test -f "$cfg" || { echo "::error::$cfg not found"; exit 1; }
+          fail=0
+          if grep -nE '"bucket_name"[[:space:]]*:[[:space:]]*"(dodo-workspaces|dodo-fork-snapshots)"' "$cfg"; then
+            echo "::error file=$cfg::$cfg binds a production R2 bucket to the preview worker"
+            fail=1
+          fi
+          # Empty `"crons": []` is required (it clears the deployed schedule);
+          # any non-empty list is refused. Newlines are flattened so a
+          # multi-line array is caught too.
+          if tr -d '\n' < "$cfg" | grep -qE '"crons"[[:space:]]*:[[:space:]]*\[[[:space:]]*"'; then
+            echo "::error file=$cfg::$cfg declares a cron trigger; the preview worker must not run scheduled work"
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "Refusing to deploy: the preview worker must stay detached from production storage and schedules."
+            exit 1
+          fi
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .nvmrc
           cache: npm
       - name: Install
         run: npm ci
@@ -49,7 +77,12 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       - name: Comment preview URL on PR
+        # Best-effort: the job grants issues/pull-requests write above, but a
+        # comment failure (token scope, API blip) must not colour the
+        # deploy-preview check red - the check reports whether the preview
+        # worker deployed.
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |

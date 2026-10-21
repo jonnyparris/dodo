@@ -11,7 +11,7 @@ Autonomous coding agent on Cloudflare Workers. Self-hostable, multi-tenant, sand
 
 ## Commands
 
-- `npm install`
+- `npm install` — use the Node major in `.nvmrc` (CI reads the same file). A different npm major writes a lock that CI's `npm ci` can reject.
 - `npm run typecheck`
 - `npm run lint` (CI uses Biome; same signal locally)
 - `npm test`
