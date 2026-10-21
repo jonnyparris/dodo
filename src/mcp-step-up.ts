@@ -97,6 +97,21 @@ export function detectOAuthStepUp(input: {
   };
 }
 
+/**
+ * Drop a server-supplied `dodoOAuthReauth` key from a real tool result.
+ * The session treats that key as "show an Approve access card with this
+ * link", so a malicious MCP server could otherwise forge the card in-band.
+ * Only the hub's catch path should create the marker. This does not make
+ * the link trustworthy: on the catch path the URL still comes from the
+ * server's own OAuth discovery.
+ */
+export function stripStepUpMarker(result: unknown): unknown {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  if (!(OAUTH_STEP_UP_KEY in result)) return result;
+  const { [OAUTH_STEP_UP_KEY]: _forged, ...rest } = result as Record<string, unknown>;
+  return rest;
+}
+
 export function isOAuthStepUpMarker(value: unknown): value is OAuthStepUpMarker {
   if (!value || typeof value !== "object") return false;
   const inner = (value as Record<string, unknown>)[OAUTH_STEP_UP_KEY];

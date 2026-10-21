@@ -71,15 +71,16 @@ const DEFAULT_CLOUDFLARE_REMOTE_MCP_CATALOG: McpCatalogEntry[] = [
     id: "cloudflare-api",
     name: "Cloudflare API",
     description:
-      "Call the whole Cloudflare API (Workers, DNS, R2, D1, zones, and more) from code mode, on your own account. Powered by the Cloudflare API MCP server.",
+      "Search and call the whole Cloudflare API (Workers, DNS, R2, D1, zones, and more) on your own account, through the server's search and execute tools. Powered by the Cloudflare API MCP server.",
     // Supports OAuth step-up (changelog 2026-10-19): connect with few
     // scopes, and a call that needs more gets a 403 insufficient_scope.
-    // Dodo turns that into an "Approve access" card mid-session and retries
-    // (src/mcp-step-up.ts), so users never need Full access up front.
+    // Dodo turns that into an "Approve access" card mid-session; once the
+    // person approves and replies, the model retries the call once
+    // (src/mcp-step-up.ts). So users never need Full access up front.
     // DCR with Dodo's Worker-hosted redirect URI works (checked 2026-10-21).
     url: "https://mcp.cloudflare.com/mcp",
     setupGuide:
-      "Connect with OAuth. On the Cloudflare consent page pick Minimal or Read only, not Full access. When a call needs more access, Dodo shows an Approve access button; approve it and the call is retried.",
+      "Connect with OAuth. On the Cloudflare consent page pick Minimal or Read only, not Full access. When a call needs more access, Dodo asks you to approve it (an Approve access button, or a link from the agent). Only approve on a page at https://mcp.cloudflare.com/. Then reply done and the agent retries the call.",
     auth_type: "oauth",
     knownHosts: ["mcp.cloudflare.com"],
   },

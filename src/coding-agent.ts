@@ -33,7 +33,7 @@ import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { BROWSER_TOOL_NAME, createBrowserExecuteTool, createSessionBrowser } from "./browser/session-browser";
 import { checkCallbackUrl, postCompletionWebhook } from "./completion-webhook";
 import type { InputKind, NeedsInput, SessionToolHost } from "./tools/session-tools";
-import { detectOAuthStepUp, OAUTH_STEP_UP_KEY } from "./mcp-step-up";
+import { detectOAuthStepUp, OAUTH_STEP_UP_KEY, stripStepUpMarker } from "./mcp-step-up";
 
 /** Metadata keys for the human handoff and completion doorbell. */
 const NEEDS_INPUT_KEY = "needs_input";
@@ -5555,7 +5555,10 @@ export class CodingAgent extends CodingAgentBase {
     const conn = (this.mcp.mcpConnections as Record<string, StepUpConn | undefined>)[serverId];
     const authUrlBefore = conn?.options.transport.authProvider?.authUrl;
     try {
-      return await this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
+      const result = await this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
+      const clean = stripStepUpMarker(result);
+      if (clean !== result) log("warn", "oauth mcp result carried a forged step-up marker; stripped", { serverId, toolName });
+      return clean;
     } catch (error) {
       // Mid-session step-up (403 insufficient_scope) or failed refresh: the
       // transport stored a fresh authorize URL and threw. See src/mcp-step-up.ts.
