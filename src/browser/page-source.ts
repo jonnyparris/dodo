@@ -96,6 +96,8 @@ const CHALLENGE_PATTERNS: RegExp[] = [
   /press (?:&|and) hold to confirm you are a human/i,
   /access to this page has been denied/i,
   /captcha-delivery\.com/i,
+  // DataDome's visible text; toMarkdown drops the captcha-delivery.com script.
+  /please enable js and disable any ad ?blocker/i,
   /incapsula incident id/i,
   /pardon our interruption/i,
   /you don't have permission to access .{0,200} on this server/i,

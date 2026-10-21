@@ -238,6 +238,8 @@ describe("isChallengePage", () => {
     ["Turnstile", "Verify you are human by completing the action below."],
     ["PerimeterX", "# Access to this page has been denied\n\nPress & Hold to confirm you are a human (and not a bot)."],
     ["DataDome", "Please enable JS and disable any ad blocker\n\n![](https://geo.captcha-delivery.com/captcha/?initialCid=x)"],
+    // Live plain fetch of g2.com / etsy.com, 2026-10-21: toMarkdown keeps only this line.
+    ["DataDome (text only)", "Please enable JS and disable any ad blocker"],
     ["Imperva", "Request unsuccessful. Incapsula incident ID: 123-456"],
     ["Akamai", "# Access Denied\n\nYou don't have permission to access \"http://e.com/\" on this server.\n\nReference #18.abc"],
   ])("spots %s", (_name, markdown) => {
