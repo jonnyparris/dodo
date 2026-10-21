@@ -54,7 +54,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * Strip terminal control characters (ESC/OSC/C1) from remote text before it
  * reaches the terminal: tool output and shared-session messages are untrusted.
  */
-const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "");
 
 // ─── Credentials ───
 
@@ -83,7 +83,7 @@ function loadCredentials(): Credentials | string {
   } catch {
     return `DODO_URL is not a URL: ${url}`;
   }
-  const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
   if (parsed.protocol !== "https:" && !local) return `DODO_URL must be https (the Access secret is sent on every request): ${url}`;
   return { url: url.replace(/\/+$/, ""), clientId, clientSecret };
 }
@@ -294,7 +294,14 @@ export default function dodo(pi: ExtensionAPI) {
   function renderMessage(m: ChatMessage, sessionId: string): void {
     if (seen.has(m.id) || (m.role !== "user" && m.role !== "assistant")) return;
     seen.add(m.id);
-    pi.appendEntry<MessageEntry>("dodo-message", { id: m.id, role: m.role, content: clean(m.content ?? ""), author: m.authorEmail, model: m.model, sessionId });
+    pi.appendEntry<MessageEntry>("dodo-message", {
+      id: m.id,
+      role: m.role,
+      content: clean(m.content ?? ""),
+      author: m.authorEmail ? clean(m.authorEmail) : null,
+      model: m.model ? clean(m.model) : null,
+      sessionId,
+    });
   }
 
   /** Render any messages the client missed (reconnect, or pi was closed). */
@@ -395,7 +402,9 @@ export default function dodo(pi: ExtensionAPI) {
         if (err instanceof FatalStreamError) {
           note("error", `Dodo stream stopped: ${err.message}. Detached.`);
           notify(`Dodo stream stopped: ${err.message}. Detached.`, "error");
+          attachGen++;
           detachQuiet();
+          pi.appendEntry("dodo-detach", {});
           return;
         }
         if (backoff >= 8000) notify(`Dodo stream: ${(err as Error).message}. Retrying…`, "warning");
@@ -406,7 +415,10 @@ export default function dodo(pi: ExtensionAPI) {
     }
   }
 
-  async function attach(id: string, title: string | null, opts: { history?: number; record?: boolean } = {}): Promise<void> {
+  /** Returns true when this call ended up attached (false if a newer attach or a detach overtook it). */
+  async function attach(rawId: string, rawTitle: string | null, opts: { history?: number; record?: boolean; fresh?: boolean } = {}): Promise<boolean> {
+    const id = rawId;
+    const title = rawTitle ? clean(rawTitle) : null;
     // Each attach takes a generation; an older attach that resumes after a
     // newer one started gives up instead of overwriting it.
     const gen = ++attachGen;
@@ -414,12 +426,14 @@ export default function dodo(pi: ExtensionAPI) {
       client().request<SessionState>(`/session/${id}`),
       client().request<{ model?: string }>("/api/config").catch(() => ({ model: undefined })),
     ]);
-    if (gen !== attachGen) return;
+    if (gen !== attachGen) return false;
     // Any id answers 200 (with an empty sessionId) for the admin, so check it
     // is real: a prompted session reports its id; a fresh one reports "" until
     // its first prompt but is in my session list.
-    if (s.sessionId !== id && !(await listSessions()).some((x) => x.id === id)) throw new Error(`No Dodo session ${short(id)}.`);
-    if (gen !== attachGen) return;
+    // `fresh` = POST /session just returned it (it may live in a delegated
+    // owner's list, not mine).
+    if (!opts.fresh && s.sessionId !== id && !(await listSessions()).some((x) => x.id === id)) throw new Error(`No Dodo session ${short(id)}.`);
+    if (gen !== attachGen) return false;
     detachQuiet();
     attached = { id, title };
     state = s;
@@ -431,9 +445,10 @@ export default function dodo(pi: ExtensionAPI) {
     } catch (err) {
       if (gen === attachGen) note("warning", `Could not load history: ${(err as Error).message}`);
     }
-    if (gen !== attachGen) return;
+    if (gen !== attachGen) return false;
     void connect(id);
     notify(`Attached to Dodo session ${short(id)}. Your input now goes to Dodo. /dodo detach to stop.`);
+    return true;
   }
 
   function detachQuiet(): void {
@@ -474,12 +489,13 @@ export default function dodo(pi: ExtensionAPI) {
     if (choice === NEW) return newSession("");
     const s = sessions[labels.indexOf(choice)]!;
     await attach(s.id, s.title);
+    return;
   }
 
   async function newSession(prompt: string): Promise<void> {
     const { id } = await client().request<{ id: string }>("/session", { method: "POST" });
-    await attach(id, prompt ? oneLine(prompt, 60) : null, { history: 0 });
-    if (prompt) await sendPrompt(prompt);
+    const ok = await attach(id, prompt ? oneLine(prompt, 60) : null, { history: 0, fresh: true });
+    if (ok && prompt && attached?.id === id) await sendPrompt(prompt);
   }
 
   async function sendPrompt(content: string, images?: Array<{ data: string; mimeType: string }>): Promise<void> {
@@ -508,7 +524,7 @@ export default function dodo(pi: ExtensionAPI) {
     const r = await client().request<{ modelOverride: SessionState["modelOverride"] }>(`/session/${attached.id}/model-override`, { method: "PUT", body: { model } });
     if (state) state = { ...state, modelOverride: r.modelOverride };
     updateStatus();
-    const running = state?.status === "running" ? " The running prompt keeps its main model; subagents it starts from now on use the new one." : "";
+    const running = state?.status === "running" ? " The running prompt keeps its current models." : "";
     notify(model ? `Session model → ${model}.${running}` : `Session model → your default.${running}`);
   }
 
@@ -597,11 +613,12 @@ export default function dodo(pi: ExtensionAPI) {
           case "attach": {
             if (!rest[0]) return await pickAndAttach(ctx);
             const s = await resolveSession(rest[0]);
-            return await attach(s.id, s.title);
+            await attach(s.id, s.title);
+            return;
           }
           case "detach":
+            attachGen++; // also cancels an attach that is still loading
             if (!attached) return notify("Not attached.");
-            attachGen++;
             detachQuiet();
             pi.appendEntry("dodo-detach", {});
             return notify("Detached. Input goes to the local model again; the Dodo session keeps running.");
@@ -631,7 +648,7 @@ export default function dodo(pi: ExtensionAPI) {
             const url = `${client().creds.url}/${id ? `#session=${id}` : ""}`;
             const [cmd, ...cmdArgs] = process.platform === "darwin" ? ["open", url] : process.platform === "win32" ? ["cmd", "/c", "start", "", url] : ["xdg-open", url];
             const child = spawn(cmd!, cmdArgs, { detached: true, stdio: "ignore" });
-            child.on("error", () => notify(`Open ${url}`, "info"));
+            child.on("error", () => notify(`Could not open a browser. URL: ${url}`, "warning"));
             child.unref();
             return;
           }

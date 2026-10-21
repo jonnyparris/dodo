@@ -5946,9 +5946,9 @@ export class CodingAgent extends CodingAgentBase {
   /**
    * PUT /model-override: set or clear the session model override without
    * sending a prompt (pi client `/dodo model`). Same rules as the prompt body
-   * fields: owner only, "" clears. The main model changes from the next
-   * prompt; a running prompt keeps its main model, but subagents it starts
-   * after the change use the new override.
+   * fields: owner only, "" clears. Takes effect from the next prompt; a
+   * running prompt keeps its models (facet-mode subagents it starts later
+   * re-read the override).
    */
   private async handleModelOverride(request: Request): Promise<Response> {
     const parsed = modelOverrideBodySchema.safeParse(await request.json().catch(() => null));

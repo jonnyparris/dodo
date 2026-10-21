@@ -15,7 +15,7 @@ Attach [pi](https://github.com/earendil-works/pi) to a Dodo session. What you ty
 
 While attached, everything you type except `/commands` and `!shell` goes to Dodo. The footer shows `🦤 <session> · <model>`. If you close pi while attached, it attaches again when you reopen that pi session, and shows the messages you missed.
 
-`/dodo model` changes only the attached session (`PUT /session/:id/model-override`). Your default model and your other sessions stay as they are. A prompt that is already running keeps its main model, but subagents it starts after the change use the new one. Only the session owner can change it.
+`/dodo model` changes only the attached session (`PUT /session/:id/model-override`). Your default model and your other sessions stay as they are. It takes effect from the next prompt; a prompt that is already running keeps its models. Only the session owner can change it.
 
 ## Setup
 
