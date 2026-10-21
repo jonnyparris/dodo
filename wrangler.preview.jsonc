@@ -80,6 +80,12 @@
       "enabled": true
     }
   },
+  // Explicitly empty: omitting `triggers` leaves the last deployed cron in
+  // place, so the preview worker kept firing scheduled work (fork-snapshot
+  // cleanup and friends). An empty list clears it on deploy.
+  "triggers": {
+    "crons": []
+  },
   "build": {
     "command": "npm run build"
   },

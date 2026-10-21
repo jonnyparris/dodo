@@ -53,7 +53,10 @@ jobs:
             echo "::error file=$cfg::$cfg binds a production R2 bucket to the preview worker"
             fail=1
           fi
-          if grep -nE '"crons"[[:space:]]*:' "$cfg"; then
+          # Empty `"crons": []` is required (it clears the deployed schedule);
+          # any non-empty list is refused. Newlines are flattened so a
+          # multi-line array is caught too.
+          if tr -d '\n' < "$cfg" | grep -qE '"crons"[[:space:]]*:[[:space:]]*\[[[:space:]]*"'; then
             echo "::error file=$cfg::$cfg declares a cron trigger; the preview worker must not run scheduled work"
             fail=1
           fi
