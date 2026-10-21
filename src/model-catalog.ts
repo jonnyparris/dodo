@@ -14,17 +14,20 @@ export function extractGeneratePrompt(content: string): string | null {
   return prompt.length > 0 ? prompt : null;
 }
 
+/** Prices are USD per million tokens (base tier). Entries that pi-ai also
+ *  knows must match its bundled catalog: test/model-catalog-prices-unit.test.ts
+ *  fails when they drift (2026-10: Haiku, Opus, GPT-5.4 and Gemini Flash had). */
 export const FALLBACK_MODELS = [
-  { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_000_000 },
+  { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "OpenAI", costInput: 2.5, costOutput: 15, contextWindow: 1_000_000 },
   { id: "openai/gpt-4.1", name: "GPT-4.1", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_000_000 },
   { id: "openai/gpt-4.1-mini", name: "GPT-4.1 Mini", provider: "OpenAI", costInput: 0.4, costOutput: 1.6, contextWindow: 1_000_000 },
   { id: "anthropic/claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "Anthropic", costInput: 3, costOutput: 15, contextWindow: 200_000 },
-  { id: "anthropic/claude-opus-4-6", name: "Claude Opus 4.6", provider: "Anthropic", costInput: 15, costOutput: 75, contextWindow: 200_000 },
-  { id: "anthropic/claude-haiku-4-5", name: "Claude Haiku 4.5", provider: "Anthropic", costInput: 0.8, costOutput: 4, contextWindow: 200_000 },
+  { id: "anthropic/claude-opus-4-6", name: "Claude Opus 4.6", provider: "Anthropic", costInput: 5, costOutput: 25, contextWindow: 200_000 },
+  { id: "anthropic/claude-haiku-4-5", name: "Claude Haiku 4.5", provider: "Anthropic", costInput: 1, costOutput: 5, contextWindow: 200_000 },
   { id: "openai/o3-mini", name: "o3-mini", provider: "OpenAI", costInput: 1.1, costOutput: 4.4, contextWindow: 200_000 },
   { id: "openai/o4-mini", name: "o4-mini", provider: "OpenAI", costInput: 1.1, costOutput: 4.4, contextWindow: 200_000 },
   { id: "google/gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "Google", costInput: 1.25, costOutput: 10, contextWindow: 1_000_000 },
-  { id: "google/gemini-2.5-flash", name: "Gemini 2.5 Flash", provider: "Google", costInput: 0.15, costOutput: 0.6, contextWindow: 1_000_000 },
+  { id: "google/gemini-2.5-flash", name: "Gemini 2.5 Flash", provider: "Google", costInput: 0.3, costOutput: 2.5, contextWindow: 1_000_000 },
   { id: "deepseek/deepseek-chat", name: "DeepSeek Chat", provider: "DeepSeek", costInput: 0.27, costOutput: 1.1, contextWindow: 128_000 },
   { id: "deepseek/deepseek-reasoner", name: "DeepSeek Reasoner", provider: "DeepSeek", costInput: 0.55, costOutput: 2.19, contextWindow: 128_000 },
 ];
