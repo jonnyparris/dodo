@@ -30,6 +30,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { inputTokens } from "./gateway-usage.ts";
 
 // ─── Spec ───
 
@@ -64,7 +65,10 @@ interface Spec {
 interface GatewayStats {
   requests: number;
   errors: number;
+  /** Full prompt tokens, comparable across providers (Anthropic cache reads/writes added back). */
   tokensIn: number;
+  /** Part of tokensIn served from the provider's prompt cache. */
+  tokensInCached: number;
   tokensOut: number;
   cost: number;
   byRole: Record<string, { requests: number; cost: number; models: string[] }>;
@@ -243,6 +247,9 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
 
 interface GatewayLog {
   model: string;
+  provider?: string;
+  path?: string;
+  usage_metadata?: { input_tokens?: number; input_cached_tokens?: number; input_cache_creation_tokens?: number } | null;
   cost?: number;
   tokens_in: number | null;
   tokens_out: number | null;
@@ -268,7 +275,7 @@ async function gatewayStats(sessionId: string, gateway: string): Promise<Gateway
     logs.push(...body.result);
     if (body.result.length < 50) break;
   }
-  const stats: GatewayStats = { requests: 0, errors: 0, tokensIn: 0, tokensOut: 0, cost: 0, byRole: {} };
+  const stats: GatewayStats = { requests: 0, errors: 0, tokensIn: 0, tokensInCached: 0, tokensOut: 0, cost: 0, byRole: {} };
   for (const l of logs) {
     let meta: { dodo_session?: string; dodo_role?: string } = {};
     if (typeof l.metadata === "string") {
@@ -281,7 +288,9 @@ async function gatewayStats(sessionId: string, gateway: string): Promise<Gateway
     const role = meta.dodo_role ?? "unknown";
     stats.requests++;
     if (!l.success || (l.status_code !== undefined && l.status_code !== 200)) stats.errors++;
-    stats.tokensIn += l.tokens_in ?? 0;
+    const input = inputTokens(l);
+    stats.tokensIn += input.total;
+    stats.tokensInCached += input.cached;
     stats.tokensOut += l.tokens_out ?? 0;
     stats.cost += l.cost ?? 0;
     const r = (stats.byRole[role] ??= { requests: 0, cost: 0, models: [] });
