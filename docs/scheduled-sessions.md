@@ -74,6 +74,14 @@ write access on the source session at create time. Fork sources are
 resolved via `resolveSessionPermission` — session owner, platform admin,
 SharedIndex grant, or a valid share cookie.
 
+**Fork sources survive the idle sweep.** The sweep soft-deletes sessions
+idle for 10+ minutes with no prompts. It skips any session named as a
+schedule's `sourceSessionId`, and any session that has ever been forked
+from (`sessions.fork_source = 1`, set by both the fork endpoint and
+scheduled forks, in the source owner's DO). The flag never clears; delete
+the session by hand when it is no longer needed. Sessions forked before
+this flag existed are not backfilled: fork them once to protect them.
+
 **Cap:** 50 scheduled sessions per user. Returns 400 with a clear message
 when exceeded.
 

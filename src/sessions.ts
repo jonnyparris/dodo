@@ -80,6 +80,28 @@ export async function forkSessionInternal(
     throw new SourceSessionMissingError(sourceSessionId);
   }
 
+  // Flag the source as a fork source (in the source owner's DO) so the
+  // idle sweep keeps it. Done before the snapshot so a sweep can't land
+  // mid-fork. A 404 means the source is soft-deleted (/check still sees
+  // those rows): fail now rather than fork from a session about to be
+  // purged. Any other failure is logged, not thrown.
+  let markRes: Response | null = null;
+  try {
+    markRes = await userControlFetch(
+      env,
+      checkOwner,
+      `/sessions/${encodeURIComponent(sourceSessionId)}/fork-source`,
+      { method: "POST" },
+    );
+    if (!markRes.ok && markRes.status !== 404) throw new Error(`status ${markRes.status}`);
+  } catch (err) {
+    log("warn", "fork: failed to mark source as fork source", {
+      sourceSessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+  if (markRes?.status === 404) throw new SourceSessionMissingError(sourceSessionId);
+
   // 1. Snapshot the source session.
   const sourceAgent = await getAgentByName(env.CODING_AGENT as never, sourceSessionId);
   const exportStart = Date.now();
