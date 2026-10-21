@@ -57,7 +57,8 @@ const DEFAULT_CLOUDFLARE_REMOTE_MCP_CATALOG: McpCatalogEntry[] = [
     // Browser Rendering MCP above (which works from Dodo), unlike cf-portal
     // on portal.mcp.cfdata.org (loopback-only redirect, excluded below).
     // Admin-owned sessions get the built-in `web_search` tool instead
-    // (env.AI.websearch() via AI Gateway — see src/web-search.ts), which
+    // (the agents/websearch SDK tool over env.AI.websearch() via AI
+    // Gateway — see src/web-search.ts), which
     // replaced the reverted dedicated env.WEBSEARCH binding. This MCP stays
     // for non-admin users, who bill their own account.
     url: "https://websearch-staging.mcp.cloudflare.com/mcp",

@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { isWebSearchEnabled } from "../src/agentic";
+import { adaptTool, modelOutputToContent } from "../src/pi/tools";
 import type { Env } from "../src/types";
 import {
   createWebSearchTool,
   hasWebSearch,
   parseWebSearchProvider,
-  renderWebSearchResults,
-  trimDescription,
+  type DodoWebSearchOutput,
   type WebSearchAi,
 } from "../src/web-search";
 
@@ -18,42 +18,15 @@ function fakeAi(response: Response | Error) {
   return { ai: { websearch } as WebSearchAi, websearch };
 }
 
+// Test harness: execute and toModelOutput are always defined for our tool.
+type AnyTool = any;
+
 async function run(t: ReturnType<typeof createWebSearchTool>, input: { query: string; limit?: number }) {
-  // biome-ignore lint: test harness — execute is always defined for our tool
-  return (t as any).execute(input, { toolCallId: "t1", messages: [] });
+  const output = (await (t as AnyTool).execute(input, { toolCallId: "t1", messages: [] })) as DodoWebSearchOutput;
+  const model = modelOutputToContent(await (t as AnyTool).toModelOutput({ toolCallId: "t1", input, output }));
+  const text = model.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+  return { output, text, isError: model.isError };
 }
-
-describe("trimDescription", () => {
-  it("collapses whitespace and leaves short text alone", () => {
-    expect(trimDescription("a\n\n  b  c")).toBe("a b c");
-  });
-
-  it("cuts long text at a word boundary with an ellipsis", () => {
-    const out = trimDescription("word ".repeat(300), 50);
-    expect(out.length).toBeLessThanOrEqual(51);
-    expect(out.endsWith("word…")).toBe(true);
-  });
-});
-
-describe("renderWebSearchResults", () => {
-  it("numbers results, drops items without a URL, falls back to URL for title", () => {
-    const text = renderWebSearchResults("q", {
-      items: [
-        { url: "https://a.example", title: "A", description: "first" },
-        { title: "no url" },
-        { url: "https://b.example", lastModified: "2026-10-01" },
-      ],
-    });
-    expect(text).toContain('2 results for "q":');
-    expect(text).toContain("1. A\nhttps://a.example\nfirst");
-    expect(text).toContain("2. https://b.example\nhttps://b.example\nLast modified: 2026-10-01");
-    expect(text).not.toContain("no url");
-  });
-
-  it("tells the model to rephrase on zero results", () => {
-    expect(renderWebSearchResults("q", { items: [] })).toMatch(/No results/);
-  });
-});
 
 describe("parseWebSearchProvider / hasWebSearch", () => {
   it("defaults unknown providers to ceramic", () => {
@@ -79,31 +52,71 @@ describe("isWebSearchEnabled", () => {
   });
 });
 
-describe("createWebSearchTool", () => {
-  it("calls env.AI.websearch with gateway, provider and a clamped limit", async () => {
+describe("createWebSearchTool (agents/websearch/ai-sdk)", () => {
+  it("keeps Dodo's description", () => {
+    const { ai } = fakeAi(Response.json({ items: [] }));
+    expect(createWebSearchTool({ ai, gatewayId: "gw" }).description).toMatch(/browser_markdown/);
+  });
+
+  it("adapts to a pi tool with a plain JSON schema", async () => {
+    const { ai } = fakeAi(Response.json({ items: [] }));
+    const reg = await adaptTool("web_search", createWebSearchTool({ ai, gatewayId: "gw" }) as AnyTool);
+    const params = reg.parameters as unknown as { required?: string[]; properties: Record<string, unknown> };
+    expect(Object.keys(params.properties).sort()).toEqual(["limit", "query"]);
+    expect(params.required).toEqual(["query"]);
+    expect(reg.replay).toBe("safe");
+  });
+
+  it("calls env.AI.websearch with gateway, provider and a capped limit", async () => {
     const { ai, websearch } = fakeAi(
       Response.json({
-        items: [{ url: "https://a.example", title: "A", description: "x".repeat(5000) }],
-        metadata: { requestId: "req-1", latencyMs: 300 },
+        items: [
+          { url: "https://a.example", title: "A", description: "x ".repeat(5000) },
+          { title: "no url" },
+          { url: "https://b.example" },
+        ],
+        metadata: { query: "hello", requestId: "req-1", latencyMs: 300 },
       }),
     );
-    const t = createWebSearchTool({ ai, gatewayId: "gw", provider: "ceramic" });
-    const out = await run(t, { query: "hello", limit: 50 });
-    expect(websearch).toHaveBeenCalledWith({ gatewayId: "gw", query: "hello", provider: "ceramic", limit: 5 });
-    expect(out.requestId).toBe("req-1");
-    expect(out.results.length).toBeLessThan(800);
+    const t = createWebSearchTool({ ai, gatewayId: "gw", provider: "linkup" });
+    const { output, text, isError } = await run(t, { query: "hello", limit: 50 });
+    expect(websearch).toHaveBeenCalledWith(
+      expect.objectContaining({ gatewayId: "gw", query: "hello", provider: "linkup", limit: 5 }),
+    );
+    expect(isError).toBe(false);
+    // Host keeps the full response; the model reads the trimmed rendering.
+    expect("error" in output).toBe(false);
+    if (!("error" in output)) {
+      expect(output.metadata.requestId).toBe("req-1");
+      expect(output.provider).toBe("linkup");
+      expect(output.items).toHaveLength(2);
+    }
+    expect(text).toContain('2 results for "hello":');
+    expect(text).toContain("1. A\nhttps://a.example\n");
+    expect(text).toContain("2. https://b.example\nhttps://b.example");
+    expect(text).not.toContain("no url");
+    expect(text.length).toBeLessThan(800);
   });
 
-  it("returns a structured error with guidance on HTTP failure", async () => {
+  it("tells the model to rephrase on zero results", async () => {
+    const { ai } = fakeAi(Response.json({ items: [], metadata: { query: "q" } }));
+    const { text } = await run(createWebSearchTool({ ai, gatewayId: "gw" }), { query: "q" });
+    expect(text).toMatch(/No results/);
+  });
+
+  it("returns a non-retryable error-text result on 402", async () => {
     const { ai } = fakeAi(new Response("no credits", { status: 402 }));
-    const out = await run(createWebSearchTool({ ai, gatewayId: "gw" }), { query: "q" });
-    expect(out.error).toMatch(/402/);
-    expect(out.error).toMatch(/without web search/);
+    const { output, text, isError } = await run(createWebSearchTool({ ai, gatewayId: "gw" }), { query: "q" });
+    expect(isError).toBe(true);
+    expect(output).toMatchObject({ code: "web_search_payment_required" });
+    expect(text).toMatch(/Do not retry/);
   });
 
-  it("returns a structured error when the binding throws", async () => {
-    const { ai } = fakeAi(new Error("web_search_unsupported_runtime"));
-    const out = await run(createWebSearchTool({ ai, gatewayId: "gw" }), { query: "q" });
-    expect(out.error).toMatch(/unsupported_runtime/);
+  it("returns a retryable error-text result when the binding throws", async () => {
+    const { ai } = fakeAi(new Error("boom"));
+    const { output, text, isError } = await run(createWebSearchTool({ ai, gatewayId: "gw" }), { query: "q" });
+    expect(isError).toBe(true);
+    expect(output).toMatchObject({ code: "web_search_unavailable" });
+    expect(text).toMatch(/retry once/);
   });
 });
