@@ -134,6 +134,7 @@ function makeDodo(base: string) {
           headers: { ...auth, ...(body !== undefined ? { "content-type": "application/json" } : {}), "user-agent": "dodo-model-ab/1" },
           body: body !== undefined ? JSON.stringify(body) : undefined,
           redirect: "manual",
+          signal: AbortSignal.timeout(120_000),
         });
         const text = await res.text();
         if (!res.ok) throw new Error(`${method} ${path} → ${res.status}: ${text.slice(0, 300)}`);
@@ -175,11 +176,18 @@ async function prepareSession(dodo: Dodo, task: Task): Promise<string> {
 
 async function waitForPrompt(dodo: Dodo, sessionId: string, promptId: string, timeoutMs: number): Promise<string> {
   const deadline = Date.now() + timeoutMs;
+  let failures = 0;
   while (Date.now() < deadline) {
     await sleep(10_000);
-    const { prompts } = await dodo.get<{ prompts: Array<{ id: string; status: string }> }>(`/session/${sessionId}/prompts`);
-    const p = prompts.find((x) => x.id === promptId);
-    if (p && !["queued", "running"].includes(p.status)) return p.status;
+    try {
+      const { prompts } = await dodo.get<{ prompts: Array<{ id: string; status: string }> }>(`/session/${sessionId}/prompts`);
+      failures = 0;
+      const p = prompts.find((x) => x.id === promptId);
+      if (p && !["queued", "running"].includes(p.status)) return p.status;
+    } catch (err) {
+      // One slow or 5xx poll must not end a 30-minute run.
+      if (++failures >= 6) throw err;
+    }
   }
   await dodo.post(`/session/${sessionId}/abort`).catch(() => {});
   return "timeout";
@@ -224,22 +232,27 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
         log(`${task.id}/${armName}: could not collect ${path}: ${(err as Error).message}`);
       }
     }
-    if (task.verify) {
-      const v = spawnSync("sh", ["-c", task.verify], {
-        encoding: "utf8",
-        env: { ...process.env, BENCH_TASK: task.id, BENCH_ARM: armName, BENCH_SESSION: result.sessionId, BENCH_OUT: resolve(runDir), BENCH_ANSWER: resolve(runDir, "answer.md") },
-        timeout: 15 * 60_000,
-      });
-      const output = `${v.stdout ?? ""}${v.stderr ?? ""}`;
-      writeFileSync(join(runDir, "verify.log"), output);
-      result.verify = { passed: v.status === 0, output: output.trim().split("\n").slice(-8).join("\n") };
-    }
-    log(`${task.id}/${armName}: ${result.status} in ${result.wallSeconds}s${result.verify ? `, verify ${result.verify.passed ? "PASS" : "FAIL"}` : ""}`);
+    log(`${task.id}/${armName}: ${result.status} in ${result.wallSeconds}s`);
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err);
     log(`${task.id}/${armName}: ERROR ${result.error}`);
+    // Don't leave the agent running (and billing) until cleanup.
+    if (result.sessionId) await dodo.post(`/session/${result.sessionId}/abort`).catch(() => {});
   }
   return result;
+}
+
+function runVerify(task: Task, result: RunResult, outDir: string) {
+  const runDir = join(outDir, `${task.id}-${result.arm}`);
+  const v = spawnSync("sh", ["-c", task.verify!], {
+    encoding: "utf8",
+    env: { ...process.env, BENCH_TASK: task.id, BENCH_ARM: result.arm, BENCH_SESSION: result.sessionId, BENCH_OUT: resolve(runDir), BENCH_ANSWER: resolve(runDir, "answer.md") },
+    timeout: 15 * 60_000,
+  });
+  const output = `${v.stdout ?? ""}${v.stderr ?? ""}`;
+  writeFileSync(join(runDir, "verify.log"), output);
+  result.verify = { passed: v.status === 0, output: output.trim().split("\n").slice(-8).join("\n") };
+  log(`${task.id}/${result.arm}: verify ${result.verify.passed ? "PASS" : "FAIL"}`);
 }
 
 // ─── AI Gateway cost ───
@@ -265,11 +278,13 @@ async function gatewayStats(sessionId: string, gateway: string): Promise<Gateway
     url.searchParams.set("search", sessionId);
     url.searchParams.set("per_page", "50");
     url.searchParams.set("page", String(page));
-    const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+    const res = await fetch(url, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000) });
     if (!res.ok) throw new Error(`AI Gateway logs → ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const body = (await res.json()) as { result: GatewayLog[]; result_info?: { total_count?: number } };
     logs.push(...body.result);
-    if (body.result.length < 50) break;
+    const total = body.result_info?.total_count;
+    if (body.result.length === 0 || (total !== undefined ? logs.length >= total : body.result.length < 50)) break;
+    if (page === 99) log(`AI Gateway logs for ${sessionId}: stopped at 99 pages, cost is a lower bound`);
   }
   const stats: GatewayStats = { requests: 0, errors: 0, tokensIn: 0, tokensOut: 0, cost: 0, byRole: {} };
   for (const l of logs) {
@@ -349,6 +364,10 @@ async function main() {
   // share a per-model rate limit and finish in about the same wall time.
   for (const task of tasks) {
     const batch = await Promise.all(armNames.map((a) => runOne(dodo, task, a, spec.arms[a]!, outDir)));
+    // Verify after the whole batch, one at a time: verifiers share one checkout,
+    // and a blocking verify mid-batch would stall the other arms' polling and
+    // inflate their wall time.
+    for (const r of batch) if (task.verify && !r.error) runVerify(task, r, outDir);
     results.push(...batch);
     writeFileSync(join(outDir, "results.json"), JSON.stringify(results, null, 1));
   }

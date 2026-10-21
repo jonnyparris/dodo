@@ -9,7 +9,14 @@ cd "$DODO_CHECKOUT" || exit 2
 trap 'git checkout -q -- src/index.ts' EXIT
 cp "$BENCH_OUT/files/dodo/src/index.ts" src/index.ts
 echo "## typecheck"; npm run -s typecheck > /tmp/model-ab-tc.$$ 2>&1; tc=$?; tail -3 /tmp/model-ab-tc.$$
-echo "## route tests"; npx vitest run test/dodo.test.ts test/permission-enforcement.test.ts test/pi-default-e2e.test.ts > /tmp/model-ab-rt.$$ 2>&1; rt=$?; grep -E "Test Files|Tests " /tmp/model-ab-rt.$$
+echo "## route tests"
+# Killed (rc >= 124) is an infra failure, not a verdict: retry once.
+for _ in 1 2; do
+  npx vitest run test/dodo.test.ts test/permission-enforcement.test.ts test/pi-default-e2e.test.ts > /tmp/model-ab-rt.$$ 2>&1; rt=$?
+  [ $rt -lt 124 ] && break
+  echo "vitest killed (rc=$rt), retrying"
+done
+grep -E "Test Files|Tests " /tmp/model-ab-rt.$$
 blocks=$(grep -c '"x-dodo-opencode-base-url"' src/index.ts)
 echo "remaining header blocks: $blocks"
 rm -f /tmp/model-ab-tc.$$ /tmp/model-ab-rt.$$

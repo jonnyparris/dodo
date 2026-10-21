@@ -4,9 +4,10 @@
  * Each run:
  *   1. Lists Workers AI text-generation models (Cloudflare API).
  *   2. Compares them with the state file. New models that pass the filter
- *      (function calling, context >= 128K, input price <= $3/M, not deprecated)
- *      get a bench, at most --max per run. The first run only records what is
- *      already there.
+ *      (function calling, context >= 128K, priced at <= $3/M in and <= $10/M
+ *      out, not deprecated) get a bench, at most --max per run; the rest wait
+ *      for the next run. Rejected models are re-checked every run. The first
+ *      run only records what is already there.
  *   3. Brings the throwaway verifier checkout (DODO_CHECKOUT) up to the pinned
  *      fixture branches (bench/base, bench/bugfix-base; see scripts/bench-seed.sh).
  *   4. Runs bench/model-ab.ts with the auto spec plus one arm per new model,
@@ -14,8 +15,9 @@
  *   5. With --report-dir, copies summary.md there as
  *      YYYY-MM-DD-dodo-model-ab-<model>.md.
  *
- * A bench that fails outright (Dodo down, every run errored) is retried on the
- * next run, up to 3 attempts.
+ * A bench where no new-model run completed (Dodo down, model not serving,
+ * crash) is retried on the next run, up to 3 attempts. One run at a time
+ * (lock file next to the state file).
  *
  * Run (Node 24):
  *   node bench/model-watch.ts [--spec bench/model-ab.auto.json] [--state FILE]
@@ -30,12 +32,15 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  applyPlan,
+  lastPage,
   armName,
+  benchOk,
   buildSpec,
   type Candidate,
   type CatalogModel,
@@ -79,7 +84,10 @@ function parseArgs(argv: string[]) {
     else if (k === "--checkout") a.checkout = v();
     else if (k === "--out") a.out = v();
     else if (k === "--report-dir") a.reportDir = v();
-    else if (k === "--max") a.max = Number(v());
+    else if (k === "--max") {
+      a.max = Number(v());
+      if (!Number.isInteger(a.max) || a.max < 0) throw new Error("--max must be an integer >= 0");
+    }
     else if (k === "--model") a.force.push(v());
     else if (k === "--dry-run") a.dryRun = true;
     else throw new Error(`unknown argument ${k}`);
@@ -89,16 +97,18 @@ function parseArgs(argv: string[]) {
 
 async function listCatalog(account: string, token: string): Promise<CatalogModel[]> {
   const all: CatalogModel[] = [];
-  for (let page = 1; page < 20; page++) {
+  for (let page = 1; ; page++) {
+    if (page > 50) throw new Error("Workers AI catalog: more than 50 pages, giving up");
     const url = new URL(`https://api.cloudflare.com/client/v4/accounts/${account}/ai/models/search`);
     url.searchParams.set("task", "Text Generation");
     url.searchParams.set("per_page", "100");
     url.searchParams.set("page", String(page));
-    const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+    const res = await fetch(url, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000) });
     if (!res.ok) throw new Error(`Workers AI catalog → ${res.status}: ${(await res.text()).slice(0, 200)}`);
-    const body = (await res.json()) as { result: CatalogModel[] };
-    all.push(...body.result);
-    if (body.result.length < 100) break;
+    const body = (await res.json()) as { result: CatalogModel[]; result_info?: { total_count?: number } };
+    const before = all.length;
+    for (const m of body.result) if (!all.some((x) => x.name === m.name)) all.push(m);
+    if (lastPage({ pageLength: body.result.length, perPage: 100, added: all.length - before, total: body.result_info?.total_count, have: all.length })) break;
   }
   return all;
 }
@@ -110,16 +120,57 @@ function readState(path: string): WatchState {
 
 function writeState(path: string, state: WatchState) {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(state, null, 1)}\n`);
+  // Write + rename: a kill mid-write must not leave truncated JSON that breaks every later run.
+  writeFileSync(`${path}.tmp`, `${JSON.stringify(state, null, 1)}\n`);
+  renameSync(`${path}.tmp`, path);
+}
+
+/** One run at a time (launchd + a manual run would race on state and the shared checkout). */
+function lock(path: string): () => void {
+  mkdirSync(dirname(path), { recursive: true });
+  for (let i = 0; i < 3; i++) {
+    try {
+      writeFileSync(path, String(process.pid), { flag: "wx" });
+      return () => rmSync(path, { force: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    if (lockHeld(path)) throw new Error(`another model-watch is running (lock ${path})`);
+    rmSync(path, { force: true }); // stale
+  }
+  throw new Error(`could not take lock ${path}`);
+}
+
+function lockHeld(path: string): boolean {
+  let pid: number;
+  let ageMs: number;
+  try {
+    pid = Number(readFileSync(path, "utf8"));
+    ageMs = Date.now() - statSync(path).mtimeMs;
+  } catch {
+    return false; // gone: retry
+  }
+  if (ageMs > 12 * 3600_000) return false; // no bench runs this long; PIDs get reused
+  if (!pid) return ageMs < 10_000; // being written right now
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EPERM") return false;
+  }
+  try {
+    return sh("ps", ["-p", String(pid), "-o", "command="]).includes("model-watch");
+  } catch {
+    return false;
+  }
 }
 
 function sh(cmd: string, args: string[], cwd?: string): string {
   return execFileSync(cmd, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
-/** Clone or refresh the throwaway checkout the verify scripts swap files in. Returns the fixture commit. */
+/** Clone or refresh the throwaway checkout the verify scripts swap files in. Returns the fixture commits. */
 function prepareCheckout(dir: string, checkout: NonNullable<AutoSpec["checkout"]>): string {
-  const [main, ...rest] = checkout.branches;
+  const [main] = checkout.branches;
   if (!main) throw new Error("spec.checkout.branches is empty");
   if (!existsSync(join(dir, ".git"))) {
     mkdirSync(dirname(dir), { recursive: true });
@@ -137,15 +188,15 @@ function prepareCheckout(dir: string, checkout: NonNullable<AutoSpec["checkout"]
     const r = spawnSync("npm", ["ci", "--no-audit", "--no-fund", "--loglevel=error"], { cwd: dir, stdio: "inherit" });
     if (r.status !== 0) throw new Error("npm ci failed in the verifier checkout");
   }
-  for (const b of rest) sh("git", ["rev-parse", "--verify", `origin/${b}`], dir);
-  return `${main}@${head.slice(0, 7)}`;
+  const shas = checkout.branches.map((b) => `${b}@${sh("git", ["rev-parse", "--short=7", "--verify", `origin/${b}`], dir)}`);
+  return shas.join(", ");
 }
 
 async function dodoCommit(base: string): Promise<string | undefined> {
   try {
     const id = process.env.DODO_ACCESS_CLIENT_ID ?? sh("security", ["find-generic-password", "-s", "dodo-smoke-access", "-a", "client_id", "-w"]);
     const secret = process.env.DODO_ACCESS_CLIENT_SECRET ?? sh("security", ["find-generic-password", "-s", "dodo-smoke-access", "-a", "client_secret", "-w"]);
-    const res = await fetch(`${base}/version.json`, { headers: { "CF-Access-Client-Id": id, "CF-Access-Client-Secret": secret }, redirect: "manual" });
+    const res = await fetch(`${base}/version.json`, { headers: { "CF-Access-Client-Id": id, "CF-Access-Client-Secret": secret }, redirect: "manual", signal: AbortSignal.timeout(30_000) });
     return res.ok ? ((await res.json()) as { commit?: string }).commit : undefined;
   } catch {
     return undefined;
@@ -158,7 +209,7 @@ interface RunResult {
   error?: string;
 }
 
-async function benchOne(c: Candidate, spec: AutoSpec, args: ReturnType<typeof parseArgs>, fixture: string): Promise<{ ok: boolean; runDir: string; error?: string; report?: string }> {
+async function benchOne(c: Candidate, spec: AutoSpec, args: ReturnType<typeof parseArgs>, meta: { fixture?: string; dodoCommit?: string }): Promise<{ ok: boolean; runDir: string; error?: string; report?: string }> {
   const date = new Date().toISOString().slice(0, 10);
   const runDir = join(args.out, `${new Date().toISOString().replace(/[:.]/g, "-")}-${armName(c.id)}`);
   mkdirSync(runDir, { recursive: true });
@@ -174,10 +225,10 @@ async function benchOne(c: Candidate, spec: AutoSpec, args: ReturnType<typeof pa
   const resultsPath = join(runDir, "results.json");
   const results: RunResult[] = existsSync(resultsPath) ? JSON.parse(readFileSync(resultsPath, "utf8")) : [];
   const mine = results.filter((x) => x.arm === armName(c.id));
-  const ok = r.status === 0 && mine.some((x) => !x.error);
+  const ok = benchOk(r.status, results, armName(c.id));
   const reportPath = join(runDir, "report.md");
   if (!existsSync(reportPath)) return { ok: false, runDir, error: `model-ab exited ${r.status} without a report` };
-  const header = summaryHeader([c], spec.arms, { date, runDir, dodoCommit: await dodoCommit(spec.base ?? ""), fixture });
+  const header = summaryHeader([c], spec.arms, { date, runDir, ...meta });
   const failures = mine.filter((x) => x.error || x.status !== "completed").map((x) => `${x.status}${x.error ? `: ${x.error}` : ""}`);
   const body = `${header}${readFileSync(reportPath, "utf8")}${failures.length ? `\nNew-model runs that did not complete: ${failures.join("; ")}\n` : ""}`;
   const summary = join(runDir, "summary.md");
@@ -185,7 +236,10 @@ async function benchOne(c: Candidate, spec: AutoSpec, args: ReturnType<typeof pa
   let report: string | undefined;
   if (args.reportDir) {
     mkdirSync(args.reportDir, { recursive: true });
-    report = join(args.reportDir, `${date}-dodo-model-ab-${armName(c.id)}.md`);
+    // A retry or forced re-run the same day gets -2, -3, … instead of overwriting.
+    const stem = join(args.reportDir, `${date}-dodo-model-ab-${armName(c.id)}`);
+    report = `${stem}.md`;
+    for (let n = 2; existsSync(report); n++) report = `${stem}-${n}.md`;
     copyFileSync(summary, report);
   }
   return { ok, runDir, report, error: ok ? undefined : `new-model arm: ${failures.join("; ") || `model-ab exited ${r.status}`}` };
@@ -197,8 +251,19 @@ async function main() {
   const account = process.env.CLOUDFLARE_ACCOUNT_ID;
   if (!token || !account) throw new Error("set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID");
   const spec = JSON.parse(readFileSync(args.spec, "utf8")) as AutoSpec;
-  const filter = { ...DEFAULT_FILTER, ...spec.filter };
+  // The reference arm's own model is never "new": benching it against itself proves nothing.
+  const refModels = Object.values(spec.arms).map((arm) => arm.model);
+  const filter = { ...DEFAULT_FILTER, ...spec.filter, exclude: [...(spec.filter?.exclude ?? DEFAULT_FILTER.exclude), ...refModels] };
 
+  const unlock = args.dryRun ? () => {} : lock(`${args.state}.lock`);
+  try {
+    await watch(args, account, token, spec, filter);
+  } finally {
+    unlock();
+  }
+}
+
+async function watch(args: ReturnType<typeof parseArgs>, account: string, token: string, spec: AutoSpec, filter: typeof DEFAULT_FILTER) {
   const catalog = (await listCatalog(account, token)).map((m) => toCandidate(m));
   const state = readState(args.state);
   const missing = args.force.filter((id) => !catalog.some((c) => c.id === id));
@@ -210,22 +275,35 @@ async function main() {
   if (p.deferred.length) log(`over --max ${args.max}, next run: ${p.deferred.join(", ")}`);
   if (args.dryRun) return;
 
-  const now = new Date().toISOString();
-  for (const id of p.newlySeen) state.seen[id] = now;
-  writeState(args.state, state);
+  // Pending attempts are written before anything can fail, so a crash still counts toward MAX_ATTEMPTS.
+  const before = structuredClone(state.runs);
+  writeState(args.state, applyPlan(state, p, new Date().toISOString(), args.force));
   if (!p.bench.length) return;
 
-  const fixture = spec.checkout ? prepareCheckout(args.checkout, spec.checkout) : undefined;
+  let fixture: string | undefined;
+  try {
+    fixture = spec.checkout ? prepareCheckout(args.checkout, spec.checkout) : undefined;
+  } catch (err) {
+    // Not the model's fault: give the attempt back.
+    for (const c of p.bench) {
+      const prev = before[c.id];
+      if (prev) state.runs[c.id] = prev;
+      else delete state.runs[c.id];
+    }
+    writeState(args.state, state);
+    throw err;
+  }
+  const dodo = await dodoCommit(spec.base ?? "");
   let failed = 0;
   for (const c of p.bench) {
     let res: Awaited<ReturnType<typeof benchOne>>;
     try {
-      res = await benchOne(c, spec, args, fixture ?? "");
+      res = await benchOne(c, spec, args, { fixture, dodoCommit: dodo });
     } catch (err) {
       res = { ok: false, runDir: "", error: err instanceof Error ? err.message : String(err) };
     }
-    const prev = state.runs[c.id];
-    state.runs[c.id] = { at: new Date().toISOString(), ok: res.ok, attempts: (prev?.attempts ?? 0) + 1, runDir: res.runDir || undefined, error: res.error };
+    const keepOld = !res.ok && args.force.includes(c.id) && before[c.id]?.ok;
+    if (!keepOld) state.runs[c.id] = { ...state.runs[c.id]!, at: new Date().toISOString(), ok: res.ok, runDir: res.runDir || undefined, error: res.error };
     writeState(args.state, state);
     if (!res.ok) failed++;
     log(`${c.id}: ${res.ok ? "done" : `FAILED (${res.error})`}${res.report ? ` → ${res.report}` : ""}`);
