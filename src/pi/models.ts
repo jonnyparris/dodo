@@ -6,12 +6,14 @@
 // sessionAffinityFormat), driven by the conversation's persisted provider
 // session id.
 
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, ProviderStreams } from "@earendil-works/pi-ai";
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
+import { log } from "../logger";
+import { rateLimitFetch } from "./rate-limit-fetch";
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -88,6 +90,19 @@ export function gatewayHeaders(config: GatewayConfig, env: Env): Record<string, 
       };
 }
 
+/**
+ * Give every model request a fetch that waits out 429s (see
+ * rate-limit-fetch.ts). A caller-supplied fetch is kept as the base.
+ */
+export function withRateLimitRetry(api: ProviderStreams, fetchOptions?: Parameters<typeof rateLimitFetch>[1]): ProviderStreams {
+  const wrap = <O extends { fetch?: typeof fetch } | undefined>(o: O) => ({ ...o, fetch: rateLimitFetch(o?.fetch, fetchOptions) });
+  return {
+    ...api,
+    stream: (model, context, options) => api.stream(model, context, wrap(options)),
+    streamSimple: (model, context, options) => api.streamSimple(model, context, wrap(options)),
+  };
+}
+
 /** Install (or replace) the Dodo gateway provider with exactly these models. */
 export function setDodoProvider(models: MutableModels, modelIds: readonly string[], config: GatewayConfig, env: Env): MutableModels {
   const unique = [...new Set(modelIds.filter(Boolean))];
@@ -105,7 +120,10 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
         },
       },
       models: list,
-      api: openAICompletionsApi(),
+      api: withRateLimitRetry(openAICompletionsApi(), {
+        onWait: ({ attempt, delayMs, retryAfter }) =>
+          log("warn", "pi: model rate limited, waiting", { sessionId: config.sessionId, attempt, delayMs: Math.round(delayMs), retryAfter }),
+      }),
     }),
   );
   return models;
