@@ -34,7 +34,7 @@ describe("FALLBACK_MODELS prices", () => {
     },
   );
 
-  it("UNCHECKED only lists catalog entries", () => {
+  it("UNCHECKED and CONTEXT_WINDOW_OVERRIDES only list catalog entries", () => {
     const ids = new Set(FALLBACK_MODELS.map((m) => m.id));
     for (const id of [...UNCHECKED, ...Object.keys(CONTEXT_WINDOW_OVERRIDES)]) expect(ids.has(id), id).toBe(true);
   });
@@ -53,13 +53,14 @@ describe("FALLBACK_MODELS context windows", () => {
   it.each(FALLBACK_MODELS.filter((m) => !UNCHECKED.has(m.id)).map((m) => [m.id, m] as const))(
     "%s matches pi-ai's bundled catalog",
     (id, model) => {
-      const pi = piModel(id)!;
+      const pi = piModel(id);
+      expect(pi, `${id} is missing from pi-ai's catalog: fix the id or add it to UNCHECKED`).toBeDefined();
       const override = CONTEXT_WINDOW_OVERRIDES[id];
       if (override) {
         // Re-check the override when pi-ai changes its number.
-        expect({ dodo: model.contextWindow, pi: pi.contextWindow }).toEqual(override);
+        expect({ dodo: model.contextWindow, pi: pi!.contextWindow }).toEqual(override);
       } else {
-        expect(model.contextWindow).toBe(pi.contextWindow);
+        expect(model.contextWindow).toBe(pi!.contextWindow);
       }
     },
   );
