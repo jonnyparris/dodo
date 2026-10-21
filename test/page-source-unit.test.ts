@@ -123,6 +123,17 @@ describe("createDodoPageSource", () => {
     expect(notes).toContain("quickAction: down");
   });
 
+  it("ignores frontmatter when spotting a thin shell", async () => {
+    const shell = `---\ntitle: Free, collaborative whiteboard\ndescription: ${"An app. ".repeat(30)}\n---\n\nLoading`;
+    const source = createDodoPageSource({
+      ai: stubAi(shell) as unknown as Ai,
+      cache: new PageCache(),
+      fetch: stubFetch("<div id=root></div>", html),
+      browser: browserStub("# Rendered app"),
+    });
+    expect((await source.fetch({ url: "https://app.e.com/" })).via).toBe("rendered");
+  });
+
   it("refuses private hosts before fetching", async () => {
     const seen: Request[] = [];
     const source = createDodoPageSource({

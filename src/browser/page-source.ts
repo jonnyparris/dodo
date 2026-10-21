@@ -57,11 +57,16 @@ function browserMayHelp(status: number): boolean {
   return status === 401 || status === 403 || status === 429 || status >= 500;
 }
 
+/** Body text without the YAML frontmatter (title, description, og tags) toMarkdown puts on top. */
+function bodyText(markdown: string): string {
+  return markdown.replace(/^\s*---\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/, "").trim();
+}
+
 function isThinHtml(page: WebFetchPage): boolean {
   return (
     page.via === "converted" &&
     (page.contentType === "text/html" || page.contentType === "application/xhtml+xml") &&
-    page.content.trim().length < THIN_MARKDOWN_CHARS
+    bodyText(page.content).length < THIN_MARKDOWN_CHARS
   );
 }
 
@@ -97,7 +102,7 @@ export function createDodoPageSource(options: DodoPageSourceOptions): WebFetchSo
         page = await direct.fetch(request, { signal });
         if (browserMayHelp(page.status)) reason = `plain fetch got HTTP ${page.status}`;
         else if (isThinHtml(page)) {
-          reason = `HTML converted to only ${page.content.trim().length} chars (likely client-rendered)`;
+          reason = `HTML converted to only ${bodyText(page.content).length} chars of body text (likely client-rendered)`;
         } else {
           cache.set(key, page);
           return page;
