@@ -12,7 +12,7 @@ describe("modelSupportsVision", () => {
     "anthropic/claude-sonnet-4-6",
   ])("%s takes images", (id) => expect(modelSupportsVision(id)).toBe(true));
 
-  it.each(["@cf/qwen/qwen2.5-coder-32b-instruct", "@cf/zai-org/glm-5.3", "deepseek/deepseek-chat"])("%s does not", (id) =>
+  it.each(["@cf/qwen/qwen2.5-coder-32b-instruct", "@cf/zai-org/glm-5.3", "deepseek/deepseek-v4-pro"])("%s does not", (id) =>
     expect(modelSupportsVision(id)).toBe(false),
   );
 });

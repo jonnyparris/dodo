@@ -18,8 +18,8 @@ export function extractGeneratePrompt(content: string): string | null {
  *  and Gemini 2.5 Pro cost more above 272k/200k input tokens). They must match
  *  pi-ai's bundled vendor catalogs: test/model-catalog-prices-unit.test.ts
  *  fails on drift (2026-10: Haiku, Opus, GPT-5.4 and Gemini Flash had drifted).
- *  Not checked: context windows, cache prices, and the two DeepSeek ids
- *  (pi-ai no longer lists them; DeepSeek has moved to deepseek-flash/-v4-pro). */
+ *  Not checked: context windows and cache prices. DeepSeek prices are the peak
+ *  rate (off-peak is half). deepseek-chat/-reasoner were retired 2026-07-24. */
 export const FALLBACK_MODELS = [
   { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "OpenAI", costInput: 2.5, costOutput: 15, contextWindow: 1_000_000 },
   { id: "openai/gpt-4.1", name: "GPT-4.1", provider: "OpenAI", costInput: 2, costOutput: 8, contextWindow: 1_000_000 },
@@ -31,8 +31,8 @@ export const FALLBACK_MODELS = [
   { id: "openai/o4-mini", name: "o4-mini", provider: "OpenAI", costInput: 1.1, costOutput: 4.4, contextWindow: 200_000 },
   { id: "google/gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "Google", costInput: 1.25, costOutput: 10, contextWindow: 1_000_000 },
   { id: "google/gemini-2.5-flash", name: "Gemini 2.5 Flash", provider: "Google", costInput: 0.3, costOutput: 2.5, contextWindow: 1_000_000 },
-  { id: "deepseek/deepseek-chat", name: "DeepSeek Chat", provider: "DeepSeek", costInput: 0.27, costOutput: 1.1, contextWindow: 128_000 },
-  { id: "deepseek/deepseek-reasoner", name: "DeepSeek Reasoner", provider: "DeepSeek", costInput: 0.55, costOutput: 2.19, contextWindow: 128_000 },
+  { id: "deepseek/deepseek-flash", name: "DeepSeek V4.1 Flash", provider: "DeepSeek", costInput: 0.3, costOutput: 1.2, contextWindow: 1_000_000 },
+  { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", provider: "DeepSeek", costInput: 1.32, costOutput: 3.96, contextWindow: 1_000_000 },
 ];
 
 /** Workers AI chat/text models — advertised in the model picker so users can
