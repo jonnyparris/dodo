@@ -46,20 +46,28 @@ describe("subagent message pruning", () => {
     expect(out).toBe(messages); // same reference — no copy
   });
 
-  it("prunes middle groups when history exceeds the window", () => {
-    // Build: user + 6 groups (each group = assistant + tool result)
-    // Window = 4 → keep initial user + last 4 groups, drop middle 2.
+  it("does not prune until the history reaches twice the window", () => {
+    // Window = 4 → up to 7 groups are kept unpruned.
     const messages: ModelMessage[] = [makeUser("find the bug")];
-    for (let i = 1; i <= 6; i++) {
+    for (let i = 1; i <= 7; i++) {
       messages.push(makeAssistant(`step ${i}`));
       messages.push(makeToolResult(`call-${i}`, `result ${i}`));
     }
-    // Total: 1 user + 12 (assistant+tool pairs) = 13 messages.
+    expect(pruneSubagentHistory(messages, 4)).toBe(messages);
+  });
+
+  it("drops a whole window of groups once the budget is exceeded", () => {
+    // Build: user + 8 groups (each group = assistant + tool result)
+    // Window = 4 → 8 groups hits 2*window, drop the oldest 4.
+    const messages: ModelMessage[] = [makeUser("find the bug")];
+    for (let i = 1; i <= 8; i++) {
+      messages.push(makeAssistant(`step ${i}`));
+      messages.push(makeToolResult(`call-${i}`, `result ${i}`));
+    }
 
     const out = pruneSubagentHistory(messages, 4);
 
-    // Expect: [user, marker, assistant-3, tool-3, asst-4, tool-4, asst-5, tool-5, asst-6, tool-6]
-    // = 1 + 1 + 8 = 10 messages
+    // Expect: [user, marker, asst-5, tool-5, ..., asst-8, tool-8] = 1 + 1 + 8
     expect(out).not.toBe(messages);
     expect(out.length).toBe(10);
 
@@ -72,12 +80,12 @@ describe("subagent message pruning", () => {
     expect(String(out[1].content)).toContain("pruned");
     expect(String(out[1].content)).toContain("earlier");
 
-    // Last messages must be the final group (assistant step 6 + its tool result).
+    expect(out[2].content).toBe("step 5");
     const last = out[out.length - 1];
     expect(last.role).toBe("tool");
     const secondLast = out[out.length - 2];
     expect(secondLast.role).toBe("assistant");
-    expect(secondLast.content).toBe("step 6");
+    expect(secondLast.content).toBe("step 8");
   });
 
   it("preserves the initial user query as goal anchor", () => {
@@ -127,6 +135,53 @@ describe("subagent message pruning", () => {
     // Current impl keeps at least 1 group as fallback; check length.
     expect(out.length).toBeGreaterThanOrEqual(2);
     expect(out[0].content).toBe("q");
+  });
+});
+
+describe("subagent pruning keeps a cacheable prefix", () => {
+  /** Request each step would send: the pruned view of the full history. */
+  function requests(steps: number, windowSize: number): string[][] {
+    const history: ModelMessage[] = [makeUser("q")];
+    const out: string[][] = [];
+    for (let i = 1; i <= steps; i++) {
+      out.push(pruneSubagentHistory(history, windowSize).map((m) => JSON.stringify(m)));
+      history.push(makeAssistant(`step ${i}`));
+      history.push(makeToolResult(`call-${i}`, `result ${i}`));
+    }
+    return out;
+  }
+
+  function isPrefix(prev: string[], next: string[]): boolean {
+    return prev.length <= next.length && prev.every((m, i) => next[i] === m);
+  }
+
+  it("uses the same marker text however much was pruned", () => {
+    const reqs = requests(20, 4);
+    const markers = new Set(reqs.filter((r) => r.length > 1 && r[1].includes("pruned")).map((r) => r[1]));
+    expect(markers.size).toBe(1);
+  });
+
+  it("only breaks the previous request's prefix once per window of steps", () => {
+    const windowSize = 4;
+    const reqs = requests(20, windowSize);
+    let breaks = 0;
+    for (let i = 1; i < reqs.length; i++) {
+      if (!isPrefix(reqs[i - 1], reqs[i])) breaks++;
+    }
+    // 20 steps: cuts at 8, 12, 16, 20 groups → steps 9, 13, 17 (step i sees i-1 groups).
+    expect(breaks).toBe(3);
+    // A one-group sliding window would break the prefix on every step after the first prune.
+  });
+
+  it("keeps between windowSize and 2*windowSize-1 groups once pruning starts", () => {
+    const windowSize = 4;
+    const reqs = requests(30, windowSize);
+    for (const r of reqs) {
+      if (!r[1]?.includes("pruned")) continue;
+      const groups = r.filter((m) => m.includes('"role":"assistant"')).length;
+      expect(groups).toBeGreaterThanOrEqual(windowSize);
+      expect(groups).toBeLessThanOrEqual(2 * windowSize - 1);
+    }
   });
 });
 
