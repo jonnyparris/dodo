@@ -7,6 +7,7 @@ describe("modelSupportsVision", () => {
   it.each([
     "@cf/zai-org/glm-5.3-flash", // the default Workers AI model
     "@cf/moonshotai/kimi-k2.6",
+    "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
     "@cf/google/gemma-4-26b-a4b-it",
     "@cf/meta/llama-4-scout-17b-16e-instruct",
     "anthropic/claude-sonnet-4-6",
