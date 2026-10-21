@@ -349,9 +349,7 @@ export class PiEngine {
         const m = event.entry.model?.[0] as AssistantMessage | undefined;
         if (m?.stopReason !== "aborted" && m?.stopReason !== "error") emitText(textOf(m));
         acc.streamed = "";
-        // Total prompt tokens incl. cache reads/writes — what the AI SDK's
-        // inputTokens reported on Think, and what users compare against bills.
-        acc.input += (m?.usage?.input ?? 0) + (m?.usage?.cacheRead ?? 0) + (m?.usage?.cacheWrite ?? 0);
+        acc.input += m?.usage?.input ?? 0;
         acc.output += m?.usage?.output ?? 0;
         if (m?.usage) acc.context = (m.usage.input ?? 0) + (m.usage.cacheRead ?? 0) + (m.usage.cacheWrite ?? 0);
         return;
