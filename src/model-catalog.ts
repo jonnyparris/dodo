@@ -1,3 +1,5 @@
+import { CLOUDFLARE_WORKERS_AI_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai.models";
+
 /** Canonical /generate slash command regex. Shared by the server entry points
  *  (handleMessage/handlePrompt) and the browser client so all paths agree on
  *  what qualifies as an image-generation request. `[\s\S]+` (not `.+`) preserves
@@ -48,6 +50,21 @@ export const WORKERS_AI_MODELS = [
   { id: "@cf/meta/llama-4-scout-17b-16e-instruct", name: "Llama 4 Scout 17B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 131_072 },
   { id: "@cf/qwen/qwen2.5-coder-32b-instruct", name: "Qwen 2.5 Coder 32B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 32_768 },
 ];
+
+/** Context window for ids neither list has: 128k is a guess that suits most
+ *  vendor chat models. */
+export const DEFAULT_CONTEXT_WINDOW = 128_000;
+
+const CATALOG_CONTEXT_WINDOWS = new Map<string, number>([...FALLBACK_MODELS, ...WORKERS_AI_MODELS].map((m) => [m.id, m.contextWindow]));
+
+/** Context window (tokens) for a Dodo model id: Dodo's catalog, then pi-ai's
+ *  Workers AI catalog for `@cf/` ids Dodo doesn't advertise, then the default.
+ *  Without the pi-ai step a session set to e.g. `@cf/qwen/qwen3-30b-a3b-fp8`
+ *  (32,768 window) got 128k, so pi-ai sent `max_tokens` 32000 on top of the
+ *  prompt and Workers AI rejected the first turn with a 400 (2026-10-22). */
+export function contextWindowFor(modelId: string): number {
+  return CATALOG_CONTEXT_WINDOWS.get(modelId) ?? CLOUDFLARE_WORKERS_AI_MODELS[modelId as keyof typeof CLOUDFLARE_WORKERS_AI_MODELS]?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+}
 
 /** Workers AI image-generation models. Not surfaced in the chat model picker —
  *  they're invoked via dedicated endpoints (e.g. POST /session/:id/generate).
