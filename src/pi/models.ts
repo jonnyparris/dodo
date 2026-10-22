@@ -28,14 +28,15 @@ import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { CLOUDFLARE_AI_GATEWAY_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-ai-gateway.models";
 import { CLOUDFLARE_PROVIDER_ID, createAI } from "agents/models/pi-ai";
 import { bindingGatewayId, adaptBindingForCreateAI, gatewayMetadata, workersAIOnRunPath } from "../cloudflare-ai";
-
-export { workersAIOnRunPath };
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
 import { log } from "../logger";
 import { rateLimitFetch, type RateLimitFetchOptions } from "./rate-limit-fetch";
 import { type StreamIdleTimeoutInfo, withStreamIdleTimeout } from "./stream-idle-timeout";
+
+// Moved to cloudflare-ai.ts (the subagents use it too); re-exported for existing callers.
+export { workersAIOnRunPath };
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
 /** The `api` createAI gives Workers AI models (its run path, not a wire format). */

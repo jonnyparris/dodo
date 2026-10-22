@@ -10,7 +10,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { bindingGatewayId } from "../src/cloudflare-ai";
 import { fakeAIBinding } from "./helpers/fake-ai-binding";
-import { addAnthropicCacheOptions, buildProviderForModel, pruneSubagentHistory } from "../src/subagent-runner";
+import { addAnthropicCacheOptions, buildProviderForModel, pruneSubagentHistory, runSubagentForProfile } from "../src/subagent-runner";
+import { EXPLORE_PROFILE } from "../src/agent-profile";
 import type { AppConfig, Env } from "../src/types";
 
 const CC = { type: "ephemeral" };
@@ -228,6 +229,32 @@ describe("buildProviderForModel routing", () => {
       const assistant = msgs.find((m) => m.role === "assistant")!;
       expect(assistant.content).toBe("");
       expect(msgs.find((m) => m.role === "tool")).toMatchObject({ tool_call_id: "call_1" });
+    });
+
+    it("runs a whole explore subagent on the run path: transcript keeps tool inputs, max_tokens is the subagent cap", async () => {
+      let step = 0;
+      const { binding, runCalls } = fakeAIBinding(
+        () => new Response("unexpected", { status: 500 }),
+        () =>
+          step++ === 0
+            ? completion({ content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "grep", arguments: '{"q":"x"}' } }] }, "tool_calls")
+            : completion({ content: "found it" }),
+      );
+      const grep = tool({ description: "g", inputSchema: jsonSchema({ type: "object", properties: { q: { type: "string" } } }), execute: async () => "a.ts:1" });
+      const out = await runSubagentForProfile(EXPLORE_PROFILE, {
+        prompt: "find x",
+        model: KIMI,
+        config,
+        env: flagged(binding),
+        toolset: { grep },
+        sessionAffinity: "sess-1",
+        resultSchemaName: undefined,
+      });
+      expect(out.finalText).toBe("found it");
+      expect(out.toolCalls).toEqual(["grep"]);
+      expect(out.transcript).toContainEqual({ role: "tool", content: 'grep: {"q":"x"}' });
+      expect(runCalls).toHaveLength(2);
+      expect(runCalls[0].inputs.max_tokens).toBe(4000);
     });
 
     it("stays on /compat with the flag off, on OpenCode, or without a reachable binding", async () => {

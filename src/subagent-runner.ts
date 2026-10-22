@@ -451,12 +451,14 @@ function buildAnthropicCreateAIProvider(gatewayId: string, env: Env, sessionAffi
 /**
  * `@cf/` models through createAI's Workers AI run path over the `AI` binding
  * (`env.AI.run` with the gateway option, plus createAI's per-model request
- * quirks), the same leg the main session uses with WORKERS_AI_VIA_BINDING.
+ * quirks), the leg the main session uses with WORKERS_AI_VIA_BINDING.
  * No AI_GATEWAY_KEY. createAI's AI SDK models are LanguageModelV4, which is
  * why this needed AI SDK 7. `maxOutputTokens` (executeSubagent) becomes
  * `max_tokens`. A rate limit comes back as a retryable 429 (a thrown
  * AiError 3021/3040 is turned into one by adaptBindingForCreateAI), which
- * the AI SDK's own retries wait out, as on `/compat`.
+ * the AI SDK's own retries (maxRetries) handle, as on `/compat`. Unlike the
+ * main session there is no rateLimitFetch wait on the binding: subagents
+ * never had one on `/compat` either.
  */
 function buildWorkersAICreateAIProvider(gatewayId: string, env: Env, sessionAffinity?: string) {
   const metadata = gatewayMetadata(sessionAffinity, "subagent");
@@ -776,8 +778,8 @@ async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentRes
           entries.push({ role: "assistant", content: step.text });
         }
         for (const tc of step.toolCalls ?? []) {
-          const args = (tc as { args?: unknown }).args;
-          entries.push({ role: "tool", content: `${tc.toolName}: ${JSON.stringify(args)}` });
+          // AI SDK 5+ tool calls carry `input` (there is no `args`).
+          entries.push({ role: "tool", content: `${tc.toolName}: ${JSON.stringify(tc.input)}` });
         }
         return entries;
       }),

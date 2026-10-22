@@ -178,7 +178,7 @@ export async function generateStructured<T>(
   while (attempts <= maxRetries) {
     attempts += 1;
     try {
-      // AI SDK v6 dropped the explicit `mode` arg from generateObject —
+      // AI SDK v6+ has no explicit `mode` arg on generateObject —
       // the provider's structured-output path is selected automatically
       // from the model's reported capabilities. Our own `mode` value
       // stays useful as metadata on the result (it tells callers what
