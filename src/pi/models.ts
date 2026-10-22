@@ -148,7 +148,8 @@ function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLim
   // On the Workers AI run path each send (429 resends included) also takes a
   // slot from the shared per-model budget, as withModelBudgetStreams does on
   // /compat: same key, so main turns and subagents share one book. Built per
-  // request, so maxWaitScope "total" covers one request and its resends.
+  // `run` call (createAI makes one per model request), so maxWaitScope
+  // "total" covers one request and its resends.
   const binding = adaptBindingForCreateAI(env.AI, (run, signal, model) => {
     const send: typeof fetch = () => run();
     const gated =

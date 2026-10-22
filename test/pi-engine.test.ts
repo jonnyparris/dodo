@@ -600,6 +600,29 @@ describe("pi gateway wire: Workers AI through createAI's run path (WORKERS_AI_VI
     await vi.waitFor(() => expect(reported).toEqual([`ai-gateway:${KIMI}`]));
   }, 20_000);
 
+  it("a drained cloudflare/@cf/ ref on /compat takes the same budget slot", async () => {
+    vi.stubGlobal("fetch", async () => reply());
+    const acquired: Array<[string, string]> = [];
+    const SHARED_INDEX = {
+      idFromName: () => "global",
+      get: () => ({
+        modelBudgetAcquire: async (key: string, _rpm: number, priority: string) => {
+          acquired.push([key, priority]);
+          return { ok: true, waitMs: 0, used: 1, limit: 10 };
+        },
+        modelBudgetReport429: async () => {},
+      }),
+    };
+    const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+    const env = { AI: binding, AI_GATEWAY_KEY: "gw-key", CLOUDFLARE_ACCOUNT_ID: "acct", SHARED_INDEX } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(runCalls).toHaveLength(0);
+    expect(acquired).toEqual([[`ai-gateway:${KIMI}`, "main"]]);
+  });
+
   it("passes other thrown binding errors through as a failed turn, without retrying", async () => {
     const { binding, runCalls } = fakeAIBinding(
       () => new Response("unexpected", { status: 500 }),
