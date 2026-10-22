@@ -199,9 +199,11 @@ export function compatBindingFetch(binding: Ai, gatewayId: string, compatBaseUrl
     if (!url.startsWith(prefix) || method !== "POST") return base(input, init);
     const request = new Request(input, init);
     const endpoint = url.slice(prefix.length);
+    // Read outside the try, so a read error surfaces as itself, not as "not JSON". Callers (pi-ai, the AI SDK) send string bodies.
+    const text = await request.text();
     let query: unknown;
     try {
-      query = JSON.parse(await request.text());
+      query = JSON.parse(text);
     } catch {
       // pi-ai and the AI SDK always send JSON. Over HTTP this would go without the key, so fail loudly instead.
       throw new TypeError(`compatBindingFetch: ${endpoint} body is not JSON`);

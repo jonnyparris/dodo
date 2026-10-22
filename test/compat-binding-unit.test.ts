@@ -99,7 +99,7 @@ describe("compatBindingFetch", () => {
     const reader = res.body!.getReader();
     await reader.read();
     ac.abort();
-    await expect(reader.read()).rejects.toBeDefined();
+    await expect(reader.read()).rejects.toMatchObject({ name: "AbortError" });
     await new Promise((r) => setTimeout(r, 0));
     expect(cancelled).toBe(true);
   });
