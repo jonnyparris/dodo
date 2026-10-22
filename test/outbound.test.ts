@@ -256,11 +256,16 @@ describe("allowlist scopes and method limits", () => {
 
   it("removes an x-dodo-blocked header sent by the upstream", async () => {
     await post({});
-    vi.stubGlobal("fetch", async () => new Response("ok", { headers: { [BLOCKED_HEADER]: "host" } }));
+    vi.stubGlobal("fetch", async () => new Response("ok", { headers: { [BLOCKED_HEADER]: "host", [STRIPPED_HEADERS_HEADER]: "fake" } }));
     const outbound = new AllowlistOutbound(createExecutionContext(), env as Env);
     const res = await outbound.fetch(new Request(`https://${HOST}/x`));
     expect(res.status).toBe(200);
     expect(res.headers.has(BLOCKED_HEADER)).toBe(false);
+    expect(res.headers.has(STRIPPED_HEADERS_HEADER)).toBe(false);
+    // Same on the path that strips credentials.
+    const stripped = await outbound.fetch(new Request(`https://${HOST}/x`, { headers: { authorization: "Bearer x" } }));
+    expect(stripped.headers.has(BLOCKED_HEADER)).toBe(false);
+    expect(stripped.headers.get(STRIPPED_HEADERS_HEADER)).toBe("authorization");
   });
 
   it("a GET/HEAD-only host refuses writes with 405 and forwards reads", async () => {

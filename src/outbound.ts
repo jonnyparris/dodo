@@ -70,6 +70,13 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     const checkResponse = await stub.fetch(
       `https://shared-index/allowlist/check?scope=sandbox&hostname=${encodeURIComponent(hostname)}`,
     );
+    if (!checkResponse.ok) {
+      // Infra failure, not a policy block: no x-dodo-blocked, so the agent may retry.
+      return new Response(JSON.stringify({ error: `Allowlist check failed (HTTP ${checkResponse.status}); try again` }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    }
     const { allowed, allowCredentials, methods } = (await checkResponse.json()) as {
       allowed: boolean;
       allowCredentials?: boolean;
@@ -87,10 +94,11 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     const { request: outboundRequest, stripped } = sanitizeEgressRequest(request, { allowCredentials: allowCredentials === true });
     if (stripped.length === 0) {
       const upstream = await fetch(outboundRequest);
-      if (!upstream.headers.has(BLOCKED_HEADER)) return upstream;
-      // Upstream must not be able to fake a Dodo policy block.
+      if (!upstream.headers.has(BLOCKED_HEADER) && !upstream.headers.has(STRIPPED_HEADERS_HEADER)) return upstream;
+      // Upstream must not be able to fake Dodo's own headers.
       const response = new Response(upstream.body, upstream);
       response.headers.delete(BLOCKED_HEADER);
+      response.headers.delete(STRIPPED_HEADERS_HEADER);
       return response;
     }
 

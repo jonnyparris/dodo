@@ -97,10 +97,19 @@ async function proxyToSharedIndex(env: Env, path: string, init?: RequestInit): P
 const catalogHostnames = new Set(MCP_CATALOG.flatMap((entry) => entry.knownHosts ?? []).map((h) => h.toLowerCase()));
 
 async function isHostAllowed(env: Env, hostname: string): Promise<boolean> {
-  const checkRes = await proxyToSharedIndex(env, `/allowlist/check?scope=mcp&hostname=${encodeURIComponent(hostname)}`);
-  // SharedIndex unreachable: keep the old catalog-only answer rather than 500.
-  if (!checkRes.ok) return catalogHostnames.has(hostname);
-  const checkBody = (await checkRes.json()) as { allowed: boolean; listed?: boolean };
+  let checkBody: { allowed: boolean; listed?: boolean };
+  try {
+    const checkRes = await proxyToSharedIndex(env, `/allowlist/check?scope=mcp&hostname=${encodeURIComponent(hostname)}`);
+    if (!checkRes.ok) throw new Error(`allowlist check HTTP ${checkRes.status}`);
+    checkBody = (await checkRes.json()) as { allowed: boolean; listed?: boolean };
+  } catch (err) {
+    // SharedIndex unavailable: give catalog hosts the answer they always had
+    // before scopes (allowed without a lookup). This skips an admin's
+    // mcp: off during the outage, which is the price of not 500ing OAuth.
+    log("warn", "allowlist check failed", { hostname, error: err instanceof Error ? err.message : String(err) });
+    if (catalogHostnames.has(hostname)) return true;
+    throw err;
+  }
   if (checkBody.allowed) return true;
   // An admin's explicit mcp: off beats the catalog's implicit allow.
   if (checkBody.listed) return false;
