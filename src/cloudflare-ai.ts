@@ -97,6 +97,8 @@ export async function runWithLocalSignal(run: GatewayRun, request: unknown, opti
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => reject(abortReason(signal));
+    // run() may have aborted the signal synchronously; "abort" won't fire again.
+    if (signal.aborted) return onAbort();
     signal.addEventListener("abort", onAbort, { once: true });
   });
   let response: Response;

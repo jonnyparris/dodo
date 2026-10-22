@@ -221,6 +221,9 @@ export function withRateLimitRetry(api: ProviderStreams, fetchOptions?: Paramete
  * `anthropic-messages` api: a turn persisted before this change refers to
  * them as `dodo-gateway/anthropic/…`, and pi-durable resumes it with that
  * ref. Those streams look the model up by id and send the createAI one.
+ *
+ * `opts.idleMs` overrides the stream idle timeout (tests only; default
+ * DEFAULT_STREAM_IDLE_TIMEOUT_MS).
  */
 export function setDodoProvider(
   models: MutableModels,
