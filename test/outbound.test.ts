@@ -12,6 +12,9 @@
  *     injection for raw sandbox `fetch()` is intentionally unavailable so
  *     the sandbox has no direct access to user secrets.
  *
+ * It also checks the sandbox egress policy: MCP catalog hosts must go
+ * through the SharedIndex allowlist like any other host.
+ *
  * The failure mode this guards against: passing a plain `{ fetch: ... }`
  * object cast `as Fetcher` to `DynamicWorkerExecutor`'s `globalOutbound`
  * fails at WorkerCode construction time with:
@@ -20,7 +23,11 @@
  *   the provided value is not of type 'Fetcher'.
  */
 import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:workers";
+import { getSharedIndexStub } from "../src/auth";
 import { OWNER_ID_HEADER } from "../src/outbound";
+import { MCP_CATALOG } from "../src/mcp-catalog";
+import type { Env } from "../src/types";
 
 describe("OWNER_ID_HEADER", () => {
   it("constant is preserved for compatibility / future reuse", () => {
@@ -28,27 +35,31 @@ describe("OWNER_ID_HEADER", () => {
   });
 });
 
-describe("AllowlistOutbound — allowlist still enforced (defence-in-depth)", () => {
-  // Re-implement the catalog-host check so we can verify the perimeter
-  // logic without spinning up the full Workers runtime. Keep this in sync
-  // with src/outbound.ts (drift is caught by integration tests below).
-  function inCatalog(hostname: string, catalog: Set<string>): boolean {
-    return catalog.has(hostname);
-  }
-
-  const catalog = new Set(["api.githubcopilot.com", "browser.mcp.cloudflare.com"]);
-
-  it("catalog hosts bypass the SharedIndex allowlist check", () => {
-    expect(inCatalog("api.githubcopilot.com", catalog)).toBe(true);
-    expect(inCatalog("browser.mcp.cloudflare.com", catalog)).toBe(true);
-  });
-
-  it("non-catalog hosts must go through the allowlist", () => {
-    // This isn't an end-to-end test — it just asserts the catalog short-circuit
-    // is selective. The actual allowlist enforcement is exercised in
-    // shared-index.test.ts and admin.test.ts which spin up the full DO.
-    expect(inCatalog("api.github.com", catalog)).toBe(false);
-    expect(inCatalog("evil.com", catalog)).toBe(false);
+describe("AllowlistOutbound — MCP catalog hosts get no sandbox bypass", () => {
+  // Goes through the real OUTBOUND service binding (the same Fetcher the
+  // codemode sandbox gets as globalOutbound). The test SharedIndex has an
+  // empty allowlist, so a 403 proves no catalog host skips the check.
+  // MCP connections run outside the sandbox (OAuth on the per-user hub
+  // CodingAgent, the rest via HttpMcpClient), so it never needs these.
+  it("returns 403 for every catalog knownHost, OAuth or not", async () => {
+    const e = env as Env;
+    if (!e.OUTBOUND) throw new Error("OUTBOUND binding missing");
+    const hosts = MCP_CATALOG.flatMap((x) => x.knownHosts ?? []);
+    expect(hosts).toContain("browser.mcp.cloudflare.com");
+    // Precondition: none of these hosts is on the admin allowlist, so a 200
+    // can only mean a bypass, not test setup.
+    const list = await getSharedIndexStub(e).fetch("https://shared-index/allowlist");
+    const allowlisted = JSON.stringify(await list.json());
+    for (const host of hosts) expect(allowlisted, host).not.toContain(`"${host}"`);
+    for (const host of hosts) {
+      const res = await e.OUTBOUND.fetch(`https://${host}/mcp`, {
+        method: "POST",
+        headers: { authorization: "Bearer attacker-token" },
+        body: "{}",
+      });
+      expect(res.status, host).toBe(403);
+      expect(await res.text()).toContain("not in allowlist");
+    }
   });
 });
 
