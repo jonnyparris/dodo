@@ -13,6 +13,12 @@ name: dodo-preview
 #   CLOUDFLARE_API_TOKEN — API token with Workers Scripts Write + Workers
 #     Routes Write + Access Apps and Policies Write on the account/zone.
 #   CLOUDFLARE_ACCOUNT_ID — the account id (also set as a var in the config).
+#
+# This workflow triggers on pull_request_target, so GitHub runs THIS file from
+# the base branch (main), not from the pull request. A pull request therefore
+# cannot delete or weaken the guard below, which inspects that same pull
+# request's config. The code and config that get deployed still come from the
+# pull request head (see the Checkout step).
 
 on:
   workflow_dispatch:
@@ -21,7 +27,11 @@ on:
         description: Branch or ref to deploy as preview
         required: true
         default: main
-  pull_request:
+  # pull_request_target, not pull_request. For pull_request_target GitHub runs
+  # this workflow file from the base branch, so the guard below is supplied by
+  # main and cannot be removed by the pull request it checks. The deploy still
+  # builds the head commit (see the Checkout ref).
+  pull_request_target:
     branches:
       - main
     types: [opened, synchronize, reopened]
@@ -30,6 +40,10 @@ jobs:
   deploy-preview:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # pull_request_target exposes repository secrets to fork pull requests, so
+    # only same-repo branches run here. Fork pull requests get no repo secret
+    # and could not deploy anyway.
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
     # The repo's default workflow token is read-only, so the "Comment preview
     # URL on PR" step needs an explicit grant to reach the issues REST
     # endpoints (REST issue comments cover pull requests too).
@@ -81,7 +95,7 @@ jobs:
         # comment failure (token scope, API blip) must not colour the
         # deploy-preview check red - the check reports whether the preview
         # worker deployed.
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         continue-on-error: true
         uses: actions/github-script@v7
         with:
