@@ -257,7 +257,8 @@ export function withModelBudgetStreams(api: ProviderStreams, budget: ModelBudget
   };
 }
 
-export interface DodoProviderHooks {
+/** Options for setDodoProvider: a production hook plus a test seam. */
+export interface DodoProviderOptions {
   /** A main-turn request is waiting for a model-budget slot (UI: "waiting for model capacity"). */
   onBudgetWait?: (info: ModelBudgetWaitInfo) => void;
   /** Overrides the stream idle timeout (tests only; default DEFAULT_STREAM_IDLE_TIMEOUT_MS). */
@@ -277,13 +278,12 @@ export interface DodoProviderHooks {
  * Workers AI models on `openai-completions` also take a slot from the shared
  * per-model budget (model-budget.ts); the createAI leg is Anthropic only.
  */
-
 export function setDodoProvider(
   models: MutableModels,
   modelIds: readonly string[],
   config: GatewayConfig,
   env: Env,
-  opts: DodoProviderHooks = {},
+  opts: DodoProviderOptions = {},
 ): MutableModels {
   const unique = [...new Set(modelIds.filter(Boolean))];
   const rateLimitOptions = {
