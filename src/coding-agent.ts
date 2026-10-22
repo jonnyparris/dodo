@@ -4343,7 +4343,7 @@ export class CodingAgent extends CodingAgentBase {
       },
       modelRef: () => {
         const config = this.piGatewayConfig();
-        return agentModelRef(config.model, config);
+        return agentModelRef(config.model, config, this.env);
       },
       onLoopVerdict: (verdict) => log("warn", "pi: loop guard", { sessionId: this.sessionId(), ...verdict }),
       systemPrompt: () => this.getSystemPrompt(),

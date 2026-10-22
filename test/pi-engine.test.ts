@@ -7,9 +7,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { entriesToMessages, PiEngine, type PiEngineHost } from "../src/pi/engine";
 import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "../src/pi/tools";
-import { agentModelRef, anthropicGatewayBaseUrl, anthropicGatewayStreams, dodoModel, gatewayHeaders, modelCost, setDodoProvider } from "../src/pi/models";
+import { agentModelRef, CREATE_AI_PROVIDER_ID, createAIGatewayId, dodoModel, gatewayHeaders, modelCost, setDodoProvider } from "../src/pi/models";
+import { fakeAIBinding } from "./helpers/fake-ai-binding";
 import { calculateCost, createModels } from "@earendil-works/pi-ai/models";
-import type { StreamOptions } from "@earendil-works/pi-ai";
 
 function host(storage: DurableObjectStorage, faux: ReturnType<typeof fauxProvider>, events: Array<{ type: string; data: unknown }>): PiEngineHost {
   return {
@@ -227,69 +227,59 @@ describe("pi adapters", () => {
     expect(long.total).toBeCloseTo((100_000 * 5 + 1000 * 22.5 + 200_000 * 0.5) / 1e6);
   });
 
-  it("sends Anthropic models on an AI Gateway /compat URL to the native /anthropic endpoint", () => {
+  it("sends catalogued Anthropic models on an AI Gateway /compat URL through createAI", () => {
     const config = { activeGateway: "ai-gateway" as const, opencodeBaseURL: "", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acct/gw/compat/" };
-    expect(anthropicGatewayBaseUrl(config)).toBe("https://gateway.ai.cloudflare.com/v1/acct/gw/anthropic");
-    const m = dodoModel("anthropic/claude-sonnet-4-6", config, {} as never);
+    const env = { AI: fakeAIBinding(() => new Response("")).binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    expect(createAIGatewayId("anthropic/claude-sonnet-4-6", config, env)).toBe("gw");
+    const m = dodoModel("anthropic/claude-sonnet-4-6", config, env);
     expect(m.api).toBe("anthropic-messages");
+    expect(m.provider).toBe(CREATE_AI_PROVIDER_ID);
     expect(m.id).toBe("anthropic/claude-sonnet-4-6");
-    expect(m.baseUrl).toBe("https://gateway.ai.cloudflare.com/v1/acct/gw/anthropic");
+    expect(m.contextWindow).toBe(1_000_000);
     expect(m.cost.cacheRead).toBeCloseTo(0.3);
     expect(m.cost.cacheWrite).toBeCloseTo(3.75);
+    expect(agentModelRef("anthropic/claude-sonnet-4-6", config, env)).toEqual({ provider: CREATE_AI_PROVIDER_ID, modelId: m.id });
     // Non-Anthropic models and the OpenCode gateway keep /compat.
-    expect(dodoModel("@cf/moonshotai/kimi-k2.6", config, {} as never).api).toBe("openai-completions");
-    expect(dodoModel("anthropic/claude-sonnet-4-6", { ...config, activeGateway: "opencode", opencodeBaseURL: "https://oc/compat" }, {} as never).api).toBe("openai-completions");
-    // A custom proxy URL that isn't /compat stays on the OpenAI-compatible path.
-    expect(anthropicGatewayBaseUrl({ ...config, aiGatewayBaseURL: "https://proxy.example/v1" })).toBeUndefined();
-    // So does a custom proxy that merely ends in /compat.
-    expect(anthropicGatewayBaseUrl({ ...config, aiGatewayBaseURL: "https://proxy.example/compat" })).toBeUndefined();
-    expect(dodoModel("anthropic/claude-sonnet-4-6", { ...config, aiGatewayBaseURL: "https://proxy.example/compat" }, {} as never).api).toBe("openai-completions");
-    // The model ref matches the registered id on both paths.
-    expect(agentModelRef("anthropic/claude-sonnet-4-6", config).modelId).toBe(m.id);
-  });
-
-  it("keeps a caller's onPayload result and rewrites the model id after it", async () => {
-    let sent: Record<string, unknown> | undefined;
-    const fake = {
-      stream: (async () => undefined) as never,
-      streamSimple: (async (_m: unknown, _c: unknown, options?: StreamOptions) => {
-        sent = (await options!.onPayload!({ model: "anthropic/claude-sonnet-4-6", max_tokens: 1 }, {} as never)) as Record<string, unknown>;
-      }) as never,
-    };
-    const streams = anthropicGatewayStreams(fake);
-    await streams.streamSimple({} as never, {} as never, {
-      onPayload: (p: unknown) => ({ ...(p as object), metadata: { user_id: "s1" } }),
-    } as never);
-    expect(sent).toEqual({ model: "claude-sonnet-4-6", max_tokens: 1, metadata: { user_id: "s1" } });
+    expect(dodoModel("@cf/moonshotai/kimi-k2.6", config, env).api).toBe("openai-completions");
+    expect(dodoModel("anthropic/claude-sonnet-4-6", { ...config, activeGateway: "opencode", opencodeBaseURL: "https://oc/compat" }, env).api).toBe("openai-completions");
+    // An Anthropic id pi-ai's gateway catalog doesn't list, no binding, or a
+    // URL the binding can't reach: OpenAI-compatible path.
+    expect(createAIGatewayId("anthropic/claude-not-a-model", config, env)).toBeUndefined();
+    expect(dodoModel("anthropic/claude-sonnet-4-6", config, {} as never).api).toBe("openai-completions");
+    expect(dodoModel("anthropic/claude-sonnet-4-6", { ...config, aiGatewayBaseURL: "https://proxy.example/compat" }, env).api).toBe("openai-completions");
+    expect(agentModelRef("anthropic/claude-sonnet-4-6", config, {} as never).provider).toBe("dodo-gateway");
   });
 });
 
-describe("pi gateway wire: native Anthropic on AI Gateway", () => {
+describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  function sse(events: Array<Record<string, unknown>>): Response {
+  function sse(events: Array<Record<string, unknown>>, status = 200): Response {
     const body = events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join("");
-    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    return new Response(body, { status, headers: { "content-type": "text/event-stream" } });
   }
+  const reply = () =>
+    sse([
+      { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", model: "claude-sonnet-4-6", content: [], stop_reason: null, usage: { input_tokens: 12, output_tokens: 1, cache_read_input_tokens: 9000, cache_creation_input_tokens: 500 } } },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hello" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } },
+      { type: "message_stop" },
+    ]);
+  const config = { activeGateway: "ai-gateway" as const, opencodeBaseURL: "", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acct/gw/compat", sessionId: "sess-9" };
 
-  it("uses cf-aig-authorization only, the native model id, cache_control markers, and reports cache usage", async () => {
-    const seen: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
-    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
-      const req = new Request(input, init);
-      seen.push({ url: req.url, headers: req.headers, body: await req.json() });
-      return sse([
-        { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", model: "claude-sonnet-4-6", content: [], stop_reason: null, usage: { input_tokens: 12, output_tokens: 1, cache_read_input_tokens: 9000, cache_creation_input_tokens: 500 } } },
-        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hello" } },
-        { type: "content_block_stop", index: 0 },
-        { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } },
-        { type: "message_stop" },
-      ]);
+  it("calls the AI binding with no gateway key, the native model id, cache_control markers and session metadata, and reports cache usage", async () => {
+    const fetched: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      fetched.push(String(input));
+      return new Response("unexpected", { status: 500 });
     });
-    const config = { activeGateway: "ai-gateway" as const, opencodeBaseURL: "", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acct/gw/compat" };
+    const { binding, calls } = fakeAIBinding(() => reply());
+    const env = { AI: binding, AI_GATEWAY_KEY: "gw-key", CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
     const models = createModels();
-    setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, { AI_GATEWAY_KEY: "gw-key" } as never);
-    const ref = agentModelRef("anthropic/claude-sonnet-4-6", config);
+    setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
+    const ref = agentModelRef("anthropic/claude-sonnet-4-6", config, env);
     const model = models.getModel(ref.provider, ref.modelId)!;
     const res = await models.complete(model, {
       systemPrompt: "You are Dodo.",
@@ -298,26 +288,42 @@ describe("pi gateway wire: native Anthropic on AI Gateway", () => {
     });
     expect(res.errorMessage).toBeUndefined();
     expect(res.stopReason).toBe("stop");
-    expect(seen).toHaveLength(1);
-    const req = seen[0]!;
-    expect(req.url.split("?")[0]).toBe("https://gateway.ai.cloudflare.com/v1/acct/gw/anthropic/v1/messages");
-    expect(req.headers.get("cf-aig-authorization")).toBe("Bearer gw-key");
-    expect(req.headers.get("x-api-key")).toBeNull();
-    expect(req.headers.get("authorization")).toBeNull();
-    expect(req.body.model).toBe("claude-sonnet-4-6");
-    const json = JSON.stringify(req.body);
-    expect(json.match(/"cache_control"/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
-    expect((req.body.system as Array<Record<string, unknown>>).at(-1)?.cache_control).toEqual({ type: "ephemeral" });
-    expect((req.body.tools as Array<Record<string, unknown>>).at(-1)?.cache_control).toEqual({ type: "ephemeral" });
+    expect(fetched).toEqual([]);
+    expect(calls).toHaveLength(1);
+    const c = calls[0]!;
+    expect(c.gatewayId).toBe("gw");
+    expect(c.request.provider).toBe("anthropic");
+    expect(c.request.endpoint).toBe("v1/messages");
+    expect(JSON.stringify(c)).not.toContain("gw-key");
+    expect((c.options.gateway as { metadata?: unknown }).metadata).toEqual({ dodo_session: "sess-9", dodo_role: "main" });
+    const body = c.request.query;
+    expect(body.model).toBe("claude-sonnet-4-6");
+    expect((body.system as Array<Record<string, unknown>>).at(-1)?.cache_control).toMatchObject({ type: "ephemeral" });
+    expect((body.tools as Array<Record<string, unknown>>).at(-1)?.cache_control).toMatchObject({ type: "ephemeral" });
     // Usage: pi-ai splits uncached input from cache reads/writes and prices them.
     expect(res.model).toBe("anthropic/claude-sonnet-4-6");
     expect(res.usage.input).toBe(12);
     expect(res.usage.cacheRead).toBe(9000);
     expect(res.usage.cacheWrite).toBe(500);
-    expect(res.usage.totalTokens).toBe(12 + 5 + 9000 + 500);
     expect(res.usage.cost.cacheRead).toBeCloseTo((9000 * 0.3) / 1e6);
     expect(res.usage.cost.cacheWrite).toBeCloseTo((500 * 3.75) / 1e6);
   });
+
+  it("waits out a 429 from the gateway and resends the binding call", async () => {
+    let n = 0;
+    const { binding, calls } = fakeAIBinding(() =>
+      n++ === 0
+        ? new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }), { status: 429, headers: { "content-type": "application/json", "retry-after": "0" } })
+        : reply(),
+    );
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    const models = createModels();
+    setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
+    const ref = agentModelRef("anthropic/claude-sonnet-4-6", config, env);
+    const res = await models.complete(models.getModel(ref.provider, ref.modelId)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(calls).toHaveLength(2);
+  }, 20_000);
 });
 
 describe("pi gateway wire", () => {
@@ -335,7 +341,7 @@ describe("pi gateway wire", () => {
       const env = { AI_GATEWAY_KEY: "gw-key", OPENCODE_GATEWAY_TOKEN: "oc-token" } as never;
       const models = createModels();
       setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
-      const ref = agentModelRef("anthropic/claude-sonnet-4-6", config);
+      const ref = agentModelRef("anthropic/claude-sonnet-4-6", config, env);
       const model = models.getModel(ref.provider, ref.modelId)!;
       const res = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
       expect(res.stopReason).toBe("error");

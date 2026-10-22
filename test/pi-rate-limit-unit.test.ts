@@ -228,7 +228,7 @@ describe("pi gateway provider + rate limits", () => {
     ]);
     const config = { activeGateway: "ai-gateway" as const, opencodeBaseURL: "", aiGatewayBaseURL: "https://gw.example/v1" };
     const models = setDodoProvider(createModels(), ["@cf/zai-org/glm-4.7-flash"], config, { AI_GATEWAY_KEY: "k" } as unknown as Env);
-    const ref = agentModelRef("@cf/zai-org/glm-4.7-flash", config);
+    const ref = agentModelRef("@cf/zai-org/glm-4.7-flash", config, {} as never);
     const model = models.getModel(ref.provider, ref.modelId)!;
     const message = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, { fetch: base });
     expect(message.stopReason).toBe("stop");
