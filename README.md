@@ -200,7 +200,7 @@ npx wrangler secret put ADMIN_EMAIL             # required
 npx wrangler secret put SECRETS_MASTER_KEY      # recommended: openssl rand -hex 32
 npx wrangler secret put COOKIE_SECRET           # recommended: openssl rand -hex 32
 npx wrangler secret put DODO_MCP_TOKEN          # recommended: openssl rand -base64url 32
-npx wrangler secret put AI_GATEWAY_KEY          # or OPENCODE_GATEWAY_TOKEN
+npx wrangler secret put AI_GATEWAY_KEY          # or OPENCODE_GATEWAY_TOKEN; not needed when the gateway is in this Worker's account (see below)
 
 npm run deploy:safe   # deploy, then run the post-deploy smoke probe
 ```
@@ -334,7 +334,7 @@ Dodo doesn't bundle a model. Set the model and gateway in the UI (Settings) or w
 
 | Gateway | Setup |
 |---|---|
-| **AI Gateway** | Secret `AI_GATEWAY_KEY`, var `AI_GATEWAY_BASE_URL`. Workers AI models (`@cf/…`) go through the same gateway. Anthropic models go through the `AI` binding instead (createAI, no key) when the URL is a gateway in the Worker's own account (`CLOUDFLARE_ACCOUNT_ID`). |
+| **AI Gateway** | Var `AI_GATEWAY_BASE_URL`. When the URL is a gateway in the Worker's own account (`CLOUDFLARE_ACCOUNT_ID`), every model goes through the `AI` binding and needs no key: Anthropic through createAI, everything else to `/compat` through the binding's universal endpoint (`COMPAT_VIA_BINDING=0` sends `/compat` over HTTP with `AI_GATEWAY_KEY` instead). Otherwise secret `AI_GATEWAY_KEY` is the auth. |
 | **OpenCode** | Secret `OPENCODE_GATEWAY_TOKEN`. Models fill in automatically. |
 
 Model ids look like `anthropic/claude-sonnet-4-6` or `@cf/zai-org/glm-5.3-flash`. The picker only offers models the active gateway can route.
@@ -352,7 +352,7 @@ Model ids look like `anthropic/claude-sonnet-4-6` or `@cf/zai-org/glm-5.3-flash`
 | `SECRETS_MASTER_KEY` | Recommended | Encrypts per-user secrets at rest |
 | `COOKIE_SECRET` | Recommended | Signs share-link cookies |
 | `DODO_MCP_TOKEN` | Recommended | Bearer token for `/mcp` |
-| `AI_GATEWAY_KEY` | If using AI Gateway | Gateway auth |
+| `AI_GATEWAY_KEY` | If using an AI Gateway the `AI` binding can't reach (another account), or with `COMPAT_VIA_BINDING=0` | Gateway auth over HTTP |
 | `OPENCODE_GATEWAY_TOKEN` | If using OpenCode | Gateway auth |
 | `REPLICATE_API_TOKEN` | For images | `/generate` and image edits |
 | `CF_ACCESS_AUD` / `CF_ACCESS_TEAM_DOMAIN` | If using Access | Multi-user auth |

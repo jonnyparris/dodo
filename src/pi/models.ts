@@ -13,7 +13,7 @@
 // every Anthropic turn paid full input price for the whole prefix. Those
 // models are registered under createAI's own provider id (`cloudflare`).
 
-import type { Model, ProviderStreams } from "@earendil-works/pi-ai";
+import type { Api, Model, ProviderStreams } from "@earendil-works/pi-ai";
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
@@ -22,7 +22,7 @@ import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { CLOUDFLARE_AI_GATEWAY_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-ai-gateway.models";
 import { CLOUDFLARE_PROVIDER_ID, createAI } from "agents/models/pi-ai";
-import { bindingGatewayId, adaptBindingForCreateAI, gatewayMetadata } from "../cloudflare-ai";
+import { bindingGatewayId, adaptBindingForCreateAI, compatBindingFetch, compatBindingGatewayId, gatewayMetadata } from "../cloudflare-ai";
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
@@ -189,14 +189,31 @@ const GATEWAY_AUTH_HEADERS = new Set(["authorization", "x-api-key", "cf-aig-auth
  * cloudflare-ai-gateway provider does.
  */
 export function gatewayHeaders(config: GatewayConfig, env: Env): Record<string, string | null> {
-  return config.activeGateway === "opencode"
-    ? { "cf-access-token": env.OPENCODE_GATEWAY_TOKEN ?? "", Authorization: null }
-    : {
-        "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
-        "x-api-key": env.AI_GATEWAY_KEY ?? "",
-        ...aigMetadataHeader(config.sessionId, "main"),
-        Authorization: null,
-      };
+  if (config.activeGateway === "opencode") return { "cf-access-token": env.OPENCODE_GATEWAY_TOKEN ?? "", Authorization: null };
+  // Over the binding (withCompatBinding) the binding is the auth: no key.
+  const key: Record<string, string> = compatBindingGatewayId(config, env)
+    ? {}
+    : { "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`, "x-api-key": env.AI_GATEWAY_KEY ?? "" };
+  return { ...key, ...aigMetadataHeader(config.sessionId, "main"), Authorization: null };
+}
+
+/**
+ * Send `/compat` model requests over the `AI` binding instead of HTTP with
+ * AI_GATEWAY_KEY (compatBindingFetch), when the binding reaches the
+ * configured gateway. Sets the request's base fetch, so
+ * withRateLimitRetry (applied inside this) still waits out 429s around it.
+ */
+export function withCompatBinding(api: ProviderStreams, config: GatewayConfig, env: Env): ProviderStreams {
+  const gatewayId = compatBindingGatewayId(config, env);
+  if (!gatewayId) return api;
+  const compatBase = trim(config.aiGatewayBaseURL);
+  const wrap = <O extends { fetch?: typeof fetch } | undefined>(model: Model<Api>, o: O): O =>
+    trim(model.baseUrl) === compatBase ? ({ ...o, fetch: compatBindingFetch(env.AI, gatewayId, compatBase, o?.fetch) } as O) : o;
+  return {
+    ...api,
+    stream: (model, context, options) => api.stream(model, context, wrap(model, options)),
+    streamSimple: (model, context, options) => api.streamSimple(model, context, wrap(model, options)),
+  };
 }
 
 /**
@@ -279,7 +296,7 @@ export function setDodoProvider(
       // Waits out per-minute 429s inside the request (rate-limit-fetch.ts)
       // and fails a request that goes quiet as retryable (stream-idle-timeout.ts).
       api: {
-        "openai-completions": withStreamIdleTimeout(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), idleOptions),
+        "openai-completions": withStreamIdleTimeout(withCompatBinding(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), config, env), idleOptions),
         ...(legacyAnthropic ? { "anthropic-messages": legacyAnthropic } : {}),
       },
     }),

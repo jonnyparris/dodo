@@ -2,7 +2,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createAI } from "agents/models/ai-sdk";
 import { generateText, stepCountIs, wrapLanguageModel, type LanguageModel, type LanguageModelMiddleware, type ModelMessage, type ToolSet } from "ai";
-import { adaptBindingForCreateAI, bindingGatewayId, gatewayMetadata } from "./cloudflare-ai";
+import { adaptBindingForCreateAI, bindingGatewayId, compatBindingFetch, compatBindingGatewayId, gatewayMetadata } from "./cloudflare-ai";
 import type { AgentProfile } from "./agent-profile";
 import {
   EXPLORE_PROFILE,
@@ -463,7 +463,13 @@ export function aigMetadataHeader(sessionId: string | undefined, role: "main" | 
   return sessionId ? { "cf-aig-metadata": JSON.stringify({ dodo_session: sessionId, dodo_role: role }) } : {};
 }
 
-export function resolveWireModelId(modelId: string, _activeGateway: "opencode" | "ai-gateway"): string {
+export function resolveWireModelId(modelId: string, activeGateway: "opencode" | "ai-gateway"): string {
+  // AI Gateway's `/compat` names Google AI Studio `google-ai-studio`:
+  // `google/gemini-2.5-flash` is "Model not found" there, with or without the
+  // key (checked 2026-10-22). OpenCode's gateway is left as it was.
+  if (activeGateway === "ai-gateway" && modelId.startsWith("google/")) {
+    return `google-ai-studio/${modelId.slice("google/".length)}`;
+  }
   // Workers AI models (@cf/…) must be wire-prefixed with `workers-ai/` on
   // BOTH gateways. The AI Gateway and the OpenCode gateway both proxy these
   // via Cloudflare's unified OpenAI-compatible endpoint, which expects the
@@ -497,11 +503,12 @@ export function buildProviderForModel(
     ? `${trimBaseUrl(config.opencodeBaseURL)}`
     : `${trimBaseUrl(config.aiGatewayBaseURL)}`;
 
+  // `/compat` over the `AI` binding needs no AI_GATEWAY_KEY (compatBindingFetch).
+  const compatGatewayId = isOpencode ? undefined : compatBindingGatewayId(config, env);
   const headers: Record<string, string> = isOpencode
     ? { "cf-access-token": env.OPENCODE_GATEWAY_TOKEN ?? "" }
     : {
-        "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
-        "x-api-key": env.AI_GATEWAY_KEY ?? "",
+        ...(compatGatewayId ? {} : { "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`, "x-api-key": env.AI_GATEWAY_KEY ?? "" }),
         // Workers AI prefix caching is per-replica. Without a stable
         // affinity key, consecutive steps of one conversation land on
         // different replicas and re-pay full prefill every step.
@@ -515,6 +522,7 @@ export function buildProviderForModel(
     headers,
     includeUsage: true,
     name: effectiveGateway,
+    ...(compatGatewayId ? { fetch: compatBindingFetch(env.AI, compatGatewayId, baseURL) } : {}),
     transformRequestBody: addAnthropicCacheMarkers,
   });
 

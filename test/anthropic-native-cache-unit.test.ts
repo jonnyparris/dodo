@@ -161,8 +161,10 @@ describe("buildProviderForModel routing", () => {
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     };
     const { binding, calls: bindingCalls } = fakeAIBinding(() => anthropicReply());
+    // COMPAT_VIA_BINDING=0: /compat over HTTP with the key (by default it goes over the binding, see compat-binding-unit.test.ts).
+    const httpEnv = { ...envWith(binding), COMPAT_VIA_BINDING: "0" } as Env;
     let calls = captureFetch(completion);
-    await generateText({ model: buildProviderForModel("@cf/moonshotai/kimi-k2.6", config, envWith(binding)).chatModel("@cf/moonshotai/kimi-k2.6"), prompt: "hi" });
+    await generateText({ model: buildProviderForModel("@cf/moonshotai/kimi-k2.6", config, httpEnv).chatModel("@cf/moonshotai/kimi-k2.6"), prompt: "hi" });
     expect(calls[0].url).toBe("https://gateway.ai.cloudflare.com/v1/acc/gw/compat/chat/completions");
     expect(calls[0].headers.get("cf-aig-authorization")).toBe("Bearer aig-key");
 
