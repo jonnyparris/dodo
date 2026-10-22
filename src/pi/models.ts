@@ -222,7 +222,13 @@ export function withRateLimitRetry(api: ProviderStreams, fetchOptions?: Paramete
  * them as `dodo-gateway/anthropic/…`, and pi-durable resumes it with that
  * ref. Those streams look the model up by id and send the createAI one.
  */
-export function setDodoProvider(models: MutableModels, modelIds: readonly string[], config: GatewayConfig, env: Env): MutableModels {
+export function setDodoProvider(
+  models: MutableModels,
+  modelIds: readonly string[],
+  config: GatewayConfig,
+  env: Env,
+  opts: { idleMs?: number } = {},
+): MutableModels {
   const unique = [...new Set(modelIds.filter(Boolean))];
   const rateLimitOptions = {
     onWait: ({ attempt, delayMs, retryAfter }: { attempt: number; delayMs: number; retryAfter: string | null }) =>
@@ -241,6 +247,7 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       ? ({ ...options, headers: Object.fromEntries(Object.entries(options.headers).filter(([k]) => !GATEWAY_AUTH_HEADERS.has(k.toLowerCase()))) } as O)
       : options;
   const idleOptions = {
+    idleMs: opts.idleMs,
     onTimeout: (info: StreamIdleTimeoutInfo) => log("warn", "pi: model stream idle, failing the request for retry", { sessionId: config.sessionId, ...info }),
   };
   // Every leg fails a request that goes quiet as retryable (stream-idle-timeout.ts).

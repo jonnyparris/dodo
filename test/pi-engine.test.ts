@@ -354,6 +354,22 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("fails a binding stream that goes quiet as a retryable idle timeout, on both refs", async () => {
+    // Headers arrive, then the SSE body never sends anything.
+    const { binding } = fakeAIBinding(
+      () => new Response(new ReadableStream({ start() {} }), { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    const models = createModels();
+    setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env, { idleMs: 50 });
+    const ref = agentModelRef("anthropic/claude-sonnet-4-6", config, env);
+    for (const model of [models.getModel(ref.provider, ref.modelId)!, models.getModel("dodo-gateway", "anthropic/claude-sonnet-4-6")!]) {
+      const res = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+      expect(res.stopReason).toBe("error");
+      expect(res.errorMessage).toMatch(/idle timeout/);
+    }
+  });
+
   it("waits out a 429 from the gateway and resends the binding call", async () => {
     let n = 0;
     const { binding, calls } = fakeAIBinding(() =>

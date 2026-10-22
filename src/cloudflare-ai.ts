@@ -92,12 +92,13 @@ export async function runWithLocalSignal(run: GatewayRun, request: unknown, opti
   if (!signal) return run(request, options);
   const { signal: _dropped, ...rest } = options!;
   if (signal.aborted) throw abortReason(signal);
+  // Start the call first: a synchronous throw then leaves no abort listener behind.
+  const pending = run(request, rest);
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => reject(abortReason(signal));
     signal.addEventListener("abort", onAbort, { once: true });
   });
-  const pending = run(request, rest);
   let response: Response;
   try {
     response = await Promise.race([pending, aborted]);
