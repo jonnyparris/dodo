@@ -1,17 +1,8 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { getSharedIndexStub } from "./auth";
-import { MCP_CATALOG } from "./mcp-catalog";
 import type { Env } from "./types";
 
 export const OWNER_ID_HEADER = "x-dodo-owner-id";
-
-// Catalog knownHosts are implicitly allowed at runtime so codemode fetches
-// to (e.g.) `api.githubcopilot.com` don't require an admin to also add
-// the host to the SharedIndex allowlist. Mirrors the config-time check
-// in src/index.ts:isHostAllowed. (audit follow-up F6)
-const CATALOG_HOSTNAMES = new Set(
-  MCP_CATALOG.flatMap((entry) => entry.knownHosts ?? []).map((h) => h.toLowerCase()),
-);
 
 /**
  * WorkerEntrypoint that intercepts all outbound fetch() calls from sandboxed
@@ -28,6 +19,19 @@ const CATALOG_HOSTNAMES = new Set(
  * tokens resolve in the parent DO via resolveRemoteToken() and are passed
  * directly to isomorphic-git.
  *
+ * MCP catalog hosts get no bypass here. src/index.ts:isHostAllowed lets
+ * catalog knownHosts skip the allowlist when a user adds or edits an MCP
+ * server or starts OAuth. Every MCP connection then runs outside the
+ * sandbox: OAuth through the Agents SDK MCP manager on the per-user hub
+ * CodingAgent, static_headers and refresh_token through HttpMcpClient in
+ * the session DO (or UserControl / ChatMonitorAgent). The sandbox never
+ * talks to an MCP server, so it has no reason to reach those hosts. An earlier bypass did
+ * let it, which meant a prompt-injected script could call, for example,
+ * browser.mcp.cloudflare.com with an attacker's own bearer token and send
+ * workspace data to the attacker's account. That closes one route only:
+ * any host on the SharedIndex allowlist still receives whatever headers
+ * the sandbox sets.
+ *
  * Configured as a self-referencing service binding (OUTBOUND) in wrangler.jsonc
  * and passed as `globalOutbound` to DynamicWorkerExecutor.
  */
@@ -36,22 +40,17 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     const url = new URL(request.url);
     const hostname = url.hostname.toLowerCase();
 
-    // Static catalog hosts are always allowed — admins shouldn't have to
-    // duplicate well-known MCP catalog entries into the SharedIndex
-    // allowlist for runtime sandbox fetches. (audit follow-up F6)
-    if (!CATALOG_HOSTNAMES.has(hostname)) {
-      const stub = getSharedIndexStub(this.env);
-      const checkResponse = await stub.fetch(
-        `https://shared-index/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
-      );
-      const { allowed } = (await checkResponse.json()) as { allowed: boolean };
+    const stub = getSharedIndexStub(this.env);
+    const checkResponse = await stub.fetch(
+      `https://shared-index/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
+    );
+    const { allowed } = (await checkResponse.json()) as { allowed: boolean };
 
-      if (!allowed) {
-        return new Response(
-          JSON.stringify({ error: `Outbound request to ${hostname} blocked — not in allowlist` }),
-          { status: 403, headers: { "content-type": "application/json" } },
-        );
-      }
+    if (!allowed) {
+      return new Response(
+        JSON.stringify({ error: `Outbound request to ${hostname} blocked — not in allowlist` }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      );
     }
 
     // Strip the owner-id header in case any caller still sets it — the

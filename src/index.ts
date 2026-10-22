@@ -89,7 +89,11 @@ async function proxyToSharedIndex(env: Env, path: string, init?: RequestInit): P
   return stub.fetch(`https://shared-index${path}`, init);
 }
 
-/** Catalog knownHosts are implicitly allowed (avoids requiring admin to manually allowlist them). */
+/**
+ * Catalog knownHosts are implicitly allowed at config time only (add/edit an
+ * MCP config, start OAuth). Not exempt for codemode sandbox egress; see
+ * src/outbound.ts.
+ */
 const catalogHostnames = new Set(MCP_CATALOG.flatMap((entry) => entry.knownHosts ?? []).map((h) => h.toLowerCase()));
 
 async function isHostAllowed(env: Env, hostname: string): Promise<boolean> {
