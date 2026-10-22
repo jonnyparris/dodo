@@ -147,11 +147,13 @@ export async function runAsResponse(run: () => Promise<Response>): Promise<Respo
 }
 
 /**
- * The `AI` binding, adapted for createAI: `gateway(id).run` keeps the
- * AbortSignal on this side of the RPC boundary (runWithLocalSignal) and, when
- * `retry` is given, goes through it. createAI never calls `fetch`, so the 429
- * wait in rate-limit-fetch.ts has to sit on the binding instead. Everything
- * else passes through untouched.
+ * The `AI` binding, adapted for createAI: `gateway(id).run` (Anthropic) and
+ * `run` (Workers AI run path) keep the AbortSignal on this side of the RPC
+ * boundary (runWithLocalSignal) and, when `retry` is given, go through it.
+ * `run` also turns a thrown rate limit into a 429 (runAsResponse). createAI
+ * never calls `fetch`, so the 429 wait in rate-limit-fetch.ts has to sit on
+ * the binding instead. `then` and `aiGatewayLogId` read as undefined (on the
+ * stub they'd be remote calls); everything else passes through.
  */
 export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
   // `env.AI` is an RPC stub: every property access, `.bind` and `.call`
