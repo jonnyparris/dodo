@@ -9,6 +9,8 @@ import {
   TASK_PROFILE,
   resolveProfileModel,
 } from "./agent-profile";
+import { log } from "./logger";
+import { withModelBudget } from "./model-budget-fetch";
 import { lookupResultSchema } from "./result-schema-registry";
 import { generateStructured, type StructuredMode } from "./structured-output";
 import type { AppConfig, Env } from "./types";
@@ -516,6 +518,15 @@ export function buildProviderForModel(
     includeUsage: true,
     name: effectiveGateway,
     transformRequestBody: addAnthropicCacheMarkers,
+    // Workers AI models: draw from the per-model budget shared with main
+    // turns, leaving the main-turn reserve alone (src/model-budget.ts).
+    fetch: withModelBudget((input, init) => fetch(input, init), {
+      env,
+      gateway: effectiveGateway,
+      modelId,
+      priority: "subagent",
+      onWait: (info) => log("info", "subagent: waiting for model capacity", { sessionId: sessionAffinity, ...info, waitMs: Math.round(info.waitMs) }),
+    }),
   });
 
   const translate = (m: string) => resolveWireModelId(m, effectiveGateway);

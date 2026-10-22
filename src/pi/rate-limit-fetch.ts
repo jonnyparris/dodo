@@ -19,7 +19,9 @@
 //
 // Worst case: each of the harness's 4 attempts gets its own budget, so a
 // rate limit that never clears fails the turn after about 4 x 60s + 14s
-// of waiting (plus request time) instead of 14s. The wait here is in memory: if the DO is evicted during
+// of waiting (plus request time) instead of 14s. On Workers AI models the
+// shared model budget (src/model-budget-fetch.ts) adds up to 30s per
+// attempt: about 4 x 90s + 14s in all. The wait here is in memory: if the DO is evicted during
 // it, pi-durable's recovery reruns the generation (the fiber heartbeat
 // wakes it), so the cost is a restarted wait, not a stuck turn.
 
@@ -49,7 +51,7 @@ const RETRY_AFTER_JITTER_MS = 1_000;
 // decides (the "429" prefix makes everything else count as transient),
 // plus Workers AI's daily free-allocation wording.
 const DAILY_LIMIT = /daily|per day|\bRPD\b|\bTPD\b|allocation/i;
-function transient(body: string): boolean {
+export function transient(body: string): boolean {
   if (DAILY_LIMIT.test(body)) return false;
   return isRetryableAssistantError({ stopReason: "error", errorMessage: `429 ${body}` } as AssistantMessage);
 }
@@ -60,7 +62,7 @@ function abortError(): Error {
   return error;
 }
 
-function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+export function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(abortError());
     const onAbort = () => {

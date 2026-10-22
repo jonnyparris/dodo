@@ -27,6 +27,7 @@ import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../mode
 import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
 import { log } from "../logger";
+import { type ModelBudgetClient, type ModelBudgetWaitInfo, withModelBudget } from "../model-budget-fetch";
 import { rateLimitFetch, type RateLimitFetchOptions } from "./rate-limit-fetch";
 import { type StreamIdleTimeoutInfo, withStreamIdleTimeout } from "./stream-idle-timeout";
 
@@ -213,6 +214,57 @@ export function withRateLimitRetry(api: ProviderStreams, fetchOptions?: Paramete
 }
 
 /**
+ * Longest one main-turn model request (one harness attempt, with all its
+ * 429 resends) waits for budget slots before sending anyway. With the 60s
+ * 429 wait in rate-limit-fetch.ts that is at most ~90s of waiting per
+ * attempt, inside the 5-minute stream idle timeout; the harness makes up
+ * to 4 attempts per prompt.
+ */
+export const MAIN_BUDGET_MAX_WAIT_MS = 30_000;
+
+export interface ModelBudgetStreamOptions {
+  env: Pick<Env, "SHARED_INDEX" | "MODEL_RPM_LIMITS">;
+  gateway: string;
+  client?: ModelBudgetClient;
+  onWait?: (info: ModelBudgetWaitInfo) => void;
+}
+
+/**
+ * Give every model request a fetch that takes a slot from the shared
+ * per-model budget first (src/model-budget.ts), as a main turn: it may use
+ * the reserve subagents leave free. Must wrap *outside* withRateLimitRetry,
+ * so the 429 resends go through the budget too. `model.name` is the Dodo id.
+ */
+export function withModelBudgetStreams(api: ProviderStreams, budget: ModelBudgetStreamOptions): ProviderStreams {
+  const wrap = <O extends { fetch?: typeof fetch } | undefined>(model: Model<never>, o: O) => ({
+    ...o,
+    fetch: withModelBudget(o?.fetch ?? ((input, init) => fetch(input, init)), {
+      env: budget.env,
+      gateway: budget.gateway,
+      modelId: model.name,
+      priority: "main",
+      client: budget.client,
+      onWait: budget.onWait,
+      maxWaitMs: MAIN_BUDGET_MAX_WAIT_MS,
+      // wrap() runs once per model request, so this is per request incl. resends.
+      maxWaitScope: "total",
+    }),
+  });
+  return {
+    ...api,
+    stream: (model, context, options) => api.stream(model, context, wrap(model as Model<never>, options)),
+    streamSimple: (model, context, options) => api.streamSimple(model, context, wrap(model as Model<never>, options)),
+  };
+}
+
+export interface DodoProviderHooks {
+  /** A main-turn request is waiting for a model-budget slot (UI: "waiting for model capacity"). */
+  onBudgetWait?: (info: ModelBudgetWaitInfo) => void;
+  /** Overrides the stream idle timeout (tests only; default DEFAULT_STREAM_IDLE_TIMEOUT_MS). */
+  idleMs?: number;
+}
+
+/**
  * Install (or replace) the Dodo gateway provider with exactly these models.
  * Models on the createAI leg go into a second provider, `cloudflare`, whose
  * streams are createAI's (no gateway key; auth is the binding).
@@ -222,15 +274,16 @@ export function withRateLimitRetry(api: ProviderStreams, fetchOptions?: Paramete
  * them as `dodo-gateway/anthropic/…`, and pi-durable resumes it with that
  * ref. Those streams look the model up by id and send the createAI one.
  *
- * `opts.idleMs` overrides the stream idle timeout (tests only; default
- * DEFAULT_STREAM_IDLE_TIMEOUT_MS).
+ * Workers AI models on `openai-completions` also take a slot from the shared
+ * per-model budget (model-budget.ts); the createAI leg is Anthropic only.
  */
+
 export function setDodoProvider(
   models: MutableModels,
   modelIds: readonly string[],
   config: GatewayConfig,
   env: Env,
-  opts: { idleMs?: number } = {},
+  opts: DodoProviderHooks = {},
 ): MutableModels {
   const unique = [...new Set(modelIds.filter(Boolean))];
   const rateLimitOptions = {
@@ -249,6 +302,14 @@ export function setDodoProvider(
     options?.headers
       ? ({ ...options, headers: Object.fromEntries(Object.entries(options.headers).filter(([k]) => !GATEWAY_AUTH_HEADERS.has(k.toLowerCase()))) } as O)
       : options;
+  const budget: ModelBudgetStreamOptions = {
+    env,
+    gateway: config.activeGateway,
+    onWait: (info) => {
+      log("info", "pi: waiting for model capacity", { sessionId: config.sessionId, ...info, waitMs: Math.round(info.waitMs) });
+      opts.onBudgetWait?.(info);
+    },
+  };
   const idleOptions = {
     idleMs: opts.idleMs,
     onTimeout: (info: StreamIdleTimeoutInfo) => log("warn", "pi: model stream idle, failing the request for retry", { sessionId: config.sessionId, ...info }),
@@ -279,7 +340,8 @@ export function setDodoProvider(
       // Waits out per-minute 429s inside the request (rate-limit-fetch.ts)
       // and fails a request that goes quiet as retryable (stream-idle-timeout.ts).
       api: {
-        "openai-completions": withStreamIdleTimeout(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), idleOptions),
+        // Workers AI models also take a slot from the shared per-model budget (model-budget.ts).
+        "openai-completions": withStreamIdleTimeout(withModelBudgetStreams(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), budget), idleOptions),
         ...(legacyAnthropic ? { "anthropic-messages": legacyAnthropic } : {}),
       },
     }),
