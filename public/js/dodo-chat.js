@@ -255,6 +255,8 @@ function connectSSE(id){
   eventSource.addEventListener("presence",(e)=>{const data=JSON.parse(e.data);presenceUsers=data.users||[];renderPresence()});
 
   eventSource.addEventListener("needs_input",(e)=>{let d=null;try{d=JSON.parse(e.data)}catch{}renderNeedsInput(d)});
+  // Main turn queued behind the shared per-model Workers AI budget (src/model-budget.ts).
+  eventSource.addEventListener("model_wait",(e)=>{resetSseActivityTimer();let d={};try{d=JSON.parse(e.data)}catch{}const secs=Math.max(1,Math.round((Number(d.waitMs)||0)/1000));if(!$("thinking-indicator"))showThinking();const el=$("thinking-indicator");if(el)el.innerHTML=`Waiting for model capacity (~${secs}s)<span class="thinking-dots"></span>`});
   eventSource.addEventListener("cron_update",()=>{if(typeof loadCron==='function')loadCron()});
   eventSource.addEventListener("queue_update",(e)=>{
     const{queue}=JSON.parse(e.data);

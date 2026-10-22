@@ -49,7 +49,7 @@ const RETRY_AFTER_JITTER_MS = 1_000;
 // decides (the "429" prefix makes everything else count as transient),
 // plus Workers AI's daily free-allocation wording.
 const DAILY_LIMIT = /daily|per day|\bRPD\b|\bTPD\b|allocation/i;
-function transient(body: string): boolean {
+export function transient(body: string): boolean {
   if (DAILY_LIMIT.test(body)) return false;
   return isRetryableAssistantError({ stopReason: "error", errorMessage: `429 ${body}` } as AssistantMessage);
 }
@@ -60,7 +60,7 @@ function abortError(): Error {
   return error;
 }
 
-function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+export function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(abortError());
     const onAbort = () => {

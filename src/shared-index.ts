@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { resolveAdminEmail } from "./auth";
 import { DEFAULT_REPLICATE_IMAGE_MODEL, FALLBACK_MODELS, WORKERS_AI_MODELS } from "./model-catalog";
+import { type BudgetDecision, type BudgetPriority, ModelBudgetBook } from "./model-budget";
 import { hashShareToken } from "./share";
 import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
 import type { AllowlistEntry, Env, SeedRecord } from "./types";
@@ -164,6 +165,8 @@ export function mapReplicateCollectionModel(
  * models cache, and (Phase 2) session shares/permissions.
  */
 export class SharedIndex extends DurableObject<Env> {
+  /** Per-model Workers AI request budget, shared by every session (src/model-budget.ts). In memory. */
+  private readonly modelBudget = new ModelBudgetBook();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -171,6 +174,16 @@ export class SharedIndex extends DurableObject<Env> {
       this.initializeSchema();
       this.seedAdmin();
     });
+  }
+
+  /** RPC: take a model-request slot, or learn how long to wait (src/model-budget-fetch.ts). */
+  modelBudgetAcquire(key: string, rpm: number, priority: BudgetPriority): BudgetDecision {
+    return this.modelBudget.acquire(key, rpm, priority);
+  }
+
+  /** RPC: a model request on `key` got a per-minute 429. */
+  modelBudgetReport429(key: string, rpm: number, retryAfterMs?: number): void {
+    this.modelBudget.report429(key, rpm, retryAfterMs);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -680,6 +693,10 @@ export class SharedIndex extends DurableObject<Env> {
       }
 
       // ─── Admin stats ───
+
+      if (request.method === "GET" && url.pathname === "/model-budget") {
+        return Response.json({ budgets: this.modelBudget.snapshot() });
+      }
 
       if (request.method === "GET" && url.pathname === "/stats") {
         return Response.json(this.getStats());
