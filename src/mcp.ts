@@ -4,6 +4,7 @@ import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, isAdmin, resolveAdminEmail } from "./auth";
 import { chatMonitorIdName, createMonitorSchema } from "./chat-monitor-agent";
 import { log } from "./logger";
+import { isMcpHostRevoked, mcpHostRevokedMessage } from "./mcp-host-scope";
 import { messageLimiter, promptLimiter } from "./rate-limit";
 import { createDraftPrForRun, createGithubRepo, pollVerifyWorkflow, triggerVerifyWorkflow } from "./github-api";
 import { getKnownRepo, listKnownRepos } from "./repos";
@@ -1452,12 +1453,16 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
 
   // --- MCP Config tools ---
 
-  server.tool("add_mcp_config", "Add an MCP integration. Bypasses host allowlist (MCP is trusted).", {
+  // The config tools below skip the host allowlist for unlisted hosts (the
+  // Dodo MCP caller is trusted) but still refuse a host an admin turned
+  // mcp off for: the connect paths would skip it anyway (src/mcp-host-scope.ts).
+  server.tool("add_mcp_config", "Add an MCP integration. Skips the host allowlist (MCP is trusted), except hosts an admin turned mcp off for.", {
     name: z.string().describe("Integration name"),
     url: z.string().url().describe("MCP server URL"),
     authToken: z.string().optional().describe("Bearer token for Authorization header"),
     sessionId: z.string().optional().describe("If provided, only enable for this session"),
   }, async ({ name, url, authToken, sessionId: targetSessionId }) => {
+    if (await isMcpHostRevoked(env, url)) return errorResult({ error: mcpHostRevokedMessage(url) });
     const headers: Record<string, string> = {};
     if (authToken) {
       headers["Authorization"] = `Bearer ${authToken}`;
@@ -1532,6 +1537,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
         .describe("Absolute expiry of the access token in unix seconds. When omitted, the access token is treated as expired and refreshed on first use."),
     },
     async (input) => {
+      if (await isMcpHostRevoked(env, input.url)) return errorResult({ error: mcpHostRevokedMessage(input.url) });
       const res = await userControlFetch(env, "/refresh-token-mcp", {
         body: JSON.stringify(input),
         headers: { "content-type": "application/json" },
@@ -1589,6 +1595,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
       scope: z.string().optional().describe("Optional OAuth scopes to request"),
     },
     async (input) => {
+      if (await isMcpHostRevoked(env, input.mcpUrl)) return errorResult({ error: mcpHostRevokedMessage(input.mcpUrl) });
       const res = await userControlFetch(env, "/oauth-dcr/start", {
         body: JSON.stringify(input),
         headers: { "content-type": "application/json" },

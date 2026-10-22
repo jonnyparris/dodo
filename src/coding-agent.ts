@@ -23,6 +23,7 @@ import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
 import { createModelOverrideStore, type ModelOverrideStore, modelOverridePatch, modelOverrideValueSchema, withModelOverride } from "./session-model-override";
 import { log } from "./logger";
 import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
+import { isMcpHostRevoked, mcpHostRevokedMessage } from "./mcp-host-scope";
 import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
 import { dispatchNotification } from "./notify";
 import { entriesToMessages, PiEngine, type PiUserContent } from "./pi/engine";
@@ -5571,11 +5572,16 @@ export class CodingAgent extends CodingAgentBase {
       const tools = this.mcp.listTools() as unknown;
       const servers = this.getMcpServers().servers as Record<string, { name?: string; server_url?: string } | undefined>;
       if (!Array.isArray(tools)) return [];
+      // Hide tools from servers whose host an admin turned mcp off for.
+      // The SDK keeps the connection (and its OAuth tokens) so turning mcp
+      // back on restores the tools without a new OAuth dance.
+      const revokedServerIds = await this.revokedOAuthServerIds(servers);
       const result: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; serverId: string; displayName?: string }> = [];
       for (const raw of tools) {
         if (!raw || typeof raw !== "object") continue;
         const t = raw as { name?: unknown; serverId?: unknown; description?: unknown; inputSchema?: unknown };
         if (typeof t.name !== "string" || typeof t.serverId !== "string") continue;
+        if (revokedServerIds.has(t.serverId)) continue;
         const server = servers[t.serverId];
         result.push({
           name: t.name,
@@ -5592,6 +5598,15 @@ export class CodingAgent extends CodingAgentBase {
     }
   }
 
+  /** OAuth hub server ids whose host has mcp turned off in the allowlist. */
+  private async revokedOAuthServerIds(
+    servers: Record<string, { server_url?: string } | undefined>,
+  ): Promise<Set<string>> {
+    const entries = Object.entries(servers).filter(([, s]) => typeof s?.server_url === "string");
+    const flags = await Promise.all(entries.map(([, s]) => isMcpHostRevoked(this.env, s!.server_url!)));
+    return new Set(entries.filter((_, i) => flags[i]).map(([id]) => id));
+  }
+
   /**
    * RPC: invoke an OAuth-connected MCP tool.
    *
@@ -5599,6 +5614,10 @@ export class CodingAgent extends CodingAgentBase {
    * credentials (which live only in the per-user hub DO) are applied.
    */
   async callOAuthTool(serverId: string, toolName: string, args: unknown): Promise<unknown> {
+    const server = (this.getMcpServers().servers as Record<string, { server_url?: string } | undefined>)[serverId];
+    if (server?.server_url && (await isMcpHostRevoked(this.env, server.server_url))) {
+      throw new Error(mcpHostRevokedMessage(server.server_url));
+    }
     return this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
   }
 
@@ -5703,12 +5722,39 @@ export class CodingAgent extends CodingAgentBase {
       // federated through the per-user hub DO and never connected from
       // session DOs directly. `refresh_token` is connected here with a
       // bearer header sourced from UserControl, which owns the refresh.
-      const enabled = configs.filter((c) => {
+      const candidates = configs.filter((c) => {
         if (!c.enabled || c.type !== "http" || !c.url) return false;
         if (c.auth_type === "oauth") return false;
         if (c.id === "browser-rendering" && !browserEnabled) return false;
         return true;
       });
+
+      // An admin's explicit `mcp: off` on a host revokes configs that point
+      // at it, not just new adds/edits (src/mcp-host-scope.ts). Checked on
+      // every call (cached 30s per isolate) and kept out of the fingerprint
+      // below, so a revocation rebuilds the gatekeepers instead of waiting
+      // for the 5-minute TTL.
+      const revokedFlags = await Promise.all(candidates.map((c) => isMcpHostRevoked(this.env, c.url!)));
+      const revoked = candidates.filter((_, i) => revokedFlags[i]);
+      const enabled = candidates.filter((_, i) => !revokedFlags[i]);
+      const recordRevoked = () => {
+        for (const c of revoked) {
+          this.mcpStatus.set(c.id, {
+            name: c.name,
+            url: c.url,
+            ok: false,
+            error: mcpHostRevokedMessage(c.url!),
+            lastCheckedAt: Date.now(),
+          });
+        }
+      };
+      if (revoked.length > 0) {
+        log("info", "mcp configs skipped: host has mcp off", {
+          sessionId,
+          mcpIds: revoked.map((c) => c.id),
+        });
+      }
+
       if (enabled.length === 0) {
         // Edge: previously connected, now everything is disabled. Drop the
         // old gatekeepers — leaving stale `mcpGatekeepers` would surface
@@ -5718,8 +5764,9 @@ export class CodingAgent extends CodingAgentBase {
             try { gk.disconnect(); } catch { /* best effort */ }
           }
           this.mcpGatekeepers = [];
-          this.mcpStatus.clear();
         }
+        this.mcpStatus.clear();
+        recordRevoked();
         this.mcpConnectedAt = 0;
         this.mcpEnabledConfigsFingerprint = "";
         return;
@@ -5760,6 +5807,7 @@ export class CodingAgent extends CodingAgentBase {
       }
       this.mcpGatekeepers = [];
       this.mcpStatus.clear();
+      recordRevoked();
 
       // Helper: ask UserControl for a current access token. UserControl
       // refreshes if expired (serialised by per-user DO single-threading).
