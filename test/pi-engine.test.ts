@@ -332,8 +332,10 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     expect(models.getModel(CREATE_AI_PROVIDER_ID, "anthropic/claude-sonnet-4-6")).toBeDefined();
     setDodoProvider(models, ["@cf/moonshotai/kimi-k2.6"], config, env);
     expect(models.getModel(CREATE_AI_PROVIDER_ID, "anthropic/claude-sonnet-4-6")).toBeUndefined();
-    // No binding route at all: the provider goes.
-    setDodoProvider(models, ["@cf/moonshotai/kimi-k2.6"], config, {} as never);
+    // Only the /compat drain entry for @cf/ refs is left (see the run-path tests).
+    expect(models.getModel(CREATE_AI_PROVIDER_ID, "@cf/moonshotai/kimi-k2.6")?.api).toBe("openai-completions");
+    // Nothing that could have a cloudflare/ ref: the provider goes.
+    setDodoProvider(models, ["openai/gpt-5.4"], config, env);
     expect(models.getModel(CREATE_AI_PROVIDER_ID, "@cf/moonshotai/kimi-k2.6")).toBeUndefined();
   });
 
@@ -491,20 +493,36 @@ describe("pi gateway wire: Workers AI through createAI's run path (WORKERS_AI_VI
     expect(runCalls).toHaveLength(2);
   }, 20_000);
 
-  it("keeps a run-path entry with the flag off, so a turn that started on the run path resumes", async () => {
-    const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
-    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
-    const models = createModels();
-    setDodoProvider(models, [KIMI], config, env);
-    // New turns: /compat.
-    expect(agentModelRef(KIMI, config, env)).toEqual({ provider: "dodo-gateway", modelId: `workers-ai/${KIMI}` });
-    // A persisted `cloudflare/@cf/…` ref still resolves and runs on the binding.
-    const persisted = models.getModel(CREATE_AI_PROVIDER_ID, KIMI);
-    expect(persisted?.api).toBe(WORKERS_AI_API);
-    const res = await models.complete(persisted!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
-    expect(res.errorMessage).toBeUndefined();
-    expect(runCalls).toHaveLength(1);
-  });
+  for (const [label, env] of [
+    ["the flag is off", { CLOUDFLARE_ACCOUNT_ID: "acct" }],
+    ["the binding can't reach the gateway", { WORKERS_AI_VIA_BINDING: "1" }],
+  ] as const) {
+    it(`resumes a persisted cloudflare/@cf/ ref on /compat when ${label}`, async () => {
+      const seen: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = new Request(input, init);
+        seen.push({ url: req.url, headers: req.headers, body: (await req.json()) as Record<string, unknown> });
+        return reply();
+      });
+      const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+      const e = { AI: binding, AI_GATEWAY_KEY: "gw-key", ...env } as never;
+      const models = createModels();
+      setDodoProvider(models, [KIMI], config, e);
+      // New turns: /compat.
+      expect(agentModelRef(KIMI, config, e)).toEqual({ provider: "dodo-gateway", modelId: `workers-ai/${KIMI}` });
+      // A turn that started on the run path still resolves, and goes to /compat.
+      const persisted = models.getModel(CREATE_AI_PROVIDER_ID, KIMI);
+      expect(persisted).toBeDefined();
+      const res = await models.complete(persisted!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+      expect(res.errorMessage).toBeUndefined();
+      expect(runCalls).toHaveLength(0);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.url).toBe(`${config.aiGatewayBaseURL}/chat/completions`);
+      expect(seen[0]!.body.model).toBe(`workers-ai/${KIMI}`);
+      expect(seen[0]!.headers.get("cf-aig-authorization")).toBe("Bearer gw-key");
+      expect(seen[0]!.headers.get("authorization")).toBeNull();
+    });
+  }
 
   it("waits out a rate limit the binding throws (AiError 3021) instead of returning", async () => {
     let n = 0;

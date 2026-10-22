@@ -301,15 +301,15 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       log("warn", "pi: model rate limited, waiting", { sessionId: config.sessionId, attempt, delayMs: Math.round(delayMs), retryAfter }),
   };
   const viaCreateAI = unique.filter((id) => createAIGatewayId(id, config, env) !== undefined);
-  // `@cf/` ids with the flag off still get a run-path entry under
-  // `cloudflare` when the binding can reach the gateway, so a turn that
-  // started on the run path (ref `cloudflare/@cf/…`) resumes after the flag
-  // is turned off. New turns use `dodo-gateway` (agentModelRef).
+  // `@cf/` ids not on the run path (flag off, or the binding can't reach the
+  // gateway) still get an entry under `cloudflare`, so a turn that started
+  // on the run path (ref `cloudflare/@cf/…`) resumes after a rollback. That
+  // entry is a /compat model: turning the flag off moves in-flight turns
+  // back to /compat too. New turns use `dodo-gateway` (agentModelRef).
   const draining = unique.filter((id) => id.startsWith("@cf/") && !viaCreateAI.includes(id));
-  const drainGatewayId = draining.length > 0 ? bindingGatewayId(config, env) : undefined;
-  const gatewayId = viaCreateAI.length > 0 ? createAIGatewayId(viaCreateAI[0], config, env) : drainGatewayId;
+  const gatewayId = viaCreateAI.length > 0 ? createAIGatewayId(viaCreateAI[0], config, env) : undefined;
   const createAIModels = viaCreateAI.map((id) => dodoModel(id, config, env) as Model<"anthropic-messages"> | Model<WorkersAIApi>);
-  const drainModels = gatewayId && drainGatewayId ? draining.map((id) => workersAIModel(id, gatewayId, env)) : [];
+  const drainModels = draining.map((id): Model<"openai-completions"> => ({ ...compatModel(id, config), id, provider: CREATE_AI_PROVIDER_ID }));
   // Anthropic createAI models are also listed under dodo-gateway (legacy
   // refs, see below). `@cf/` ones are not: their old ref is
   // `dodo-gateway/workers-ai/@cf/…` on openai-completions, so they stay in
@@ -330,6 +330,16 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
   // Every leg fails a request that goes quiet as retryable (stream-idle-timeout.ts).
   const createAIStreams: ProviderStreams | undefined =
     ai && withStreamIdleTimeout(withWorkersAIMaxTokens({ stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams), idleOptions);
+  const compatStreams = withStreamIdleTimeout(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), idleOptions);
+  // Drained `cloudflare/@cf/…` refs: send the /compat model (wire id
+  // `workers-ai/@cf/…`) with the gateway auth the `cloudflare` provider
+  // doesn't resolve.
+  const drainAuth = <O extends { headers?: Record<string, string | null>; apiKey?: string } | undefined>(options: O): O =>
+    ({ ...options, apiKey: "unused", headers: { ...options?.headers, ...gatewayHeaders(config, env) } }) as O;
+  const drainStreams: ProviderStreams = {
+    stream: (model, context, options) => compatStreams.stream(compatModel(model.id, config), context, drainAuth(options)),
+    streamSimple: (model, context, options) => compatStreams.streamSimple(compatModel(model.id, config), context, drainAuth(options)),
+  };
   const legacyAnthropic: ProviderStreams | undefined = createAIStreams && {
     stream: (model, context, options) => createAIStreams.stream(byId.get(model.id) ?? model, context, keyless(options)),
     streamSimple: (model, context, options) => createAIStreams.streamSimple(byId.get(model.id) ?? model, context, keyless(options)),
@@ -355,12 +365,12 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       // Waits out per-minute 429s inside the request (rate-limit-fetch.ts)
       // and fails a request that goes quiet as retryable (stream-idle-timeout.ts).
       api: {
-        "openai-completions": withStreamIdleTimeout(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), idleOptions),
+        "openai-completions": compatStreams,
         ...(legacyAnthropic ? { "anthropic-messages": legacyAnthropic } : {}),
       },
     }),
   );
-  if (!ai) {
+  if (!ai && drainModels.length === 0) {
     // Nothing on the createAI leg now: drop a provider an earlier config installed.
     models.deleteProvider(CREATE_AI_PROVIDER_ID);
     return models;
@@ -371,7 +381,10 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       name: "Cloudflare AI (binding)",
       auth: { apiKey: { name: "Cloudflare AI (binding)", resolve: async () => ({ auth: {} }) } },
       models: [...createAIModels, ...drainModels],
-      api: { "anthropic-messages": createAIStreams as ProviderStreams, [WORKERS_AI_API]: createAIStreams as ProviderStreams },
+      api: {
+        ...(createAIStreams ? { "anthropic-messages": createAIStreams, [WORKERS_AI_API]: createAIStreams } : {}),
+        "openai-completions": drainStreams,
+      },
     }),
   );
   return models;
