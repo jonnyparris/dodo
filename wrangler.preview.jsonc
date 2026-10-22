@@ -60,10 +60,19 @@
       "new_sqlite_classes": ["ChatMonitorAgent"]
     }
   ],
-  // No r2_buckets on purpose: the preview worker must never be bound to the
-  // production buckets (dodo-workspaces / dodo-fork-snapshots). Every branch
-  // deployed here runs unreviewed code, so it gets no production storage.
+  // The preview worker must never be bound to the production buckets
+  // (dodo-workspaces / dodo-fork-snapshots). Every branch deployed here runs
+  // unreviewed code, so it gets no production storage.
   // See .github/workflows/dodo-preview.yml, which refuses such a deploy.
+  //
+  // FORK_SNAPSHOTS points at a preview-only bucket so fork / seed / bench
+  // flows work on preview. Crons are off here, so the 1-hour TTL sweep in
+  // UserControl never runs; the bucket has an R2 lifecycle rule that
+  // deletes objects after 1 day instead. WORKSPACE_BUCKET stays unbound
+  // (attachments degrade to null on preview).
+  "r2_buckets": [
+    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-preview-fork-snapshots" }
+  ],
   "browser": {
     "binding": "BROWSER"
   },
