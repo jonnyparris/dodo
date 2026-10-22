@@ -150,6 +150,27 @@ describe("PUT /session/:id/model-override", () => {
     expect((await json<Session>(await call(`/session/${id}`))).model).toBe(config.model);
   });
 
+  it("session details report the override's model and context window before the next prompt", async () => {
+    type Details = Session & { contextWindow: number; contextBudget: number };
+    const id = await newSession();
+
+    // Fresh session, no prompt yet: the override still decides the model.
+    await send(`/session/${id}/model-override`, { model: "anthropic/claude-sonnet-4-6", exploreModel: "anthropic/claude-haiku-4-5" }, "PUT");
+    let s = await json<Details>(await call(`/session/${id}`));
+    expect(s.model).toBe("anthropic/claude-sonnet-4-6");
+    expect(s.exploreModel).toBe("anthropic/claude-haiku-4-5");
+    expect(s.contextWindow).toBe(1_000_000);
+    expect(s.contextBudget).toBe(800_000);
+
+    // After a prompt configured the session, a later PUT shows straight away.
+    const p = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "hi" }));
+    await waitForPrompt(id, p.promptId);
+    await send(`/session/${id}/model-override`, { model: "anthropic/claude-haiku-4-5" }, "PUT");
+    s = await json<Details>(await call(`/session/${id}`));
+    expect(s.model).toBe("anthropic/claude-haiku-4-5");
+    expect(s.contextWindow).toBe(200_000);
+  });
+
   it("rejects bad bodies and guests", async () => {
     const id = await newSession();
     expect((await send(`/session/${id}/model-override`, { model: "bad id" }, "PUT")).status).toBe(400);

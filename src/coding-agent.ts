@@ -5046,9 +5046,16 @@ export class CodingAgent extends CodingAgentBase {
     const totalTokenInput = Number(metaTotals?.total_in ?? 0);
     const totalTokenOutput = Number(metaTotals?.total_out ?? 0);
 
-    // Context window info
+    // Context window info. Report the model the next prompt will run on:
+    // the session override wins (it can be set with PUT /model-override
+    // after the last prompt configured the session), then the model the
+    // last prompt configured, then the Worker default. Same order as
+    // ensureThinkConfig / readAppConfig.
     const config = this.getConfig();
-    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const modelOverride = this.modelOverride.read();
+    const modelId = modelOverride.model ?? config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const exploreModel = modelOverride.exploreModel ?? config?.exploreModel;
+    const taskModel = modelOverride.taskModel ?? config?.taskModel;
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
     // Use latest assistant turn's input tokens as the best proxy for current context size
@@ -5069,7 +5076,6 @@ export class CodingAgent extends CodingAgentBase {
     const compactionCount = onPi
       ? parseInt(this.readMetadata("pi_compactions") ?? "0", 10) || 0
       : thinkSid ? this.sessions.compactionCount(thinkSid) : 0;
-    const modelOverride = this.modelOverride.read();
 
     return {
       activePromptId,
@@ -5087,8 +5093,8 @@ export class CodingAgent extends CodingAgentBase {
       totalTokenInput,
       totalTokenOutput,
       updatedAt,
-      ...(config?.exploreModel ? { exploreModel: config.exploreModel } : {}),
-      ...(config?.taskModel ? { taskModel: config.taskModel } : {}),
+      ...(exploreModel ? { exploreModel } : {}),
+      ...(taskModel ? { taskModel } : {}),
       ...(Object.keys(modelOverride).length > 0 ? { modelOverride } : {}),
     };
   }

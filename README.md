@@ -337,7 +337,7 @@ Dodo doesn't bundle a model. Set the model and gateway in the UI (Settings) or w
 | **AI Gateway** | Secret `AI_GATEWAY_KEY`, var `AI_GATEWAY_BASE_URL`. Workers AI models (`@cf/…`) go through the same gateway. |
 | **OpenCode** | Secret `OPENCODE_GATEWAY_TOKEN`. Models fill in automatically. |
 
-Model ids look like `anthropic/claude-sonnet-4` or `@cf/zai-org/glm-5.3-flash`. The picker only offers models the active gateway can route.
+Model ids look like `anthropic/claude-sonnet-4-6` or `@cf/zai-org/glm-5.3-flash`. The picker only offers models the active gateway can route.
 
 **Verified on pi-durable:** GLM 5.3 Flash (the default, with vision), Kimi K2.6 and Gemma on Workers AI. **Known issue:** tool calls on the text-only Workers AI models `gpt-oss-120b` and `qwen2.5-coder-32b` fail with a 400 (they reject array user content).
 
