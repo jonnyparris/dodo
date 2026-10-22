@@ -401,11 +401,12 @@ export function addAnthropicCacheOptions(params: LanguageModelV3CallOptions): La
     const partMarked = parts?.some((p) => hasAnthropicCache(p?.providerOptions)) ?? false;
     if (!hasAnthropicCache(msg.providerOptions) && !partMarked) {
       // A message-level breakpoint lands on the last part, and reasoning
-      // parts can't carry one; mark the last part that can instead.
+      // parts can't carry one; mark the last part that can instead. The
+      // trailing reasoning is then re-sent uncached, which is the best
+      // Anthropic allows.
       let cacheable = -1;
       for (let i = (parts?.length ?? 0) - 1; i >= 0; i--) {
-        const type = parts![i]?.type;
-        if (type !== "reasoning" && type !== "redacted-reasoning") {
+        if (parts![i]?.type !== "reasoning") {
           cacheable = i;
           break;
         }

@@ -312,7 +312,7 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
 
   it("still resolves a pre-createAI dodo-gateway/anthropic ref (persisted turn) and sends it through the binding", async () => {
     const { binding, calls } = fakeAIBinding(() => reply());
-    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    const env = { AI: binding, AI_GATEWAY_KEY: "gw-key", CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
     const models = createModels();
     setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
     const legacy = models.getModel("dodo-gateway", "anthropic/claude-sonnet-4-6");
@@ -321,6 +321,8 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     expect(res.errorMessage).toBeUndefined();
     expect(calls).toHaveLength(1);
     expect(calls[0]!.request.query.model).toBe("claude-sonnet-4-6");
+    // The dodo-gateway auth headers (gateway key) never reach the binding call.
+    expect(JSON.stringify(calls[0])).not.toContain("gw-key");
   });
 
   it("drops the createAI provider when the config no longer uses it", () => {

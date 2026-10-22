@@ -178,6 +178,9 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
   };
 }
 
+/** Headers gatewayHeaders() can add, which the createAI leg must never send. */
+const GATEWAY_AUTH_HEADERS = new Set(["authorization", "x-api-key", "cf-aig-authorization", "cf-aig-metadata", "cf-access-token"]);
+
 /**
  * Gateway auth headers. `Authorization: null` stops the OpenAI client from
  * sending its placeholder bearer token, which AI Gateway would otherwise
@@ -230,9 +233,15 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
   const createAIModels = viaCreateAI.map((id) => dodoModel(id, config, env) as Model<"anthropic-messages">);
   const ai = gatewayId ? createAIFor(config, env, gatewayId, rateLimitOptions) : undefined;
   const byId = new Map(createAIModels.map((m) => [m.id, m]));
+  // The dodo-gateway auth resolver adds the gateway key headers to every
+  // call; createAI would forward them as extra headers. Drop them here.
+  const keyless = <O extends { headers?: Record<string, string | null> } | undefined>(options: O): O =>
+    options?.headers
+      ? ({ ...options, headers: Object.fromEntries(Object.entries(options.headers).filter(([k]) => !GATEWAY_AUTH_HEADERS.has(k.toLowerCase()))) } as O)
+      : options;
   const legacyAnthropic: ProviderStreams | undefined = ai && {
-    stream: (model, context, options) => ai.stream(byId.get(model.id) ?? model, context, options),
-    streamSimple: (model, context, options) => ai.streamSimple(byId.get(model.id) ?? model, context, options),
+    stream: (model, context, options) => ai.stream(byId.get(model.id) ?? model, context, keyless(options)),
+    streamSimple: (model, context, options) => ai.streamSimple(byId.get(model.id) ?? model, context, keyless(options)),
   };
   models.setProvider(
     createProvider({

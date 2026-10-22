@@ -16,7 +16,10 @@
 // `env.AI.run` or OpenAI to the Responses wire changes behaviour that needs
 // its own live A/B first.
 
+import { log } from "./logger";
 import type { Env } from "./types";
+
+let warnedAccount = false;
 
 export interface GatewayRouteConfig {
   activeGateway: "opencode" | "ai-gateway";
@@ -45,7 +48,16 @@ export function bindingGatewayId(config: GatewayRouteConfig, env: Pick<Env, "AI"
   const match = /^\/v1\/([^/]+)\/([^/]+)\/compat$/.exec(path);
   if (!match) return undefined;
   const [, accountId, gatewayId] = match;
-  if (!env.CLOUDFLARE_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID !== accountId) return undefined;
+  if (env.CLOUDFLARE_ACCOUNT_ID?.trim() !== accountId) {
+    if (!warnedAccount) {
+      warnedAccount = true;
+      log("warn", "createAI: CLOUDFLARE_ACCOUNT_ID is unset or doesn't match AI_GATEWAY_BASE_URL; Anthropic stays on /compat (no prompt caching)", {
+        gatewayAccount: accountId,
+        accountSet: !!env.CLOUDFLARE_ACCOUNT_ID,
+      });
+    }
+    return undefined;
+  }
   return gatewayId;
 }
 
