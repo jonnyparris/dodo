@@ -150,6 +150,49 @@ describe("PUT /session/:id/model-override", () => {
     expect((await json<Session>(await call(`/session/${id}`))).model).toBe(config.model);
   });
 
+  it("session details show the models the next prompt runs on, from the PUT onwards", async () => {
+    type Details = Session & { contextWindow: number; contextBudget: number };
+    const before = await json<{ model: string; exploreModel?: string; taskModel?: string }>(await call("/api/config"));
+    const owner = { model: "anthropic/claude-haiku-4-5", exploreModel: "@cf/test/owner-explore", taskModel: "@cf/test/owner-task" };
+    await send("/api/config", owner, "PUT");
+    try {
+      // Fresh session, no prompt: the owner's model, not the Worker default.
+      const id = await newSession();
+      let s = await json<Details>(await call(`/session/${id}`));
+      expect(s.model).toBe(owner.model);
+      expect(s.contextWindow).toBe(200_000);
+
+      // Fresh session, override set with PUT: shows straight away.
+      await send(`/session/${id}/model-override`, { model: "anthropic/claude-sonnet-4-6", exploreModel: "@cf/test/explore-b" }, "PUT");
+      s = await json<Details>(await call(`/session/${id}`));
+      expect(s.model).toBe("anthropic/claude-sonnet-4-6");
+      expect(s.exploreModel).toBe("@cf/test/explore-b");
+      expect(s.taskModel).toBe(owner.taskModel);
+      expect(s.contextWindow).toBe(1_000_000);
+      expect(s.contextBudget).toBe(800_000);
+
+      // After a prompt ran on the override, clearing it goes back to the
+      // owner's models at once, not the cleared override the config held.
+      const p = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "hi" }));
+      await waitForPrompt(id, p.promptId);
+      expect((await json<Details>(await call(`/session/${id}`))).model).toBe("anthropic/claude-sonnet-4-6");
+      await send(`/session/${id}/model-override`, { model: "", exploreModel: "" }, "PUT");
+      s = await json<Details>(await call(`/session/${id}`));
+      expect(s.modelOverride).toBeUndefined();
+      expect(s.model).toBe(owner.model);
+      expect(s.exploreModel).toBe(owner.exploreModel);
+      expect(s.contextWindow).toBe(200_000);
+
+      // The session config itself moved too (pi and goal auto-continue turns read it).
+      const stub = await getAgentByName(typedEnv.CODING_AGENT as never, id);
+      const cfg = await inDO<{ model: string; exploreModel?: string }>(stub, async (agent) => agent.getConfig());
+      expect(cfg.model).toBe(owner.model);
+      expect(cfg.exploreModel).toBe(owner.exploreModel);
+    } finally {
+      await send("/api/config", { model: before.model, exploreModel: before.exploreModel ?? "", taskModel: before.taskModel ?? "" }, "PUT");
+    }
+  });
+
   it("rejects bad bodies and guests", async () => {
     const id = await newSession();
     expect((await send(`/session/${id}/model-override`, { model: "bad id" }, "PUT")).status).toBe(400);

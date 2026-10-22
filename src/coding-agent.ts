@@ -1394,6 +1394,11 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       if (request.method === "GET" && url.pathname === "/") {
+        // No prompt yet: load the owner's config so the details show the
+        // owner's model, not the Worker default. Only when the session has
+        // no config: a later change to the owner's config shows from the
+        // next prompt.
+        if (!this.getConfig()) await this.refreshConfigFromOwner();
         return Response.json(this.readSessionDetails());
       }
 
@@ -5046,9 +5051,17 @@ export class CodingAgent extends CodingAgentBase {
     const totalTokenInput = Number(metaTotals?.total_in ?? 0);
     const totalTokenOutput = Number(metaTotals?.total_out ?? 0);
 
-    // Context window info
+    // Context window info. The session config holds the models the current
+    // (or last) prompt runs on. A session override set while a prompt runs
+    // only applies from the next prompt, so it shows once the session is
+    // idle; PUT /model-override refreshes the config when idle. (Clearing
+    // an override mid-run shows the owner's model from the next prompt.)
     const config = this.getConfig();
-    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const modelOverride = this.modelOverride.read();
+    const pending = status === "running" ? {} : modelOverride;
+    const modelId = pending.model ?? config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const exploreModel = pending.exploreModel ?? config?.exploreModel;
+    const taskModel = pending.taskModel ?? config?.taskModel;
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
     // Use latest assistant turn's input tokens as the best proxy for current context size
@@ -5069,7 +5082,6 @@ export class CodingAgent extends CodingAgentBase {
     const compactionCount = onPi
       ? parseInt(this.readMetadata("pi_compactions") ?? "0", 10) || 0
       : thinkSid ? this.sessions.compactionCount(thinkSid) : 0;
-    const modelOverride = this.modelOverride.read();
 
     return {
       activePromptId,
@@ -5087,8 +5099,8 @@ export class CodingAgent extends CodingAgentBase {
       totalTokenInput,
       totalTokenOutput,
       updatedAt,
-      ...(config?.exploreModel ? { exploreModel: config.exploreModel } : {}),
-      ...(config?.taskModel ? { taskModel: config.taskModel } : {}),
+      ...(exploreModel ? { exploreModel } : {}),
+      ...(taskModel ? { taskModel } : {}),
       ...(Object.keys(modelOverride).length > 0 ? { modelOverride } : {}),
     };
   }
@@ -5893,6 +5905,7 @@ export class CodingAgent extends CodingAgentBase {
     }
     const stub = getUserControlStub(this.env, ownerEmail);
     const response = await stub.fetch("https://user-control/config");
+    if (!response.ok) throw new Error(`UserControl /config returned ${response.status}`);
     const appConfig = (await response.json()) as AppConfig;
 
     const existing = this.getConfig();
@@ -5902,12 +5915,17 @@ export class CodingAgent extends CodingAgentBase {
       ownerEmail,
       createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
       browserEnabled: this.browserEnabled(),
-      activeGateway: existing?.activeGateway ?? appConfig.activeGateway,
+      // Model and gateway both from the owner's live config, so they stay a
+      // routable pair. Not existing.model: that can be an override the owner
+      // has since cleared. Every route sends the owner's config as x-dodo-*
+      // headers anyway, so for a prompt that came through a route they agree.
+      activeGateway: appConfig.activeGateway ?? existing?.activeGateway,
       gitAuthorEmail: appConfig.gitAuthorEmail,
       gitAuthorName: appConfig.gitAuthorName,
-      model: override.model ?? existing?.model ?? appConfig.model,
-      opencodeBaseURL: existing?.opencodeBaseURL ?? appConfig.opencodeBaseURL,
-      aiGatewayBaseURL: existing?.aiGatewayBaseURL ?? appConfig.aiGatewayBaseURL,
+      model: override.model ?? appConfig.model,
+      opencodeBaseURL: appConfig.opencodeBaseURL ?? existing?.opencodeBaseURL,
+      aiGatewayBaseURL: appConfig.aiGatewayBaseURL ?? existing?.aiGatewayBaseURL,
+      replicateImageModel: appConfig.replicateImageModel ?? existing?.replicateImageModel,
       // Always pull the latest prefix from UserControl so config changes
       // take effect on the next prompt without requiring a session restart.
       systemPromptPrefix: appConfig.systemPromptPrefix,
@@ -5956,8 +5974,22 @@ export class CodingAgent extends CodingAgentBase {
     this.ensureMetadata(this.requireSessionId(request), request.headers.get("x-owner-email"));
     const denied = this.applyModelOverride(parsed.data, request.headers.get("x-author-email"));
     if (denied) return denied;
+    // Idle: rebuild the session config now, so the details, /debug/compaction
+    // and a goal auto-continue turn all see the new models. A running prompt
+    // keeps its models; the next prompt's readAppConfig applies the override.
+    if (this.control.read().status !== "running") await this.refreshConfigFromOwner();
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
     return Response.json({ modelOverride: this.modelOverride.read() });
+  }
+
+  /** readAppConfig for display paths: a UserControl failure must not fail the request. */
+  private async refreshConfigFromOwner(): Promise<void> {
+    if (!this.readMetadata("owner_email")) return;
+    try {
+      await this.readAppConfig();
+    } catch (error) {
+      log("warn", "could not refresh session config from owner", { sessionId: this.sessionId(), error: String(error) });
+    }
   }
 
   /**
