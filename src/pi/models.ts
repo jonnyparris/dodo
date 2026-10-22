@@ -24,6 +24,8 @@ import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, anthropicGatewayBaseUrl, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
+import { log } from "../logger";
+import { rateLimitFetch } from "./rate-limit-fetch";
 
 export { anthropicGatewayBaseUrl };
 
@@ -157,6 +159,19 @@ export function gatewayHeaders(config: GatewayConfig, env: Env): Record<string, 
       };
 }
 
+/**
+ * Give every model request a fetch that waits out 429s (see
+ * rate-limit-fetch.ts). A caller-supplied fetch is kept as the base.
+ */
+export function withRateLimitRetry(api: ProviderStreams, fetchOptions?: Parameters<typeof rateLimitFetch>[1]): ProviderStreams {
+  const wrap = <O extends { fetch?: typeof fetch } | undefined>(o: O) => ({ ...o, fetch: rateLimitFetch(o?.fetch, fetchOptions) });
+  return {
+    ...api,
+    stream: (model, context, options) => api.stream(model, context, wrap(options)),
+    streamSimple: (model, context, options) => api.streamSimple(model, context, wrap(options)),
+  };
+}
+
 /** Dodo's `anthropic/claude-…` id → the id Anthropic's Messages API expects. */
 export function nativeAnthropicModelId(modelId: string): string {
   return modelId.replace(/^anthropic\//, "");
@@ -193,6 +208,10 @@ export function anthropicGatewayStreams(api: ProviderStreams = anthropicMessages
 export function setDodoProvider(models: MutableModels, modelIds: readonly string[], config: GatewayConfig, env: Env): MutableModels {
   const unique = [...new Set(modelIds.filter(Boolean))];
   const list = unique.map((id) => dodoModel(id, config, env));
+  const rateLimitOptions = {
+    onWait: ({ attempt, delayMs, retryAfter }: { attempt: number; delayMs: number; retryAfter: string | null }) =>
+      log("warn", "pi: model rate limited, waiting", { sessionId: config.sessionId, attempt, delayMs: Math.round(delayMs), retryAfter }),
+  };
   models.setProvider(
     createProvider({
       id: DODO_PROVIDER_ID,
@@ -207,9 +226,10 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       },
       models: list,
       // Keyed by model.api: Anthropic on AI Gateway goes native (see top).
+      // Both wait out per-minute 429s inside the request (rate-limit-fetch.ts).
       api: {
-        "openai-completions": openAICompletionsApi(),
-        "anthropic-messages": anthropicGatewayStreams(),
+        "openai-completions": withRateLimitRetry(openAICompletionsApi(), rateLimitOptions),
+        "anthropic-messages": withRateLimitRetry(anthropicGatewayStreams(), rateLimitOptions),
       },
     }),
   );
