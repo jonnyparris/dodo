@@ -3,6 +3,7 @@ import { createExecutionContext, runDurableObjectAlarm, runInDurableObject, wait
 import { env } from "cloudflare:workers";
 import type { Env } from "../src/types";
 import { resetMockAgentic } from "./helpers/agentic-mock";
+import { ThinkHistoryWriter } from "./helpers/think-history";
 
 vi.mock("@cloudflare/codemode", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@cloudflare/codemode")>();
@@ -438,6 +439,23 @@ describe("Idle session auto-cleanup", () => {
 
     expect(await getSessionStatus(forkId)).toBe("idle");
     expect(await hasPromptsFlag(forkId)).toBe(1);
+  });
+
+  it("keeps an unmigrated Think-era session that has history but no prompt or metadata rows", async () => {
+    const sessionId = await createSession();
+    const typedEnv = env as Env;
+    const agentStub = typedEnv.CODING_AGENT.get(typedEnv.CODING_AGENT.idFromName(sessionId));
+    await agentStub.fetch(new Request(`https://coding-agent/?sessionId=${encodeURIComponent(sessionId)}`));
+    await runInDurableObject(agentStub, async (instance, state) => {
+      const w = new ThinkHistoryWriter(state.storage.sql);
+      (instance as unknown as { setThinkSessionId(id: string): void }).setThinkSessionId(w.sessionId);
+      w.append({ id: "t-user", role: "user", parts: [{ type: "text", text: "hello" }] });
+    });
+
+    await backdateSession(sessionId, 11 * 60);
+    await runSweep();
+
+    expect(await getSessionStatus(sessionId)).toBe("idle");
   });
 
   it("refuses to fork a soft-deleted source", async () => {

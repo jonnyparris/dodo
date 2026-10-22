@@ -49,7 +49,7 @@ const MAX_DELAY_SECONDS = 90 * 86400;
 const MAX_SCHEDULES_PER_USER = 50;
 
 // ─── Idle-session cleanup constants ───
-/** Sessions with no prompts that have been idle longer than this get soft-deleted. */
+/** Sessions with no prompts or messages that have been idle longer than this get soft-deleted. */
 const IDLE_SESSION_TTL_SECONDS = 600; // 10 minutes
 /** How often the DO alarm re-runs the idle sweep. */
 const IDLE_SWEEP_INTERVAL_SECONDS = 300; // 5 minutes
@@ -3774,8 +3774,8 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Alarm handler. Serves two buckets of work:
    *   1. Scheduled-session fires (overdue rows in scheduled_sessions).
-   *   2. Idle-session sweep — soft-deletes sessions with no prompts that
-   *      have been idle for more than IDLE_SESSION_TTL_SECONDS.
+   *   2. Idle-session sweep — soft-deletes sessions with no prompts or
+   *      transcript messages that have been idle for more than IDLE_SESSION_TTL_SECONDS.
    *
    * The DO input gate serialises alarm() with fetch handlers, so a
    * concurrent DELETE can't interleave between rows. The per-iteration

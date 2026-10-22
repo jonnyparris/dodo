@@ -1482,9 +1482,15 @@ export class CodingAgent extends CodingAgentBase {
         // `messages` counts transcript messages too: a fork imports the
         // source's messages but not its prompt rows, so prompts alone
         // reads 0 and the sweep would delete a forked conversation.
+        // message_metadata gets a row for every message appendTranscript
+        // writes (fork import, /generate, Think→pi migration ids); Think
+        // history that was never migrated is counted from its own table.
+        // Overcounting only keeps a session; undercounting deletes one.
         const row = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM prompts"))[0] as SqlRow | null);
         const msgRow = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM message_metadata"))[0] as SqlRow | null);
-        return Response.json({ count: Number(row?.n ?? 0), messages: Number(msgRow?.n ?? 0) });
+        const thinkSessionId = this.getCurrentSessionId();
+        const thinkMessages = thinkSessionId ? this.sessions.getMessageCount(thinkSessionId) : 0;
+        return Response.json({ count: Number(row?.n ?? 0), messages: Math.max(Number(msgRow?.n ?? 0), thinkMessages) });
       }
 
       if (request.method === "GET" && url.pathname === "/prompt-queue") {
