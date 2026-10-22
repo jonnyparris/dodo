@@ -33,10 +33,16 @@ import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { BROWSER_TOOL_NAME, createBrowserExecuteTool, createSessionBrowser } from "./browser/session-browser";
 import { checkCallbackUrl, postCompletionWebhook } from "./completion-webhook";
 import type { InputKind, NeedsInput, SessionToolHost } from "./tools/session-tools";
-import { detectOAuthStepUp, OAUTH_STEP_UP_KEY, stripStepUpMarker } from "./mcp-step-up";
+import { detectOAuthStepUp, OAUTH_STEP_UP_KEY, issuersMatch, parseStepUpParks, planStepUpRecovery, safeOrigin, stripStepUpMarker, type StepUpParks } from "./mcp-step-up";
 
 /** Metadata keys for the human handoff and completion doorbell. */
 const NEEDS_INPUT_KEY = "needs_input";
+/** Hub DO: when each OAuth MCP server was parked for a step-up (src/mcp-step-up.ts). */
+const STEP_UP_PARKS_KEY = "oauth_step_up_parks";
+/** Longest a hub wake waits for step-up park recovery (connect + discover). */
+// onStart runs inside the lifecycle's blockConcurrencyWhile (30s limit,
+// shared with the rest of startup): stay well under it.
+const STEP_UP_RECOVERY_WAIT_MS = 10_000;
 const COMPLETION_WEBHOOK_KEY = "completion_webhook";
 /** While a person is needed, poke the browser this often (Browser Run idle keep_alive is 180 s). */
 const BROWSER_WARM_INTERVAL_SECONDS = 120;
@@ -1312,7 +1318,7 @@ export class CodingAgent extends CodingAgentBase {
     };
   }
 
-  override onStart(): void {
+  override onStart(): void | Promise<void> {
     // Opens the Think-era SessionManager (read-only history) and restarts
     // fibers an eviction interrupted. See DodoAgentBase.
     super.onStart();
@@ -1352,6 +1358,26 @@ export class CodingAgent extends CodingAgentBase {
     // with source="queue" to drain a single item with the right policy.
     if (!this.control.readActivePromptId()) {
       void this.drainOneQueuedPrompt();
+    }
+
+    // Hub DO only in practice: bring back servers a step-up parked before
+    // this restart (see planStepUpRecovery). No-op without parks. Awaited
+    // (capped) so a wake caused by the OAuth callback itself handles the
+    // callback only after the server is parked again: mid-reconnect the
+    // SDK would drop the code as stale.
+    // Past the cap, a callback that lands mid-reconnect is dropped as stale:
+    // the next call 403s again and raises a fresh card. Better than a hung
+    // MCP server blocking every session's OAuth tools.
+    const recovery = this.recoverStepUpParks();
+    if (recovery) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cap = new Promise<void>((r) => {
+        timer = setTimeout(() => {
+          log("warn", "oauth mcp step-up park recovery still running after cap", { capMs: STEP_UP_RECOVERY_WAIT_MS });
+          r();
+        }, STEP_UP_RECOVERY_WAIT_MS);
+      });
+      return Promise.race([recovery, cap]).finally(() => clearTimeout(timer));
     }
   }
 
@@ -2804,7 +2830,7 @@ export class CodingAgent extends CodingAgentBase {
     this.emitEvent({ type: "needs_input", data: null });
   }
 
-  private async requestUserInput(input: { kind: InputKind; reason: string; authUrl?: string }): Promise<NeedsInput> {
+  private async requestUserInput(input: { kind: InputKind; reason: string; oauthServerId?: string }): Promise<NeedsInput> {
     let liveView = false;
     if (this.browser) {
       try {
@@ -2813,7 +2839,7 @@ export class CodingAgent extends CodingAgentBase {
         log("warn", "request_user_input: live view check failed", { sessionId: this.sessionId(), error: err instanceof Error ? err.message : String(err) });
       }
     }
-    const state: NeedsInput = { kind: input.kind, reason: input.reason, liveView, at: new Date().toISOString(), ...(input.authUrl ? { authUrl: input.authUrl } : {}) };
+    const state: NeedsInput = { kind: input.kind, reason: input.reason, liveView, at: new Date().toISOString(), ...(input.oauthServerId ? { oauthServerId: input.oauthServerId } : {}) };
     this.writeMetadata(NEEDS_INPUT_KEY, JSON.stringify(state));
     this.emitEvent({ type: "needs_input", data: state });
     dispatchNotification(this.env, this.ctx, {
@@ -5548,36 +5574,149 @@ export class CodingAgent extends CodingAgentBase {
    * credentials (which live only in the per-user hub DO) are applied.
    */
   async callOAuthTool(serverId: string, toolName: string, args: unknown): Promise<unknown> {
-    type StepUpConn = {
-      connectionState: string;
-      options: { transport: { authProvider?: { authUrl?: string } } };
+    type StepUpProvider = {
+      authUrl?: string;
+      clientId?: string;
+      invalidateCredentials?: (scope: "discovery") => Promise<void>;
+      tokens?: () => Promise<{ issuer?: string } | undefined>;
+      clientInformation?: () => Promise<{ issuer?: string } | undefined>;
+      discoveryState?: () => Promise<{ authorizationServerUrl?: string; authorizationServerMetadata?: { issuer?: string } } | undefined>;
     };
+    type StepUpConn = { connectionState: string; options: { transport: { authProvider?: StepUpProvider } } };
     const conn = (this.mcp.mcpConnections as Record<string, StepUpConn | undefined>)[serverId];
-    const authUrlBefore = conn?.options.transport.authProvider?.authUrl;
+    const provider = conn?.options.transport.authProvider;
+    const authUrlBefore = provider?.authUrl;
+    const safe = async <T>(f: (() => Promise<T>) | undefined): Promise<T | undefined> => {
+      try {
+        return await f?.call(provider);
+      } catch {
+        return undefined;
+      }
+    };
+    // Which authorization server issued the current grant. Read *before*
+    // the call, from the tokens only: a failed auth() against a different
+    // AS re-registers there (new clientId), after which the provider's
+    // client info describes the new AS and would vouch for its link.
+    const grantIssuer = (await safe(provider?.tokens))?.issuer;
     try {
       const result = await this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
       const clean = stripStepUpMarker(result);
       if (clean !== result) log("warn", "oauth mcp result carried a forged step-up marker; stripped", { serverId, toolName });
       return clean;
     } catch (error) {
+      // A failed auth() against a swapped AS registers a new client there and
+      // switches the provider's in-memory clientId, hiding the real grant
+      // (and letting the next call vouch for the new AS). Put back the
+      // persisted one on every failure path; parallel calls agree on it.
+      if (provider) {
+        const rowClientId = (this.mcp as unknown as { getServersFromStorage(): Array<{ id: string; client_id?: string | null }> })
+          .getServersFromStorage().find((r) => r.id === serverId)?.client_id;
+        let current: string | undefined;
+        try {
+          current = provider.clientId; // the DO provider's getter throws when unset
+        } catch {
+          current = undefined;
+        }
+        if (rowClientId && current !== rowClientId) {
+          provider.clientId = rowClientId;
+          log("warn", "oauth mcp clientId changed by a failed auth; restored", { serverId });
+        }
+      }
       // Mid-session step-up (403 insufficient_scope) or failed refresh: the
       // transport stored a fresh authorize URL and threw. See src/mcp-step-up.ts.
+      const authUrlAfter = provider?.authUrl;
+      if (!conn || !provider || !authUrlAfter || authUrlAfter === authUrlBefore) throw error;
       const server = (this.getMcpServers().servers as Record<string, { name?: string } | undefined>)[serverId];
-      const stepUp = detectOAuthStepUp({
-        serverId,
-        serverName: server?.name,
-        error,
-        authUrlBefore,
-        authUrlAfter: conn?.options.transport.authProvider?.authUrl,
-      });
-      if (!conn || !stepUp) throw error;
+      // The authorization server the new link belongs to: the failed auth()
+      // just saved its discovery.
+      const discovery = await safe(provider.discoveryState);
+      const linkIssuer = discovery?.authorizationServerMetadata?.issuer ?? discovery?.authorizationServerUrl;
+      const stepUp = detectOAuthStepUp({ serverId, serverName: server?.name, error, authUrlBefore, authUrlAfter, grantIssuer, linkIssuer });
+      if (!stepUp) {
+        log("warn", "oauth mcp re-authorization link refused", { serverId, grantIssuer: grantIssuer ?? null, linkIssuer: linkIssuer ?? null, authOrigin: safeOrigin(authUrlAfter) });
+        // A swapped AS left its discovery behind; drop it so the next auth()
+        // re-discovers. Only on a real mismatch: a pending legitimate link
+        // needs its discovery state on the callback leg.
+        if (grantIssuer && linkIssuer && !issuersMatch(grantIssuer, linkIssuer)) {
+          await safe(provider.invalidateCredentials ? () => provider.invalidateCredentials!("discovery") : undefined);
+        }
+        throw error;
+      }
       // Put the connection where the SDK's callback route expects it, so the
       // code is exchanged (and new scopes saved) instead of dropped as stale.
       conn.connectionState = "authenticating";
       (this.mcp as unknown as { persistAuthContinuation(id: string, c: unknown): unknown }).persistAuthContinuation(serverId, conn);
+      this.writeStepUpParks({ ...this.readStepUpParks(), [serverId]: { at: Date.now(), authUrl: stepUp.authUrl } });
       log("info", "oauth mcp needs re-authorization", { serverId, scope: stepUp.scope ?? null });
       return { [OAUTH_STEP_UP_KEY]: stepUp };
     }
+  }
+
+  private readStepUpParks(): StepUpParks {
+    return parseStepUpParks(this.readMetadata(STEP_UP_PARKS_KEY));
+  }
+
+  private writeStepUpParks(parks: StepUpParks): void {
+    if (Object.keys(parks).length === 0) {
+      if (this.readMetadata(STEP_UP_PARKS_KEY) !== null) this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", STEP_UP_PARKS_KEY);
+      return;
+    }
+    this.writeMetadata(STEP_UP_PARKS_KEY, JSON.stringify(parks));
+  }
+
+  /**
+   * After a hub restart, reconnect servers a step-up parked, using the old
+   * grant, so ignoring the Approve access card doesn't remove their tools
+   * from every session. Runs from onStart, after the SDK's restore.
+   */
+  private recoverStepUpParks(): Promise<void> | undefined {
+    const parks = this.readStepUpParks();
+    if (Object.keys(parks).length === 0) return undefined;
+    type Conn = { connectionState: string };
+    type Mgr = {
+      mcpConnections: Record<string, Conn | undefined>;
+      clearServerAuthUrl(id: string): void;
+      establishConnection(id: string): Promise<void>;
+      getServersFromStorage(): Array<{ id: string; auth_url?: string | null }>;
+    };
+    const mgr = this.mcp as unknown as Mgr;
+    const authUrlOf = (): Record<string, string | null | undefined> => {
+      const out: Record<string, string | null | undefined> = {};
+      for (const row of mgr.getServersFromStorage()) out[row.id] = row.auth_url;
+      return out;
+    };
+    const next: StepUpParks = { ...parks };
+    const work: Promise<void>[] = [];
+    for (const { serverId, action } of planStepUpRecovery(parks, authUrlOf(), Date.now())) {
+      const conn = mgr.mcpConnections[serverId];
+      if (action === "drop" || !conn || conn.connectionState !== "authenticating") {
+        delete next[serverId];
+        continue;
+      }
+      if (action === "unpark") {
+        mgr.clearServerAuthUrl(serverId);
+        delete next[serverId];
+      }
+      const parkedUrl = parks[serverId]!.authUrl;
+      const reconnect = mgr.establishConnection(serverId).then(() => {
+        // Still waiting for the person: park again (tools stay loaded), so
+        // the callback exchanges the code instead of dropping it as stale.
+        // Only if the parked link is still the saved one: if the reconnect
+        // found the old grant dead, the SDK saved its own link instead.
+        const live = mgr.mcpConnections[serverId];
+        // `connected` (discovery failed) also counts as authorized for the
+        // callback, so park that too.
+        const reachable = live?.connectionState === "ready" || live?.connectionState === "connected";
+        if (action === "keep" && reachable && authUrlOf()[serverId] === parkedUrl) live.connectionState = "authenticating";
+        log("info", "oauth mcp step-up park recovered", { serverId, action, state: live?.connectionState ?? null });
+      }).catch((err) => {
+        log("warn", "oauth mcp step-up park recovery failed", { serverId, action, error: err instanceof Error ? err.message : String(err) });
+      });
+      this.ctx.waitUntil(reconnect);
+      work.push(reconnect);
+    }
+    this.writeStepUpParks(next);
+    return work.length ? Promise.all(work).then(() => undefined) : undefined;
   }
 
   /**

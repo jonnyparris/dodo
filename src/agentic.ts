@@ -1933,13 +1933,13 @@ export function buildOAuthMcpTools(
           const result = await executor(info.serverId, info.name, args);
           if (!isOAuthStepUpMarker(result)) return result;
           // The server needs the person to approve more access. Raise the
-          // needs-input card with the link (top-level turns), then tell the
-          // model to stop and retry once after the reply.
+          // needs-input card (server id only, never the link: see
+          // stepUpToolResult), then tell the model to stop and retry once.
           const stepUp = result[OAUTH_STEP_UP_KEY];
           let cardShown = false;
           if (sessionTools) {
             try {
-              await sessionTools.requestUserInput({ kind: "login", reason: stepUpReason(stepUp), authUrl: stepUp.authUrl });
+              await sessionTools.requestUserInput({ kind: "login", reason: stepUpReason(stepUp), oauthServerId: stepUp.serverId });
               cardShown = true;
             } catch (err) {
               log("warn", "oauth-mcp step-up card failed", { serverId: info.serverId, err: err instanceof Error ? err.message : String(err) });

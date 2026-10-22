@@ -3,8 +3,13 @@ import { buildOAuthMcpTools } from "../src/agentic";
 import {
   detectOAuthStepUp,
   isOAuthStepUpMarker,
+  issuersMatch,
+  isTrustedAuthUrl,
   isUnauthorizedError,
   OAUTH_STEP_UP_KEY,
+  parseStepUpParks,
+  planStepUpRecovery,
+  STEP_UP_PARK_TTL_MS,
   scopeFromAuthUrl,
   stepUpReason,
   stepUpToolResult,
@@ -34,7 +39,8 @@ describe("isUnauthorizedError", () => {
 });
 
 describe("detectOAuthStepUp", () => {
-  const base = { serverId: "srv", serverName: "Cloudflare API", authUrlBefore: undefined };
+  const iss = "https://mcp.example.com";
+  const base = { serverId: "srv", serverName: "Cloudflare API", authUrlBefore: undefined, grantIssuer: iss, linkIssuer: iss };
   it("returns the new authorize URL and its scopes", () => {
     const s = detectOAuthStepUp({ ...base, error: new UnauthorizedError(), authUrlAfter: AUTH_URL });
     expect(s).toEqual({ serverId: "srv", serverName: "Cloudflare API", authUrl: AUTH_URL, scope: "user:read account:read workers_scripts:write" });
@@ -47,6 +53,69 @@ describe("detectOAuthStepUp", () => {
   });
   it("rejects non-http URLs", () => {
     expect(detectOAuthStepUp({ ...base, error: new UnauthorizedError(), authUrlAfter: "javascript:alert(1)" })).toBeNull();
+  });
+  it("rejects a link from a different authorization server than the grant's", () => {
+    const err = new UnauthorizedError();
+    const grantIssuer = "https://mcp.example.com";
+    expect(detectOAuthStepUp({ ...base, error: err, authUrlAfter: AUTH_URL, grantIssuer, linkIssuer: "https://mcp.example.com/" })).not.toBeNull();
+    expect(detectOAuthStepUp({ ...base, error: err, authUrlAfter: AUTH_URL, grantIssuer, linkIssuer: "https://evil.example" })).toBeNull();
+    expect(detectOAuthStepUp({ ...base, error: err, authUrlAfter: AUTH_URL, grantIssuer, linkIssuer: undefined })).toBeNull();
+    expect(detectOAuthStepUp({ ...base, error: err, authUrlAfter: AUTH_URL, grantIssuer: undefined })).toBeNull();
+  });
+});
+
+describe("isTrustedAuthUrl", () => {
+  it("needs https; http only for loopback with a loopback grant", () => {
+    const a = { grantIssuer: "https://auth.example.com", linkIssuer: "https://auth.example.com" };
+    expect(isTrustedAuthUrl("https://auth.example.com/authorize", a)).toBe(true);
+    expect(isTrustedAuthUrl("http://auth.example.com/authorize", a)).toBe(false);
+    expect(isTrustedAuthUrl("http://127.0.0.1/authorize", a)).toBe(false);
+    const local = "http://localhost:8788";
+    expect(isTrustedAuthUrl("http://localhost:8788/authorize", { grantIssuer: local, linkIssuer: local })).toBe(true);
+    expect(isTrustedAuthUrl("data:text/html,x", a)).toBe(false);
+    expect(isTrustedAuthUrl("nope", a)).toBe(false);
+  });
+  it("refuses when the grant has no issuer stamp", () => {
+    expect(isTrustedAuthUrl("https://auth.example.com/authorize")).toBe(false);
+    expect(isTrustedAuthUrl("https://auth.example.com/authorize", { linkIssuer: "https://auth.example.com" })).toBe(false);
+  });
+  it("pins to the grant's authorization server, not the endpoint host", () => {
+    const cf = "https://mcp.cloudflare.com";
+    expect(isTrustedAuthUrl("https://mcp.cloudflare.com/authorize?x=1", { grantIssuer: cf, linkIssuer: cf })).toBe(true);
+    // Same AS, endpoint on another host (allowed by RFC 8414 metadata).
+    expect(isTrustedAuthUrl("https://login.cloudflare.com/authorize", { grantIssuer: cf, linkIssuer: `${cf}/` })).toBe(true);
+    expect(isTrustedAuthUrl("https://mcp.cloudflare.com/authorize", { grantIssuer: cf, linkIssuer: "https://mcp.cloudflare.com.evil.example" })).toBe(false);
+    expect(isTrustedAuthUrl("https://mcp.cloudflare.com/authorize", { grantIssuer: cf })).toBe(false);
+  });
+  it("issuersMatch tolerates one trailing slash only", () => {
+    expect(issuersMatch("https://a.example", "https://a.example/")).toBe(true);
+    expect(issuersMatch("https://a.example/x", "https://a.example/x")).toBe(true);
+    expect(issuersMatch("https://a.example", "https://b.example")).toBe(false);
+  });
+});
+
+describe("step-up park recovery plan", () => {
+  const now = 1_000_000_000;
+  it("keeps fresh parks, unparks stale ones, drops ones that aren't ours any more", () => {
+    const parks = {
+      fresh: { at: now - 60_000, authUrl: "https://a/x" },
+      stale: { at: now - STEP_UP_PARK_TTL_MS, authUrl: "https://a/y" },
+      done: { at: now - 1000, authUrl: "https://a/z" },
+      sdk: { at: now - 1000, authUrl: "https://a/old" },
+    };
+    const plan = planStepUpRecovery(parks, { fresh: "https://a/x", stale: "https://a/y", done: null, sdk: "https://a/sdk-own-reauth" }, now);
+    expect(plan).toEqual([
+      { serverId: "fresh", action: "keep" },
+      { serverId: "stale", action: "unpark" },
+      { serverId: "done", action: "drop" },
+      { serverId: "sdk", action: "drop" },
+    ]);
+  });
+  it("parses only well-formed entries", () => {
+    expect(parseStepUpParks('{"a":{"at":1,"authUrl":"https://x"},"b":1,"c":{"at":"x","authUrl":"y"},"d":null}')).toEqual({ a: { at: 1, authUrl: "https://x" } });
+    expect(parseStepUpParks("[1]")).toEqual({});
+    expect(parseStepUpParks("{bad")).toEqual({});
+    expect(parseStepUpParks(null)).toEqual({});
   });
 });
 
@@ -64,10 +133,11 @@ describe("helpers", () => {
     const s = { serverId: "srv", serverName: "Cloudflare API", authUrl: AUTH_URL, scope: "a b" };
     expect(stepUpReason(s)).toContain("Cloudflare API needs you to approve more access (asks for: a b)");
     const shown = stepUpToolResult(s, true);
-    expect(shown.authUrl).toBe(AUTH_URL);
     expect(shown.next).toMatch(/End your turn/);
     expect(shown.next).toMatch(/retry this exact call once/);
-    expect(stepUpToolResult(s, false).next).toMatch(/Give the person this authUrl/);
+    expect(stepUpToolResult(s, false).next).toMatch(/could not show the person/);
+    // The transcript is visible to read-only share viewers: never the link.
+    for (const r of [shown, stepUpToolResult(s, false)]) expect(JSON.stringify(r)).not.toContain("https://");
   });
 });
 
@@ -76,17 +146,18 @@ describe("buildOAuthMcpTools step-up handling", () => {
   // biome-ignore lint: test harness — execute is always defined for our tools
   const run = (t: any, args: unknown) => t.execute(args, { toolCallId: "t1", messages: [] });
 
-  it("raises the needs-input card with the link and returns retry guidance", async () => {
+  it("raises the needs-input card with the server id (not the link) and returns retry guidance", async () => {
     const stepUp = { serverId: "srv", serverName: "Cloudflare API", authUrl: AUTH_URL, scope: "user:read account:read workers_scripts:write" };
     const exec = vi.fn(async () => ({ [OAUTH_STEP_UP_KEY]: stepUp }));
-    const requestUserInput = vi.fn(async (i: { kind: string; reason: string; authUrl?: string }) => ({ ...i, liveView: false, at: "now" } as never));
+    const requestUserInput = vi.fn(async (i: { kind: string; reason: string; oauthServerId?: string }) => ({ ...i, liveView: false, at: "now" } as never));
     const tools = buildOAuthMcpTools(info, exec, new Set(), { requestUserInput });
     const out = await run(tools["cloudflare-api__execute"], { code: "x" });
-    expect(requestUserInput).toHaveBeenCalledWith({ kind: "login", reason: stepUpReason(stepUp), authUrl: AUTH_URL });
+    expect(requestUserInput).toHaveBeenCalledWith({ kind: "login", reason: stepUpReason(stepUp), oauthServerId: "srv" });
     expect(out).toEqual(stepUpToolResult(stepUp, true));
+    expect(JSON.stringify(out)).not.toContain(AUTH_URL);
   });
 
-  it("without session tools (subagent) the model gets the link itself", async () => {
+  it("without a card the model reports it and stops", async () => {
     const stepUp = { serverId: "srv", authUrl: AUTH_URL };
     const tools = buildOAuthMcpTools(info, async () => ({ [OAUTH_STEP_UP_KEY]: stepUp }), new Set());
     const out = await run(tools["cloudflare-api__execute"], {});

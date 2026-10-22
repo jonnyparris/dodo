@@ -41,15 +41,20 @@ export interface NeedsInput {
   /** True when the session browser was open: the person can use Live View. */
   liveView: boolean;
   at: string;
-  /** OAuth approval link (MCP re-authorization, see src/mcp-step-up.ts). */
-  authUrl?: string;
+  /**
+   * OAuth MCP server (hub id) waiting for the owner to approve more access
+   * (src/mcp-step-up.ts). Only the id: the approval link itself would let
+   * any read-only share viewer finish OAuth for the owner. The owner's
+   * browser looks the link up via GET /api/mcp/oauth-servers.
+   */
+  oauthServerId?: string;
 }
 
 export interface SessionToolHost {
   createSchedule(input: { description: string; prompt: string } & ScheduleSpec): Promise<ScheduleRecord>;
   listSchedules(): ScheduleRecord[];
   cancelSchedule(id: string): Promise<boolean>;
-  requestUserInput(input: { kind: InputKind; reason: string; authUrl?: string }): Promise<NeedsInput>;
+  requestUserInput(input: { kind: InputKind; reason: string; oauthServerId?: string }): Promise<NeedsInput>;
 }
 
 const CRON_RE = /^\s*(\S+\s+){4}\S+\s*$/;
