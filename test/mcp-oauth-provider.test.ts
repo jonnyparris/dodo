@@ -1,7 +1,8 @@
 /**
- * DodoOAuthClientProvider writes the step-up issuer pin only for a real code
- * exchange (src/mcp-oauth-provider.ts), against real DO storage. The hub
- * flows are in test/mcp-step-up-hub.test.ts.
+ * DodoOAuthClientProvider writes the step-up issuer pin only for a code
+ * exchange, i.e. a save inside runWithCodeVerifierState
+ * (src/mcp-oauth-provider.ts), against real DO storage. The hub flows are in
+ * test/mcp-step-up-hub.test.ts.
  */
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
@@ -11,6 +12,7 @@ import { DodoOAuthClientProvider } from "../src/mcp-oauth-provider";
 
 const AS = "https://as.example";
 const PHISH = "https://phish.example";
+const STATE = "nonce1.srv1";
 
 async function withProvider(fn: (p: DodoOAuthClientProvider, pin: () => Promise<string | undefined>) => Promise<void>): Promise<void> {
   const ns = (env as Env).CODING_AGENT;
@@ -19,8 +21,6 @@ async function withProvider(fn: (p: DodoOAuthClientProvider, pin: () => Promise<
     const p = new DodoOAuthClientProvider(state.storage, "owner@dodo.test", "https://dodo.test/cb");
     p.serverId = "srv1";
     p.clientId = "client-1";
-    // Legacy verifier key: codeVerifier() falls back to it outside a callback.
-    await state.storage.put(`${p.keyPrefix("client-1")}/code_verifier`, "verifier-1");
     await fn(p, () => p.pinnedIssuer());
   });
 }
@@ -28,8 +28,7 @@ async function withProvider(fn: (p: DodoOAuthClientProvider, pin: () => Promise<
 describe("DodoOAuthClientProvider issuer pin", () => {
   it("pins the issuer of a code exchange", async () => {
     await withProvider(async (p, pin) => {
-      await p.codeVerifier();
-      await p.saveTokens({ access_token: "a1", token_type: "Bearer", issuer: AS });
+      await p.runWithCodeVerifierState(STATE, () => p.saveTokens({ access_token: "a1", token_type: "Bearer", issuer: AS }));
       expect(await pin()).toBe(AS);
     });
   });
@@ -37,28 +36,38 @@ describe("DodoOAuthClientProvider issuer pin", () => {
   it("does not pin an upgrade stamp or a refresh", async () => {
     await withProvider(async (p, pin) => {
       await p.saveTokens({ access_token: "a1", token_type: "Bearer" });
-      // Upgrade stamp: the SDK reads tokens, then re-saves them with an issuer.
       const t = await p.tokens();
-      await p.saveTokens({ ...t!, issuer: PHISH });
-      // Refresh: reads tokens, saves new ones.
-      await p.tokens();
-      await p.saveTokens({ access_token: "a2", token_type: "Bearer", issuer: PHISH });
+      await p.saveTokens({ ...t!, issuer: PHISH }); // upgrade stamp
+      await p.saveTokens({ access_token: "a2", token_type: "Bearer", issuer: PHISH }); // refresh
       expect(await pin()).toBeUndefined();
     });
   });
 
-  it("a failed exchange does not leave the next save pinning", async () => {
+  it("a save outside the exchange never pins, even while an exchange is running", async () => {
     await withProvider(async (p, pin) => {
-      await p.saveTokens({ access_token: "a1", token_type: "Bearer" });
-      await p.codeVerifier(); // exchange starts, then its token request fails: no save
-      const t = await p.tokens(); // a later auth() run: upgrade stamp
-      await p.saveTokens({ ...t!, issuer: PHISH });
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      // An exchange is in flight (its token request is slow)...
+      const exchange = p.runWithCodeVerifierState(STATE, async () => {
+        await gate;
+        throw new Error("token request failed"); // ...and then fails: no save.
+      });
+      // ...while a parallel refresh saves tokens from another AS.
+      await p.saveTokens({ access_token: "a2", token_type: "Bearer", issuer: PHISH });
+      release();
+      await expect(exchange).rejects.toThrow("token request failed");
       expect(await pin()).toBeUndefined();
-      // Even without a tokens() read in between, re-saving the same access
-      // token (the stamp) never pins.
-      await p.codeVerifier();
-      await p.saveTokens({ ...t!, issuer: PHISH });
+      // Later saves (after the failed exchange) don't pin either.
+      await p.saveTokens({ access_token: "a3", token_type: "Bearer", issuer: PHISH });
       expect(await pin()).toBeUndefined();
+    });
+  });
+
+  it("a re-exchange moves the pin", async () => {
+    await withProvider(async (p, pin) => {
+      await p.runWithCodeVerifierState(STATE, () => p.saveTokens({ access_token: "a1", token_type: "Bearer", issuer: AS }));
+      await p.runWithCodeVerifierState(STATE, () => p.saveTokens({ access_token: "a1", token_type: "Bearer", issuer: `${AS}/v2` }));
+      expect(await pin()).toBe(`${AS}/v2`);
     });
   });
 });

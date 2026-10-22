@@ -346,6 +346,11 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
       }
     });
   }
+  const providerAuthUrl = (hub: Hub, id: string) =>
+    runInDurableObject(hub as unknown as DurableObjectStub, async (instance: unknown) => {
+      const conns = (instance as { mcp: { mcpConnections: Record<string, { options: { transport: { authProvider?: { authUrl?: string } } } }> } }).mcp.mcpConnections;
+      return conns[id]?.options.transport.authProvider?.authUrl ?? null;
+    });
   const pinOf = (hub: Hub, owner: string, id: string) =>
     runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) =>
       ((await state.storage.get(`/${owner}/${id}/dodo_issuer_pin`)) as { issuer?: string } | undefined)?.issuer);
@@ -376,17 +381,16 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     // discovered (the phishing one).
     const first = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
     expect(stepUpOf(first)).toBeUndefined();
+    const firstLink = await providerAuthUrl(hub, id);
     // Second call: before the pin, the grant's stamp now named the phishing
     // AS, so its link matched and raised the card.
     const second = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
     expect(stepUpOf(second)).toBeUndefined();
-    // It did get as far as a phishing link: refused, not failed earlier.
-    const linkOrigin = await runInDurableObject(hub as unknown as DurableObjectStub, async (instance: unknown) => {
-      const conns = (instance as { mcp: { mcpConnections: Record<string, { options: { transport: { authProvider?: { authUrl?: string } } } }> } }).mcp.mcpConnections;
-      const u = conns[id]?.options.transport.authProvider?.authUrl;
-      return u ? new URL(u).origin : null;
-    });
-    expect(linkOrigin).toBe(PHISH);
+    // The second call built a fresh phishing link (new state) and it was
+    // refused, rather than failing before the issuer check.
+    const secondLink = await providerAuthUrl(hub, id);
+    expect(secondLink).not.toBe(firstLink);
+    expect(new URL(secondLink!).origin).toBe(PHISH);
     expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
     expect(await pinOf(hub, owner, id)).toBeUndefined();
   });
@@ -422,7 +426,7 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     // so no refresh token went to any token endpoint.
     expect(fake.tokenRequests.slice(before).filter((p) => p.get("refresh_token"))).toEqual([]);
     expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
-    // A refresh is not a code exchange: the pin stays on the real AS.
+    // No exchange happened, so the pin is untouched.
     expect(await pinOf(hub, owner, id)).toBe(S);
   });
 

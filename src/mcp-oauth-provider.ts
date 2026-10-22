@@ -18,57 +18,53 @@
  * is connected again from Settings. Removing a server clears every key under
  * its prefix (`clearServerStorage`), pin included.
  *
+ * "A code exchange" = a saveTokens inside `runWithCodeVerifierState`, which
+ * agents' OAuth callback handler wraps around `completeAuthorization`. An
+ * async context, not a flag on this (shared, long-lived) instance, so a
+ * refresh running in parallel can never save inside it. agents'
+ * `connectToServer({ reconnect: { oauthCode } })` exchanges without that
+ * wrapper; Dodo doesn't use it, and it would just leave no pin (no card).
+ *
  * Accepted risk, not handled here: for a grant still unstamped (saved before
  * the SDK upgrade and unused since), the first non-forced auth() after the
  * MCP server swaps `authorization_servers` stamps it with the swapped AS and
- * sends its refresh token there (client index.mjs, auth()). Blocking that
+ * sends its refresh token there (client index.mjs, auth()). Every later
+ * refresh goes there too: the grant is now stamped for that AS. Blocking it
  * means dropping the refresh token on the stamp save, which forces every
  * such grant to reconnect. Not done: the MCP server already receives the
  * access token on every call, and few such grants remain since agents 0.28
- * (2026-10-17) stamped every grant used since. Stamped grants are safe: the
- * SDK drops a grant whose stamp names another AS before refreshing.
+ * (2026-10-17) stamped every grant used since. Grants stamped before a swap
+ * are safe: the SDK drops a grant whose stamp names another AS before
+ * refreshing. Either way, step-up trusts only the pin.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { DurableObjectOAuthClientProvider } from "agents";
+import { log } from "./logger";
 
 type SaveTokensArgs = Parameters<DurableObjectOAuthClientProvider["saveTokens"]>;
 
-export class DodoOAuthClientProvider extends DurableObjectOAuthClientProvider {
-  /**
-   * Set when the SDK reads the PKCE verifier: only the authorization-code
-   * exchange does, right before its token request. Cleared by any tokens()
-   * read: the exchange doesn't read tokens before saving, while the refresh
-   * and upgrade-stamp paths do. So a failed exchange can't leave it set for
-   * a later save. A parallel read clearing it early skips the pin, which
-   * fails closed (the previous pin, if any, stays).
-   */
-  private codeExchangeInFlight = false;
+/** Present only inside an OAuth callback's code exchange. */
+const codeExchange = new AsyncLocalStorage<true>();
 
+export class DodoOAuthClientProvider extends DurableObjectOAuthClientProvider {
   /** Per server, not per client: a re-registration must not move it. */
   private issuerPinKey(): string {
     return `/${this.clientName}/${this.serverId}/dodo_issuer_pin`;
   }
 
-  override async codeVerifier(): Promise<string> {
-    const verifier = await super.codeVerifier();
-    this.codeExchangeInFlight = true;
-    return verifier;
-  }
-
-  override async tokens(...args: Parameters<DurableObjectOAuthClientProvider["tokens"]>): ReturnType<DurableObjectOAuthClientProvider["tokens"]> {
-    this.codeExchangeInFlight = false;
-    return super.tokens(...args);
+  override async runWithCodeVerifierState<T>(state: string, callback: () => Promise<T>): Promise<T> {
+    return super.runWithCodeVerifierState(state, () => codeExchange.run(true, callback));
   }
 
   override async saveTokens(...[tokens, context]: SaveTokensArgs): Promise<void> {
-    const exchange = this.codeExchangeInFlight;
-    // super.tokens: our tokens() override would clear the flag (already read).
-    const prev = exchange ? await super.tokens().catch(() => undefined) : undefined;
-    this.codeExchangeInFlight = false;
     await super.saveTokens(tokens, context);
-    // A real exchange always brings a new access token; the SDK's upgrade
-    // stamp re-saves the same one.
-    if (exchange && typeof tokens.issuer === "string" && tokens.access_token !== prev?.access_token) {
+    if (codeExchange.getStore() !== true || typeof tokens.issuer !== "string") return;
+    try {
       await this.storage.put(this.issuerPinKey(), { issuer: tokens.issuer, at: Date.now() });
+    } catch (err) {
+      // The exchange itself worked; without a pin the next step-up just gets
+      // no card until a reconnect.
+      log("warn", "oauth mcp issuer pin write failed", { serverId: this.serverId, error: err instanceof Error ? err.message : String(err) });
     }
   }
 
