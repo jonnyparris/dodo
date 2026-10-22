@@ -1325,7 +1325,7 @@ export class CodingAgent extends CodingAgentBase {
    */
   static stepUpRecoveryWaitMs = STEP_UP_RECOVERY_WAIT_MS;
 
-  /** Hub DO OAuth provider: flags SDK upgrade stamps (src/mcp-oauth-provider.ts). */
+  /** Hub DO OAuth provider: pins the step-up issuer on code exchange (src/mcp-oauth-provider.ts). */
   override createMcpOAuthProvider(callbackUrl: string): DodoOAuthClientProvider {
     return new DodoOAuthClientProvider(this.ctx.storage, this.name, callbackUrl);
   }

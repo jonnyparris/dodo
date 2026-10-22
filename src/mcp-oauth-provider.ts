@@ -17,6 +17,16 @@
  * from before this provider) gets no Approve access card until the server
  * is connected again from Settings. Removing a server clears every key under
  * its prefix (`clearServerStorage`), pin included.
+ *
+ * Accepted risk, not handled here: for a grant still unstamped (saved before
+ * the SDK upgrade and unused since), the first non-forced auth() after the
+ * MCP server swaps `authorization_servers` stamps it with the swapped AS and
+ * sends its refresh token there (client index.mjs, auth()). Blocking that
+ * means dropping the refresh token on the stamp save, which forces every
+ * such grant to reconnect. Not done: the MCP server already receives the
+ * access token on every call, and few such grants remain since agents 0.28
+ * (2026-10-17) stamped every grant used since. Stamped grants are safe: the
+ * SDK drops a grant whose stamp names another AS before refreshing.
  */
 import { DurableObjectOAuthClientProvider } from "agents";
 
@@ -25,8 +35,11 @@ type SaveTokensArgs = Parameters<DurableObjectOAuthClientProvider["saveTokens"]>
 export class DodoOAuthClientProvider extends DurableObjectOAuthClientProvider {
   /**
    * Set when the SDK reads the PKCE verifier: only the authorization-code
-   * exchange does (a refresh never does). The next saveTokens is that
-   * exchange's result.
+   * exchange does, right before its token request. Cleared by any tokens()
+   * read: the exchange doesn't read tokens before saving, while the refresh
+   * and upgrade-stamp paths do. So a failed exchange can't leave it set for
+   * a later save. A parallel read clearing it early skips the pin, which
+   * fails closed (the previous pin, if any, stays).
    */
   private codeExchangeInFlight = false;
 
@@ -41,11 +54,20 @@ export class DodoOAuthClientProvider extends DurableObjectOAuthClientProvider {
     return verifier;
   }
 
+  override async tokens(...args: Parameters<DurableObjectOAuthClientProvider["tokens"]>): ReturnType<DurableObjectOAuthClientProvider["tokens"]> {
+    this.codeExchangeInFlight = false;
+    return super.tokens(...args);
+  }
+
   override async saveTokens(...[tokens, context]: SaveTokensArgs): Promise<void> {
     const exchange = this.codeExchangeInFlight;
+    // super.tokens: our tokens() override would clear the flag (already read).
+    const prev = exchange ? await super.tokens().catch(() => undefined) : undefined;
     this.codeExchangeInFlight = false;
     await super.saveTokens(tokens, context);
-    if (exchange && typeof tokens.issuer === "string") {
+    // A real exchange always brings a new access token; the SDK's upgrade
+    // stamp re-saves the same one.
+    if (exchange && typeof tokens.issuer === "string" && tokens.access_token !== prev?.access_token) {
       await this.storage.put(this.issuerPinKey(), { issuer: tokens.issuer, at: Date.now() });
     }
   }

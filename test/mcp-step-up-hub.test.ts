@@ -350,9 +350,21 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) =>
       ((await state.storage.get(`/${owner}/${id}/dodo_issuer_pin`)) as { issuer?: string } | undefined)?.issuer);
 
-  it("the code exchange pins the authorization server", async () => {
+  it("the code exchange pins the authorization server; removing the server drops the pin", async () => {
     const { hub, id, owner } = await connected();
     expect(await pinOf(hub, owner, id)).toBe(S);
+    await hub.removeMcpServer(id);
+    expect(await pinOf(hub, owner, id)).toBeUndefined();
+  });
+
+  it("a refresh does not write the pin", async () => {
+    const { fake, hub, id, owner } = await connected();
+    await dropPin(hub, owner, id);
+    fake.expireAll();
+    const before = fake.tokenRequests.length;
+    expect(((await hub.callOAuthTool(id, "forge", {})) as { content?: unknown }).content).toEqual([{ type: "text", text: "hi" }]);
+    expect(fake.tokenRequests.slice(before).some((p) => p.get("grant_type") === "refresh_token")).toBe(true);
+    expect(await pinOf(hub, owner, id)).toBeUndefined();
   });
 
   it("a pre-upgrade grant stamped by a swapped authorization server never gets a card", async () => {
@@ -368,6 +380,13 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     // AS, so its link matched and raised the card.
     const second = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
     expect(stepUpOf(second)).toBeUndefined();
+    // It did get as far as a phishing link: refused, not failed earlier.
+    const linkOrigin = await runInDurableObject(hub as unknown as DurableObjectStub, async (instance: unknown) => {
+      const conns = (instance as { mcp: { mcpConnections: Record<string, { options: { transport: { authProvider?: { authUrl?: string } } } }> } }).mcp.mcpConnections;
+      const u = conns[id]?.options.transport.authProvider?.authUrl;
+      return u ? new URL(u).origin : null;
+    });
+    expect(linkOrigin).toBe(PHISH);
     expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
     expect(await pinOf(hub, owner, id)).toBeUndefined();
   });
