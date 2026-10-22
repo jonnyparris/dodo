@@ -46,6 +46,7 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `src/shared-index.ts` — global singleton DO (user allowlist, host allowlist, models cache, session shares/permissions)
 - `src/crypto.ts` — hybrid envelope encryption (PBKDF2 + HKDF + AES-GCM) for per-user secrets
 - `src/rate-limit.ts` — per-user rate limiting
+- `src/model-budget.ts` / `src/model-budget-fetch.ts` — shared per-model Workers AI request budget (book lives in the SharedIndex DO). Main turns and explore/task subagents take a slot before each model request; subagents leave a 25% reserve for main turns and back off after a 429. Override caps with `MODEL_RPM_LIMITS`; inspect with `GET /api/admin/model-budget`
 
 ## Skills
 

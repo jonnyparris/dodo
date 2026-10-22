@@ -33,7 +33,8 @@ import { combineAbortSignals } from "@earendil-works/pi-ai/utils/abort-signals";
  * Generous on purpose: models whose reasoning isn't streamed can be quiet
  * for minutes before the first token, and a false positive costs a full
  * retry of the request. The 429 wait in rate-limit-fetch.ts (at most 60s
- * per request) sits inside this window.
+ * per request) plus the model-budget wait (at most 30s per request,
+ * src/pi/models.ts MAIN_BUDGET_MAX_WAIT_MS) sit inside this window.
  */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60_000;
 

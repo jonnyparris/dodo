@@ -4348,7 +4348,10 @@ export class CodingAgent extends CodingAgentBase {
       storage: this.ctx.storage,
       configureModels: (models) => {
         const config = this.piGatewayConfig();
-        setDodoProvider(models, [config.model], config, this.env);
+        setDodoProvider(models, [config.model], config, this.env, {
+          // The UI shows "waiting for model capacity" instead of a silent stall.
+          onBudgetWait: (info) => this.emitEvent({ type: "model_wait", data: { model: config.model, waitMs: Math.round(info.waitMs), used: info.used, limit: info.limit } }),
+        });
       },
       modelRef: () => {
         const config = this.piGatewayConfig();

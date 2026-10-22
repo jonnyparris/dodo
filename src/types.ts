@@ -25,6 +25,9 @@ export interface Env {
   DEFAULT_EXPLORE_MODEL?: string;
   /** Default model for the `task` subagent. Same fallback semantics. */
   DEFAULT_TASK_MODEL?: string;
+  /** JSON `{ "<model id>" | "@cf/*": rpm }` overriding the Workers AI per-model
+   *  request budgets in src/model-budget.ts. 0 turns a budget off. */
+  MODEL_RPM_LIMITS?: string;
   DEPLOY_MCP_CATALOG_CONFIG?: string;
   DODO_MCP_TOKEN?: string;
   DODO_COMMIT?: string;
