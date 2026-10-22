@@ -130,5 +130,6 @@ describe("turn stall guard", () => {
     expect(turnStallLimitsFromEnv({ TURN_STALL_SECONDS: "0" })).toEqual({ idleMs: 0, longMs: 0 });
     expect(turnStallLimitsFromEnv({ TURN_STALL_SECONDS: "3600" })).toEqual({ idleMs: 3_600_000, longMs: 3_600_000 });
     expect(turnStallLimitsFromEnv({ TURN_STALL_SECONDS: "abc" }).idleMs).toBe(DEFAULT_TURN_STALL_IDLE_MS);
+    expect(turnStallLimitsFromEnv({ TURN_STALL_SECONDS: "0.5" }).idleMs).toBe(1000);
   });
 });

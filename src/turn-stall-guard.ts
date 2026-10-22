@@ -1,5 +1,6 @@
-// Fail a prompt turn that stops making progress anywhere, not only inside
-// a model request.
+// Fail a prompt turn that stops making progress: its setup steps and the
+// pi run, not only a model request. (Finalizing a finished turn is local
+// and not covered.)
 //
 // On 10-21 session f25c9901 sat in one turn for 30 minutes with no AI
 // Gateway traffic until an outside abort ended it. PR #140
@@ -52,7 +53,8 @@ export function turnStallLimitsFromEnv(env: { TURN_STALL_SECONDS?: string; TURN_
   const seconds = (raw: string | undefined): number | null => {
     if (raw === undefined || raw.trim() === "") return null;
     const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+    // Only an exact 0 turns the guard off; 0.5 rounds up to 1s.
+    return Number.isFinite(n) && n >= 0 ? Math.ceil(n) : null;
   };
   const idle = seconds(env.TURN_STALL_SECONDS);
   const long = seconds(env.TURN_STALL_TOOL_SECONDS);
