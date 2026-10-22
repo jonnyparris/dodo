@@ -175,10 +175,11 @@ export function withRateLimitRetry(api: ProviderStreams, fetchOptions?: Paramete
 }
 
 /**
- * Longest one main-turn model request (with all its 429 resends) waits for
- * budget slots before sending anyway. With the 60s 429 wait in
- * rate-limit-fetch.ts that is at most ~90s of waiting per request, inside
- * the 5-minute stream idle timeout.
+ * Longest one main-turn model request (one harness attempt, with all its
+ * 429 resends) waits for budget slots before sending anyway. With the 60s
+ * 429 wait in rate-limit-fetch.ts that is at most ~90s of waiting per
+ * attempt, inside the 5-minute stream idle timeout; the harness makes up
+ * to 4 attempts per prompt.
  */
 export const MAIN_BUDGET_MAX_WAIT_MS = 30_000;
 

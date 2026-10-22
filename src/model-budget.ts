@@ -61,6 +61,8 @@ const MIN_CAP_SHARE = 0.25;
 const RECOVERY_SHARE = 0.1;
 /** Least cut to the learned cap per 429 episode. */
 const CAP_CUT_SHARE = 0.2;
+/** One 429 episode: later 429s inside this interval don't cut the cap again. */
+const CUT_INTERVAL_MS = 15_000;
 /** Subagent hold after a 429 without Retry-After. */
 const DEFAULT_COOLDOWN_MS = 5_000;
 const MAX_COOLDOWN_MS = WINDOW_MS;
@@ -72,8 +74,14 @@ interface Bucket {
   stamps: number[];
   cooldownUntil: number;
   lastCapChange: number;
+  lastCutAt: number;
   throttled: number;
   rateLimited: number;
+}
+
+/** Whole requests per minute, at least 1 (RPC and env input may be fractional or junk). */
+function normaliseRpm(rpm: number): number {
+  return Number.isFinite(rpm) ? Math.max(1, Math.floor(rpm)) : 1;
 }
 
 function minCap(rpm: number): number {
@@ -96,10 +104,11 @@ export class ModelBudgetBook {
 
   constructor(private readonly now: () => number = () => Date.now()) {}
 
-  private bucket(key: string, rpm: number, now: number): Bucket {
+  private bucket(key: string, rawRpm: number, now: number): Bucket {
+    const rpm = normaliseRpm(rawRpm);
     let b = this.buckets.get(key);
     if (!b) {
-      b = { rpm, cap: rpm, stamps: [], cooldownUntil: 0, lastCapChange: now, throttled: 0, rateLimited: 0 };
+      b = { rpm, cap: rpm, stamps: [], cooldownUntil: 0, lastCapChange: now, lastCutAt: Number.NEGATIVE_INFINITY, throttled: 0, rateLimited: 0 };
       this.buckets.set(key, b);
     }
     if (b.rpm !== rpm) {
@@ -120,7 +129,9 @@ export class ModelBudgetBook {
   }
 
   /** Take a slot, or say how long to wait for one. */
-  acquire(key: string, rpm: number, priority: BudgetPriority): BudgetDecision {
+  acquire(key: string, rpm: number, rawPriority: BudgetPriority): BudgetDecision {
+    // RPC input: anything that isn't "main" is treated as a subagent.
+    const priority: BudgetPriority = rawPriority === "main" ? "main" : "subagent";
     const now = this.now();
     const b = this.bucket(key, rpm, now);
     const limit = priorityLimit(b.cap, priority, b.rpm);
@@ -144,11 +155,12 @@ export class ModelBudgetBook {
     const now = this.now();
     const b = this.bucket(key, rpm, now);
     b.rateLimited++;
-    // Shrink once per 429 episode: the 429s of one burst arrive together and
-    // must not each cut the cap. The rejected request is already stamped, so
+    // Shrink at most once per CUT_INTERVAL_MS: the 429s of one burst arrive
+    // together and must not each cut the cap. The rejected request is already stamped, so
     // the real cap is below `used`; `used` can also include requests sent
     // past the budget (or rejected ones), so cut by at least 20% as well.
-    if (now >= b.cooldownUntil) {
+    if (now - b.lastCutAt >= CUT_INTERVAL_MS) {
+      b.lastCutAt = now;
       const learned = Math.max(minCap(b.rpm), Math.min(b.stamps.length - 1, Math.floor(b.cap * (1 - CAP_CUT_SHARE))));
       if (learned < b.cap) b.cap = learned;
     }
@@ -207,9 +219,10 @@ function parseOverrides(json?: string): Record<string, number> {
   try {
     const parsed = JSON.parse(json) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      out = Object.fromEntries(
-        Object.entries(parsed).filter((e): e is [string, number] => typeof e[1] === "number" && Number.isFinite(e[1]) && e[1] >= 0),
-      );
+      for (const [id, value] of Object.entries(parsed)) {
+        if (typeof value === "number" && Number.isFinite(value) && value >= 0) out[id] = Math.floor(value);
+        else log("warn", "MODEL_RPM_LIMITS entry ignored: rpm must be a number >= 0", { model: id });
+      }
     }
   } catch {
     out = {};

@@ -114,9 +114,23 @@ describe("ModelBudgetBook", () => {
     book.report429(KEY, 50, 5_000);
     book.report429(KEY, 50, 5_000);
     expect(book.snapshot()[0].cap).toBe(40);
+    c.advance(10_000); // cooldown over, still inside the 15s episode
+    book.report429(KEY, 50, 5_000);
+    expect(book.snapshot()[0].cap).toBe(40);
     c.advance(5_000);
     book.report429(KEY, 50, 5_000);
     expect(book.snapshot()[0].cap).toBe(32);
+  });
+
+  it("fractional or junk rpm and priority from RPC can't produce a NaN wait", () => {
+    const book = new ModelBudgetBook(clock().now);
+    for (let i = 0; i < 3; i++) book.acquire("f", 2.5, "subagent");
+    const d = book.acquire("f", 2.5, "subagent");
+    expect(d.ok).toBe(false);
+    expect(Number.isFinite(d.waitMs)).toBe(true);
+    expect(book.acquire("n", Number.NaN, "main").ok).toBe(true);
+    expect(book.acquire("n", Number.NaN, "main").ok).toBe(false);
+    expect(book.acquire("p", 4, "bogus" as never).limit).toBe(3); // treated as subagent
   });
 
   it("snapshot reports use, waits and 429s", () => {
@@ -152,6 +166,8 @@ describe("modelRpm", () => {
     expect(modelRpm("@cf/zai-org/glm-5.3-flash", o)).toBeUndefined();
     expect(modelRpm("anthropic/claude-sonnet-4-6", o)).toBeUndefined();
     expect(modelRpm("@cf/moonshotai/kimi-k2.6", "{not json")).toBe(50);
+    expect(modelRpm("@cf/moonshotai/kimi-k2.6", JSON.stringify({ "@cf/moonshotai/kimi-k2.6": 20.7 }))).toBe(20);
+    expect(modelRpm("@cf/moonshotai/kimi-k2.6", JSON.stringify({ "@cf/moonshotai/kimi-k2.6": "20" }))).toBe(50);
   });
 });
 
@@ -200,6 +216,19 @@ describe("budgetFetch", () => {
     await f("https://gw/chat");
     await f("https://gw/chat");
     expect(waits.reduce((a, b) => a + b, 0)).toBe(5_000);
+  });
+
+  it("fails open when the budget client throws synchronously", async () => {
+    const client = {
+      acquire: () => {
+        throw new Error("no binding");
+      },
+      report429: () => {
+        throw new Error("no binding");
+      },
+    } as unknown as ModelBudgetClient;
+    const f = budgetFetch(async () => rateLimited(), { client, key: "k", rpm: 4, priority: "main" });
+    expect((await f("https://gw/chat")).status).toBe(429);
   });
 
   it("fails open when the budget call hangs", async () => {

@@ -5,13 +5,15 @@
 //
 // It sits under any 429 retry wrapper, so every resend asks for its own
 // slot. Fails open: if the budget call throws or takes longer than
-// BUDGET_CALL_TIMEOUT_MS, the request goes out. After maxWaitMs of waiting
+// BUDGET_CALL_TIMEOUT_MS, the request goes out (a timed-out acquire may
+// still have taken a slot in the DO; it ages out in a minute). After maxWaitMs of waiting
 // the request goes out anyway: a subagent is never failed by the budget,
 // and a 429 it then gets is retried (and re-gated) by the AI SDK.
 
 import { abortableSleep, retryAfterMs, transient } from "./pi/rate-limit-fetch";
 import type { BudgetDecision, BudgetPriority } from "./model-budget";
 import { budgetKey, modelRpm } from "./model-budget";
+import { log } from "./logger";
 import type { Env } from "./types";
 
 export interface ModelBudgetClient {
@@ -47,7 +49,18 @@ export interface BudgetFetchOptions {
   callTimeoutMs?: number;
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+/** Budget calls that fail open, logged at most once a minute per isolate. */
+let lastFailOpenLog = 0;
+function logFailOpen(key: string, error: unknown): void {
+  const now = Date.now();
+  if (now - lastFailOpenLog < 60_000) return;
+  lastFailOpenLog = now;
+  log("warn", "model budget unavailable, sending without a slot", { key, error: error instanceof Error ? error.message : String(error) });
+}
+
+/** `call()` with a deadline; a synchronous throw becomes a rejection. */
+function withTimeout<T>(call: () => Promise<T>, ms: number): Promise<T> {
+  const promise = Promise.resolve().then(call);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error("model budget call timed out")), ms);
@@ -81,8 +94,11 @@ export function budgetFetch(base: typeof fetch, options: BudgetFetchOptions): ty
     const signal = init?.signal ?? (typeof Request !== "undefined" && input instanceof Request ? input.signal : undefined);
     let waited = options.maxWaitScope === "total" ? waitedTotal : 0;
     for (;;) {
-      const decision = await withTimeout(client.acquire(key, rpm, priority), callTimeoutMs).catch(() => undefined);
-      if (!decision || decision.ok) break;
+      const decision = await withTimeout(() => client.acquire(key, rpm, priority), callTimeoutMs).catch((error) => {
+        logFailOpen(key, error);
+        return undefined;
+      });
+      if (!decision || decision.ok || !Number.isFinite(decision.waitMs)) break;
       const left = maxWaitMs - waited;
       if (left <= 0) break;
       const waitMs = Math.min(left, decision.waitMs + Math.random() * WAIT_JITTER_MS);
@@ -94,9 +110,8 @@ export function budgetFetch(base: typeof fetch, options: BudgetFetchOptions): ty
     const response = await base(input, init);
     if (response.status === 429) {
       const body = await response.clone().text().catch(() => "");
-      if (transient(body)) {
-        await withTimeout(client.report429(key, rpm, retryAfterMs(response.headers)), callTimeoutMs).catch(() => {});
-      }
+      // Not awaited: the caller's own 429 wait shouldn't start late.
+      if (transient(body)) void withTimeout(() => client.report429(key, rpm, retryAfterMs(response.headers)), callTimeoutMs).catch(() => {});
     }
     return response;
   }) as typeof fetch;
