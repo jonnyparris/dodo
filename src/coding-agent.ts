@@ -33,6 +33,7 @@ import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { BROWSER_TOOL_NAME, createBrowserExecuteTool, createSessionBrowser } from "./browser/session-browser";
 import { checkCallbackUrl, postCompletionWebhook } from "./completion-webhook";
 import type { InputKind, NeedsInput, SessionToolHost } from "./tools/session-tools";
+import { DodoOAuthClientProvider } from "./mcp-oauth-provider";
 import { detectOAuthStepUp, OAUTH_STEP_UP_KEY, issuersMatch, parseStepUpParks, planStepUpRecovery, safeOrigin, stripStepUpMarker, type StepUpParks } from "./mcp-step-up";
 
 /** Metadata keys for the human handoff and completion doorbell. */
@@ -42,7 +43,7 @@ const STEP_UP_PARKS_KEY = "oauth_step_up_parks";
 /** Longest a hub wake waits for step-up park recovery (connect + discover). */
 // onStart runs inside the lifecycle's blockConcurrencyWhile (30s limit,
 // shared with the rest of startup): stay well under it.
-const STEP_UP_RECOVERY_WAIT_MS = 10_000;
+export const STEP_UP_RECOVERY_WAIT_MS = 10_000;
 const COMPLETION_WEBHOOK_KEY = "completion_webhook";
 /** While a person is needed, poke the browser this often (Browser Run idle keep_alive is 180 s). */
 const BROWSER_WARM_INTERVAL_SECONDS = 120;
@@ -1318,6 +1319,17 @@ export class CodingAgent extends CodingAgentBase {
     };
   }
 
+  /**
+   * Cap on how long onStart waits for step-up park recovery. Static and
+   * writable only so tests can shorten it (test/mcp-step-up-hub.test.ts).
+   */
+  static stepUpRecoveryWaitMs = STEP_UP_RECOVERY_WAIT_MS;
+
+  /** Hub DO OAuth provider: flags SDK upgrade stamps (src/mcp-oauth-provider.ts). */
+  override createMcpOAuthProvider(callbackUrl: string): DodoOAuthClientProvider {
+    return new DodoOAuthClientProvider(this.ctx.storage, this.name, callbackUrl);
+  }
+
   override onStart(): void | Promise<void> {
     // Opens the Think-era SessionManager (read-only history) and restarts
     // fibers an eviction interrupted. See DodoAgentBase.
@@ -1370,12 +1382,13 @@ export class CodingAgent extends CodingAgentBase {
     // MCP server blocking every session's OAuth tools.
     const recovery = this.recoverStepUpParks();
     if (recovery) {
+      const capMs = CodingAgent.stepUpRecoveryWaitMs;
       let timer: ReturnType<typeof setTimeout> | undefined;
       const cap = new Promise<void>((r) => {
         timer = setTimeout(() => {
-          log("warn", "oauth mcp step-up park recovery still running after cap", { capMs: STEP_UP_RECOVERY_WAIT_MS });
+          log("warn", "oauth mcp step-up park recovery still running after cap", { capMs });
           r();
-        }, STEP_UP_RECOVERY_WAIT_MS);
+        }, capMs);
       });
       return Promise.race([recovery, cap]).finally(() => clearTimeout(timer));
     }
@@ -5597,7 +5610,12 @@ export class CodingAgent extends CodingAgentBase {
     // the call, from the tokens only: a failed auth() against a different
     // AS re-registers there (new clientId), after which the provider's
     // client info describes the new AS and would vouch for its link.
-    const grantIssuer = (await safe(provider?.tokens))?.issuer;
+    // A grant whose issuer came from the SDK's upgrade stamp has no trusted
+    // issuer: the stamp names whatever AS that auth() discovered (see
+    // src/mcp-oauth-provider.ts). Treat it as unstamped until a reconnect.
+    const dodoProvider = provider instanceof DodoOAuthClientProvider ? provider : undefined;
+    const unverified = dodoProvider ? (await safe(() => dodoProvider.issuerUnverified())) === true : false;
+    const grantIssuer = unverified ? undefined : (await safe(provider?.tokens))?.issuer;
     try {
       const result = await this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
       const clean = stripStepUpMarker(result);

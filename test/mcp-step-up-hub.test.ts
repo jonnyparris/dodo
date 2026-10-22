@@ -55,6 +55,10 @@ function fakeServer() {
   const tokens = new Map<string, string>(); // access token -> scope
   const codes = new Map<string, string>(); // code -> scope it grants
   const tokenRequests: URLSearchParams[] = [];
+  /** Origin of each token request, same order as tokenRequests. */
+  const tokenOrigins: string[] = [];
+  /** Knobs for restart tests: list failures, and a /mcp that never answers. */
+  const knobs = { failToolsList: false, hang: null as Promise<void> | null };
   const json = (o: unknown, headers: Record<string, string> = {}) =>
     new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json", ...headers } });
   const challenge = (status: number, scope: string, error?: string) =>
@@ -87,6 +91,7 @@ function fakeServer() {
     if (url.pathname === "/token") {
       const p = new URLSearchParams(await req.text());
       tokenRequests.push(p);
+      tokenOrigins.push(o);
       const scope = p.get("grant_type") === "authorization_code" ? codes.get(p.get("code") ?? "") : BASE;
       if (!scope) return new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400, headers: { "content-type": "application/json" } });
       const access = `tok-${tokens.size + 1}`;
@@ -94,6 +99,10 @@ function fakeServer() {
       return json({ access_token: access, token_type: "Bearer", scope, refresh_token: `r-${access}`, expires_in: 3600 });
     }
     if (url.pathname === "/mcp") {
+      if (knobs.hang) {
+        await knobs.hang;
+        return new Response("gone", { status: 503 });
+      }
       const scope = tokens.get((req.headers.get("authorization") ?? "").replace(/^Bearer /, ""));
       if (!scope) return challenge(401, BASE);
       if (req.method === "GET" || req.method === "DELETE") return new Response(null, { status: 405 });
@@ -102,6 +111,7 @@ function fakeServer() {
       const ok = (result: unknown) => json({ jsonrpc: "2.0", id: msg.id, result }, { "mcp-session-id": "sess-1" });
       if (msg.method === "initialize")
         return ok({ protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fake-cf", version: "1" } });
+      if (msg.method === "tools/list" && knobs.failToolsList) return new Response("boom", { status: 500 });
       if (msg.method === "tools/list")
         return ok({ tools: [
           { name: "execute", description: "run", inputSchema: { type: "object", properties: {} } },
@@ -121,7 +131,7 @@ function fakeServer() {
     }
     return new Response("?", { status: 404 });
   };
-  return { fetchImpl, codes, tokenRequests, as };
+  return { fetchImpl, codes, tokenRequests, tokenOrigins, knobs, as };
 }
 
 async function waitForState(hub: Hub, id: string, state: string): Promise<void> {
@@ -204,7 +214,7 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     fake.codes.set("code-min", BASE);
     expect((await callback(hub, callbackUrl, added.authUrl!, "code-min")).status).toBe(302);
     await waitForState(hub, added.id, "ready");
-    return { fake, hub, getHub, id: added.id, callbackUrl };
+    return { fake, hub, getHub, id: added.id, callbackUrl, owner };
   }
   const stepUpOf = (res: unknown) => (res as Record<string, OAuthStepUp>)[OAUTH_STEP_UP_KEY];
   const exchanged = (fake: ReturnType<typeof fakeServer>, code: string) =>
@@ -308,8 +318,113 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     expect(stepUpOf(again)).toBeUndefined();
     expect(String(again)).toMatch(/Unauthorized/);
     expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
+    // The stamped grant's refresh token never went to the swapped AS: the
+    // SDK drops tokens whose issuer stamp names another AS before refresh.
+    fake.tokenRequests.forEach((p, i) => {
+      if (fake.tokenOrigins[i] === PHISH) expect(p.get("refresh_token")).toBeNull();
+    });
     // Read calls still work on the real grant.
     fake.as.current = S;
     expect(((await hub.callOAuthTool(id, "forge", {})) as { content?: unknown }).content).toEqual([{ type: "text", text: "hi" }]);
+  });
+
+  /** Strip the SEP-2352 issuer stamp from the stored grant (pre-upgrade storage). */
+  async function unstamp(hub: Hub, owner: string, id: string): Promise<void> {
+    await runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) => {
+      const keys = await state.storage.list<Record<string, unknown>>({ prefix: `/${owner}/${id}/` });
+      for (const [k, v] of keys) {
+        if (!k.endsWith("/token") && !k.endsWith("/client_info/")) continue;
+        const { issuer: _drop, ...rest } = v;
+        await state.storage.put(k, rest);
+      }
+    });
+  }
+  const unverifiedFlag = (hub: Hub, owner: string, id: string) =>
+    runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) =>
+      (await state.storage.get(`/${owner}/${id}/dodo_issuer_unverified`)) !== undefined);
+
+  it("a pre-upgrade grant stamped by a swapped authorization server never gets a card", async () => {
+    const { fake, hub, id, owner } = await connected();
+    await unstamp(hub, owner, id);
+    fake.as.current = PHISH;
+    // First call: the SDK stamps the unstamped grant with the AS it just
+    // discovered (the phishing one). No grant issuer yet → no card.
+    const first = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
+    expect(stepUpOf(first)).toBeUndefined();
+    expect(await unverifiedFlag(hub, owner, id)).toBe(true);
+    // Second call: before the fix the grant now "came from" the phishing AS,
+    // so its link matched and raised the card.
+    const second = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
+    expect(stepUpOf(second)).toBeUndefined();
+    expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
+  });
+
+  it("an upgrade stamp from the real authorization server also waits for a reconnect", async () => {
+    const { hub, id, owner } = await connected();
+    await unstamp(hub, owner, id);
+    // The stamp could have come from any AS, so even the real one gets no
+    // card until the server is reconnected from Settings (fresh grant).
+    const first = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
+    expect(stepUpOf(first)).toBeUndefined();
+    expect(await unverifiedFlag(hub, owner, id)).toBe(true);
+    const second = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
+    expect(stepUpOf(second)).toBeUndefined();
+    // A fresh connect (new grant) is not flagged.
+    const fresh = await connected();
+    expect(stepUpOf(await fresh.hub.callOAuthTool(fresh.id, "execute", { code: "write" }))).toBeTruthy();
+    expect(await unverifiedFlag(fresh.hub, fresh.owner, fresh.id)).toBe(false);
+  });
+
+  it("a restart reconnect that ends at 'connected' is parked again so the link completes", async () => {
+    const { fake, hub, getHub, id, callbackUrl } = await connected();
+    const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    expect(stepUp).toBeTruthy();
+    // After the restart the server connects but tool discovery fails, so the
+    // reconnect ends at `connected`, which the SDK callback also treats as
+    // already authorized (it would drop the code as stale).
+    fake.knobs.failToolsList = true;
+    await evictDurableObject(hub as unknown as DurableObjectStub);
+    const woke = await getHub();
+    await waitForState(woke, id, "authenticating");
+    expect((await woke.getMcpServers()).servers[id].auth_url).toBe(stepUp.authUrl);
+    fake.knobs.failToolsList = false;
+    fake.codes.set("code-write", `${BASE} ${WRITE}`);
+    expect((await callback(woke, callbackUrl, stepUp.authUrl, "code-write")).status).toBe(302);
+    expect(exchanged(fake, "code-write")).toBe(true);
+    await waitForState(woke, id, "ready");
+  });
+
+  it("a hung reconnect delays the hub's wake only up to the recovery cap", async () => {
+    const { fake, hub, getHub, id } = await connected();
+    const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    expect(stepUp).toBeTruthy();
+    type CapClass = { stepUpRecoveryWaitMs: number };
+    const cls = await runInDurableObject(hub as unknown as DurableObjectStub, async (instance: object) => instance.constructor as unknown as CapClass);
+    const before = cls.stepUpRecoveryWaitMs;
+    expect(before).toBe(10_000);
+    let release!: () => void;
+    fake.knobs.hang = new Promise<void>((r) => { release = r; });
+    try {
+      // Shortened so the test is quick; the code path is the same.
+      await runInDurableObject(hub as unknown as DurableObjectStub, async (instance: object) => {
+        (instance.constructor as unknown as CapClass).stepUpRecoveryWaitMs = 300;
+      });
+      await evictDurableObject(hub as unknown as DurableObjectStub);
+      const started = Date.now();
+      const woke = await getHub();
+      const servers = (await woke.getMcpServers()).servers;
+      const waited = Date.now() - started;
+      // The MCP server never answers, so without the cap the wake would block
+      // until the reconnect gives up. With it, the first request runs at ~cap.
+      expect(waited).toBeGreaterThanOrEqual(250);
+      expect(waited).toBeLessThan(5_000);
+      expect(servers[id]).toBeTruthy();
+    } finally {
+      await runInDurableObject(hub as unknown as DurableObjectStub, async (instance: object) => {
+        (instance.constructor as unknown as CapClass).stepUpRecoveryWaitMs = before;
+      }).catch(() => undefined);
+      release();
+      fake.knobs.hang = null;
+    }
   });
 });

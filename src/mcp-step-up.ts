@@ -24,7 +24,8 @@
  * A restart while parked is handled by `planStepUpRecovery`.
  *
  * This module is pure (no DO, no SDK imports) so it unit-tests cheaply.
- * Probably belongs upstream in `agents` (MCPClientManager.callTool); delete
+ * Belongs upstream in `agents` (MCPClientManager.callTool, filed as
+ * https://github.com/cloudflare/agents/issues/2658); delete
  * once the SDK surfaces mid-session auth itself.
  */
 
@@ -104,11 +105,11 @@ export function issuersMatch(a: string, b: string): boolean {
  *   stops a server from swapping `authorization_servers` mid-session to
  *   send the person to another host. Its endpoints may live on any https
  *   origin: the metadata comes from the issuer itself.
- * No grant issuer (tokens saved before the SDK stamped them) → refused.
- * Known gap: the failed auth() then stamps those tokens with whatever AS it
- * just discovered, so if that was a swapped AS, the *next* step-up trusts
- * it. Only affects grants saved before the SDK stamped issuers and never
- * refreshed since; reconnecting the server closes it.
+ * No grant issuer → refused. That covers tokens saved before the SDK
+ * stamped them, and tokens whose stamp came from the SDK's upgrade path
+ * (the first auth() after the upgrade stamps them with whatever AS it just
+ * discovered, possibly a swapped one). `DodoOAuthClientProvider` flags that
+ * stamp and the hub passes no grant issuer until the server is reconnected.
  */
 export function isTrustedAuthUrl(authUrl: string, issuers: { grantIssuer?: string; linkIssuer?: string } = {}): boolean {
   let u: URL;
