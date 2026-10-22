@@ -640,6 +640,8 @@ app.delete("/api/admin/users/:email/browser", adminGuard as never, async (c) =>
 );
 
 app.get("/api/admin/stats", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/stats"));
+// Workers AI per-model request budgets (src/model-budget.ts): learned cap, use in the last minute, waits, 429s.
+app.get("/api/admin/model-budget", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/model-budget"));
 
 app.get("/api/admin/users/detailed", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users/detailed"));
 
