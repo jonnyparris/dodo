@@ -174,11 +174,12 @@ function expandEnv(value: string): string {
   });
 }
 
-async function prepareSession(dodo: Dodo, task: Task): Promise<string> {
-  if (task.fork) return (await dodo.post<{ id: string }>(`/session/${expandEnv(task.fork)}/fork`)).id;
+/** Fork or create the run's session. `onId` gets the id before the clone, so a failed clone still leaves an id to clean up. */
+async function prepareSession(dodo: Dodo, task: Task, onId: (id: string) => void): Promise<void> {
+  if (task.fork) return onId((await dodo.post<{ id: string }>(`/session/${expandEnv(task.fork)}/fork`)).id);
   const { id } = await dodo.post<{ id: string }>("/session");
+  onId(id);
   if (task.clone) await dodo.post(`/session/${id}/git/clone`, { url: task.clone.url, dir: task.clone.dir, branch: task.clone.branch });
-  return id;
 }
 
 /**
@@ -243,7 +244,9 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
   const result: RunResult = { task: task.id, arm: armName, sessionId: "", models: arm, status: "error", wallSeconds: 0, tokenInput: 0, tokenOutput: 0, answer: "" };
   const runDir = join(outDir, `${task.id}-${armName}`);
   try {
-    result.sessionId = await prepareSession(dodo, task);
+    await prepareSession(dodo, task, (id) => {
+      result.sessionId = id;
+    });
     const t0 = Date.now();
     const sent = await dodo.post<{ promptId: string }>(`/session/${result.sessionId}/prompt`, {
       content: task.prompt,
