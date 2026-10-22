@@ -1418,6 +1418,16 @@ export class UserControl extends DurableObject<Env> {
       this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN fork_source INTEGER NOT NULL DEFAULT 0");
     } catch { /* column already exists */ }
 
+    // has_prompts = 1 once the session is known to hold a prompt. Set when
+    // the CodingAgent reports status 'running' (user / queue prompts; cron,
+    // watchdog and other syncIndex:false sources don't report it) and, for
+    // everything else including rows that predate the column, by the idle
+    // sweep after it counts prompts. The sweep filters on it in SQL, so prompted sessions stop
+    // taking batch slots and newer empty sessions get reached.
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN has_prompts INTEGER NOT NULL DEFAULT 0");
+    } catch { /* column already exists */ }
+
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS memory_entries (
         id TEXT PRIMARY KEY,
@@ -1895,7 +1905,17 @@ export class UserControl extends DurableObject<Env> {
     const nextTitle = patch.title === undefined ? current.title : patch.title;
     const nextStatus = patch.status ?? current.status;
     const now = nowEpoch();
-    this.ctx.storage.sql.exec("UPDATE sessions SET title = ?, status = ?, updated_at = ? WHERE id = ?", nextTitle, nextStatus, now, id);
+    // 'running' means a prompt was dispatched; from then on the session
+    // is never an idle-sweep candidate.
+    const prompted = nextStatus === "running" ? 1 : 0;
+    this.ctx.storage.sql.exec(
+      "UPDATE sessions SET title = ?, status = ?, updated_at = ?, has_prompts = MAX(has_prompts, ?) WHERE id = ?",
+      nextTitle,
+      nextStatus,
+      now,
+      prompted,
+      id,
+    );
     return this.getSession(id);
   }
 
@@ -2972,6 +2992,8 @@ export class UserControl extends DurableObject<Env> {
         err: err instanceof Error ? err.message : String(err),
       });
     }
+    // Arm the periodic wake if the sync failed, so the reconcile retries.
+    await this.rearmAlarm();
     return { token, created_at: now };
   }
 
@@ -3691,10 +3713,21 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Set the DO alarm to fire at the earliest pending work:
    *   - next scheduled-session fire (min next_run_epoch)
-   *   - next idle-session sweep (if any idle sessions exist)
+   *   - next periodic wake (idle-session sweep + MCP token reconcile),
+   *     only while there is an idle session the sweep could delete or an
+   *     MCP token still waiting to sync to SharedIndex
    * Clears the alarm when neither bucket has pending work.
+   *
+   * `fromAlarm` is set by alarm() itself: the alarm that is running now
+   * is spent, so the periodic leg restarts from now. Every other caller
+   * keeps an earlier armed alarm, so frequent calls (one per session
+   * create) can't keep pushing the sweep back.
    */
-  private async rearmAlarm(): Promise<void> {
+  private async rearmAlarm(opts: { fromAlarm?: boolean } = {}): Promise<void> {
+    // Read the armed alarm before the SQL reads so nothing awaits between
+    // computing the candidates and setAlarm (registerSession calls this
+    // fire-and-forget, so two calls can overlap).
+    const armed = opts.fromAlarm ? null : await this.ctx.storage.getAlarm();
     const candidates: number[] = [];
 
     const nextSched = (Array.from(this.ctx.storage.sql.exec(
@@ -3704,13 +3737,22 @@ export class UserControl extends DurableObject<Env> {
       candidates.push(Number(nextSched.t) * 1000);
     }
 
-    // Only keep the idle sweep armed while there are idle sessions to
-    // watch. Empty userbases shouldn't pay for periodic wake-ups.
-    const idle = (Array.from(this.ctx.storage.sql.exec(
-      "SELECT 1 AS has FROM sessions WHERE status = 'idle' LIMIT 1",
+    // Only wake periodically when there is work for the sweep or the
+    // token reconcile. Empty userbases shouldn't pay for wake-ups. The
+    // session filter matches sweepIdleSessions minus the age cutoff:
+    // prompted, seed and fork-source sessions are never deleted.
+    const sweepable = (Array.from(this.ctx.storage.sql.exec(
+      `SELECT 1 AS has FROM sessions
+        WHERE status = 'idle' AND has_prompts = 0 AND kind != 'seed' AND fork_source = 0
+          AND id NOT IN (SELECT source_session_id FROM scheduled_sessions WHERE source_session_id IS NOT NULL)
+        LIMIT 1`,
     ))[0] as SqlRow | null);
-    if (idle?.has != null) {
-      candidates.push(Date.now() + IDLE_SWEEP_INTERVAL_SECONDS * 1000);
+    const unsyncedToken = (Array.from(this.ctx.storage.sql.exec(
+      "SELECT 1 AS has FROM user_mcp_tokens WHERE synced_to_index = 0 LIMIT 1",
+    ))[0] as SqlRow | null);
+    if (sweepable?.has != null || unsyncedToken?.has != null) {
+      const nextWake = Date.now() + IDLE_SWEEP_INTERVAL_SECONDS * 1000;
+      candidates.push(armed !== null ? Math.min(armed, nextWake) : nextWake);
     }
 
     if (candidates.length === 0) {
@@ -3780,7 +3822,7 @@ export class UserControl extends DurableObject<Env> {
     // index side; bounded LIMIT keeps wake-ups cheap.
     await this.reconcileUnsyncedMcpTokens();
 
-    await this.rearmAlarm();
+    await this.rearmAlarm({ fromAlarm: true });
   }
 
   /**
@@ -3816,7 +3858,7 @@ export class UserControl extends DurableObject<Env> {
     // fork schedule is a template, and deleting it breaks later forks.
     const candidates = Array.from(this.ctx.storage.sql.exec(
       `SELECT id FROM sessions
-        WHERE status = 'idle' AND kind != 'seed' AND fork_source = 0 AND updated_at < ?
+        WHERE status = 'idle' AND has_prompts = 0 AND kind != 'seed' AND fork_source = 0 AND updated_at < ?
           AND id NOT IN (SELECT source_session_id FROM scheduled_sessions WHERE source_session_id IS NOT NULL)
         ORDER BY updated_at ASC LIMIT ?`,
       cutoff,
@@ -3838,7 +3880,13 @@ export class UserControl extends DurableObject<Env> {
         continue;
       }
 
-      if (promptCount > 0) continue;
+      if (promptCount > 0) {
+        // Remember it, so this session never takes a batch slot again.
+        // Without this, 25+ old prompted sessions sit at the head of the
+        // ORDER BY updated_at queue and newer empty ones are never reached.
+        this.ctx.storage.sql.exec("UPDATE sessions SET has_prompts = 1 WHERE id = ?", sessionId);
+        continue;
+      }
 
       // Reuse the same soft-delete primitive as the manual DELETE path
       // so the 5-min recovery window behaves identically.
@@ -3848,7 +3896,7 @@ export class UserControl extends DurableObject<Env> {
       const deleteExpiry = nowEpoch() + 300;
       const deleted = this.ctx.storage.sql.exec(
         `UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ?
-          WHERE id = ? AND status = 'idle' AND fork_source = 0 AND updated_at < ?
+          WHERE id = ? AND status = 'idle' AND has_prompts = 0 AND fork_source = 0 AND updated_at < ?
             AND id NOT IN (SELECT source_session_id FROM scheduled_sessions WHERE source_session_id IS NOT NULL)`,
         deleteExpiry,
         nowEpoch(),

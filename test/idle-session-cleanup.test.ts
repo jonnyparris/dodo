@@ -260,6 +260,146 @@ describe("Idle session auto-cleanup", () => {
     const dead = await stub.fetch(`https://user-control/sessions/${deadId}/fork-source`, { method: "POST" });
     expect(dead.status).toBe(404);
   });
+  async function seedPrompt(sessionId: string): Promise<void> {
+    const typedEnv = env as Env;
+    const agentStub = typedEnv.CODING_AGENT.get(typedEnv.CODING_AGENT.idFromName(sessionId));
+    await agentStub.fetch(new Request(`https://coding-agent/?sessionId=${encodeURIComponent(sessionId)}`));
+    await runInDurableObject(agentStub, async (_, state) => {
+      const now = Math.floor(Date.now() / 1000);
+      state.storage.sql.exec(
+        "INSERT INTO prompts (id, session_id, content, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        `p-${sessionId}`, sessionId, "hello", "completed", now, now,
+      );
+    });
+  }
+
+  async function hasPromptsFlag(sessionId: string): Promise<number> {
+    return await runInDurableObject(getUserControlStub(), async (_, state) =>
+      (state.storage.sql.exec("SELECT has_prompts FROM sessions WHERE id = ?", sessionId).toArray()[0] as { has_prompts: number }).has_prompts);
+  }
+
+  it("marks a session as prompted once a prompt starts (status 'running')", async () => {
+    const sessionId = await createSession();
+    expect(await hasPromptsFlag(sessionId)).toBe(0);
+    const stub = getUserControlStub();
+    const res = await stub.fetch(`https://user-control/sessions/${sessionId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status: "running" }),
+    });
+    expect(res.status).toBe(200);
+    await stub.fetch(`https://user-control/sessions/${sessionId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status: "idle" }),
+    });
+    expect(await hasPromptsFlag(sessionId)).toBe(1);
+
+    // The flag alone keeps it: its CodingAgent holds no prompt rows here.
+    await backdateSession(sessionId, 11 * 60);
+    await runSweep();
+    expect(await getSessionStatus(sessionId)).toBe("idle");
+  });
+
+  it("reaches newer empty sessions behind a full batch of old prompted ones", async () => {
+    // Regression: the sweep took the 25 oldest idle sessions and skipped
+    // prompted ones without remembering them, so 25+ old prompted
+    // sessions blocked every newer empty session for good.
+    const BATCH = 25;
+    const prompted: string[] = [];
+    for (let i = 0; i < BATCH + 1; i++) {
+      const id = await createSession();
+      await seedPrompt(id);
+      await backdateSession(id, 3600 + (BATCH - i) * 60); // all older than the control
+      prompted.push(id);
+    }
+    const control = await createSession();
+    await backdateSession(control, 11 * 60);
+
+    // First pass counts prompts on the oldest 25 and flags them.
+    await runSweep();
+    // Second pass skips the flagged ones in SQL and reaches the control.
+    await runSweep();
+
+    expect(await getSessionStatus(control)).toBe("deleted");
+    for (const id of prompted) {
+      expect(await getSessionStatus(id)).toBe("idle");
+      expect(await hasPromptsFlag(id)).toBe(1);
+    }
+  }, 120_000);
+
+  it("does not push an armed sweep later when sessions keep being created", async () => {
+    await createSession();
+    const stub = getUserControlStub();
+    const soon = Date.now() + 30_000;
+    await runInDurableObject(stub, async (_, state) => {
+      state.storage.setAlarm(soon);
+    });
+    await createSession();
+    const alarmAt = await runInDurableObject<import("../src/user-control").UserControl, number | null>(
+      stub,
+      async (_, state) => await state.storage.getAlarm(),
+    );
+    expect(alarmAt).toBe(soon);
+  });
+
+  async function readAlarm(): Promise<number | null> {
+    return await runInDurableObject<import("../src/user-control").UserControl, number | null>(
+      getUserControlStub(),
+      async (_, state) => await state.storage.getAlarm(),
+    );
+  }
+
+  it("pulls a far-off armed alarm in to the sweep interval", async () => {
+    await createSession();
+    const stub = getUserControlStub();
+    await runInDurableObject(stub, async (_, state) => {
+      state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+    });
+    await createSession();
+    const alarmAt = await readAlarm();
+    expect(alarmAt).not.toBeNull();
+    expect(alarmAt!).toBeLessThanOrEqual(Date.now() + 5 * 60 * 1000);
+  });
+
+  it("clears the alarm when the only idle sessions are prompted", async () => {
+    const sessionId = await createSession();
+    await seedPrompt(sessionId);
+    await backdateSession(sessionId, 11 * 60);
+    await runSweep();
+    expect(await hasPromptsFlag(sessionId)).toBe(1);
+    expect(await readAlarm()).toBeNull();
+  });
+
+  it("keeps waking while an MCP token is waiting to sync", async () => {
+    const stub = getUserControlStub();
+    await runInDurableObject(stub, async (_, state) => {
+      state.storage.sql.exec("DELETE FROM user_mcp_tokens");
+      state.storage.sql.exec(
+        "INSERT INTO user_mcp_tokens (token, email, label, created_at, last_used_at, synced_to_index) VALUES (?, ?, NULL, ?, NULL, 0)",
+        "dodo_unsynced_test", "dev@dodo.local", Date.now(),
+      );
+    });
+    // Make the SharedIndex replay fail so the row stays unsynced.
+    const typedEnv = env as Env;
+    const spy = vi.spyOn(typedEnv.SHARED_INDEX, "get").mockImplementation(() => ({
+      fetch: async () => new Response("down", { status: 503 }),
+    }) as never);
+    try {
+      await runSweep();
+    } finally {
+      spy.mockRestore();
+    }
+    const alarmAt = await readAlarm();
+    const synced = await runInDurableObject(stub, async (_, state) => {
+      const row = state.storage.sql.exec("SELECT synced_to_index FROM user_mcp_tokens WHERE token = ?", "dodo_unsynced_test").toArray()[0] as { synced_to_index: number };
+      state.storage.sql.exec("DELETE FROM user_mcp_tokens WHERE token = ?", "dodo_unsynced_test");
+      return row.synced_to_index;
+    });
+    expect(synced).toBe(0);
+    expect(alarmAt).not.toBeNull();
+  });
+
   it("refuses to fork a soft-deleted source", async () => {
     const baseId = await createSession();
     await backdateSession(baseId, 11 * 60);
