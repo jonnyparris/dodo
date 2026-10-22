@@ -1395,7 +1395,9 @@ export class CodingAgent extends CodingAgentBase {
 
       if (request.method === "GET" && url.pathname === "/") {
         // No prompt yet: load the owner's config so the details show the
-        // owner's model, not the Worker default. Once per session.
+        // owner's model, not the Worker default. Only when the session has
+        // no config: a later change to the owner's config shows from the
+        // next prompt.
         if (!this.getConfig()) await this.refreshConfigFromOwner();
         return Response.json(this.readSessionDetails());
       }
@@ -5052,7 +5054,8 @@ export class CodingAgent extends CodingAgentBase {
     // Context window info. The session config holds the models the current
     // (or last) prompt runs on. A session override set while a prompt runs
     // only applies from the next prompt, so it shows once the session is
-    // idle; PUT /model-override refreshes the config when idle.
+    // idle; PUT /model-override refreshes the config when idle. (Clearing
+    // an override mid-run shows the owner's model from the next prompt.)
     const config = this.getConfig();
     const modelOverride = this.modelOverride.read();
     const pending = status === "running" ? {} : modelOverride;
@@ -5902,6 +5905,7 @@ export class CodingAgent extends CodingAgentBase {
     }
     const stub = getUserControlStub(this.env, ownerEmail);
     const response = await stub.fetch("https://user-control/config");
+    if (!response.ok) throw new Error(`UserControl /config returned ${response.status}`);
     const appConfig = (await response.json()) as AppConfig;
 
     const existing = this.getConfig();
@@ -5911,15 +5915,17 @@ export class CodingAgent extends CodingAgentBase {
       ownerEmail,
       createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
       browserEnabled: this.browserEnabled(),
-      activeGateway: existing?.activeGateway ?? appConfig.activeGateway,
+      // Model and gateway both from the owner's live config, so they stay a
+      // routable pair. Not existing.model: that can be an override the owner
+      // has since cleared. Every route sends the owner's config as x-dodo-*
+      // headers anyway, so for a prompt that came through a route they agree.
+      activeGateway: appConfig.activeGateway ?? existing?.activeGateway,
       gitAuthorEmail: appConfig.gitAuthorEmail,
       gitAuthorName: appConfig.gitAuthorName,
-      // Not existing.model: that can be an override the owner has since
-      // cleared. Every route sends the owner's model as x-dodo-model anyway,
-      // so for a prompt that came through a route the two agree.
       model: override.model ?? appConfig.model,
-      opencodeBaseURL: existing?.opencodeBaseURL ?? appConfig.opencodeBaseURL,
-      aiGatewayBaseURL: existing?.aiGatewayBaseURL ?? appConfig.aiGatewayBaseURL,
+      opencodeBaseURL: appConfig.opencodeBaseURL ?? existing?.opencodeBaseURL,
+      aiGatewayBaseURL: appConfig.aiGatewayBaseURL ?? existing?.aiGatewayBaseURL,
+      replicateImageModel: appConfig.replicateImageModel ?? existing?.replicateImageModel,
       // Always pull the latest prefix from UserControl so config changes
       // take effect on the next prompt without requiring a session restart.
       systemPromptPrefix: appConfig.systemPromptPrefix,
