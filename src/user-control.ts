@@ -3585,12 +3585,15 @@ export class UserControl extends DurableObject<Env> {
     // user doesn't own (shared, or any session for a platform admin) would
     // fail every fire with source_session_missing. Reject it up front.
     if (sourceSessionId !== null) {
-      const owned = Array.from(this.ctx.storage.sql.exec(
-        "SELECT id FROM sessions WHERE id = ? AND status != 'deleted'",
+      const sourceRow = Array.from(this.ctx.storage.sql.exec(
+        "SELECT status FROM sessions WHERE id = ?",
         sourceSessionId,
-      )).length > 0;
-      if (!owned) {
-        throw new Error("Scheduled forks can only use a session you own as the source");
+      ))[0] as SqlRow | undefined;
+      if (!sourceRow) {
+        throw new Error("Scheduled forks can only use a session you own as the source. Fork the shared session first, then schedule from your copy.");
+      }
+      if (String(sourceRow.status) === "deleted") {
+        throw new Error("Source session is deleted");
       }
     }
 
@@ -4033,8 +4036,10 @@ export class UserControl extends DurableObject<Env> {
     title: string | null,
   ): Promise<string> {
     // Verify the source session exists in THIS DO. Scheduled sessions can
-    // only fork from sessions owned by the same user — the create-time
-    // permission check already ensured the caller had write on the source.
+    // only fork from sessions owned by the same user — createScheduledSession
+    // enforces that at create time, so a miss here means the source row was
+    // purged after the schedule was made (a soft-deleted source is caught by
+    // markForkSource below).
     const sourceRow = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM sessions WHERE id = ?", sourceSessionId))[0] as SqlRow | null);
     if (!sourceRow) {
       throw new SourceSessionMissingError(sourceSessionId);
