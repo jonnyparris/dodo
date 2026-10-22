@@ -56,6 +56,17 @@ function seedThinkSession(instance: any, state: DurableObjectState): ThinkHistor
   return w;
 }
 
+/** Poll a prompt's status until it equals `want` (or ~2s pass); returns the last status seen. */
+async function pollPromptStatus(id: string, promptId: string, want: string): Promise<string> {
+  let status = "";
+  for (let i = 0; i < 200 && status !== want; i++) {
+    const { prompts } = await json<{ prompts: Array<{ id: string; status: string }> }>(await call(`/session/${id}/prompts`));
+    status = prompts.find((p) => p.id === promptId)?.status ?? "";
+    if (status !== want) await new Promise((r) => setTimeout(r, 10));
+  }
+  return status;
+}
+
 async function waitForPrompt(id: string, promptId: string, ms = 2000) {
   for (let i = 0; i < ms / 10; i++) {
     const { prompts } = await json<{ prompts: Array<{ id: string; status: string; error?: string }> }>(await call(`/session/${id}/prompts`));
@@ -317,6 +328,32 @@ describe("pi is the default engine", () => {
       await new Promise((r) => setTimeout(r, 10));
     }
     throw new Error(`queued cron never ran (queue: ${JSON.stringify(queue)})`);
+  });
+
+  it("an async prompt reads 'running' once its fiber starts, not 'queued' for the whole turn", async () => {
+    const id = await newSession();
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "slow async prompt" }));
+    try {
+      expect(await pollPromptStatus(id, promptId, "running")).toBe("running");
+    } finally {
+      releaseMockSlowPrompt();
+    }
+    expect((await waitForPrompt(id, promptId)).status).toBe("completed");
+  });
+
+  it("aborting a prompt that already reads 'running' still ends 'aborted'", async () => {
+    const id = await newSession();
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "slow async prompt" }));
+    try {
+      expect(await pollPromptStatus(id, promptId, "running")).toBe("running");
+      expect((await call(`/session/${id}/abort`, { method: "POST" })).status).toBe(200);
+      expect((await waitForPrompt(id, promptId)).status).toBe("aborted");
+    } finally {
+      releaseMockSlowPrompt();
+    }
+    // Let the cancelled fiber unwind; a late write must not flip the row back.
+    await new Promise((r) => setTimeout(r, 200));
+    expect((await waitForPrompt(id, promptId)).status).toBe("aborted");
   });
 
   it("while an async prompt runs, the alarm stays a 30s heartbeat (so an evicted run wakes and recovers)", async () => {

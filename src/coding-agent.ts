@@ -3400,6 +3400,7 @@ export class CodingAgent extends CodingAgentBase {
       return Response.json({ error: "Unable to start image generation" }, { status: 500 });
     }
     const promptId = startResult.promptId;
+    this.markPromptRunning(promptId);
 
     try {
       // 1. Persist user prompt message
@@ -3667,6 +3668,8 @@ export class CodingAgent extends CodingAgentBase {
     if (promptStatus && promptStatus !== "queued" && promptStatus !== "running") {
       return;
     }
+
+    this.markPromptRunning(promptId);
 
     // Refresh the session config from the latest account config before each prompt run.
     await this.readAppConfig();
@@ -5134,6 +5137,21 @@ export class CodingAgent extends CodingAgentBase {
       createdAt,
       createdAt,
     );
+  }
+
+  /**
+   * The turn body has started: queued -> running. Without this a started
+   * row stays "queued" for the whole turn, so a turn that hangs mid-run
+   * looks exactly like one that never started. Only for the session's
+   * active prompt: a stale fiber (not reachable in the normal start path)
+   * must not mark a second row "running" that finish() would never clear.
+   */
+  private markPromptRunning(promptId: string): void {
+    if (this.control.readActivePromptId() !== promptId) return;
+    const row = Array.from(this.ctx.storage.sql.exec<{ status: string }>("SELECT status FROM prompts WHERE id = ?", promptId))[0];
+    if (row?.status !== "queued") return;
+    this.updatePrompt(promptId, { status: "running" });
+    this.emitEvent({ data: this.listPrompts(), type: "prompt" });
   }
 
   private updatePrompt(
