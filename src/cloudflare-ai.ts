@@ -182,9 +182,10 @@ export function compatBindingGatewayId(config: GatewayRouteConfig, env: Pick<Env
  * request body and response stream: only the transport and the auth change.
  * Checked live 2026-10-22 (dodo-aig-probe): OpenAI, Workers AI and Google
  * ids stream over it, and cf-aig-metadata / x-session-affinity still reach
- * the gateway log. Unified billing applies the same as with the key.
+ * the gateway log. Requests succeed and are billed without the key
+ * (unified billing), as on the Anthropic leg.
  *
- * URLs outside `compatBaseUrl` go to `base` unchanged. The AbortSignal stays
+ * Other URLs and methods go to `base` unchanged; a non-JSON `/compat` body throws. The AbortSignal stays
  * on this side of the RPC boundary (runWithLocalSignal); cancelling the body
  * reaches upstream (the gateway logs 499, measured on the same probe).
  */
@@ -192,15 +193,18 @@ export function compatBindingFetch(binding: Ai, gatewayId: string, compatBaseUrl
   const prefix = `${compatBaseUrl.replace(/\/+$/, "")}/`;
   type Callable = Record<PropertyKey, (...args: unknown[]) => unknown>;
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    // Decide before building a Request: that would consume a Request input's body.
+    const url = input instanceof Request ? input.url : String(input);
+    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    if (!url.startsWith(prefix) || method !== "POST") return base(input, init);
     const request = new Request(input, init);
-    if (!request.url.startsWith(prefix) || request.method !== "POST") return base(input, init);
-    const endpoint = request.url.slice(prefix.length);
-    const text = await request.text();
+    const endpoint = url.slice(prefix.length);
     let query: unknown;
     try {
-      query = JSON.parse(text);
+      query = JSON.parse(await request.text());
     } catch {
-      return base(request.url, { method: "POST", headers: request.headers, body: text, signal: init?.signal ?? request.signal });
+      // pi-ai and the AI SDK always send JSON. Over HTTP this would go without the key, so fail loudly instead.
+      throw new TypeError(`compatBindingFetch: ${endpoint} body is not JSON`);
     }
     const headers: Record<string, string> = {};
     request.headers.forEach((value, key) => {

@@ -7,7 +7,7 @@
 import { generateText } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { compatBindingFetch, compatBindingGatewayId } from "../src/cloudflare-ai";
-import { gatewayHeaders, withCompatBinding } from "../src/pi/models";
+import { gatewayHeaders, withCompatBinding, withRateLimitRetry } from "../src/pi/models";
 import { buildProviderForModel, resolveWireModelId } from "../src/subagent-runner";
 import type { AppConfig, Env } from "../src/types";
 import { fakeAIBinding } from "./helpers/fake-ai-binding";
@@ -63,14 +63,45 @@ describe("compatBindingFetch", () => {
     expect(res.status).toBe(429);
   });
 
-  it("leaves other URLs and non-JSON bodies on the base fetch", async () => {
+  it("leaves other URLs and methods on the base fetch, Request bodies intact; throws on a non-JSON /compat body", async () => {
     const { binding, calls } = fakeAIBinding(() => json(completion));
-    const base = vi.fn(async () => new Response("http"));
-    const f = compatBindingFetch(binding, "gw", BASE, base);
+    const bodies: string[] = [];
+    const base = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(input instanceof Request ? await input.text() : String(init?.body ?? ""));
+      return new Response("http");
+    });
+    const f = compatBindingFetch(binding, "gw", BASE, base as typeof fetch);
     await f("https://example.com/x", { method: "POST", body: "{}" });
-    await f(`${BASE}/chat/completions`, { method: "POST", body: "not json" });
-    expect(base).toHaveBeenCalledTimes(2);
+    await f(new Request("https://example.com/y", { method: "POST", body: "{\"r\":1}" }));
+    await f(`${BASE}/models`);
+    expect(bodies).toEqual(["{}", "{\"r\":1}", ""]);
+    await expect(f(`${BASE}/chat/completions`, { method: "POST", body: "not json" })).rejects.toThrow(/not JSON/);
     expect(calls).toHaveLength(0);
+  });
+
+  it("accepts a Request input for /compat", async () => {
+    const { binding, calls } = fakeAIBinding(() => json(completion));
+    const f = compatBindingFetch(binding, "gw", BASE, vi.fn() as never);
+    const res = await f(new Request(`${BASE}/chat/completions`, { method: "POST", headers: { "x-api-key": "k" }, body: "{\"model\":\"m\"}" }));
+    expect(res.status).toBe(200);
+    expect(calls[0].request).toMatchObject({ endpoint: "chat/completions", query: { model: "m" } });
+    expect(calls[0].request.headers["x-api-key"]).toBeUndefined();
+  });
+
+  it("stops the body and rejects the read when the caller aborts mid-stream", async () => {
+    let cancelled = false;
+    const { binding } = fakeAIBinding(() => new Response(new ReadableStream({
+      start(c) { c.enqueue(new TextEncoder().encode("data: 1\n\n")); },
+      cancel() { cancelled = true; },
+    })));
+    const ac = new AbortController();
+    const res = await compatBindingFetch(binding, "gw", BASE)(`${BASE}/chat/completions`, { method: "POST", body: "{}", signal: ac.signal });
+    const reader = res.body!.getReader();
+    await reader.read();
+    ac.abort();
+    await expect(reader.read()).rejects.toBeDefined();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(cancelled).toBe(true);
   });
 });
 
@@ -118,6 +149,17 @@ describe("main session on /compat", () => {
     const cfg = { ...config, sessionId: "s" } as never;
     expect(gatewayHeaders(cfg, envWith(binding))).toEqual({ "cf-aig-metadata": JSON.stringify({ dodo_session: "s", dodo_role: "main" }), Authorization: null });
     expect(gatewayHeaders(cfg, envWith(binding, { COMPAT_VIA_BINDING: "0" }))).toMatchObject({ "cf-aig-authorization": "Bearer aig-key", "x-api-key": "aig-key" });
+  });
+
+  it("the 429 wait wraps the binding fetch (withCompatBinding outside withRateLimitRetry)", async () => {
+    let n = 0;
+    const { binding, calls } = fakeAIBinding(() => (++n === 1 ? new Response("{}", { status: 429, headers: { "retry-after": "0" } }) : json(completion)));
+    let status = 0;
+    const inner = { stream: (_m: unknown, _c: unknown, o?: { fetch?: typeof fetch }) => { void o!.fetch!(`${BASE}/chat/completions`, { method: "POST", body: "{}" }).then((r) => { status = r.status; }); return undefined; }, streamSimple: () => undefined } as never;
+    const api = withCompatBinding(withRateLimitRetry(inner, { sleep: async () => {} } as never), config as never, envWith(binding));
+    (api as { stream: Function }).stream({ baseUrl: BASE }, {}, {});
+    await vi.waitFor(() => expect(status).toBe(200));
+    expect(calls).toHaveLength(2);
   });
 
   it("withCompatBinding sets the binding fetch for /compat models only, keeping the caller's fetch as base", async () => {
