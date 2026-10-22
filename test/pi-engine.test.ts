@@ -558,6 +558,48 @@ describe("pi gateway wire: Workers AI through createAI's run path (WORKERS_AI_VI
     expect(runCalls).toHaveLength(2);
   }, 20_000);
 
+  it("takes a shared model-budget slot per send on the run path, 429 resends included, and reports the 429", async () => {
+    let n = 0;
+    const { binding, runCalls } = fakeAIBinding(
+      () => new Response("unexpected", { status: 500 }),
+      () => (n++ === 0 ? new Response(JSON.stringify({ errors: [{ message: "Capacity temporarily exceeded" }] }), { status: 429, headers: { "content-type": "application/json", "retry-after": "0" } }) : reply()),
+    );
+    const acquired: Array<[string, string]> = [];
+    const reported: string[] = [];
+    let denyFirst = true;
+    const waits: number[] = [];
+    const SHARED_INDEX = {
+      idFromName: () => "global",
+      get: () => ({
+        modelBudgetAcquire: async (key: string, _rpm: number, priority: string) => {
+          acquired.push([key, priority]);
+          if (denyFirst) {
+            denyFirst = false;
+            return { ok: false, waitMs: 1, used: 1, limit: 1 };
+          }
+          return { ok: true, waitMs: 0, used: 1, limit: 10 };
+        },
+        modelBudgetReport429: async (key: string) => {
+          reported.push(key);
+        },
+      }),
+    };
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1", SHARED_INDEX } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env, { onBudgetWait: (info) => waits.push(info.waitMs) });
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(runCalls).toHaveLength(2);
+    // One denied + one granted before the first send, one granted before the resend. Same key as /compat.
+    expect(acquired).toEqual([
+      [`ai-gateway:${KIMI}`, "main"],
+      [`ai-gateway:${KIMI}`, "main"],
+      [`ai-gateway:${KIMI}`, "main"],
+    ]);
+    expect(waits).toHaveLength(1);
+    await vi.waitFor(() => expect(reported).toEqual([`ai-gateway:${KIMI}`]));
+  }, 20_000);
+
   it("passes other thrown binding errors through as a failed turn, without retrying", async () => {
     const { binding, runCalls } = fakeAIBinding(
       () => new Response("unexpected", { status: 500 }),

@@ -142,12 +142,30 @@ export function workersAIOnRunPath(modelId: string, env: Pick<Env, "WORKERS_AI_V
   return flag === "1" || flag === "true";
 }
 
-function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLimit?: RateLimitFetchOptions) {
+function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLimit?: RateLimitFetchOptions, budget?: ModelBudgetStreamOptions) {
   // createAI never calls fetch, so the 429 wait wraps the binding call. The
   // URL is a label only: the wrapped "fetch" ignores it and calls the binding.
-  const binding = adaptBindingForCreateAI(env.AI, (run, signal) =>
-    rateLimitFetch(() => run(), rateLimit)("https://gateway.ai.cloudflare.com/universal", { signal: signal ?? undefined }),
-  );
+  // On the Workers AI run path each send (429 resends included) also takes a
+  // slot from the shared per-model budget, as withModelBudgetStreams does on
+  // /compat: same key, so main turns and subagents share one book. Built per
+  // request, so maxWaitScope "total" covers one request and its resends.
+  const binding = adaptBindingForCreateAI(env.AI, (run, signal, model) => {
+    const send: typeof fetch = () => run();
+    const gated =
+      budget && model
+        ? withModelBudget(send, {
+            env: budget.env,
+            gateway: budget.gateway,
+            modelId: model,
+            priority: "main",
+            client: budget.client,
+            onWait: budget.onWait,
+            maxWaitMs: MAIN_BUDGET_MAX_WAIT_MS,
+            maxWaitScope: "total",
+          })
+        : send;
+    return rateLimitFetch(gated, rateLimit)("https://gateway.ai.cloudflare.com/universal", { signal: signal ?? undefined });
+  });
   const metadata = gatewayMetadata(config.sessionId, "main");
   return createAI({ binding, id: gatewayId, ...(metadata ? { metadata } : {}) });
 }
@@ -347,8 +365,9 @@ export interface DodoProviderOptions {
  * them as `dodo-gateway/anthropic/…`, and pi-durable resumes it with that
  * ref. Those streams look the model up by id and send the createAI one.
  *
- * Workers AI models on `openai-completions` also take a slot from the shared
- * per-model budget (model-budget.ts); the createAI leg is Anthropic only.
+ * Workers AI models take a slot from the shared per-model budget
+ * (model-budget.ts) on both legs: `openai-completions` (/compat) and the
+ * createAI run path (WORKERS_AI_VIA_BINDING).
  */
 export function setDodoProvider(
   models: MutableModels,
@@ -378,7 +397,7 @@ export function setDodoProvider(
   // the /compat list too and a persisted turn resumes on `/compat` as it started.
   const legacyAliased = createAIModels.filter((m): m is Model<"anthropic-messages"> => m.api === "anthropic-messages");
   const viaCompat = unique.filter((id) => !legacyAliased.some((m) => m.id === id));
-  const ai = gatewayId ? createAIFor(config, env, gatewayId, rateLimitOptions) : undefined;
+
   const byId = new Map(createAIModels.map((m) => [m.id, m]));
   // The dodo-gateway auth resolver adds the gateway key headers to every
   // call; createAI would forward them as extra headers. Drop them here.
@@ -394,6 +413,7 @@ export function setDodoProvider(
       opts.onBudgetWait?.(info);
     },
   };
+  const ai = gatewayId ? createAIFor(config, env, gatewayId, rateLimitOptions, budget) : undefined;
   const idleOptions = {
     idleMs: opts.idleMs,
     onTimeout: (info: StreamIdleTimeoutInfo) => log("warn", "pi: model stream idle, failing the request for retry", { sessionId: config.sessionId, ...info }),

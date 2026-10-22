@@ -124,7 +124,8 @@ export async function runWithLocalSignal(run: GatewayRun, request: unknown, opti
   return new Response(readable, response);
 }
 
-type Retry = (send: () => Promise<Response>, signal?: AbortSignal | null) => Promise<Response>;
+/** `model` is the Workers AI model id on the run path (for the per-model budget); undefined on `gateway(id).run`. */
+type Retry = (send: () => Promise<Response>, signal?: AbortSignal | null, model?: string) => Promise<Response>;
 
 /** Workers AI rate-limit errors: 3021 (requests per minute) and 3040 (capacity), by code or by their wording. */
 const RATE_LIMIT_ERROR = /(?:^|AiError:?\s*)(3021|3040):|per min rate reached|capacity temporarily exceeded/i;
@@ -165,9 +166,9 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
   // Workers AI path for `@cf/` models when WORKERS_AI_VIA_BINDING is on).
   type Callable = Record<PropertyKey, (...args: unknown[]) => unknown>;
   const stub = binding as unknown as Callable;
-  const local = (run: GatewayRun): GatewayRun => (request, options) => {
+  const local = (run: GatewayRun, model?: string): GatewayRun => (request, options) => {
     const send = () => runWithLocalSignal(run, request, options);
-    return retry ? retry(send, options?.signal) : send();
+    return retry ? retry(send, options?.signal, model) : send();
   };
   return new Proxy(binding, {
     get(target, prop) {
@@ -190,7 +191,7 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
       // leg, because `/compat` waited out Workers AI 429s too.
       if (prop === "run") {
         return (model: unknown, inputs: unknown, options?: Parameters<GatewayRun>[1]) =>
-          local((_req, opts) => runAsResponse(() => stub.run(model, inputs, opts) as Promise<Response>))(undefined, options);
+          local((_req, opts) => runAsResponse(() => stub.run(model, inputs, opts) as Promise<Response>), typeof model === "string" ? model : undefined)(undefined, options);
       }
       // createAI reads this after a run call as a fallback log id. On the stub
       // it would be a remote property (an RpcPromise, not a string); the
