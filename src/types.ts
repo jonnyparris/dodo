@@ -28,6 +28,11 @@ export interface Env {
   /** JSON `{ "<model id>" | "@cf/*": rpm }` overriding the Workers AI per-model
    *  request budgets in src/model-budget.ts. 0 turns a budget off. */
   MODEL_RPM_LIMITS?: string;
+  /** Turn stall guard (src/turn-stall-guard.ts): seconds without progress before a
+   *  turn fails. Default 900; 0 turns the guard off. */
+  TURN_STALL_SECONDS?: string;
+  /** Same, while a tool call or compaction is open. Default 1800. */
+  TURN_STALL_TOOL_SECONDS?: string;
   DEPLOY_MCP_CATALOG_CONFIG?: string;
   DODO_MCP_TOKEN?: string;
   DODO_COMMIT?: string;
