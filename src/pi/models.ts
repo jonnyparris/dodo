@@ -26,6 +26,7 @@ import { aigMetadataHeader, anthropicGatewayBaseUrl, resolveWireModelId } from "
 import type { Env } from "../types";
 import { log } from "../logger";
 import { rateLimitFetch } from "./rate-limit-fetch";
+import { withStreamIdleTimeout } from "./stream-idle-timeout";
 
 export { anthropicGatewayBaseUrl };
 
@@ -212,6 +213,10 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
     onWait: ({ attempt, delayMs, retryAfter }: { attempt: number; delayMs: number; retryAfter: string | null }) =>
       log("warn", "pi: model rate limited, waiting", { sessionId: config.sessionId, attempt, delayMs: Math.round(delayMs), retryAfter }),
   };
+  const idleOptions = {
+    onTimeout: ({ model, idleMs, events }: { model: string; idleMs: number; events: number }) =>
+      log("warn", "pi: model stream idle, failing the request for retry", { sessionId: config.sessionId, model, idleMs, events }),
+  };
   models.setProvider(
     createProvider({
       id: DODO_PROVIDER_ID,
@@ -226,10 +231,11 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       },
       models: list,
       // Keyed by model.api: Anthropic on AI Gateway goes native (see top).
-      // Both wait out per-minute 429s inside the request (rate-limit-fetch.ts).
+      // Both wait out per-minute 429s inside the request (rate-limit-fetch.ts),
+      // and fail a request that goes quiet as retryable (stream-idle-timeout.ts).
       api: {
-        "openai-completions": withRateLimitRetry(openAICompletionsApi(), rateLimitOptions),
-        "anthropic-messages": withRateLimitRetry(anthropicGatewayStreams(), rateLimitOptions),
+        "openai-completions": withStreamIdleTimeout(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), idleOptions),
+        "anthropic-messages": withStreamIdleTimeout(withRateLimitRetry(anthropicGatewayStreams(), rateLimitOptions), idleOptions),
       },
     }),
   );
