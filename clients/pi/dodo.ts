@@ -219,8 +219,11 @@ class LiveView {
       const secs = ((Date.now() - this.tool.started) / 1000).toFixed(0);
       lines.push(truncateToWidth(`  ⚙ ${this.tool.name} ${this.tool.input} · ${secs}s`, width));
     }
+    // Past `until` the budget wait is over and the request is in flight, so the line goes away
+    // (a further wait sends a new model_wait frame).
     const waitMs = this.wait ? this.wait.until - Date.now() : 0;
-    if (waitMs > 0) lines.push(truncateToWidth(`  ⏳ waiting for model capacity (${this.wait!.model}) · ~${Math.max(1, Math.round(waitMs / 1000))}s`, width));
+    if (waitMs <= 0) this.wait = undefined;
+    else lines.push(truncateToWidth(`  ⏳ waiting for model capacity (${this.wait!.model}) · ~${Math.max(1, Math.round(waitMs / 1000))}s`, width));
     return lines;
   }
   invalidate(): void {}
@@ -345,10 +348,11 @@ export default function dodo(pi: ExtensionAPI) {
       }
       case "model_wait": {
         // The server holds this turn until a model-budget slot frees up; show
-        // a countdown instead of a silent stall. Cleared by the next output.
-        const d = data as { model?: string; waitMs?: number } | null;
+        // a countdown instead of a silent stall. Cleared when the countdown
+        // ends, or earlier by text, a tool call, an assistant message, an error or idle.
+        const d = data as { model?: unknown; waitMs?: unknown } | null;
         const ms = Math.max(1000, Number(d?.waitMs) || 0);
-        live.wait = { model: clean(d?.model ?? modelOf(state)), until: Date.now() + ms };
+        live.wait = { model: clean(typeof d?.model === "string" && d.model ? d.model : modelOf(state)), until: Date.now() + ms };
         showLive(true);
         live.refresh();
         return;
@@ -391,6 +395,8 @@ export default function dodo(pi: ExtensionAPI) {
         return;
       }
       case "error_message":
+        live.wait = undefined;
+        live.refresh();
         note("error", clean((data as { message: string }).message ?? ""));
         return;
       case "needs_input": {
