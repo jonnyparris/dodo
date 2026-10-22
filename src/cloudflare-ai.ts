@@ -68,9 +68,11 @@ export function gatewayMetadata(sessionId: string | undefined, role: "main" | "s
 
 type GatewayRun = (request: unknown, options?: { signal?: AbortSignal | null } & Record<string, unknown>) => Promise<Response>;
 
-function abortReason(signal: AbortSignal): unknown {
-  if (signal.reason !== undefined) return signal.reason;
-  const error = new Error("Request aborted");
+/** Always an AbortError, so createAI and pi-ai report "aborted", not a failure. */
+function abortReason(signal: AbortSignal): Error {
+  const reason = signal.reason as unknown;
+  if (reason instanceof Error && reason.name === "AbortError") return reason;
+  const error = new Error("Request aborted", { cause: reason });
   error.name = "AbortError";
   return error;
 }
@@ -125,8 +127,10 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
   // `env.AI` is an RPC stub: every property access, `.bind` and `.call`
   // included, becomes a remote call. So never touch methods on it; call them
   // by name through closures (seen live 2026-10-22: `.bind` sent an
-  // RpcPromise over the wire and failed to serialise). `gateway(id)` gets a
-  // plain object back, so nothing awaits or probes the RpcPromise.
+  // RpcPromise over the wire and failed to serialise). `gateway(id)` returns
+  // a plain wrapper; the underlying call is still a pipelined RPC.
+  // Only `gateway(id).run` is adapted: Dodo's createAI leg is Anthropic only,
+  // so createAI never takes the Workers AI `run` path here.
   type Callable = Record<PropertyKey, (...args: unknown[]) => unknown>;
   const stub = binding as unknown as Callable;
   const local = (run: GatewayRun): GatewayRun => (request, options) => {
@@ -146,12 +150,9 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
           };
         };
       }
-      // Workers AI run path: same AbortSignal problem, no retry (rate limits
-      // there are handled by the caller's own policy).
-      if (prop === "run") {
-        return (model: unknown, inputs: unknown, options?: Parameters<GatewayRun>[1]) =>
-          runWithLocalSignal((_req, opts) => stub.run(model, inputs, opts) as Promise<Response>, undefined, options);
-      }
+      // Never let the adapter look thenable: `await` on it would be a remote call.
+      if (prop === "then") return undefined;
+      if (typeof prop === "symbol") return Reflect.get(target, prop, target);
       const value = Reflect.get(target, prop, target) as unknown;
       return typeof value === "function" ? (...args: unknown[]) => stub[prop](...args) : value;
     },

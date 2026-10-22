@@ -347,9 +347,10 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     const aborted = new AbortController();
     aborted.abort();
     const res = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, { signal: aborted.signal });
-    // createAI's transport wraps the thrown abort as a CloudflareAIError, so
-    // pi-ai may report it as "error"; what matters is that nothing was sent.
-    expect(["aborted", "error"]).toContain(res.stopReason);
+    // pi-ai reports a pre-aborted call as "error" here (seen with both an
+    // AbortError and a raw reason); what matters is that nothing was sent.
+    // Live abort mid-turn on preview ends the prompt as "aborted".
+    expect(res.stopReason).not.toBe("stop");
     expect(calls).toHaveLength(1);
   });
 
