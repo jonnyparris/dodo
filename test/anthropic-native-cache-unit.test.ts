@@ -8,7 +8,7 @@ import { generateText, jsonSchema, tool } from "ai";
 import { generateStructured } from "../src/structured-output";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { bindingGatewayId } from "../src/cloudflare-ai";
+import { bindingGatewayId, runWithLocalSignal } from "../src/cloudflare-ai";
 import { fakeAIBinding } from "./helpers/fake-ai-binding";
 import { addAnthropicCacheOptions, buildProviderForModel, pruneSubagentHistory } from "../src/subagent-runner";
 import type { AppConfig, Env } from "../src/types";
@@ -197,5 +197,32 @@ describe("buildProviderForModel routing", () => {
     expect(out).toMatchObject({ ok: true, data: { answer: "42" } });
     expect(calls).toHaveLength(1);
     expect(calls[0].request.provider).toBe("anthropic");
+  });
+});
+
+describe("runWithLocalSignal", () => {
+  it("rejects as AbortError when run() aborts the signal synchronously, and cancels the late body", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    let resolveLate!: (r: Response) => void;
+    const run = () => {
+      controller.abort("stop");
+      return new Promise<Response>((r) => (resolveLate = r));
+    };
+    await expect(runWithLocalSignal(run, {}, { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    resolveLate(new Response(new ReadableStream({ cancel: () => void (cancelled = true) })));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(cancelled).toBe(true);
+  });
+
+  it("never passes the signal to the binding call", async () => {
+    let seen: Record<string, unknown> | undefined;
+    const run = async (_req: unknown, options?: Record<string, unknown>) => {
+      seen = options;
+      return new Response("ok");
+    };
+    const res = await runWithLocalSignal(run, {}, { signal: new AbortController().signal, gateway: { id: "gw" } });
+    expect(await res.text()).toBe("ok");
+    expect(seen).toEqual({ gateway: { id: "gw" } });
   });
 });
