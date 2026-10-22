@@ -486,6 +486,13 @@ export class UserControl extends DurableObject<Env> {
         return Response.json({ found: true });
       }
 
+      if (request.method === "POST" && url.pathname.match(/^\/sessions\/[^/]+\/fork-source$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const marked = this.markForkSource(sessionId);
+        if (!marked) return Response.json({ error: `Session '${sessionId}' not found` }, { status: 404 });
+        return Response.json({ marked: true, sessionId });
+      }
+
       if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/[^/]+$/) && !url.pathname.includes("/mcp-overrides") && !url.pathname.includes("/soft-delete") && !url.pathname.includes("/restore")) {
         const sessionId = url.pathname.split("/").at(-1) ?? "";
         this.ctx.storage.sql.exec("DELETE FROM sessions WHERE id = ?", sessionId);
@@ -1401,6 +1408,14 @@ export class UserControl extends DurableObject<Env> {
     // session list and exempt from idle cleanup. (audit follow-up: seed cache)
     try {
       this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'");
+    } catch { /* column already exists */ }
+
+    // fork_source = 1 once anything has forked from this session. Fork
+    // bases (bench harness, hand-built templates) usually have zero
+    // prompts, so without this flag the idle sweep deletes them and the
+    // next fork fails with "Source session not found".
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN fork_source INTEGER NOT NULL DEFAULT 0");
     } catch { /* column already exists */ }
 
     this.ctx.storage.sql.exec(`
@@ -3769,6 +3784,19 @@ export class UserControl extends DurableObject<Env> {
   }
 
   /**
+   * Flag a live session as a fork source so the idle sweep keeps it.
+   * One-way: nothing clears the flag. The user can still delete the
+   * session by hand. Returns false if no live session has that id.
+   */
+  private markForkSource(sessionId: string): boolean {
+    const cursor = this.ctx.storage.sql.exec(
+      "UPDATE sessions SET fork_source = 1 WHERE id = ? AND status != 'deleted'",
+      sessionId,
+    );
+    return cursor.rowsWritten > 0;
+  }
+
+  /**
    * Soft-delete sessions that have been idle for at least
    * IDLE_SESSION_TTL_SECONDS *and* never received a prompt. The "no
    * prompts" check requires a per-session cross-DO call to the
@@ -3783,9 +3811,14 @@ export class UserControl extends DurableObject<Env> {
     // Seed sessions (admin-owned warm clones) are exempt from idle
     // cleanup — they intentionally have no prompts and exist precisely
     // so they outlive a normal idle window. Cleaning them up would
-    // defeat the cache.
+    // defeat the cache. Fork sources are exempt for the same reason:
+    // anything forked from (fork_source = 1) or named as the source of a
+    // fork schedule is a template, and deleting it breaks later forks.
     const candidates = Array.from(this.ctx.storage.sql.exec(
-      "SELECT id FROM sessions WHERE status = 'idle' AND kind != 'seed' AND updated_at < ? ORDER BY updated_at ASC LIMIT ?",
+      `SELECT id FROM sessions
+        WHERE status = 'idle' AND kind != 'seed' AND fork_source = 0 AND updated_at < ?
+          AND id NOT IN (SELECT source_session_id FROM scheduled_sessions WHERE source_session_id IS NOT NULL)
+        ORDER BY updated_at ASC LIMIT ?`,
       cutoff,
       IDLE_SWEEP_BATCH_SIZE,
     ));
@@ -3809,13 +3842,20 @@ export class UserControl extends DurableObject<Env> {
 
       // Reuse the same soft-delete primitive as the manual DELETE path
       // so the 5-min recovery window behaves identically.
+      // Re-check the exemptions in the UPDATE itself: countSessionPrompts
+      // awaits a cross-DO call, and the session may have been forked,
+      // prompted or touched in the meantime.
       const deleteExpiry = nowEpoch() + 300;
-      this.ctx.storage.sql.exec(
-        "UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?",
+      const deleted = this.ctx.storage.sql.exec(
+        `UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ?
+          WHERE id = ? AND status = 'idle' AND fork_source = 0 AND updated_at < ?
+            AND id NOT IN (SELECT source_session_id FROM scheduled_sessions WHERE source_session_id IS NOT NULL)`,
         deleteExpiry,
         nowEpoch(),
         sessionId,
+        cutoff,
       );
+      if (deleted.rowsWritten === 0) continue;
       this.emitUserEvent({ type: "sessions_changed", reason: "deleted", sessionId });
       log("info", "idle-sweep: soft-deleted empty idle session", { sessionId });
     }
@@ -3985,6 +4025,12 @@ export class UserControl extends DurableObject<Env> {
     const sourceRow = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM sessions WHERE id = ?", sourceSessionId))[0] as SqlRow | null);
     if (!sourceRow) {
       throw new SourceSessionMissingError(sourceSessionId);
+    }
+    // Keep the source once the schedule row is gone (one-shot schedules
+    // delete their row on success). Direct SQL: a stub fetch to this DO
+    // from inside it would deadlock.
+    if (!this.markForkSource(sourceSessionId)) {
+      throw new SourceSessionMissingError(sourceSessionId); // soft-deleted
     }
 
     // Snapshot the source agent. Buffer to ArrayBuffer so we can both

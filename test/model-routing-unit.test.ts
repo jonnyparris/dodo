@@ -74,7 +74,7 @@ describe("isRoutableByOpencodeGateway", () => {
     expect(isRoutableByOpencodeGateway("anthropic/claude-opus-4-7")).toBe(true);
     expect(isRoutableByOpencodeGateway("openai/gpt-5.4")).toBe(true);
     expect(isRoutableByOpencodeGateway("google/gemini-3-pro")).toBe(true);
-    expect(isRoutableByOpencodeGateway("deepseek/deepseek-chat")).toBe(true);
+    expect(isRoutableByOpencodeGateway("deepseek/deepseek-flash")).toBe(true);
   });
 
   it("rejects models falsely prefixed with anthropic/ by the models.dev fallback", () => {

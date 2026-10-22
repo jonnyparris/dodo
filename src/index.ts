@@ -2643,6 +2643,18 @@ app.post("/session/:id/abort", async (c) => {
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/abort");
 });
 
+// Set or clear the per-session model override without sending a prompt.
+// Owner only (the DO checks x-author-email against the session owner).
+app.put("/session/:id/model-override", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/model-override", {
+    "x-author-email": email,
+    "x-owner-email": c.get("sessionOwnerEmail") || email,
+  });
+});
+
 app.get("/session/:id/browser", async (c) => {
   const denied = requirePermission(c, "readonly");
   if (denied) return denied;
