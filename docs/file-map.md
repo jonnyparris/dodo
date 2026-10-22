@@ -34,6 +34,7 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `src/session-model-override.ts` — per-session `model` / `exploreModel` / `taskModel` override (prompt body or `PUT /session/:id/model-override` → metadata → session + facet config)
 - `src/session-goal.ts` — goal helpers + types. See `docs/session-goals.md`
 - `src/watchdog.ts` — stall detection for long prompts. See `docs/session-watchdog.md`
+- `src/turn-stall-guard.ts` — built-in: fails a turn with no progress for 15 min (30 min while a tool runs), setup steps included. `TURN_STALL_SECONDS` / `TURN_STALL_TOOL_SECONDS`. See `docs/session-watchdog.md`
 - `src/chat-monitor-agent.ts` — polls a Google Chat space and forwards messages into a session
 - `src/presence.ts` — WebSocket presence tracking
 - `src/autopilot.ts` — self-diagnose loop: `buildDiagnoseGoal`, `buildSupervisorGoal`, owner resolution

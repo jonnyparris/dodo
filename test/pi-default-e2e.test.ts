@@ -360,13 +360,16 @@ describe("pi is the default engine", () => {
     const id = await newSession();
     const inDO = runInDurableObject as unknown as (stub: unknown, fn: (instance: any) => Promise<void>) => Promise<void>;
     let restore: (() => void) | undefined;
+    let releaseHung: (() => void) | undefined;
     await inDO(await agent(id), async (instance) => {
       instance.turnStallLimitsOverride = { idleMs: 300, longMs: 300 };
       // Stub a setup step (not connectMcpServers: the first request's owner
       // check calls that synchronously). Never settles and ignores the
       // abort: what an unbounded fetch does.
       const original = instance.warmTurnContext;
-      instance.warmTurnContext = () => new Promise(() => {});
+      instance.warmTurnContext = () => new Promise<void>((resolve) => {
+        releaseHung = resolve;
+      });
       restore = () => {
         instance.warmTurnContext = original;
         instance.turnStallLimitsOverride = null;
@@ -379,6 +382,11 @@ describe("pi is the default engine", () => {
     expect(failed.error).toContain("warm_context");
     const session = await json<{ status: string; activePromptId?: string | null }>(await call(`/session/${id}`));
     expect(session.status).toBe("idle");
+
+    // The hung step finishing late must not carry on with the dead turn.
+    await inDO(await agent(id), async () => releaseHung?.());
+    await new Promise((r) => setTimeout(r, 300));
+    expect((await messages(id)).filter((m) => m.role === "user")).toEqual([]);
 
     await inDO(await agent(id), async () => restore?.());
     const next = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "after the stall" }));

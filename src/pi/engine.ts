@@ -237,6 +237,12 @@ export class PiEngine {
 
   /** Run (or reattach to) the turn for one Dodo prompt. */
   async run(input: PiTurnInput): Promise<PiTurnResult> {
+    // The turn can be aborted (user abort, turn stall guard) while a setup
+    // step below is still waiting. Stop before writing anything new.
+    const bail = () => {
+      if (input.signal?.aborted) throw input.signal.reason ?? new Error("aborted");
+    };
+    bail();
     input.onPhase?.("pi_open");
     const harness = await this.open();
     this.registry.install(input.tools);
@@ -261,8 +267,10 @@ export class PiEngine {
       recovered = submission !== undefined;
     }
     if (!submission) {
+      bail();
       input.onPhase?.("prepare");
       const { content, entry } = await input.prepare();
+      bail();
       input.onPhase?.("submit");
       submission = await root.submit(
         { type: "input", content, requestId: input.promptId, entry: { kind: DODO_USER_ENTRY, data: entry } },
@@ -279,6 +287,8 @@ export class PiEngine {
 
     const acc: BridgeState = { steps: 0, input: 0, output: 0, context: 0, toolCalls: [], streamed: "" };
     const stream = await watchEvents(harness, root.id, this.ctx);
+    // A recovered turn can attach with tool calls already running.
+    input.onEvent?.(stream.snapshot);
     stream.start(async (events) => {
       for (const event of events) {
         input.onEvent?.(event);
@@ -290,6 +300,8 @@ export class PiEngine {
       void root.abort(this.ctx).catch(() => {});
     };
     input.signal?.addEventListener("abort", onAbort, { once: true });
+    // Aborted between submit and here: the listener won't fire for a past abort.
+    if (input.signal?.aborted) onAbort();
     let settled: Awaited<ReturnType<Submission["wait"]>>;
     try {
       const waitCtx = input.signal ? withAbortSignal(input.signal, this.ctx) : this.ctx;

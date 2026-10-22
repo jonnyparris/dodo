@@ -68,6 +68,43 @@ describe("turn stall guard", () => {
     expect(err.message).toContain("waiting on tool mcp__x__slow");
   });
 
+  it("takes open tool calls from a snapshot (a recovered turn attaching mid-tool)", async () => {
+    const guard = createTurnStallGuard({ limits: { idleMs: 40, longMs: 400 } });
+    guard.event({ type: "snapshot", tools: [{ callId: "c1", name: "ci_run", status: "running" }, { callId: "c0", name: "read", status: "done" }], compactions: [] });
+    await sleep(120);
+    expect(guard.fired).toBeNull();
+    // An overflow snapshot with nothing running replaces the set.
+    guard.event({ type: "snapshot", tools: [], compactions: [] });
+    const err = await stallOf(guard);
+    expect(err.info.limitMs).toBe(40);
+  });
+
+  it("treats an open compaction like a tool call", async () => {
+    const guard = createTurnStallGuard({ limits: { idleMs: 40, longMs: 400 } });
+    guard.event({ type: "compaction_start" });
+    await sleep(120);
+    expect(guard.fired).toBeNull();
+    guard.stop();
+  });
+
+  it("settles run() on an abort of the turn signal, without waiting for the stall", async () => {
+    const controller = new AbortController();
+    const guard = createTurnStallGuard({ limits: { idleMs: 10_000, longMs: 10_000 }, signal: controller.signal });
+    const p = guard.run(never()).catch((e: unknown) => e);
+    controller.abort(new Error("user abort"));
+    expect(((await p) as Error).message).toBe("user abort");
+    expect(guard.fired).toBeNull();
+    guard.stop();
+  });
+
+  it("rejects run() at once when the turn signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("gone"));
+    const guard = createTurnStallGuard({ limits: { idleMs: 10_000, longMs: 10_000 }, signal: controller.signal });
+    expect(((await guard.run(never()).catch((e: unknown) => e)) as Error).message).toBe("gone");
+    guard.stop();
+  });
+
   it("does nothing once stopped, and nothing when turned off", async () => {
     let fired = 0;
     const stopped = createTurnStallGuard({ limits: { idleMs: 30, longMs: 30 }, onStall: () => fired++ });

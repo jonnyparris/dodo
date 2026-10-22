@@ -91,6 +91,10 @@ export interface TurnStallEvent {
   type: string;
   toolCallId?: string;
   toolName?: string;
+  /** `snapshot` events: the tool calls of the current round (at attach, and after a stream overflow). */
+  tools?: ReadonlyArray<{ callId: string; name: string; status: string }>;
+  /** `snapshot` events: live compactions. */
+  compactions?: readonly unknown[];
 }
 
 export interface TurnStallGuard {
@@ -98,7 +102,7 @@ export interface TurnStallGuard {
   touch(phase: string): void;
   /** A pi agent event arrived. Moves the clock and tracks open tool calls. */
   event(event: TurnStallEvent): void;
-  /** Race `work` against the stall. The loser's rejection is swallowed. */
+  /** Race `work` against the stall (and the abort signal, if given). The loser's rejection is swallowed. */
   run<T>(work: Promise<T>): Promise<T>;
   /** The stall, once it fired. */
   readonly fired: TurnStallError | null;
@@ -112,6 +116,12 @@ export interface TurnStallGuardOptions {
   onStall?: (error: TurnStallError) => void;
   /** Called on every touch/event (e.g. to keep the session's updated_at fresh). */
   onProgress?: () => void;
+  /**
+   * The turn's abort signal. `run()` also settles (rejects with the abort
+   * reason) when it aborts, so a user abort doesn't wait for a step that
+   * ignores the signal.
+   */
+  signal?: AbortSignal;
   now?: () => number;
 }
 
@@ -180,7 +190,13 @@ export function createTurnStallGuard(options: TurnStallGuardOptions): TurnStallG
     event(e) {
       if (stopped) return;
       events++;
-      if (e.type === "tool_execution_start" && e.toolCallId) openTools.set(e.toolCallId, e.toolName ?? "tool");
+      if (e.type === "snapshot") {
+        // Attach (a recovered turn may already have tools running) or a
+        // stream overflow: the snapshot is the whole truth.
+        openTools.clear();
+        for (const t of e.tools ?? []) if (t.status === "running") openTools.set(t.callId, t.name);
+        compacting = (e.compactions?.length ?? 0) > 0;
+      } else if (e.type === "tool_execution_start" && e.toolCallId) openTools.set(e.toolCallId, e.toolName ?? "tool");
       else if (e.type === "tool_execution_end" && e.toolCallId) openTools.delete(e.toolCallId);
       else if (e.type === "compaction_start") compacting = true;
       else if (e.type === "compaction_end") compacting = false;
@@ -190,8 +206,21 @@ export function createTurnStallGuard(options: TurnStallGuardOptions): TurnStallG
       // If the stall wins, `work` may still settle later; don't let its
       // rejection surface as unhandled.
       work.catch(() => {});
-      if (stopped && !fired) return work;
-      return Promise.race([work, stalled]);
+      const racers: Promise<T>[] = [work];
+      if (!(stopped && !fired)) racers.push(stalled);
+      const signal = options.signal;
+      if (signal) {
+        racers.push(
+          new Promise<never>((_, reject) => {
+            if (signal.aborted) return reject(signal.reason);
+            const onAbort = () => reject(signal.reason);
+            signal.addEventListener("abort", onAbort, { once: true });
+            const drop = () => signal.removeEventListener("abort", onAbort);
+            work.then(drop, drop);
+          }),
+        );
+      }
+      return racers.length === 1 ? work : Promise.race(racers);
     },
     get fired() {
       return fired;

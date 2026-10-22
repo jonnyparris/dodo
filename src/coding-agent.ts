@@ -3705,12 +3705,13 @@ export class CodingAgent extends CodingAgentBase {
         // Refresh the session config from the latest account config before each prompt run.
         stall.touch("read_config");
         await this.readAppConfig();
+        if (signal.aborted) throw signal.reason;
         stall.touch("migrate_think");
         await this.migrateThinkSessionToPi();
+        if (signal.aborted) throw signal.reason;
         return this.runPiChat(content, { promptId, authorEmail, signal, images, stall });
       })());
       stall.stop();
-      if (stall.fired) throw stall.fired;
 
       // Guard: treat empty LLM response as a failure — UNLESS the prompt
       // was aborted, in which case the empty result is expected and
@@ -3778,7 +3779,8 @@ export class CodingAgent extends CodingAgentBase {
       await this.finishPrompt(promptId, { error: message, status: "failed" });
     } finally {
       stall.stop();
-      this._fiberAbortController = null;
+      // A queued prompt may already have started its own fiber (and controller).
+      if (this._fiberAbortController === controller) this._fiberAbortController = null;
       await this.syncSessionIndex({ status: "idle", title });
       this.emitEvent({ data: this.listPrompts(), type: "prompt" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
@@ -3800,6 +3802,7 @@ export class CodingAgent extends CodingAgentBase {
     const limits = this.turnStallLimitsOverride ?? turnStallLimitsFromEnv(this.env);
     return createTurnStallGuard({
       limits,
+      signal: controller.signal,
       onProgress: () => {
         const now = Date.now();
         if (now - this._lastActivityTouch < 30_000) return;
@@ -4678,17 +4681,25 @@ export class CodingAgent extends CodingAgentBase {
     options: { promptId: string; authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }>; stall?: TurnStallGuard },
   ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string; steps: number; toolCalls: string[] }> {
     const stall = options.stall;
+    // After a stall (or user abort) the turn's caller has moved on; a setup
+    // step that finishes late must not go on to touch per-turn state.
+    const bail = () => {
+      if (options.signal?.aborted) throw options.signal.reason ?? new Error("aborted");
+    };
     stall?.touch("connect_mcp");
     await this.connectMcpServers();
+    bail();
     stall?.touch("warm_context");
     await this.warmTurnContext();
-    this._toolAttachments.clear();
-    this._toolCallNames.clear();
+    bail();
     stall?.touch("build_tools");
     const tools = await buildToolsExtension(this.getTools(), {
       onCall: (name) => this._toolCallNames.add(name),
       extra: this.piNativeTools(),
     });
+    bail();
+    this._toolAttachments.clear();
+    this._toolCallNames.clear();
     const result = await this.piEngine().run({
       promptId: options.promptId,
       tools,
