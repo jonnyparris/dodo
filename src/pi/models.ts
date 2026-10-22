@@ -17,7 +17,8 @@
 // its Workers AI run path (`env.AI.run` + per-model request quirks), main
 // session only. Off by default until the live A/B says so.
 
-import type { Model, ProviderStreams } from "@earendil-works/pi-ai";
+import type { Api, Model, ProviderStreams, TranscriptContext } from "@earendil-works/pi-ai";
+import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
@@ -244,6 +245,26 @@ export function gatewayHeaders(config: GatewayConfig, env: Env): Record<string, 
 }
 
 /**
+ * createAI's chat-completions wire sends `max_tokens` only when the caller
+ * passes `maxTokens`, and pi-durable doesn't. pi-ai's own openai-completions
+ * leg fills it from the model (clamped to the room left in the context), so
+ * on `/compat` every turn had a cap. Without one Workers AI uses its own
+ * small default: on preview gpt-oss-120b stopped with `length` and an empty
+ * answer (2026-10-22). Fill it the way pi-ai does, Workers AI models only.
+ */
+export function withWorkersAIMaxTokens(api: ProviderStreams): ProviderStreams {
+  const fill = <O extends { maxTokens?: number } | undefined>(model: Model<Api>, context: TranscriptContext, options: O): O =>
+    model.api !== WORKERS_AI_API || options?.maxTokens !== undefined
+      ? options
+      : ({ ...options, maxTokens: clampMaxTokensToContext(model, context, model.maxTokens) } as O);
+  return {
+    ...api,
+    stream: (model, context, options) => api.stream(model, context, fill(model, context, options)),
+    streamSimple: (model, context, options) => api.streamSimple(model, context, fill(model, context, options)),
+  };
+}
+
+/**
  * Give every model request a fetch that waits out 429s (see
  * rate-limit-fetch.ts). A caller-supplied fetch is kept as the base.
  */
@@ -294,7 +315,7 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
   };
   // Every leg fails a request that goes quiet as retryable (stream-idle-timeout.ts).
   const createAIStreams: ProviderStreams | undefined =
-    ai && withStreamIdleTimeout({ stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams, idleOptions);
+    ai && withStreamIdleTimeout(withWorkersAIMaxTokens({ stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams), idleOptions);
   const legacyAnthropic: ProviderStreams | undefined = createAIStreams && {
     stream: (model, context, options) => createAIStreams.stream(byId.get(model.id) ?? model, context, keyless(options)),
     streamSimple: (model, context, options) => createAIStreams.streamSimple(byId.get(model.id) ?? model, context, keyless(options)),

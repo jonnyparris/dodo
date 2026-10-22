@@ -465,6 +465,8 @@ describe("pi gateway wire: Workers AI through createAI's run path (WORKERS_AI_VI
     expect(c.options.extraHeaders).toMatchObject({ "x-session-affinity": "sess-7" });
     expect(c.inputs.model).toBeUndefined();
     expect(c.inputs.stream).toBe(true);
+    // A cap like pi-ai's own leg: the model's maxTokens, clamped to the room left in the context.
+    expect(c.inputs.max_tokens).toBe(32_000);
     const assistant = (c.inputs.messages as Array<Record<string, unknown>>).find((m) => m.role === "assistant")!;
     expect(assistant.content).toBe("");
     expect((c.inputs.tools as unknown[]).length).toBe(1);
@@ -485,6 +487,20 @@ describe("pi gateway wire: Workers AI through createAI's run path (WORKERS_AI_VI
     expect(res.errorMessage).toBeUndefined();
     expect(runCalls).toHaveLength(2);
   }, 20_000);
+
+  it("clamps max_tokens to the room left in a small context window", async () => {
+    const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    // Not in Dodo's catalog: pi-ai's Workers AI catalog says 32,768 tokens.
+    setDodoProvider(models, ["@cf/qwen/qwen3-30b-a3b-fp8"], config, env);
+    const m = models.getModel(CREATE_AI_PROVIDER_ID, "@cf/qwen/qwen3-30b-a3b-fp8")!;
+    expect(m.contextWindow).toBe(32_768);
+    await models.complete(m, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    const cap = runCalls[0]!.inputs.max_tokens as number;
+    expect(cap).toBeGreaterThan(20_000);
+    expect(cap).toBeLessThan(32_768 - 4096);
+  });
 });
 
 describe("pi gateway wire", () => {
