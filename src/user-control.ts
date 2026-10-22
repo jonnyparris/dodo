@@ -1418,11 +1418,12 @@ export class UserControl extends DurableObject<Env> {
       this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN fork_source INTEGER NOT NULL DEFAULT 0");
     } catch { /* column already exists */ }
 
-    // has_prompts = 1 once the session is known to hold a prompt. Set when
+    // has_prompts = 1 once the session is known to hold a prompt or a
+    // transcript (a fork imports messages but no prompt rows). Set when
     // the CodingAgent reports status 'running' (user / queue prompts; cron,
     // watchdog and other syncIndex:false sources don't report it) and, for
     // everything else including rows that predate the column, by the idle
-    // sweep after it counts prompts. The sweep filters on it in SQL, so prompted sessions stop
+    // sweep after it counts prompts and messages. The sweep filters on it in SQL, so prompted sessions stop
     // taking batch slots and newer empty sessions get reached.
     try {
       this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN has_prompts INTEGER NOT NULL DEFAULT 0");
@@ -3873,7 +3874,7 @@ export class UserControl extends DurableObject<Env> {
       } catch (err) {
         // If the CodingAgent DO is unreachable, leave the session alone —
         // better to retry next sweep than to delete blindly.
-        log("warn", "idle-sweep: failed to count prompts", {
+        log("warn", "idle-sweep: failed to count session content", {
           sessionId,
           err: err instanceof Error ? err.message : String(err),
         });
