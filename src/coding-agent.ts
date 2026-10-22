@@ -1394,6 +1394,9 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       if (request.method === "GET" && url.pathname === "/") {
+        // No prompt yet: load the owner's config so the details show the
+        // owner's model, not the Worker default. Once per session.
+        if (!this.getConfig()) await this.refreshConfigFromOwner();
         return Response.json(this.readSessionDetails());
       }
 
@@ -5046,16 +5049,16 @@ export class CodingAgent extends CodingAgentBase {
     const totalTokenInput = Number(metaTotals?.total_in ?? 0);
     const totalTokenOutput = Number(metaTotals?.total_out ?? 0);
 
-    // Context window info. Report the model the next prompt will run on:
-    // the session override wins (it can be set with PUT /model-override
-    // after the last prompt configured the session), then the model the
-    // last prompt configured, then the Worker default. Same order as
-    // ensureThinkConfig / readAppConfig.
+    // Context window info. The session config holds the models the current
+    // (or last) prompt runs on. A session override set while a prompt runs
+    // only applies from the next prompt, so it shows once the session is
+    // idle; PUT /model-override refreshes the config when idle.
     const config = this.getConfig();
     const modelOverride = this.modelOverride.read();
-    const modelId = modelOverride.model ?? config?.model ?? this.env.DEFAULT_MODEL ?? "";
-    const exploreModel = modelOverride.exploreModel ?? config?.exploreModel;
-    const taskModel = modelOverride.taskModel ?? config?.taskModel;
+    const pending = status === "running" ? {} : modelOverride;
+    const modelId = pending.model ?? config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const exploreModel = pending.exploreModel ?? config?.exploreModel;
+    const taskModel = pending.taskModel ?? config?.taskModel;
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
     // Use latest assistant turn's input tokens as the best proxy for current context size
@@ -5911,7 +5914,10 @@ export class CodingAgent extends CodingAgentBase {
       activeGateway: existing?.activeGateway ?? appConfig.activeGateway,
       gitAuthorEmail: appConfig.gitAuthorEmail,
       gitAuthorName: appConfig.gitAuthorName,
-      model: override.model ?? existing?.model ?? appConfig.model,
+      // Not existing.model: that can be an override the owner has since
+      // cleared. Every route sends the owner's model as x-dodo-model anyway,
+      // so for a prompt that came through a route the two agree.
+      model: override.model ?? appConfig.model,
       opencodeBaseURL: existing?.opencodeBaseURL ?? appConfig.opencodeBaseURL,
       aiGatewayBaseURL: existing?.aiGatewayBaseURL ?? appConfig.aiGatewayBaseURL,
       // Always pull the latest prefix from UserControl so config changes
@@ -5962,8 +5968,22 @@ export class CodingAgent extends CodingAgentBase {
     this.ensureMetadata(this.requireSessionId(request), request.headers.get("x-owner-email"));
     const denied = this.applyModelOverride(parsed.data, request.headers.get("x-author-email"));
     if (denied) return denied;
+    // Idle: rebuild the session config now, so the details, /debug/compaction
+    // and a goal auto-continue turn all see the new models. A running prompt
+    // keeps its models; the next prompt's readAppConfig applies the override.
+    if (this.control.read().status !== "running") await this.refreshConfigFromOwner();
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
     return Response.json({ modelOverride: this.modelOverride.read() });
+  }
+
+  /** readAppConfig for display paths: a UserControl failure must not fail the request. */
+  private async refreshConfigFromOwner(): Promise<void> {
+    if (!this.readMetadata("owner_email")) return;
+    try {
+      await this.readAppConfig();
+    } catch (error) {
+      log("warn", "could not refresh session config from owner", { sessionId: this.sessionId(), error: String(error) });
+    }
   }
 
   /**

@@ -3,7 +3,8 @@
  * missing from the catalog silently gets DEFAULT_CONTEXT_WINDOW (128k) for
  * the session details and for pi's compaction, and no price (2026-10:
  * DEFAULT_MODEL was `anthropic/claude-sonnet-4`, which the catalog doesn't
- * list).
+ * list). Changing a default doesn't touch owners already seeded with the old
+ * one: UserControl.seedDefaults is INSERT OR IGNORE.
  */
 import { describe, expect, it } from "vitest";
 import { FALLBACK_MODELS, WORKERS_AI_MODELS } from "../src/model-catalog";
@@ -14,7 +15,9 @@ import preview from "../wrangler.preview.jsonc?raw";
 const CATALOG_IDS = new Set([...FALLBACK_MODELS, ...WORKERS_AI_MODELS].map((m) => m.id));
 const MODEL_VARS = ["DEFAULT_MODEL", "AI_GATEWAY_DEFAULT_MODEL", "DEFAULT_EXPLORE_MODEL", "DEFAULT_TASK_MODEL"];
 
-function modelVars(source: string): Array<[string, string]> {
+function modelVars(raw: string): Array<[string, string]> {
+  // Drop whole-line comments so a commented-out default isn't checked.
+  const source = raw.split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
   const out: Array<[string, string]> = [];
   for (const name of MODEL_VARS) {
     for (const m of source.matchAll(new RegExp(`"${name}"\\s*:\\s*"([^"]*)"`, "g"))) out.push([name, m[1]!]);
