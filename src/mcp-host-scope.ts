@@ -34,21 +34,29 @@ export interface McpHostScope {
 
 /** One SharedIndex lookup for `scope=mcp`. Throws when SharedIndex fails. */
 export async function lookupMcpHostScope(env: Env, hostname: string, timeoutMs?: number): Promise<McpHostScope> {
-  const request = getSharedIndexStub(env).fetch(
-    `https://shared-index/allowlist/check?scope=mcp&hostname=${encodeURIComponent(hostname)}`,
-  );
+  const controller = new AbortController();
+  const read = async (): Promise<McpHostScope> => {
+    const res = await getSharedIndexStub(env).fetch(
+      `https://shared-index/allowlist/check?scope=mcp&hostname=${encodeURIComponent(hostname)}`,
+      { signal: controller.signal },
+    );
+    if (!res.ok) throw new Error(`allowlist check HTTP ${res.status}`);
+    const body = (await res.json()) as { allowed?: boolean; listed?: boolean };
+    return { allowed: body.allowed === true, listed: body.listed === true };
+  };
+  if (timeoutMs === undefined) return read();
+  // The race covers the body read too; abort() releases the request.
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const res = timeoutMs === undefined
-    ? await request
-    : await Promise.race([
-      request,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`allowlist check timed out after ${timeoutMs}ms`)), timeoutMs);
-      }),
-    ]).finally(() => clearTimeout(timer));
-  if (!res.ok) throw new Error(`allowlist check HTTP ${res.status}`);
-  const body = (await res.json()) as { allowed?: boolean; listed?: boolean };
-  return { allowed: body.allowed === true, listed: body.listed === true };
+  return Promise.race([
+    read(),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(`allowlist check timed out after ${timeoutMs}ms`);
+        controller.abort(err);
+        reject(err);
+      }, timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -63,6 +71,8 @@ export async function lookupMcpHostScope(env: Env, hostname: string, timeoutMs?:
 const REVOKED_CACHE_TTL_MS = 30_000;
 const FAILED_LOOKUP_TTL_MS = 5_000;
 const LOOKUP_TIMEOUT_MS = 2_000;
+/** Hosts come from user configs, so this is a backstop, not an LRU. */
+const MAX_CACHED_HOSTS = 1_000;
 const revokedCache = new Map<string, { revoked: boolean; at: number; failedAt?: number }>();
 /** One lookup per host at a time; concurrent callers share it. */
 const inFlight = new Map<string, Promise<boolean>>();
@@ -106,21 +116,27 @@ async function refreshRevoked(env: Env, hostname: string): Promise<boolean> {
   try {
     const scope = await lookupMcpHostScope(env, hostname, LOOKUP_TIMEOUT_MS);
     const revoked = scope.listed && !scope.allowed;
-    revokedCache.set(hostname, { revoked, at: Date.now() });
+    remember(hostname, { revoked, at: Date.now() });
     return revoked;
   } catch (err) {
     // Last known answer for this host, however old; else allow. Read after
     // the await: no other lookup for this host ran meanwhile (inFlight).
     const cached = revokedCache.get(hostname);
-    const revoked = cached?.revoked ?? false;
-    revokedCache.set(hostname, { revoked, at: cached?.at ?? 0, failedAt: Date.now() });
+    const known = cached !== undefined && cached.at > 0;
+    const revoked = known ? cached.revoked : false;
+    remember(hostname, { revoked, at: known ? cached.at : 0, failedAt: Date.now() });
     log("warn", "mcp connect-time allowlist check failed", {
       hostname,
-      fallback: cached ? (revoked ? "last answer: revoked" : "last answer: allowed") : "no earlier answer: allowed",
+      fallback: known ? (revoked ? "last answer: revoked" : "last answer: allowed") : "no earlier answer: allowed",
       error: err instanceof Error ? err.message : String(err),
     });
     return revoked;
   }
+}
+
+function remember(hostname: string, entry: { revoked: boolean; at: number; failedAt?: number }): void {
+  if (revokedCache.size >= MAX_CACHED_HOSTS && !revokedCache.has(hostname)) revokedCache.clear();
+  revokedCache.set(hostname, entry);
 }
 
 /** Error text shown in MCP status / tool errors for a revoked host. */

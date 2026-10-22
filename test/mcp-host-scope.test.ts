@@ -125,8 +125,16 @@ describe("isMcpHostRevoked cache", () => {
       now.mockReturnValue(t0 + 66_000); // back-off over: tries again
       expect(await isMcpHostRevoked(brokenEnv, url)).toBe(true);
       expect(calls).toBe(2);
-      // SharedIndex back: the fresh answer wins.
-      await setHost(host, { mcp: true });
+      // SharedIndex back and mcp turned on during the outage: the stale
+      // answer holds through the back-off, then the fresh answer wins.
+      await shared().fetch("https://shared-index/allowlist", {
+        body: JSON.stringify({ hostname: host, mcp: true }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      now.mockReturnValue(t0 + 68_000);
+      expect(await isMcpHostRevoked(typedEnv, url)).toBe(true);
+      now.mockReturnValue(t0 + 72_000);
       expect(await isMcpHostRevoked(typedEnv, url)).toBe(false);
     } finally {
       now.mockRestore();
@@ -155,6 +163,19 @@ describe("isMcpHostRevoked cache", () => {
     } as unknown as Env;
     const started = Date.now();
     expect(await isMcpHostRevoked(hungEnv, `https://${uniqueHost("hung")}/mcp`)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
+  it("times out a response whose body never arrives", async () => {
+    const stalledEnv = {
+      ...typedEnv,
+      SHARED_INDEX: {
+        idFromName: () => ({}),
+        get: () => ({ fetch: async () => new Response(new ReadableStream({ start() {} }), { status: 200 }) }),
+      },
+    } as unknown as Env;
+    const started = Date.now();
+    expect(await isMcpHostRevoked(stalledEnv, `https://${uniqueHost("stall")}/mcp`)).toBe(false);
     expect(Date.now() - started).toBeLessThan(10_000);
   });
 });
@@ -211,8 +232,11 @@ describe("session DO connectMcpServers", () => {
 
       // Every config revoked: gatekeepers emptied, status still explains why.
       await setHost(okHost, { mcp: false });
+      const loadOAuth = vi.spyOn(instance, "loadOAuthToolsFromHub");
       await instance.connectMcpServers();
       expect(instance.mcpGatekeepers).toHaveLength(0);
+      // OAuth hub tools still load with no HTTP configs left.
+      expect(loadOAuth).toHaveBeenCalledWith(owner);
       expect(statusFor(okHost)).toMatchObject({ ok: false, error: expect.stringContaining("turned off") });
       expect(statusFor(offHost)).toMatchObject({ ok: false, error: expect.stringContaining("turned off") });
     });

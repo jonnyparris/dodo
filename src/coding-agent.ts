@@ -5770,6 +5770,10 @@ export class CodingAgent extends CodingAgentBase {
         recordRevoked();
         this.mcpConnectedAt = 0;
         this.mcpEnabledConfigsFingerprint = "";
+        // OAuth tools live on the hub and don't depend on HTTP configs: a
+        // user with only OAuth servers (or every HTTP config revoked) still
+        // gets them.
+        await this.loadOAuthToolsFromHub(ownerEmail);
         return;
       }
 
@@ -5797,6 +5801,12 @@ export class CodingAgent extends CodingAgentBase {
           CodingAgent.MCP_REFRESH_TTL_MS,
         )
       ) {
+        // Drop status rows for configs that were removed or disabled since
+        // the last rebuild (e.g. a revoked config the user then deleted).
+        const candidateIds = new Set(candidates.map((c) => c.id));
+        for (const id of this.mcpStatus.keys()) {
+          if (!candidateIds.has(id)) this.mcpStatus.delete(id);
+        }
         await this.loadOAuthToolsFromHub(ownerEmail);
         return;
       }
