@@ -290,7 +290,8 @@ export class SharedIndex extends DurableObject<Env> {
             allowCredentials: z.boolean().optional(),
             mcp: z.boolean().optional(),
             sandbox: z.boolean().optional(),
-            methods: z.array(z.string().transform((m) => m.trim().toUpperCase()).pipe(z.enum(ALLOWLIST_METHODS))).nullable().optional(),
+            // null clears the limit; an empty list is refused so it can't be read as "no methods".
+            methods: z.array(z.string().transform((m) => m.trim().toUpperCase()).pipe(z.enum(ALLOWLIST_METHODS))).min(1).nullable().optional(),
           })
           .strict()
           .parse(await request.json());
@@ -310,12 +311,17 @@ export class SharedIndex extends DurableObject<Env> {
         // No scope: listed at all (legacy callers).
         const hostname = normalizeHostname(url.searchParams.get("hostname") ?? "");
         const scope = url.searchParams.get("scope");
+        // Fail closed on a typo'd scope rather than treating it as "listed at all".
+        if (scope !== null && scope !== "mcp" && scope !== "sandbox") {
+          return Response.json({ error: `Unknown scope: ${scope}` }, { status: 400 });
+        }
         const entry = hostname ? this.getAllowlistEntry(hostname) : null;
         const allowed = !!entry && (scope === "mcp" ? entry.mcp : scope === "sandbox" ? entry.sandbox : true);
         return Response.json({
           allowed,
           allowCredentials: entry?.allowCredentials ?? false,
           hostname,
+          listed: !!entry,
           mcp: entry?.mcp ?? false,
           methods: entry?.methods ?? null,
           sandbox: entry?.sandbox ?? false,

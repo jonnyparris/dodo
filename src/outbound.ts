@@ -97,8 +97,11 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
   }
 }
 
+/** Set on responses Dodo blocked itself, so the agent can tell them from upstream errors. */
+export const BLOCKED_HEADER = "x-dodo-blocked";
+
 function blocked(error: string, allowedMethods?: string[]): Response {
-  const headers: Record<string, string> = { "content-type": "application/json" };
+  const headers: Record<string, string> = { "content-type": "application/json", [BLOCKED_HEADER]: allowedMethods ? "method" : "host" };
   if (allowedMethods) headers.allow = allowedMethods.join(", ");
   return new Response(JSON.stringify({ error }), { status: allowedMethods ? 405 : 403, headers });
 }

@@ -23,10 +23,10 @@
  *   the provided value is not of type 'Fetcher'.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createExecutionContext } from "cloudflare:test";
+import { createExecutionContext, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { getSharedIndexStub } from "../src/auth";
-import { AllowlistOutbound, isCredentialHeader, OWNER_ID_HEADER, sanitizeEgressRequest, STRIPPED_HEADERS_HEADER } from "../src/outbound";
+import { AllowlistOutbound, BLOCKED_HEADER, isCredentialHeader, OWNER_ID_HEADER, sanitizeEgressRequest, STRIPPED_HEADERS_HEADER } from "../src/outbound";
 import { MCP_CATALOG } from "../src/mcp-catalog";
 import type { Env } from "../src/types";
 
@@ -244,6 +244,7 @@ describe("allowlist scopes and method limits", () => {
     expect((await check()).allowed).toBe(true);
     const { res, called } = await egress("GET");
     expect(res.status).toBe(403);
+    expect(res.headers.get(BLOCKED_HEADER)).toBe("host");
     expect(called).toBe(false);
   });
 
@@ -260,6 +261,7 @@ describe("allowlist scopes and method limits", () => {
       const { res, called } = await egress(method);
       expect(res.status, method).toBe(405);
       expect(res.headers.get("allow")).toBe("GET, HEAD");
+      expect(res.headers.get(BLOCKED_HEADER)).toBe("method");
       expect(await res.text()).toContain("allows only GET, HEAD");
       expect(called, method).toBe(false);
     }
@@ -276,13 +278,35 @@ describe("allowlist scopes and method limits", () => {
     expect((await egress("POST")).called).toBe(true);
   });
 
-  it("rejects unknown methods", async () => {
-    const res = await shared().fetch("https://shared-index/allowlist", {
-      body: JSON.stringify({ hostname: HOST, methods: ["TRACE"] }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
+  it("rejects unknown methods and an empty method list without creating the host", async () => {
+    for (const methods of [["TRACE"], []]) {
+      const res = await shared().fetch("https://shared-index/allowlist", {
+        body: JSON.stringify({ hostname: HOST, methods }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(res.status, JSON.stringify(methods)).toBe(400);
+    }
+    expect((await check()).allowed).toBe(false);
+  });
+
+  it("fails closed on an unknown scope", async () => {
+    await post({});
+    const res = await shared().fetch(`https://shared-index/allowlist/check?scope=Sandbox&hostname=${HOST}`);
+    expect(res.status).toBe(400);
+  });
+
+  it("migration puts rows that predate the scope columns in both scopes", async () => {
+    await post({ methods: ["GET"], mcp: false });
+    const stub = shared();
+    const row = await runInDurableObject(stub, async (instance, state) => {
+      for (const col of ["mcp", "sandbox", "methods"]) state.storage.sql.exec(`ALTER TABLE host_allowlist DROP COLUMN ${col}`);
+      (instance as unknown as { migrateAddAllowlistScopes(): void }).migrateAddAllowlistScopes();
+      return state.storage.sql.exec("SELECT mcp, sandbox, methods FROM host_allowlist WHERE hostname = ?", HOST).toArray()[0];
     });
-    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(row).toEqual({ mcp: 1, sandbox: 1, methods: null });
+    expect((await check("mcp")).allowed).toBe(true);
+    expect((await check("sandbox")).allowed).toBe(true);
   });
 });
 
