@@ -3581,6 +3581,19 @@ export class UserControl extends DurableObject<Env> {
     const sessionTitle = sourceInput.title ?? null;
     const sourceSessionId = sourceInput.source === "fork" ? sourceInput.sourceSessionId : null;
 
+    // forkScheduledSession only finds sources in THIS DO, so a source the
+    // user doesn't own (shared, or any session for a platform admin) would
+    // fail every fire with source_session_missing. Reject it up front.
+    if (sourceSessionId !== null) {
+      const owned = Array.from(this.ctx.storage.sql.exec(
+        "SELECT id FROM sessions WHERE id = ? AND status != 'deleted'",
+        sourceSessionId,
+      )).length > 0;
+      if (!owned) {
+        throw new Error("Scheduled forks can only use a session you own as the source");
+      }
+    }
+
     this.ctx.storage.sql.exec(
       `INSERT INTO scheduled_sessions (
         id, description, prompt, schedule_type,
