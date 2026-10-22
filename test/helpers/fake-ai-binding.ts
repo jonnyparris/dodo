@@ -19,5 +19,25 @@ export function fakeAIBinding(respond: (query: Record<string, unknown>) => Respo
       throw new Error("Workers AI run path not expected");
     },
   };
-  return { binding: binding as unknown as Ai, calls };
+  // Like an RPC stub: `.bind` / `.call` / `.apply` / `then` on a method or
+  // on gateway(id) would be remote calls in workerd. Fail loudly instead.
+  const rpcLike = <T extends object>(obj: T): T =>
+    new Proxy(obj, {
+      get(target, prop, receiver) {
+        if (prop === "then") throw new Error("RPC stub awaited");
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function") return value;
+        return new Proxy(value, {
+          get(fn, p) {
+            if (p === "bind" || p === "call" || p === "apply") throw new Error(`RPC stub method .${String(p)}() would be a remote call`);
+            return Reflect.get(fn, p);
+          },
+          apply(fn, _this, args) {
+            const out = Reflect.apply(fn, target, args);
+            return out && typeof out === "object" && !(out instanceof Promise) ? rpcLike(out as object) : out;
+          },
+        });
+      },
+    });
+  return { binding: rpcLike(binding) as unknown as Ai, calls };
 }

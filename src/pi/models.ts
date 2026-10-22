@@ -136,7 +136,7 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
     // createAI's catalog model (api anthropic-messages, gateway-shaped
     // baseUrl, provider `cloudflare`, id = the Dodo id) with Dodo's limits and
     // prices. Spreading keeps createAI's routing tags.
-    const base = createAI({ binding: env.AI, id: gatewayId })(modelId) as Model<"anthropic-messages">;
+    const base = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId })(modelId) as Model<"anthropic-messages">;
     return {
       ...base,
       name: modelId,

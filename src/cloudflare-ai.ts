@@ -77,11 +77,13 @@ function abortReason(signal: AbortSignal): unknown {
 
 /**
  * Call the binding without handing it the AbortSignal, and apply the signal
- * here instead. createAI passes `signal` to `env.AI.gateway(id).run`, but the
- * binding is an RPC call and workerd refuses to serialise an AbortSignal
- * without the `enable_abortsignal_rpc` flag ("AbortSignal serialization is
- * not enabled", seen live on preview 2026-10-22). On abort the wait rejects
- * and the response body stops (pipeTo cancels the source).
+ * here instead. createAI passes `signal` to the binding's `run` calls, but
+ * the binding is an RPC stub and workerd refuses to serialise an AbortSignal
+ * ("AbortSignal serialization is not enabled", seen live on preview
+ * 2026-10-22). On abort: the wait rejects at once, a response that arrives
+ * later has its body cancelled, and a body already streaming stops (pipeTo
+ * cancels the source). The binding call itself can't be cancelled from here,
+ * so an upstream request already in flight may still run to completion.
  */
 export async function runWithLocalSignal(run: GatewayRun, request: unknown, options?: Parameters<GatewayRun>[1]): Promise<Response> {
   const signal = options?.signal ?? undefined;
@@ -93,9 +95,14 @@ export async function runWithLocalSignal(run: GatewayRun, request: unknown, opti
     onAbort = () => reject(abortReason(signal));
     signal.addEventListener("abort", onAbort, { once: true });
   });
+  const pending = run(request, rest);
   let response: Response;
   try {
-    response = await Promise.race([run(request, rest), aborted]);
+    response = await Promise.race([pending, aborted]);
+  } catch (error) {
+    // Lost the race to an abort: drop whatever the binding returns later.
+    pending.then((late) => late.body?.cancel().catch(() => {}), () => {});
+    throw error;
   } finally {
     signal.removeEventListener("abort", onAbort!);
   }
@@ -118,30 +125,35 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
   // `env.AI` is an RPC stub: every property access, `.bind` and `.call`
   // included, becomes a remote call. So never touch methods on it; call them
   // by name through closures (seen live 2026-10-22: `.bind` sent an
-  // RpcPromise over the wire and failed to serialise).
+  // RpcPromise over the wire and failed to serialise). `gateway(id)` gets a
+  // plain object back, so nothing awaits or probes the RpcPromise.
   type Callable = Record<PropertyKey, (...args: unknown[]) => unknown>;
+  const stub = binding as unknown as Callable;
+  const local = (run: GatewayRun): GatewayRun => (request, options) => {
+    const send = () => runWithLocalSignal(run, request, options);
+    return retry ? retry(send, options?.signal) : send();
+  };
   return new Proxy(binding, {
     get(target, prop) {
-      if (prop !== "gateway") {
-        const value = Reflect.get(target, prop, target) as unknown;
-        return typeof value === "function" ? (...args: unknown[]) => (target as unknown as Callable)[prop](...args) : value;
+      if (prop === "gateway") {
+        return (id: string) => {
+          const gateway = stub.gateway(id) as Callable;
+          return {
+            run: local((request, options) => gateway.run(request, options) as Promise<Response>),
+            getLog: (...args: unknown[]) => gateway.getLog(...args),
+            getUrl: (...args: unknown[]) => gateway.getUrl(...args),
+            patchLog: (...args: unknown[]) => gateway.patchLog(...args),
+          };
+        };
       }
-      return (id: string) => {
-        const gateway = (target as unknown as Callable).gateway(id) as Callable;
-        return new Proxy(gateway, {
-          get(g, p) {
-            if (p !== "run") {
-              const member = Reflect.get(g, p, g) as unknown;
-              return typeof member === "function" ? (...args: unknown[]) => (g as Callable)[p](...args) : member;
-            }
-            const run: GatewayRun = (request, options) => (g as Callable).run(request, options) as Promise<Response>;
-            return (request: unknown, options?: Parameters<GatewayRun>[1]) => {
-              const send = () => runWithLocalSignal(run, request, options);
-              return retry ? retry(send, options?.signal) : send();
-            };
-          },
-        });
-      };
+      // Workers AI run path: same AbortSignal problem, no retry (rate limits
+      // there are handled by the caller's own policy).
+      if (prop === "run") {
+        return (model: unknown, inputs: unknown, options?: Parameters<GatewayRun>[1]) =>
+          runWithLocalSignal((_req, opts) => stub.run(model, inputs, opts) as Promise<Response>, undefined, options);
+      }
+      const value = Reflect.get(target, prop, target) as unknown;
+      return typeof value === "function" ? (...args: unknown[]) => stub[prop](...args) : value;
     },
   });
 }
