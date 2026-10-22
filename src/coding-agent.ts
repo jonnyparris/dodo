@@ -451,7 +451,7 @@ const SYSTEM_PROMPT = [
   "",
   "## Code execution",
   "",
-  "The **codemode** tool runs JavaScript in a sandboxed Worker with workspace filesystem and git access. Use it for build scripts, tests, one-off computations, and `fetch()` to allowlisted hosts (auth headers are NOT injected — include tokens yourself, or prefer the `git_*` tools which handle auth in the parent worker). 30-second timeout, restricted network.",
+  "The **codemode** tool runs JavaScript in a sandboxed Worker with workspace filesystem and git access. Use it for build scripts, tests, one-off computations, and `fetch()` to allowlisted hosts. Dodo injects no tokens, and it strips credential headers (Authorization, cookies, API keys) unless an admin has allowed auth for that host; the response header `x-dodo-stripped-headers` says what was removed. Never put tokens in URLs or request bodies to get around this. For git, use the `git_*` tools, which handle auth in the parent worker. 30-second timeout, restricted network.",
   "",
   "## Git",
   "",

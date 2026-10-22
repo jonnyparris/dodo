@@ -10,6 +10,14 @@ function normalizeHostname(hostname: string): string {
   return hostname.trim().toLowerCase();
 }
 
+function rowToAllowlistEntry(row: SqlRow): AllowlistEntry {
+  return {
+    allowCredentials: Number(row.allow_credentials ?? 0) === 1,
+    createdAt: epochToIso(row.created_at),
+    hostname: String(row.hostname),
+  };
+}
+
 /** Provider prefixes the opencode gateway can actually route.
  *  The models.dev provider TOMLs often fall back to `anthropic/` for non-Anthropic models
  *  (kimi, glm, qwen, mimo, minimax, etc.), which the gateway then forwards to Anthropic
@@ -250,8 +258,11 @@ export class SharedIndex extends DurableObject<Env> {
       }
 
       if (request.method === "POST" && url.pathname === "/allowlist") {
-        const body = z.object({ hostname: z.string().min(1) }).strict().parse(await request.json());
-        return Response.json(this.addAllowlistHost(body.hostname), { status: 201 });
+        const body = z
+          .object({ hostname: z.string().min(1), allowCredentials: z.boolean().optional() })
+          .strict()
+          .parse(await request.json());
+        return Response.json(this.addAllowlistHost(body.hostname, body.allowCredentials), { status: 201 });
       }
 
       if (request.method === "DELETE" && url.pathname.startsWith("/allowlist/") && !url.pathname.includes("/check")) {
@@ -262,7 +273,8 @@ export class SharedIndex extends DurableObject<Env> {
 
       if (request.method === "GET" && url.pathname === "/allowlist/check") {
         const hostname = normalizeHostname(url.searchParams.get("hostname") ?? "");
-        return Response.json({ allowed: hostname ? this.isAllowedHost(hostname) : false, hostname });
+        const entry = hostname ? this.getAllowlistEntry(hostname) : null;
+        return Response.json({ allowed: !!entry, allowCredentials: entry?.allowCredentials ?? false, hostname });
       }
 
       // ─── Models cache ───
@@ -922,6 +934,7 @@ export class SharedIndex extends DurableObject<Env> {
 
     // Phase 6: browser_enabled column (migration-safe)
     this.migrateAddBrowserEnabled();
+    this.migrateAddAllowCredentials();
 
     // Chat-monitor registry — lets admin UI/tools enumerate
     // ChatMonitorAgent DOs without scanning every UserControl. Each
@@ -974,6 +987,13 @@ export class SharedIndex extends DurableObject<Env> {
     const hasBrowserEnabled = cols.some((col) => String(col.name) === "browser_enabled");
     if (!hasBrowserEnabled) {
       this.ctx.storage.sql.exec("ALTER TABLE users ADD COLUMN browser_enabled INTEGER NOT NULL DEFAULT 0");
+    }
+  }
+
+  private migrateAddAllowCredentials(): void {
+    const cols = Array.from(this.ctx.storage.sql.exec("PRAGMA table_info(host_allowlist)"));
+    if (!cols.some((col) => String(col.name) === "allow_credentials")) {
+      this.ctx.storage.sql.exec("ALTER TABLE host_allowlist ADD COLUMN allow_credentials INTEGER NOT NULL DEFAULT 0");
     }
   }
 
@@ -1062,22 +1082,40 @@ export class SharedIndex extends DurableObject<Env> {
 
   // ─── Host allowlist ───
 
-  private addAllowlistHost(hostname: string): AllowlistEntry {
+  /**
+   * Add a host, or update its allowCredentials flag if it is already listed.
+   * Omitting allowCredentials on an existing host leaves the flag unchanged.
+   */
+  private addAllowlistHost(hostname: string, allowCredentials?: boolean): AllowlistEntry {
     const normalized = normalizeHostname(hostname);
     if (!normalized) throw new Error("Hostname is required");
-    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO host_allowlist (hostname, created_at) VALUES (?, ?)", normalized, nowEpoch());
-    return this.listAllowlist().find((entry) => entry.hostname === normalized)!;
+    // Bare hostnames only, or a bracketed IPv6 literal (what URL.hostname
+    // returns). Rejects ports and paths, which would never match, and
+    // quotes; the admin UI renders these values into HTML.
+    if (!/^([a-z0-9.-]+|\[[0-9a-f:.]+\])$/.test(normalized)) throw new Error("Invalid hostname");
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO host_allowlist (hostname, created_at, allow_credentials) VALUES (?, ?, ?)",
+      normalized,
+      nowEpoch(),
+      allowCredentials ? 1 : 0,
+    );
+    if (allowCredentials !== undefined) {
+      this.ctx.storage.sql.exec("UPDATE host_allowlist SET allow_credentials = ? WHERE hostname = ?", allowCredentials ? 1 : 0, normalized);
+    }
+    return this.getAllowlistEntry(normalized)!;
   }
 
   private listAllowlist(): AllowlistEntry[] {
-    return Array.from(this.ctx.storage.sql.exec("SELECT hostname, created_at FROM host_allowlist ORDER BY hostname ASC")).map((row) => ({
-      createdAt: epochToIso(row.created_at),
-      hostname: String(row.hostname),
-    }));
+    return Array.from(
+      this.ctx.storage.sql.exec("SELECT hostname, created_at, allow_credentials FROM host_allowlist ORDER BY hostname ASC"),
+    ).map(rowToAllowlistEntry);
   }
 
-  private isAllowedHost(hostname: string): boolean {
-    return !!(Array.from(this.ctx.storage.sql.exec("SELECT hostname FROM host_allowlist WHERE hostname = ?", hostname))[0] as SqlRow | null);
+  private getAllowlistEntry(hostname: string): AllowlistEntry | null {
+    const row = Array.from(
+      this.ctx.storage.sql.exec("SELECT hostname, created_at, allow_credentials FROM host_allowlist WHERE hostname = ?", hostname),
+    )[0] as SqlRow | undefined;
+    return row ? rowToAllowlistEntry(row) : null;
   }
 
   // ─── Models cache (migrated from AppControl) ───
