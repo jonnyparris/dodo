@@ -15,7 +15,14 @@
 // error ends the stream at once, even if the provider ignores the abort,
 // so a fetch that never settles can't hold the turn.
 //
-// A caller abort is not a timeout: it passes through as "aborted".
+// A caller abort is not a timeout: it passes through as "aborted". If the
+// provider ignores a caller abort, the stream ends (as "aborted") after a
+// short grace period (ABORT_GRACE_MS).
+//
+// Worst case for a request that always stalls: pi-durable makes 4 attempts
+// (maxRetries 3), each with its own timer, so the turn fails after about
+// 4 x 5 min = 20 min (plus 14s of backoff) instead of hanging until someone
+// aborts it.
 
 import type { AssistantMessage, AssistantMessageEvent, Model, ProviderStreams, StreamOptions } from "@earendil-works/pi-ai";
 import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
@@ -30,11 +37,16 @@ import { combineAbortSignals } from "@earendil-works/pi-ai/utils/abort-signals";
  */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60_000;
 
+/** How long a provider gets to end its own stream after a caller abort. */
+const ABORT_GRACE_MS = 1_000;
+
 export interface StreamIdleTimeoutInfo {
   model: string;
   idleMs: number;
-  /** Stream events seen before the stall; 0 means it stalled before the first one (request or headers). */
+  /** pi stream events seen before the stall. */
   events: number;
+  /** Raw provider events seen (only adapters that report them); both 0 means nothing came back at all. */
+  providerEvents: number;
 }
 
 export interface StreamIdleTimeoutOptions {
@@ -44,15 +56,16 @@ export interface StreamIdleTimeoutOptions {
 }
 
 /** The error text. Must stay matched by pi-ai's RETRYABLE pattern ("timeout"). */
-export function streamIdleTimeoutMessage(idleMs: number, events: number): string {
-  const where = events === 0 ? "before the first response event" : `after ${events} events`;
+export function streamIdleTimeoutMessage(idleMs: number, events: number, providerEvents = 0): string {
+  const where =
+    events > 0 ? `after ${events} events` : providerEvents > 0 ? `after ${providerEvents} provider events` : "before the first response event";
   return `Model stream idle timeout: no data for ${Math.round(idleMs / 1000)}s ${where}`;
 }
 
 // Scratch fields pi-ai's adapters use while a block is still streaming.
 const SCRATCH_FIELDS = ["index", "partialArgs", "customInput", "streamIndex"] as const;
 
-function timedOutMessage(model: Model<never>, partial: AssistantMessage | undefined, errorMessage: string): AssistantMessage {
+function terminalMessage(model: Model<never>, partial: AssistantMessage | undefined, errorMessage: string): AssistantMessage {
   const base: AssistantMessage = partial
     ? structuredClone(partial)
     : {
@@ -87,40 +100,70 @@ function guard<O extends StreamOptions | undefined>(
   const idle = new AbortController();
   const combined = combineAbortSignals([options?.signal, idle.signal]);
   let events = 0;
+  let providerEvents = 0;
   let partial: AssistantMessage | undefined;
   let finished = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
+  const onCallerAbort = () => {
+    clearTimeout(timer);
+    if (!finished) timer = setTimeout(fire, ABORT_GRACE_MS);
+  };
   const finish = () => {
     finished = true;
     clearTimeout(timer);
+    options?.signal?.removeEventListener("abort", onCallerAbort);
     combined.cleanup();
   };
-  const fire = () => {
-    if (finished) return;
-    // A caller abort racing the timer wins: the provider reports it as aborted.
-    if (options?.signal?.aborted) return;
-    finish();
-    onTimeout?.({ model: model.id, idleMs, events });
-    const error = timedOutMessage(model, partial, streamIdleTimeoutMessage(idleMs, events));
-    idle.abort(new Error(error.errorMessage));
-    out.push({ type: "error", reason: "error", error });
+  const end = (reason: "error" | "aborted", errorMessage: string) => {
+    const error = terminalMessage(model, partial, errorMessage);
+    out.push({ type: "error", reason, error: { ...error, stopReason: reason } });
     out.end();
   };
+  function fire() {
+    if (finished) return;
+    if (options?.signal?.aborted) {
+      // Caller aborted and the provider never ended the stream: end it for them.
+      finish();
+      end("aborted", "Request was aborted");
+      return;
+    }
+    const message = streamIdleTimeoutMessage(idleMs, events, providerEvents);
+    // Abort before finish(): cleanup() detaches idle.signal from the combined signal.
+    idle.abort(new Error(message));
+    finish();
+    end("error", message);
+    try {
+      onTimeout?.({ model: model.id, idleMs, events, providerEvents });
+    } catch {
+      // Logging only; the stream has already ended.
+    }
+  }
   const arm = () => {
+    // After a caller abort only the grace timer runs; late events must not cancel it.
+    if (finished || options?.signal?.aborted) return;
     clearTimeout(timer);
-    if (!finished) timer = setTimeout(fire, idleMs);
+    timer = setTimeout(fire, idleMs);
   };
 
-  const inner = run({
-    ...options,
-    signal: combined.signal,
-    onProviderStreamEvent: async (data: unknown, m: Model<never>) => {
-      arm();
-      await options?.onProviderStreamEvent?.(data, m);
-    },
-  } as O);
-  arm();
+  let inner: AssistantMessageEventStream;
+  try {
+    inner = run({
+      ...options,
+      signal: combined.signal,
+      onProviderStreamEvent: async (data: unknown, m: Model<never>) => {
+        providerEvents++;
+        arm();
+        await options?.onProviderStreamEvent?.(data, m);
+      },
+    } as O);
+  } catch (error) {
+    finish();
+    throw error;
+  }
+  options?.signal?.addEventListener("abort", onCallerAbort, { once: true });
+  if (options?.signal?.aborted) onCallerAbort();
+  else arm();
 
   (async () => {
     try {
@@ -138,15 +181,13 @@ function guard<O extends StreamOptions | undefined>(
         out.push(event);
       }
       if (finished) return;
-      // Ended without a terminal event: hand on whatever result it settled with.
+      // pi-ai adapters always end with done/error; if one doesn't, its result() may never settle.
       finish();
-      out.end(await inner.result());
+      end(options?.signal?.aborted ? "aborted" : "error", "Model stream ended without a terminal event");
     } catch (error) {
       if (finished) return;
       finish();
-      const message = timedOutMessage(model, partial, error instanceof Error ? error.message : String(error));
-      out.push({ type: "error", reason: options?.signal?.aborted ? "aborted" : "error", error: { ...message, stopReason: options?.signal?.aborted ? "aborted" : "error" } });
-      out.end();
+      end(options?.signal?.aborted ? "aborted" : "error", error instanceof Error ? error.message : String(error));
     }
   })();
   return out;

@@ -26,7 +26,7 @@ import { aigMetadataHeader, anthropicGatewayBaseUrl, resolveWireModelId } from "
 import type { Env } from "../types";
 import { log } from "../logger";
 import { rateLimitFetch } from "./rate-limit-fetch";
-import { withStreamIdleTimeout } from "./stream-idle-timeout";
+import { type StreamIdleTimeoutInfo, withStreamIdleTimeout } from "./stream-idle-timeout";
 
 export { anthropicGatewayBaseUrl };
 
@@ -214,8 +214,7 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       log("warn", "pi: model rate limited, waiting", { sessionId: config.sessionId, attempt, delayMs: Math.round(delayMs), retryAfter }),
   };
   const idleOptions = {
-    onTimeout: ({ model, idleMs, events }: { model: string; idleMs: number; events: number }) =>
-      log("warn", "pi: model stream idle, failing the request for retry", { sessionId: config.sessionId, model, idleMs, events }),
+    onTimeout: (info: StreamIdleTimeoutInfo) => log("warn", "pi: model stream idle, failing the request for retry", { sessionId: config.sessionId, ...info }),
   };
   models.setProvider(
     createProvider({

@@ -68,6 +68,7 @@ describe("withStreamIdleTimeout (real openai-completions adapter)", () => {
     expect(message.content).toEqual([{ type: "text", text: "hel" }]);
     expect(timeouts).toEqual([expect.objectContaining({ idleMs: 100 })]);
     expect(timeouts[0]!.events).toBeGreaterThan(0);
+    expect(message.errorMessage).toBe(streamIdleTimeoutMessage(100, timeouts[0]!.events, timeouts[0]!.providerEvents));
     expect(wasAborted()).toBe(true);
   });
 
@@ -119,6 +120,75 @@ describe("withStreamIdleTimeout (real openai-completions adapter)", () => {
     expect(message.stopReason).toBe("aborted");
     await sleep(250);
     expect(timeouts).toEqual([]);
+  });
+
+  it("a caller abort ends the stream promptly even if the provider ignores it", async () => {
+    const never = (() => new Promise<Response>(() => {})) as typeof fetch;
+    const { timeouts, onTimeout } = collect();
+    const api = withStreamIdleTimeout(openAICompletionsApi(), { idleMs: 60_000, onTimeout });
+    const controller = new AbortController();
+    const stream = api.stream(model, context, { apiKey: "unused", fetch: never, signal: controller.signal });
+    const t0 = Date.now();
+    controller.abort();
+    const message = await stream.result();
+    expect(message.stopReason).toBe("aborted");
+    expect(Date.now() - t0).toBeLessThan(5_000); // the 1s grace, not the 60s idle limit
+    expect(timeouts).toEqual([]);
+  });
+
+  it("a late event after a caller abort doesn't cancel the grace timer", async () => {
+    let emit: (() => void) | undefined;
+    const respond = () => {
+      const s = new AssistantMessageEventStream();
+      const partial = fauxAssistantMessage("");
+      s.push({ type: "start", partial } as AssistantMessageEvent);
+      emit = () => s.push({ type: "text_start", contentIndex: 0, partial } as AssistantMessageEvent);
+      return s; // ignores the abort, then goes quiet
+    };
+    const api = withStreamIdleTimeout({ stream: respond, streamSimple: respond } as unknown as ProviderStreams, { idleMs: 60_000 });
+    const controller = new AbortController();
+    const stream = api.stream(model, context, { signal: controller.signal });
+    const t0 = Date.now();
+    controller.abort();
+    await sleep(100);
+    emit?.();
+    const message = await stream.result();
+    expect(message.stopReason).toBe("aborted");
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("a timeout aborts the provider request when the caller also passed a signal", async () => {
+    const { fetch, wasAborted } = stallingFetch([chunk({ role: "assistant", content: "x" })]);
+    const { timeouts, onTimeout } = collect();
+    const api = withStreamIdleTimeout(openAICompletionsApi(), { idleMs: 100, onTimeout });
+    const caller = new AbortController();
+    const message = await api.streamSimple(model, context, { apiKey: "unused", fetch, signal: caller.signal }).result();
+    expect(message.stopReason).toBe("error");
+    expect(isRetryableAssistantError(message)).toBe(true);
+    await sleep(20);
+    expect(wasAborted()).toBe(true);
+    expect(caller.signal.aborted).toBe(false);
+    expect(timeouts).toHaveLength(1);
+  });
+
+  it("raw provider events count as activity and are reported separately", async () => {
+    const respond = (_m: unknown, _c: unknown, options?: { onProviderStreamEvent?: (d: unknown, m: unknown) => unknown }) => {
+      const s = new AssistantMessageEventStream();
+      // Pings every 60ms for 300ms, past the 100ms limit, then silence.
+      let n = 0;
+      const ping = setInterval(() => {
+        void options?.onProviderStreamEvent?.({ type: "ping" }, model);
+        if (++n === 5) clearInterval(ping);
+      }, 60);
+      return s;
+    };
+    const { timeouts, onTimeout } = collect();
+    const api = withStreamIdleTimeout({ stream: respond, streamSimple: respond } as unknown as ProviderStreams, { idleMs: 100, onTimeout });
+    const t0 = Date.now();
+    const message = await api.stream(model, context, {}).result();
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(350);
+    expect(message.errorMessage).toBe("Model stream idle timeout: no data for 0s after 5 provider events");
+    expect(timeouts).toEqual([expect.objectContaining({ events: 0, providerEvents: 5 })]);
   });
 
   it("default is 5 minutes, and the message stays retryable at that size", () => {
