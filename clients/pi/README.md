@@ -13,7 +13,7 @@ Attach [pi](https://github.com/earendil-works/pi) to a Dodo session. What you ty
 /dodo open            open the session in the browser
 ```
 
-While attached, everything you type except `/commands` and `!shell` goes to Dodo. The footer shows `🦤 <session> · <model>`. If you close pi while attached, it attaches again when you reopen that pi session, and shows the messages you missed.
+While attached, everything you type except `/commands` and `!shell` goes to Dodo. The footer shows `🦤 <session> · <model>`. When a prompt waits for a Workers AI capacity slot, the live panel shows `⏳ waiting for model capacity` with a countdown, so a queued turn doesn't look stalled. If you close pi while attached, it attaches again when you reopen that pi session, and shows the messages you missed.
 
 `/dodo model` changes only the attached session (`PUT /session/:id/model-override`). Your default model and your other sessions stay as they are. It takes effect from the next prompt. A prompt that is already running keeps its main model (in facet mode, subagents it starts later pick up the change). Only the session owner can change it.
 
