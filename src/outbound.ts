@@ -85,13 +85,21 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     }
 
     const { request: outboundRequest, stripped } = sanitizeEgressRequest(request, { allowCredentials: allowCredentials === true });
-    if (stripped.length === 0) return fetch(outboundRequest);
+    if (stripped.length === 0) {
+      const upstream = await fetch(outboundRequest);
+      if (!upstream.headers.has(BLOCKED_HEADER)) return upstream;
+      // Upstream must not be able to fake a Dodo policy block.
+      const response = new Response(upstream.body, upstream);
+      response.headers.delete(BLOCKED_HEADER);
+      return response;
+    }
 
     console.warn(
       JSON.stringify({ level: "warn", msg: "Sandbox egress: stripped credential headers", hostname, stripped }),
     );
     const upstream = await fetch(outboundRequest);
     const response = new Response(upstream.body, upstream);
+    response.headers.delete(BLOCKED_HEADER);
     response.headers.set(STRIPPED_HEADERS_HEADER, stripped.join(", "));
     return response;
   }

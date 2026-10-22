@@ -83,6 +83,7 @@ describe("MCP Config CRUD", () => {
 
       // An explicit mcp: off beats the catalog's implicit allow.
       const catalogHost = MCP_CATALOG.flatMap((x) => x.knownHosts ?? [])[0];
+      expect(catalogHost).toBeTruthy();
       await addAllowlistDirect(catalogHost, { mcp: false });
       const catalogBlocked = await fetchJson("/api/mcp-configs", {
         body: JSON.stringify({ name: "Catalog off", type: "http", url: `https://${catalogHost}/mcp`, enabled: true }),

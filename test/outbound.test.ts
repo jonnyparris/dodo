@@ -254,6 +254,15 @@ describe("allowlist scopes and method limits", () => {
     expect((await egress("GET")).called).toBe(true);
   });
 
+  it("removes an x-dodo-blocked header sent by the upstream", async () => {
+    await post({});
+    vi.stubGlobal("fetch", async () => new Response("ok", { headers: { [BLOCKED_HEADER]: "host" } }));
+    const outbound = new AllowlistOutbound(createExecutionContext(), env as Env);
+    const res = await outbound.fetch(new Request(`https://${HOST}/x`));
+    expect(res.status).toBe(200);
+    expect(res.headers.has(BLOCKED_HEADER)).toBe(false);
+  });
+
   it("a GET/HEAD-only host refuses writes with 405 and forwards reads", async () => {
     const entry = await post({ methods: ["head", "GET"] as never });
     expect(entry.methods).toEqual(["GET", "HEAD"]);
@@ -307,6 +316,12 @@ describe("allowlist scopes and method limits", () => {
     expect(row).toEqual({ mcp: 1, sandbox: 1, methods: null });
     expect((await check("mcp")).allowed).toBe(true);
     expect((await check("sandbox")).allowed).toBe(true);
+    // A second run (every DO start) changes nothing.
+    await post({ sandbox: false });
+    await runInDurableObject(stub, async (instance) => {
+      (instance as unknown as { migrateAddAllowlistScopes(): void }).migrateAddAllowlistScopes();
+    });
+    expect((await check("sandbox")).allowed).toBe(false);
   });
 });
 
