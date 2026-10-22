@@ -5731,7 +5731,8 @@ export class CodingAgent extends CodingAgentBase {
 
       // An admin's explicit `mcp: off` on a host revokes configs that point
       // at it, not just new adds/edits (src/mcp-host-scope.ts). Checked on
-      // every call (cached 30s per isolate) and kept out of the fingerprint
+      // every call (cached 30s per isolate; a failed lookup reuses the last
+      // answer, see src/mcp-host-scope.ts) and kept out of the fingerprint
       // below, so a revocation rebuilds the gatekeepers instead of waiting
       // for the 5-minute TTL.
       const revokedFlags = await Promise.all(candidates.map((c) => isMcpHostRevoked(this.env, c.url!)));

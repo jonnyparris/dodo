@@ -80,6 +80,85 @@ describe("isMcpHostRevoked", () => {
   });
 });
 
+describe("isMcpHostRevoked cache", () => {
+  it("holds an answer for 30s, then re-reads", async () => {
+    const host = uniqueHost("ttl");
+    const url = `https://${host}/mcp`;
+    const t0 = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(t0);
+    try {
+      expect(await isMcpHostRevoked(typedEnv, url)).toBe(false);
+      // Toggle without clearing the cache.
+      await shared().fetch("https://shared-index/allowlist", {
+        body: JSON.stringify({ hostname: host, mcp: false }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      now.mockReturnValue(t0 + 29_000);
+      expect(await isMcpHostRevoked(typedEnv, url)).toBe(false);
+      now.mockReturnValue(t0 + 31_000);
+      expect(await isMcpHostRevoked(typedEnv, url)).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("keeps a known revocation through a SharedIndex outage and backs off failed lookups", async () => {
+    const host = uniqueHost("stale");
+    const url = `https://${host}/mcp`;
+    await setHost(host, { mcp: false });
+    const t0 = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(t0);
+    let calls = 0;
+    const brokenEnv = {
+      ...typedEnv,
+      SHARED_INDEX: { idFromName: () => ({}), get: () => ({ fetch: async () => { calls++; throw new Error("down"); } }) },
+    } as unknown as Env;
+    try {
+      expect(await isMcpHostRevoked(typedEnv, url)).toBe(true);
+      now.mockReturnValue(t0 + 60_000); // cache expired
+      expect(await isMcpHostRevoked(brokenEnv, url)).toBe(true);
+      expect(calls).toBe(1);
+      now.mockReturnValue(t0 + 62_000); // within the 5s failure back-off
+      expect(await isMcpHostRevoked(brokenEnv, url)).toBe(true);
+      expect(calls).toBe(1);
+      now.mockReturnValue(t0 + 66_000); // back-off over: tries again
+      expect(await isMcpHostRevoked(brokenEnv, url)).toBe(true);
+      expect(calls).toBe(2);
+      // SharedIndex back: the fresh answer wins.
+      await setHost(host, { mcp: true });
+      expect(await isMcpHostRevoked(typedEnv, url)).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("shares one lookup between concurrent callers", async () => {
+    let calls = 0;
+    const countingEnv = {
+      ...typedEnv,
+      SHARED_INDEX: {
+        idFromName: () => ({}),
+        get: () => ({ fetch: async () => { calls++; return Response.json({ allowed: false, listed: true }); } }),
+      },
+    } as unknown as Env;
+    const url = `https://${uniqueHost("dedupe")}/mcp`;
+    const results = await Promise.all([1, 2, 3].map(() => isMcpHostRevoked(countingEnv, url)));
+    expect(results).toEqual([true, true, true]);
+    expect(calls).toBe(1);
+  });
+
+  it("times out a hung lookup and allows", async () => {
+    const hungEnv = {
+      ...typedEnv,
+      SHARED_INDEX: { idFromName: () => ({}), get: () => ({ fetch: () => new Promise(() => {}) }) },
+    } as unknown as Env;
+    const started = Date.now();
+    expect(await isMcpHostRevoked(hungEnv, `https://${uniqueHost("hung")}/mcp`)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+});
+
 describe("session DO connectMcpServers", () => {
   async function seedConfigs(owner: string, urls: string[]): Promise<void> {
     const uc = typedEnv.USER_CONTROL.get(typedEnv.USER_CONTROL.idFromName(owner));
