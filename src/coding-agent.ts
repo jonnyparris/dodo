@@ -824,14 +824,12 @@ export class CodingAgent extends CodingAgentBase {
       setAbortController: (c) => {
         this._fiberAbortController = c;
       },
-      readAppConfig: () => this.readAppConfig(),
+      readAppConfig: () => this.readAppConfig({ promptStart: true }),
       log: (level, message, fields) => log(level, message, fields ?? {}),
       onPromptStart: () => this.clearNeedsInput(),
       onPromptFinished: (promptId, cause) => {
         this.ringCompletionWebhook(promptId, cause.kind);
-        if (this.readMetadata(CONFIG_REFRESH_PENDING)) {
-          this.refreshConfigAfterRun().catch((error) => log("warn", "config refresh after run failed", { sessionId: this.sessionId(), error: String(error) }));
-        }
+        this.afterRunIdle();
       },
     });
   }
@@ -3233,7 +3231,7 @@ export class CodingAgent extends CodingAgentBase {
     const notifyOwner = this.control.readOwnerEmail() ?? undefined;
 
     this.ensureThinkConfig(request);
-    await this.readAppConfig();
+    await this.readAppConfig({ promptStart: true });
     try {
       await this.migrateThinkSessionToPi();
       const result = await this.runPiChat(input.content, { promptId: `sync_${crypto.randomUUID()}`, authorEmail: authorEmail ?? undefined, images: input.images });
@@ -3243,6 +3241,7 @@ export class CodingAgent extends CodingAgentBase {
         const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
         this.control.setStatus("idle");
         await this.syncSessionIndex({ status: "idle", title });
+        this.afterRunIdle();
         this.emitEvent({ data: { message }, type: "error_message" });
         this.emitEvent({ data: this.readSessionDetails(), type: "state" });
         dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: notifyOwner });
@@ -3257,6 +3256,7 @@ export class CodingAgent extends CodingAgentBase {
 
       this.control.setStatus("idle");
       await this.syncSessionIndex({ status: "idle", title });
+      this.afterRunIdle();
       this.emitEvent({ data: assistantRecord, type: "message" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
       dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: notifyOwner });
@@ -3265,6 +3265,7 @@ export class CodingAgent extends CodingAgentBase {
     } catch (error) {
       this.control.setStatus("idle");
       await this.syncSessionIndex({ status: "idle", title });
+      this.afterRunIdle();
       const message = error instanceof Error ? error.message : "Unknown LLM failure";
       this.emitEvent({ data: { message }, type: "error_message" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
@@ -3680,7 +3681,9 @@ export class CodingAgent extends CodingAgentBase {
 
     this.markPromptRunning(promptId);
 
-    // Refresh the session config from the latest account config before each prompt run.
+    // Refresh the session config from the latest account config. Not a
+    // prompt start: spawnPrompt already applied the override, and a run
+    // recovered after eviction (or retried) keeps the models it started on.
     await this.readAppConfig();
 
     // Chat completed before an eviction: just finalize.
@@ -3943,6 +3946,10 @@ export class CodingAgent extends CodingAgentBase {
     const existing = this.getConfig();
 
     if (existing) {
+      // A request that arrives mid-run (a prompt queued behind the running
+      // one) must not move the running prompt's model; the next prompt's
+      // readAppConfig applies the change.
+      if (this.control.readStatus() === "running") return;
       // Check if model/gateway/image-model changed — if so, reconfigure
       const imageModelChanged = incomingImageModel !== undefined && incomingImageModel !== existing.replicateImageModel;
       if (existing.model === incomingModel && existing.activeGateway === incomingGateway && !imageModelChanged) {
@@ -5931,7 +5938,16 @@ export class CodingAgent extends CodingAgentBase {
     }
   }
 
-  private async readAppConfig(): Promise<AppConfig> {
+  /**
+   * Rebuild the session config from the owner's live config plus the session
+   * model override. `promptStart` is for the calls that begin a run. Any
+   * other call while a prompt runs (facet spawn, git commit/pull, eviction
+   * recovery) keeps the running prompt's models and gateway, so the details
+   * and the answer's model attribution stay on what the prompt runs on; a
+   * mid-run override applies from the next prompt (and the details once the
+   * run ends, via CONFIG_REFRESH_PENDING).
+   */
+  private async readAppConfig(opts: { promptStart?: boolean } = {}): Promise<AppConfig> {
     const ownerEmail = this.readMetadata("owner_email");
     if (!ownerEmail) {
       throw new Error("Session has no owner_email. Run migration (POST /api/admin/migrate) to fix legacy sessions.");
@@ -5943,6 +5959,7 @@ export class CodingAgent extends CodingAgentBase {
 
     const existing = this.getConfig();
     const override = this.modelOverride.read();
+    const keepRunning = !opts.promptStart && existing !== null && this.control.readStatus() === "running";
     const dodoConfig: DodoConfig = {
       sessionId: this.sessionId(),
       ownerEmail,
@@ -5952,10 +5969,10 @@ export class CodingAgent extends CodingAgentBase {
       // routable pair. Not existing.model: that can be an override the owner
       // has since cleared. Every route sends the owner's config as x-dodo-*
       // headers anyway, so for a prompt that came through a route they agree.
-      activeGateway: appConfig.activeGateway ?? existing?.activeGateway,
+      activeGateway: keepRunning ? existing.activeGateway : appConfig.activeGateway ?? existing?.activeGateway,
       gitAuthorEmail: appConfig.gitAuthorEmail,
       gitAuthorName: appConfig.gitAuthorName,
-      model: override.model ?? appConfig.model,
+      model: keepRunning ? existing.model : override.model ?? appConfig.model,
       opencodeBaseURL: appConfig.opencodeBaseURL ?? existing?.opencodeBaseURL,
       aiGatewayBaseURL: appConfig.aiGatewayBaseURL ?? existing?.aiGatewayBaseURL,
       replicateImageModel: appConfig.replicateImageModel ?? existing?.replicateImageModel,
@@ -5965,8 +5982,8 @@ export class CodingAgent extends CodingAgentBase {
       // Same for subagent models — changes at the user level propagate to
       // the next prompt without needing a session recreate. A session
       // override wins.
-      exploreModel: override.exploreModel ?? appConfig.exploreModel,
-      taskModel: override.taskModel ?? appConfig.taskModel,
+      exploreModel: keepRunning ? existing.exploreModel : override.exploreModel ?? appConfig.exploreModel,
+      taskModel: keepRunning ? existing.taskModel : override.taskModel ?? appConfig.taskModel,
       // Dispatch-mode flags propagate via DodoConfig so getTools() sees
       // the latest value on the next prompt without a session restart.
       exploreMode: appConfig.exploreMode ?? "inprocess",
@@ -6030,6 +6047,12 @@ export class CodingAgent extends CodingAgentBase {
     if (await this.refreshConfigFromOwner()) this.metadataKv.delete(CONFIG_REFRESH_PENDING);
     if (this.control.read().status === "running") return;
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+  }
+
+  /** The session just went idle (async finish or the sync /message path): apply a config refresh queued by a mid-run PUT /model-override. */
+  private afterRunIdle(): void {
+    if (!this.readMetadata(CONFIG_REFRESH_PENDING)) return;
+    this.refreshConfigAfterRun().catch((error) => log("warn", "config refresh after run failed", { sessionId: this.sessionId(), error: String(error) }));
   }
 
   /** readAppConfig for display paths: a UserControl failure must not fail the request. False only when the refresh failed. */

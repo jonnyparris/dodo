@@ -257,6 +257,91 @@ describe("PUT /session/:id/model-override", () => {
     }
   });
 
+  it("mid-run: a facet spawn, git op or queued prompt doesn't move the running prompt's model to a new override", async () => {
+    type Details = Session & { status: string; contextWindow: number };
+    const before = await json<{ model: string }>(await call("/api/config"));
+    const owner = "anthropic/claude-haiku-4-5";
+    const pinned = "anthropic/claude-sonnet-4-6";
+    await send("/api/config", { model: owner }, "PUT");
+    resetMockAgentic();
+    try {
+      const id = await newSession();
+      const stub = await getAgentByName(typedEnv.CODING_AGENT as never, id);
+      const first = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "slow async prompt" }));
+      await waitForStatus(id, first.promptId, "running");
+      expect((await send(`/session/${id}/model-override`, { model: pinned, exploreModel: pinned }, "PUT")).status).toBe(200);
+
+      // A facet spawn (facetParentConfig) and a git handler both run readAppConfig mid-run.
+      const facet = await inDO<{ model: string; exploreModel?: string }>(stub, async (agent) => agent.facetParentConfig());
+      expect(facet.exploreModel).toBe(pinned); // subagents started later still pick up the new override
+      await inDO(stub, async (agent) => agent.readAppConfig());
+      // A prompt queued behind the running one carries a model too (ensureThinkConfig).
+      const queued = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "queued", model: pinned }));
+
+      let s = await json<Details>(await call(`/session/${id}`));
+      expect(s.status).toBe("running");
+      expect(s.model).toBe(owner);
+      expect(s.contextWindow).toBe(200_000);
+      expect(s.exploreModel).not.toBe(pinned);
+      expect(s.nextModel).toBe(pinned);
+      expect((await inDO<{ model: string }>(stub, async (agent) => agent.getConfig())).model).toBe(owner);
+
+      releaseMockSlowPrompt();
+      await waitForPrompt(id, first.promptId);
+      // The queued prompt gets a new prompt id when it leaves the queue.
+      expect(queued.promptId).toBeTruthy();
+      for (let i = 0; i < 500; i++) {
+        const { prompts } = await json<{ prompts: Array<{ status: string }> }>(await call(`/session/${id}/prompts`));
+        if (prompts.length === 2 && prompts.every((p) => p.status === "completed")) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      // Each answer is attributed to the model it ran on.
+      const rows = await inDO<Array<{ model: string }>>(stub, async (agent) =>
+        Array.from(agent.ctx.storage.sql.exec("SELECT model FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at, rowid")) as Array<{ model: string }>);
+      expect(rows.map((r) => r.model)).toEqual([owner, pinned]);
+      s = await json<Details>(await call(`/session/${id}`));
+      expect(s.model).toBe(pinned);
+      expect(s.exploreModel).toBe(pinned);
+    } finally {
+      releaseMockSlowPrompt();
+      await send("/api/config", { model: before.model }, "PUT");
+    }
+  });
+
+  it("mid-run on the sync /message path: an override set during the run shows once it ends", async () => {
+    type Details = Session & { status: string };
+    const before = await json<{ model: string }>(await call("/api/config"));
+    const owner = "anthropic/claude-haiku-4-5";
+    const pinned = "anthropic/claude-sonnet-4-6";
+    await send("/api/config", { model: owner }, "PUT");
+    resetMockAgentic();
+    try {
+      const id = await newSession();
+      const stub = await getAgentByName(typedEnv.CODING_AGENT as never, id);
+      const pending = send(`/session/${id}/message`, { content: "slow async prompt" });
+      // Poll the control status directly: GET /session reads a sync run as
+      // idle (it has no active prompt id), which would mask the mid-run path.
+      const status = () => inDO<string>(stub, async (agent) => agent.control.readStatus());
+      for (let i = 0; i < 500 && (await status()) !== "running"; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(await status()).toBe("running");
+      await send(`/session/${id}/model-override`, { model: pinned }, "PUT");
+      expect(await inDO(stub, async (agent) => agent.readMetadata("config_refresh_pending"))).toBe("1");
+      releaseMockSlowPrompt();
+      expect((await pending).status).toBe(200);
+      let s = await json<Details>(await call(`/session/${id}`));
+      for (let i = 0; i < 100 && s.model !== pinned; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+        s = await json<Details>(await call(`/session/${id}`));
+      }
+      expect(s.status).toBe("idle");
+      expect(s.model).toBe(pinned);
+      expect(await inDO(stub, async (agent) => agent.readMetadata("config_refresh_pending"))).toBeNull();
+    } finally {
+      releaseMockSlowPrompt();
+      await send("/api/config", { model: before.model }, "PUT");
+    }
+  });
+
   it("rejects bad bodies and guests", async () => {
     const id = await newSession();
     expect((await send(`/session/${id}/model-override`, { model: "bad id" }, "PUT")).status).toBe(400);
