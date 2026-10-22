@@ -17,6 +17,11 @@
  * `verify` command (for example: copy the agent's file into a checkout and run
  * a hidden test). Exit code 0 = pass.
  *
+ * Any run that doesn't complete keeps the session's engine detail, prompts and
+ * messages in <run dir>/<task>-<arm>/<status>/ (timeout, failed, aborted, or
+ * error when the harness itself failed, polling included), saved before the
+ * abort and the session delete.
+ *
  * Run (Node 24 strips the types itself):
  *   node bench/model-ab.ts bench/model-ab.example.json [--base https://dodo.example.com] [--tasks explore,refactor] [--keep] [--out bench/out | --run-dir dir]
  *
@@ -177,13 +182,14 @@ async function prepareSession(dodo: Dodo, task: Task): Promise<string> {
 }
 
 /**
- * Save what the session was doing at timeout, before the abort and the session
- * delete wipe it: pi live tasks + transcript (engine?detail=1), prompt history,
- * messages. Best effort: each endpoint is written or its error is. Short
- * timeout, no retries: the agent keeps running (and billing) until the abort.
+ * Save what the session was doing when a run didn't complete, before the abort
+ * and the session delete wipe it: pi live tasks + transcript
+ * (engine?detail=1), prompt history, messages. Goes to <runDir>/<reason>/.
+ * Best effort: each endpoint is written or its error is. Short timeout, no
+ * retries: the agent may still be running (and billing) until the abort.
  */
-async function saveTimeoutEvidence(dodo: Dodo, sessionId: string, runDir: string): Promise<void> {
-  const dir = join(runDir, "timeout");
+async function saveEvidence(dodo: Dodo, sessionId: string, runDir: string, reason: string): Promise<void> {
+  const dir = join(runDir, reason);
   mkdirSync(dir, { recursive: true });
   const endpoints: Array<[string, string]> = [
     ["engine.json", `/session/${sessionId}/engine?detail=1`],
@@ -223,7 +229,7 @@ async function waitForPrompt(dodo: Dodo, sessionId: string, promptId: string, ti
     const p = prompts.find((x) => x.id === promptId);
     if (p && !["queued", "running"].includes(p.status)) return p.status;
   } catch {}
-  await saveTimeoutEvidence(dodo, sessionId, runDir).catch((err) => log(`${sessionId}: could not save timeout evidence: ${(err as Error).message}`));
+  await saveEvidence(dodo, sessionId, runDir, "timeout").catch((err) => log(`${sessionId}: could not save timeout evidence: ${(err as Error).message}`));
   await dodo.post(`/session/${sessionId}/abort`).catch(() => {});
   return "timeout";
 }
@@ -235,6 +241,7 @@ async function lastAssistantText(dodo: Dodo, sessionId: string): Promise<string>
 
 async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir: string): Promise<RunResult> {
   const result: RunResult = { task: task.id, arm: armName, sessionId: "", models: arm, status: "error", wallSeconds: 0, tokenInput: 0, tokenOutput: 0, answer: "" };
+  const runDir = join(outDir, `${task.id}-${armName}`);
   try {
     result.sessionId = await prepareSession(dodo, task);
     const t0 = Date.now();
@@ -245,9 +252,12 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
       ...(arm.taskModel ? { taskModel: arm.taskModel } : {}),
     });
     log(`${task.id}/${armName}: ${result.sessionId} prompt ${sent.promptId}`);
-    const runDir = join(outDir, `${task.id}-${armName}`);
     result.status = await waitForPrompt(dodo, result.sessionId, sent.promptId, (task.timeoutMinutes ?? 30) * 60_000, runDir);
     result.wallSeconds = Math.round((Date.now() - t0) / 1000);
+    // failed / aborted: keep the evidence too (timeout already saved its own).
+    if (result.status !== "completed" && result.status !== "timeout") {
+      await saveEvidence(dodo, result.sessionId, runDir, result.status).catch((err) => log(`${result.sessionId}: could not save ${result.status} evidence: ${(err as Error).message}`));
+    }
 
     const s = await dodo.get<{ model: string; exploreModel?: string; taskModel?: string; totalTokenInput: number; totalTokenOutput: number }>(`/session/${result.sessionId}`);
     result.sessionModels = { model: s.model, exploreModel: s.exploreModel, taskModel: s.taskModel };
@@ -271,8 +281,12 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err);
     log(`${task.id}/${armName}: ERROR ${result.error}`);
-    // Don't leave the agent running (and billing) until cleanup.
-    if (result.sessionId) await dodo.post(`/session/${result.sessionId}/abort`).catch(() => {});
+    // Keep the evidence (polling died, a GET failed...), then don't leave the
+    // agent running (and billing) until cleanup.
+    if (result.sessionId) {
+      await saveEvidence(dodo, result.sessionId, runDir, "error").catch((err) => log(`${result.sessionId}: could not save error evidence: ${(err as Error).message}`));
+      await dodo.post(`/session/${result.sessionId}/abort`).catch(() => {});
+    }
   }
   return result;
 }
