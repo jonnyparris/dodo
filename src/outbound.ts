@@ -12,10 +12,9 @@ export const OWNER_ID_HEADER = "x-dodo-owner-id";
  * **Per-user token injection is currently disabled.** The duck-typed wrapper
  * that injected `x-dodo-owner-id` broke `globalOutbound` (workerd rejects
  * non-ServiceStub Fetchers). Three fix attempts (PR #52/#54/#55) all failed.
- * Sandbox fetches now run unauthenticated against remote hosts; codemode
- * authors must include their own auth headers when needed. The allowlist
- * is the only perimeter guard, which is intentional — the sandbox should
- * not have direct token access. Git operations remain authenticated because
+ * Sandbox fetches run without Dodo's tokens, and credential headers the
+ * sandbox sets itself are stripped unless the host has `allowCredentials`
+ * (see below). The sandbox should not have direct token access. Git operations remain authenticated because
  * tokens resolve in the parent DO via resolveRemoteToken() and are passed
  * directly to isomorphic-git.
  *
@@ -28,9 +27,26 @@ export const OWNER_ID_HEADER = "x-dodo-owner-id";
  * talks to an MCP server, so it has no reason to reach those hosts. An earlier bypass did
  * let it, which meant a prompt-injected script could call, for example,
  * browser.mcp.cloudflare.com with an attacker's own bearer token and send
- * workspace data to the attacker's account. That closes one route only:
- * any host on the SharedIndex allowlist still receives whatever headers
- * the sandbox sets.
+ * workspace data to the attacker's account.
+ *
+ * **Credential headers are stripped by default.** The same attack works on
+ * any allowlisted host: a script calls api.github.com with an attacker's
+ * own token and writes workspace data into the attacker's gist or repo.
+ * So unless an admin has set `allowCredentials` on the host's allowlist
+ * entry, `sanitizeEgressRequest` removes Authorization, Cookie and every
+ * header whose name looks like a credential (token, key, secret, auth,
+ * session, ...), plus any user:password in the URL. The sandbox never holds
+ * Dodo's own secrets, so the only tokens it can send are ones that reached
+ * the model's context: a token the user pasted, or one planted by injected
+ * content. For a host that really needs sandbox auth, an admin opts it in:
+ * `POST /api/allowlist {"hostname": "...", "allowCredentials": true}`.
+ * The response carries `x-dodo-stripped-headers` so the agent can see why
+ * an upstream answered 401.
+ *
+ * Not covered: tokens in the query string (e.g. GitLab `?private_token=`)
+ * or the request body (Slack `token=`, OAuth `client_secret`), and data
+ * sent without auth to a host that stores it publicly. Keep the
+ * allowlist short.
  *
  * Configured as a self-referencing service binding (OUTBOUND) in wrangler.jsonc
  * and passed as `globalOutbound` to DynamicWorkerExecutor.
@@ -44,7 +60,7 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     const checkResponse = await stub.fetch(
       `https://shared-index/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
     );
-    const { allowed } = (await checkResponse.json()) as { allowed: boolean };
+    const { allowed, allowCredentials } = (await checkResponse.json()) as { allowed: boolean; allowCredentials?: boolean };
 
     if (!allowed) {
       return new Response(
@@ -53,15 +69,78 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
       );
     }
 
-    // Strip the owner-id header in case any caller still sets it — the
-    // sandbox shouldn't be able to forge identity even if the wrapper
-    // returns one day. The header carries no auth value today.
-    const headers = new Headers(request.headers);
-    headers.delete(OWNER_ID_HEADER);
+    const { request: outboundRequest, stripped } = sanitizeEgressRequest(request, { allowCredentials: allowCredentials === true });
+    if (stripped.length === 0) return fetch(outboundRequest);
 
-    // Clone via the original request to preserve all properties (cf, signal, etc.)
-    const outboundRequest = new Request(request, { headers });
-
-    return fetch(outboundRequest);
+    console.warn(
+      JSON.stringify({ level: "warn", msg: "Sandbox egress: stripped credential headers", hostname, stripped }),
+    );
+    const upstream = await fetch(outboundRequest);
+    const response = new Response(upstream.body, upstream);
+    response.headers.set(STRIPPED_HEADERS_HEADER, stripped.join(", "));
+    return response;
   }
+}
+
+/** Response header listing the request headers AllowlistOutbound removed. */
+export const STRIPPED_HEADERS_HEADER = "x-dodo-stripped-headers";
+
+/** Exact header names that carry credentials. */
+const CREDENTIAL_HEADERS = new Set(["authorization", "proxy-authorization", "cookie"]);
+
+/** Names that match the patterns below but carry no credential. */
+const NON_CREDENTIAL_HEADERS = new Set(["sec-websocket-key", "idempotency-key", "x-idempotency-key"]);
+
+/**
+ * Header names that look like credentials. Deliberately broad: a missed
+ * custom auth header (GitLab's `PRIVATE-TOKEN`, `X-Api-Key`, ...) is the
+ * whole attack, while a stripped harmless header only costs an admin
+ * opt-in. Substrings for unambiguous words, whole words for short ones.
+ * `auth` matches unless it is the start of `author` (but `authoriz` /
+ * `authoris` still match), so `x-authorization` is caught and
+ * `author-name` is not.
+ */
+const CREDENTIAL_HEADER_PATTERN =
+  /token|secret|passw|passphrase|pwd|key|cred|cookie|sess(ion|id)|signature|auth(?!or(?!i[sz]))|(^|[-_])(pass|pat|sid|sig|otp|totp|jwt|bearer)([-_]|$)/;
+
+export function isCredentialHeader(name: string): boolean {
+  const lower = name.toLowerCase();
+  if (NON_CREDENTIAL_HEADERS.has(lower)) return false;
+  return CREDENTIAL_HEADERS.has(lower) || CREDENTIAL_HEADER_PATTERN.test(lower);
+}
+
+/**
+ * Build the request AllowlistOutbound forwards. Always removes the
+ * owner-id header (the sandbox must not forge identity). Unless
+ * allowCredentials is true, also removes credential headers and URL
+ * userinfo. Returns the names of the credential headers it removed.
+ */
+export function sanitizeEgressRequest(
+  request: Request,
+  options: { allowCredentials: boolean },
+): { request: Request; stripped: string[] } {
+  const headers = new Headers(request.headers);
+  headers.delete(OWNER_ID_HEADER);
+
+  const stripped: string[] = [];
+  let url = request.url;
+  if (!options.allowCredentials) {
+    headers.forEach((_value, name) => {
+      if (isCredentialHeader(name)) stripped.push(name);
+    });
+    for (const name of stripped) headers.delete(name);
+    const parsed = new URL(request.url);
+    if (parsed.username || parsed.password) {
+      parsed.username = "";
+      parsed.password = "";
+      url = parsed.toString();
+      stripped.push("url-userinfo");
+    }
+  }
+
+  // Clone via the original request to preserve all properties (cf, signal, etc.).
+  // redirect: "manual" hands any 3xx back to the sandbox, so the next hop
+  // re-enters AllowlistOutbound for a fresh allowlist check and strip,
+  // instead of this fetch following it to an unlisted host.
+  return { request: new Request(url, new Request(request, { headers, redirect: "manual" })), stripped };
 }

@@ -113,6 +113,42 @@ describe("SharedIndex DO", () => {
     await removeAllowlistDirect(TEST_HOST_B);
   });
 
+  it("host allowlist: allowCredentials defaults off, can be set and cleared", async () => {
+    const host = "si-test-creds.example.org";
+    const post = (body: Record<string, unknown>) =>
+      getSharedIndexStub().fetch("https://shared-index/allowlist", {
+        body: JSON.stringify(body),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+    const check = async () =>
+      (await (await fetchJson(`/api/allowlist/check?hostname=${host}`)).json()) as { allowed: boolean; allowCredentials: boolean };
+
+    const added = (await (await post({ hostname: host })).json()) as { allowCredentials: boolean };
+    expect(added.allowCredentials).toBe(false);
+    expect(await check()).toMatchObject({ allowed: true, allowCredentials: false });
+
+    expect(((await (await post({ hostname: host, allowCredentials: true })).json()) as { allowCredentials: boolean }).allowCredentials).toBe(true);
+    expect(await check()).toMatchObject({ allowed: true, allowCredentials: true });
+
+    // Re-adding without the flag leaves it unchanged.
+    await post({ hostname: host });
+    expect((await check()).allowCredentials).toBe(true);
+
+    await post({ hostname: host, allowCredentials: false });
+    expect((await check()).allowCredentials).toBe(false);
+
+    await removeAllowlistDirect(host);
+    expect(await check()).toMatchObject({ allowed: false, allowCredentials: false });
+  });
+
+  it("host allowlist rejects values that are not bare hostnames", async () => {
+    for (const hostname of ["evil.example.org/path", "x');alert(1)//", "a b.example.org", "host.example.org:8443"]) {
+      const res = await addAllowlistDirect(hostname);
+      expect(res.status, hostname).toBe(400);
+    }
+  });
+
   it("allowlist write routes return 403 for non-admin", async () => {
     const postRes = await fetchJson("/api/allowlist", {
       body: JSON.stringify({ hostname: "admin-only.example.org" }),

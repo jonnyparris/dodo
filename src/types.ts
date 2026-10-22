@@ -350,6 +350,12 @@ export interface WorkspaceEntry {
 }
 
 export interface AllowlistEntry {
+  /**
+   * When false (the default), AllowlistOutbound strips credential headers
+   * (Authorization, Cookie, X-Api-Key, ...) from sandbox fetches to this
+   * host. See src/outbound.ts.
+   */
+  allowCredentials: boolean;
   createdAt: string;
   hostname: string;
 }
