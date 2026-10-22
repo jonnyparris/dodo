@@ -176,7 +176,31 @@ async function prepareSession(dodo: Dodo, task: Task): Promise<string> {
   return id;
 }
 
-async function waitForPrompt(dodo: Dodo, sessionId: string, promptId: string, timeoutMs: number): Promise<string> {
+/**
+ * Save what the session was doing at timeout, before the abort and the session
+ * delete wipe it: pi live tasks + transcript (engine?detail=1), prompt history,
+ * messages. Best effort: each endpoint is written or its error is.
+ */
+async function saveTimeoutEvidence(dodo: Dodo, sessionId: string, runDir: string): Promise<void> {
+  const dir = join(runDir, "timeout");
+  mkdirSync(dir, { recursive: true });
+  const endpoints: Array<[string, string]> = [
+    ["engine.json", `/session/${sessionId}/engine?detail=1`],
+    ["prompts.json", `/session/${sessionId}/prompts`],
+    ["messages.json", `/session/${sessionId}/messages`],
+  ];
+  await Promise.all(
+    endpoints.map(async ([file, path]) => {
+      try {
+        writeFileSync(join(dir, file), JSON.stringify(await dodo.get<unknown>(path), null, 1));
+      } catch (err) {
+        writeFileSync(join(dir, file), JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      }
+    }),
+  );
+}
+
+async function waitForPrompt(dodo: Dodo, sessionId: string, promptId: string, timeoutMs: number, runDir: string): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   let failures = 0;
   while (Date.now() < deadline) {
@@ -198,6 +222,7 @@ async function waitForPrompt(dodo: Dodo, sessionId: string, promptId: string, ti
     const p = prompts.find((x) => x.id === promptId);
     if (p && !["queued", "running"].includes(p.status)) return p.status;
   } catch {}
+  await saveTimeoutEvidence(dodo, sessionId, runDir).catch((err) => log(`${sessionId}: could not save timeout evidence: ${(err as Error).message}`));
   await dodo.post(`/session/${sessionId}/abort`).catch(() => {});
   return "timeout";
 }
@@ -219,7 +244,8 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
       ...(arm.taskModel ? { taskModel: arm.taskModel } : {}),
     });
     log(`${task.id}/${armName}: ${result.sessionId} prompt ${sent.promptId}`);
-    result.status = await waitForPrompt(dodo, result.sessionId, sent.promptId, (task.timeoutMinutes ?? 30) * 60_000);
+    const runDir = join(outDir, `${task.id}-${armName}`);
+    result.status = await waitForPrompt(dodo, result.sessionId, sent.promptId, (task.timeoutMinutes ?? 30) * 60_000, runDir);
     result.wallSeconds = Math.round((Date.now() - t0) / 1000);
 
     const s = await dodo.get<{ model: string; exploreModel?: string; taskModel?: string; totalTokenInput: number; totalTokenOutput: number }>(`/session/${result.sessionId}`);
@@ -228,7 +254,6 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
     result.tokenOutput = s.totalTokenOutput;
     result.answer = await lastAssistantText(dodo, result.sessionId);
 
-    const runDir = join(outDir, `${task.id}-${armName}`);
     mkdirSync(runDir, { recursive: true });
     writeFileSync(join(runDir, "answer.md"), result.answer);
     for (const path of task.collect ?? []) {
