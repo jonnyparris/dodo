@@ -358,6 +358,15 @@ export interface AllowlistEntry {
   allowCredentials: boolean;
   createdAt: string;
   hostname: string;
+  /** MCP server configs (and OAuth) may point at this host. */
+  mcp: boolean;
+  /**
+   * Sandbox egress is limited to these HTTP methods, e.g. ["GET", "HEAD"]
+   * for a read-only host. null means any method. Ignored for MCP.
+   */
+  methods: string[] | null;
+  /** Codemode sandbox fetch() may reach this host. */
+  sandbox: boolean;
 }
 
 /**
