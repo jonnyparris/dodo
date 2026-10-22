@@ -10,11 +10,17 @@
 // `cache_control` marker, so Anthropic must use the native Messages wire.
 // createAI's Anthropic wire is that native wire.
 //
-// Everything else on AI Gateway (`@cf/` ids, OpenAI, Google, DeepSeek) stays
-// on `/compat` with AI_GATEWAY_KEY: createAI has no `/compat` route, Google
-// and DeepSeek are not in pi-ai's gateway catalog, and moving `@cf/` to
-// `env.AI.run` or OpenAI to the Responses wire changes behaviour that needs
-// its own live A/B first.
+// `@cf/` ids take createAI's Workers AI run path (`env.AI.run` with the
+// gateway option, plus createAI's per-model request quirks) when
+// WORKERS_AI_VIA_BINDING is on, main session only. Off by default until a
+// live A/B (bench/model-ab.ts) shows it is at least as good as `/compat`.
+//
+// Everything else on AI Gateway (OpenAI, Google, DeepSeek; `@cf/` with the
+// flag off or in explore/task subagents) stays on `/compat` with
+// AI_GATEWAY_KEY: createAI has no `/compat` route, Google and DeepSeek are
+// not in pi-ai's gateway catalog, moving OpenAI to the Responses wire needs
+// its own A/B, and createAI's AI SDK models are LanguageModelV4, which
+// AI SDK 6 (the subagents' `ai`) rejects.
 
 import { log } from "./logger";
 import type { Env } from "./types";
@@ -146,11 +152,12 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
           };
         };
       }
-      // Workers AI run path: same AbortSignal problem, no retry (rate limits
-      // there are handled by the caller's own policy).
+      // Workers AI run path (`@cf/` models when WORKERS_AI_VIA_BINDING is
+      // on): same AbortSignal problem, and the same 429 wait as the gateway
+      // leg, because `/compat` waited out Workers AI 429s too.
       if (prop === "run") {
         return (model: unknown, inputs: unknown, options?: Parameters<GatewayRun>[1]) =>
-          runWithLocalSignal((_req, opts) => stub.run(model, inputs, opts) as Promise<Response>, undefined, options);
+          local((_req, opts) => stub.run(model, inputs, opts) as Promise<Response>)(undefined, options);
       }
       const value = Reflect.get(target, prop, target) as unknown;
       return typeof value === "function" ? (...args: unknown[]) => stub[prop](...args) : value;

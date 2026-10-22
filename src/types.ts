@@ -71,6 +71,8 @@ export interface Env {
   CLOUDFLARE_API_TOKEN?: string;
   /** Cloudflare account id used to scope Workers API calls. Wrangler var. */
   CLOUDFLARE_ACCOUNT_ID?: string;
+  /** "1"/"true": `@cf/` main-session models go through createAI's Workers AI run path (env.AI.run) instead of AI Gateway /compat. A/B flag, off by default. */
+  WORKERS_AI_VIA_BINDING?: string;
   /** Worker script name used when querying observability for this worker. Wrangler var. */
   DODO_WORKER_NAME?: string;
 

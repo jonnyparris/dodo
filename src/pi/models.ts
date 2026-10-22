@@ -12,6 +12,10 @@
 // `cache_control` marker (measured 2026-10-21, PR #110), so on `/compat`
 // every Anthropic turn paid full input price for the whole prefix. Those
 // models are registered under createAI's own provider id (`cloudflare`).
+//
+// With WORKERS_AI_VIA_BINDING on, `@cf/` models go through createAI too, on
+// its Workers AI run path (`env.AI.run` + per-model request quirks), main
+// session only. Off by default until the live A/B says so.
 
 import type { Model, ProviderStreams } from "@earendil-works/pi-ai";
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
@@ -31,6 +35,9 @@ import { rateLimitFetch, type RateLimitFetchOptions } from "./rate-limit-fetch";
 import { type StreamIdleTimeoutInfo, withStreamIdleTimeout } from "./stream-idle-timeout";
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
+/** The `api` createAI gives Workers AI models (its run path, not a wire format). */
+export const WORKERS_AI_API = "cloudflare-ai";
+type WorkersAIApi = typeof WORKERS_AI_API;
 /** Provider id of models that go through createAI (Anthropic on AI Gateway). */
 export const CREATE_AI_PROVIDER_ID = CLOUDFLARE_PROVIDER_ID;
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -112,9 +119,25 @@ function inGatewayCatalog(modelId: string): boolean {
  * reach. Otherwise undefined, and the model stays on the OpenAI-compatible
  * path (uncached for Anthropic on `/compat`).
  */
-export function createAIGatewayId(modelId: string, config: GatewayConfig, env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID">): string | undefined {
-  if (!modelId.startsWith("anthropic/") || !inGatewayCatalog(modelId)) return undefined;
+export function createAIGatewayId(
+  modelId: string,
+  config: GatewayConfig,
+  env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID" | "WORKERS_AI_VIA_BINDING">,
+): string | undefined {
+  const anthropic = modelId.startsWith("anthropic/") && inGatewayCatalog(modelId);
+  if (!anthropic && !workersAIOnRunPath(modelId, env)) return undefined;
   return bindingGatewayId(config, env);
+}
+
+/**
+ * Whether an `@cf/` model goes through createAI's Workers AI run path
+ * (`env.AI.run` with the gateway option) instead of `/compat`. Opt-in via
+ * WORKERS_AI_VIA_BINDING ("1"/"true") while it is A/B'd against `/compat`.
+ */
+export function workersAIOnRunPath(modelId: string, env: Pick<Env, "WORKERS_AI_VIA_BINDING">): boolean {
+  if (!modelId.startsWith("@cf/")) return false;
+  const flag = env.WORKERS_AI_VIA_BINDING?.trim().toLowerCase();
+  return flag === "1" || flag === "true";
 }
 
 function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLimit?: RateLimitFetchOptions) {
@@ -128,11 +151,24 @@ function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLim
 }
 
 /** The pi-ai model for one Dodo model id on the configured gateway. */
-export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> | Model<"anthropic-messages"> {
-  const isOpencode = config.activeGateway === "opencode";
+export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> | Model<"anthropic-messages"> | Model<WorkersAIApi> {
   const entry = CATALOG.get(modelId);
-  const anthropic = modelId.startsWith("anthropic/");
   const gatewayId = createAIGatewayId(modelId, config, env);
+  if (gatewayId && modelId.startsWith("@cf/")) {
+    // createAI's Workers AI model (api `cloudflare-ai`, run path) with Dodo's
+    // limits and prices. `reasoning: false` like the `/compat` leg: pi sends
+    // no effort, so the model keeps its own default, same as before.
+    const base = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId })(modelId) as Model<WorkersAIApi>;
+    return {
+      ...base,
+      name: modelId,
+      reasoning: false,
+      input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
+      cost: modelCost(modelId),
+      contextWindow: entry?.contextWindow ?? base.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+      maxTokens: DEFAULT_MAX_TOKENS,
+    };
+  }
   if (gatewayId) {
     // createAI's catalog model (api anthropic-messages, gateway-shaped
     // baseUrl, provider `cloudflare`, id = the Dodo id) with Dodo's limits and
@@ -148,6 +184,14 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
       maxTokens: DEFAULT_MAX_TOKENS,
     };
   }
+  return compatModel(modelId, config);
+}
+
+/** The OpenAI-compatible (`/compat` or OpenCode) model for a Dodo id, whatever leg new turns use. */
+function compatModel(modelId: string, config: GatewayConfig): Model<"openai-completions"> {
+  const isOpencode = config.activeGateway === "opencode";
+  const entry = CATALOG.get(modelId);
+  const anthropic = modelId.startsWith("anthropic/");
   return {
     id: resolveWireModelId(modelId, config.activeGateway),
     name: modelId,
@@ -229,9 +273,14 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       log("warn", "pi: model rate limited, waiting", { sessionId: config.sessionId, attempt, delayMs: Math.round(delayMs), retryAfter }),
   };
   const viaCreateAI = unique.filter((id) => createAIGatewayId(id, config, env) !== undefined);
-  const viaGateway = unique.filter((id) => !viaCreateAI.includes(id));
   const gatewayId = viaCreateAI.length > 0 ? createAIGatewayId(viaCreateAI[0], config, env) : undefined;
-  const createAIModels = viaCreateAI.map((id) => dodoModel(id, config, env) as Model<"anthropic-messages">);
+  const createAIModels = viaCreateAI.map((id) => dodoModel(id, config, env) as Model<"anthropic-messages"> | Model<WorkersAIApi>);
+  // Anthropic createAI models are also listed under dodo-gateway (legacy
+  // refs, see below). `@cf/` ones are not: their old ref is
+  // `dodo-gateway/workers-ai/@cf/…` on openai-completions, so they stay in
+  // the /compat list too and a persisted turn resumes on `/compat` as it started.
+  const legacyAliased = createAIModels.filter((m): m is Model<"anthropic-messages"> => m.api === "anthropic-messages");
+  const viaCompat = unique.filter((id) => !legacyAliased.some((m) => m.id === id));
   const ai = gatewayId ? createAIFor(config, env, gatewayId, rateLimitOptions) : undefined;
   const byId = new Map(createAIModels.map((m) => [m.id, m]));
   // The dodo-gateway auth resolver adds the gateway key headers to every
@@ -263,8 +312,10 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
         },
       },
       models: [
-        ...viaGateway.map((id) => dodoModel(id, config, env)),
-        ...createAIModels.map((m) => ({ ...m, provider: DODO_PROVIDER_ID })),
+        // `@cf/` ids on the run path keep their /compat entry here for
+        // persisted `dodo-gateway/workers-ai/@cf/…` refs.
+        ...viaCompat.map((id): Model<"openai-completions"> | Model<"anthropic-messages"> => compatModel(id, config)),
+        ...legacyAliased.map((m) => ({ ...m, provider: DODO_PROVIDER_ID })),
       ],
       // Waits out per-minute 429s inside the request (rate-limit-fetch.ts)
       // and fails a request that goes quiet as retryable (stream-idle-timeout.ts).
@@ -285,13 +336,13 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       name: "Cloudflare AI (binding)",
       auth: { apiKey: { name: "Cloudflare AI (binding)", resolve: async () => ({ auth: {} }) } },
       models: createAIModels,
-      api: { "anthropic-messages": createAIStreams as ProviderStreams },
+      api: { "anthropic-messages": createAIStreams as ProviderStreams, [WORKERS_AI_API]: createAIStreams as ProviderStreams },
     }),
   );
   return models;
 }
 
-export function agentModelRef(modelId: string, config: GatewayConfig, env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID">): { provider: string; modelId: string } {
+export function agentModelRef(modelId: string, config: GatewayConfig, env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID" | "WORKERS_AI_VIA_BINDING">): { provider: string; modelId: string } {
   // Must match the provider/id setDodoProvider() registers the model under.
   if (createAIGatewayId(modelId, config, env)) return { provider: CREATE_AI_PROVIDER_ID, modelId };
   return { provider: DODO_PROVIDER_ID, modelId: resolveWireModelId(modelId, config.activeGateway) };
