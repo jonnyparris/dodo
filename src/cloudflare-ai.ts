@@ -115,20 +115,26 @@ type Retry = (send: () => Promise<Response>, signal?: AbortSignal | null) => Pro
  * else passes through untouched.
  */
 export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
+  // `env.AI` is an RPC stub: every property access, `.bind` and `.call`
+  // included, becomes a remote call. So never touch methods on it; call them
+  // by name through closures (seen live 2026-10-22: `.bind` sent an
+  // RpcPromise over the wire and failed to serialise).
+  type Callable = Record<PropertyKey, (...args: unknown[]) => unknown>;
   return new Proxy(binding, {
     get(target, prop) {
-      const value = Reflect.get(target, prop, target) as unknown;
-      if (prop !== "gateway" || typeof value !== "function") {
-        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      if (prop !== "gateway") {
+        const value = Reflect.get(target, prop, target) as unknown;
+        return typeof value === "function" ? (...args: unknown[]) => (target as unknown as Callable)[prop](...args) : value;
       }
       return (id: string) => {
-        const gateway = (value as (id: string) => object).call(target, id);
+        const gateway = (target as unknown as Callable).gateway(id) as Callable;
         return new Proxy(gateway, {
           get(g, p) {
-            const member = Reflect.get(g, p, g) as unknown;
-            if (typeof member !== "function") return member;
-            if (p !== "run") return (member as (...a: unknown[]) => unknown).bind(g);
-            const run = (member as GatewayRun).bind(g);
+            if (p !== "run") {
+              const member = Reflect.get(g, p, g) as unknown;
+              return typeof member === "function" ? (...args: unknown[]) => (g as Callable)[p](...args) : member;
+            }
+            const run: GatewayRun = (request, options) => (g as Callable).run(request, options) as Promise<Response>;
             return (request: unknown, options?: Parameters<GatewayRun>[1]) => {
               const send = () => runWithLocalSignal(run, request, options);
               return retry ? retry(send, options?.signal) : send();
