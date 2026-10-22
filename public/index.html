@@ -1069,7 +1069,7 @@
         <dt>Integrations</dt><dd>Connect external MCP servers (GitHub, Cloudflare, Sentry, etc.) to extend the agent's capabilities.</dd>
         <dt>Session Settings</dt><dd>Manage sharing, permissions, browser tools (requires admin approval), and per-session MCP overrides.</dd>
         <dt>Config</dt><dd>Switch LLM models and gateways. The model dropdown is populated from the available models on the OpenCode gateway.</dd>
-        <dt>Allowlist</dt><dd>Hosts that sandboxed code execution is allowed to reach. Unlisted hosts are blocked.</dd>
+        <dt>Allowlist</dt><dd>Hosts that MCP servers and sandboxed code may reach. Each host has two switches: <em>mcp</em> (new or edited MCP server configs may use it) and <em>sandbox</em> (sandbox code may fetch it). A sandbox host can be limited to GET and HEAD. Unlisted hosts are blocked.</dd>
       </dl>
       <p style="margin-top:16px"><a href="/docs" style="color:var(--accent)">Full architecture documentation</a> · <a href="/howto" style="color:var(--accent)">How-to guides</a></p>
     </div>

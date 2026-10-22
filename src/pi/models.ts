@@ -28,6 +28,7 @@ import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
 import { log } from "../logger";
 import { rateLimitFetch, type RateLimitFetchOptions } from "./rate-limit-fetch";
+import { type StreamIdleTimeoutInfo, withStreamIdleTimeout } from "./stream-idle-timeout";
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
 /** Provider id of models that go through createAI (Anthropic on AI Gateway). */
@@ -239,9 +240,15 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
     options?.headers
       ? ({ ...options, headers: Object.fromEntries(Object.entries(options.headers).filter(([k]) => !GATEWAY_AUTH_HEADERS.has(k.toLowerCase()))) } as O)
       : options;
-  const legacyAnthropic: ProviderStreams | undefined = ai && {
-    stream: (model, context, options) => ai.stream(byId.get(model.id) ?? model, context, keyless(options)),
-    streamSimple: (model, context, options) => ai.streamSimple(byId.get(model.id) ?? model, context, keyless(options)),
+  const idleOptions = {
+    onTimeout: (info: StreamIdleTimeoutInfo) => log("warn", "pi: model stream idle, failing the request for retry", { sessionId: config.sessionId, ...info }),
+  };
+  // Every leg fails a request that goes quiet as retryable (stream-idle-timeout.ts).
+  const createAIStreams: ProviderStreams | undefined =
+    ai && withStreamIdleTimeout({ stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams, idleOptions);
+  const legacyAnthropic: ProviderStreams | undefined = createAIStreams && {
+    stream: (model, context, options) => createAIStreams.stream(byId.get(model.id) ?? model, context, keyless(options)),
+    streamSimple: (model, context, options) => createAIStreams.streamSimple(byId.get(model.id) ?? model, context, keyless(options)),
   };
   models.setProvider(
     createProvider({
@@ -259,9 +266,10 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
         ...viaGateway.map((id) => dodoModel(id, config, env)),
         ...createAIModels.map((m) => ({ ...m, provider: DODO_PROVIDER_ID })),
       ],
-      // Waits out per-minute 429s inside the request (rate-limit-fetch.ts).
+      // Waits out per-minute 429s inside the request (rate-limit-fetch.ts)
+      // and fails a request that goes quiet as retryable (stream-idle-timeout.ts).
       api: {
-        "openai-completions": withRateLimitRetry(openAICompletionsApi(), rateLimitOptions),
+        "openai-completions": withStreamIdleTimeout(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), idleOptions),
         ...(legacyAnthropic ? { "anthropic-messages": legacyAnthropic } : {}),
       },
     }),
@@ -277,7 +285,7 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       name: "Cloudflare AI (binding)",
       auth: { apiKey: { name: "Cloudflare AI (binding)", resolve: async () => ({ auth: {} }) } },
       models: createAIModels,
-      api: { "anthropic-messages": { stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams },
+      api: { "anthropic-messages": createAIStreams as ProviderStreams },
     }),
   );
   return models;

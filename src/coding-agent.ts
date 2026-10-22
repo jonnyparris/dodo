@@ -451,7 +451,7 @@ const SYSTEM_PROMPT = [
   "",
   "## Code execution",
   "",
-  "The **codemode** tool runs JavaScript in a sandboxed Worker with workspace filesystem and git access. Use it for build scripts, tests, one-off computations, and `fetch()` to allowlisted hosts. Dodo injects no tokens, and it strips credential headers (Authorization, cookies, API keys) unless an admin has allowed auth for that host; the response header `x-dodo-stripped-headers` says what was removed. Never put tokens in URLs or request bodies to get around this. For git, use the `git_*` tools, which handle auth in the parent worker. 30-second timeout, restricted network.",
+  "The **codemode** tool runs JavaScript in a sandboxed Worker with workspace filesystem and git access. Use it for build scripts, tests, one-off computations, and `fetch()` to allowlisted hosts. Dodo injects no tokens, and it strips credential headers (Authorization, cookies, API keys) unless an admin has allowed auth for that host; the response header `x-dodo-stripped-headers` says what was removed. Some hosts allow only GET and HEAD; other methods get a 405. Responses with `x-dodo-blocked` are Dodo policy blocks, not upstream errors: do not retry them another way. Never put tokens in URLs or request bodies to get around this. For git, use the `git_*` tools, which handle auth in the parent worker. 30-second timeout, restricted network.",
   "",
   "## Git",
   "",
@@ -1479,8 +1479,17 @@ export class CodingAgent extends CodingAgentBase {
       if (request.method === "GET" && url.pathname === "/prompts/count") {
         // Lightweight count endpoint used by the UserControl idle-session
         // sweep. Full /prompts would serialise the whole list.
+        // `messages` counts transcript messages too: a fork imports the
+        // source's messages but not its prompt rows, so prompts alone
+        // reads 0 and the sweep would delete a forked conversation.
+        // message_metadata gets a row for every message appendTranscript
+        // writes (fork import, /generate). Think-era history is counted
+        // from its own table, which stays in place after migration to pi.
+        // Overcounting only keeps a session; undercounting deletes one.
         const row = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM prompts"))[0] as SqlRow | null);
-        return Response.json({ count: Number(row?.n ?? 0) });
+        const msgRow = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM message_metadata"))[0] as SqlRow | null);
+        const thinkMessages = this.sessions.sessionIds().reduce((n, id) => n + this.sessions.getMessageCount(id), 0);
+        return Response.json({ count: Number(row?.n ?? 0), messages: Math.max(Number(msgRow?.n ?? 0), thinkMessages) });
       }
 
       if (request.method === "GET" && url.pathname === "/prompt-queue") {

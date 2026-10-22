@@ -14,7 +14,7 @@
     "test:typecheck-smoke": "node --experimental-strip-types --experimental-detect-module --no-warnings=ExperimentalWarning scripts/smoke-typecheck.mjs",
     "lint": "biome lint .",
     "lint:fix": "biome lint --write .",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p bench",
     "types": "wrangler types"
   },
   "dependencies": {

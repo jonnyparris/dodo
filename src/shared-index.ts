@@ -11,12 +11,38 @@ function normalizeHostname(hostname: string): string {
 }
 
 function rowToAllowlistEntry(row: SqlRow): AllowlistEntry {
+  const methods = row.methods == null || row.methods === "" ? null : String(row.methods).split(",");
   return {
     allowCredentials: Number(row.allow_credentials ?? 0) === 1,
     createdAt: epochToIso(row.created_at),
     hostname: String(row.hostname),
+    mcp: Number(row.mcp ?? 1) === 1,
+    methods,
+    sandbox: Number(row.sandbox ?? 1) === 1,
   };
 }
+
+/** HTTP methods an allowlist entry may limit sandbox egress to. */
+const ALLOWLIST_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] as const;
+
+/**
+ * Normalise a method limit: uppercase, dedupe, keep the canonical order.
+ * null or an empty list means "any method".
+ */
+function normalizeAllowlistMethods(methods: string[] | null): string[] | null {
+  if (!methods || methods.length === 0) return null;
+  const wanted = new Set(methods.map((m) => m.trim().toUpperCase()));
+  return ALLOWLIST_METHODS.filter((m) => wanted.has(m));
+}
+
+const ALLOWLIST_COLUMNS = "hostname, created_at, allow_credentials, mcp, sandbox, methods";
+
+export type AllowlistUpdate = {
+  allowCredentials?: boolean;
+  mcp?: boolean;
+  methods?: string[] | null;
+  sandbox?: boolean;
+};
 
 /** Provider prefixes the opencode gateway can actually route.
  *  The models.dev provider TOMLs often fall back to `anthropic/` for non-Anthropic models
@@ -259,10 +285,18 @@ export class SharedIndex extends DurableObject<Env> {
 
       if (request.method === "POST" && url.pathname === "/allowlist") {
         const body = z
-          .object({ hostname: z.string().min(1), allowCredentials: z.boolean().optional() })
+          .object({
+            hostname: z.string().min(1),
+            allowCredentials: z.boolean().optional(),
+            mcp: z.boolean().optional(),
+            sandbox: z.boolean().optional(),
+            // null clears the limit; an empty list is refused so it can't be read as "no methods".
+            methods: z.array(z.string().transform((m) => m.trim().toUpperCase()).pipe(z.enum(ALLOWLIST_METHODS))).min(1).nullable().optional(),
+          })
           .strict()
           .parse(await request.json());
-        return Response.json(this.addAllowlistHost(body.hostname, body.allowCredentials), { status: 201 });
+        const { hostname, ...update } = body;
+        return Response.json(this.addAllowlistHost(hostname, update), { status: 201 });
       }
 
       if (request.method === "DELETE" && url.pathname.startsWith("/allowlist/") && !url.pathname.includes("/check")) {
@@ -272,9 +306,26 @@ export class SharedIndex extends DurableObject<Env> {
       }
 
       if (request.method === "GET" && url.pathname === "/allowlist/check") {
+        // scope=mcp: may an MCP server config point here (src/index.ts:isHostAllowed).
+        // scope=sandbox: may codemode sandbox fetch() reach it (src/outbound.ts).
+        // No scope: listed at all (legacy callers).
         const hostname = normalizeHostname(url.searchParams.get("hostname") ?? "");
+        const scope = url.searchParams.get("scope");
+        // Fail closed on a typo'd scope rather than treating it as "listed at all".
+        if (scope !== null && scope !== "mcp" && scope !== "sandbox") {
+          return Response.json({ error: `Unknown scope: ${scope}` }, { status: 400 });
+        }
         const entry = hostname ? this.getAllowlistEntry(hostname) : null;
-        return Response.json({ allowed: !!entry, allowCredentials: entry?.allowCredentials ?? false, hostname });
+        const allowed = !!entry && (scope === "mcp" ? entry.mcp : scope === "sandbox" ? entry.sandbox : true);
+        return Response.json({
+          allowed,
+          allowCredentials: entry?.allowCredentials ?? false,
+          hostname,
+          listed: !!entry,
+          mcp: entry?.mcp ?? false,
+          methods: entry?.methods ?? null,
+          sandbox: entry?.sandbox ?? false,
+        });
       }
 
       // ─── Models cache ───
@@ -935,6 +986,7 @@ export class SharedIndex extends DurableObject<Env> {
     // Phase 6: browser_enabled column (migration-safe)
     this.migrateAddBrowserEnabled();
     this.migrateAddAllowCredentials();
+    this.migrateAddAllowlistScopes();
 
     // Chat-monitor registry — lets admin UI/tools enumerate
     // ChatMonitorAgent DOs without scanning every UserControl. Each
@@ -995,6 +1047,18 @@ export class SharedIndex extends DurableObject<Env> {
     if (!cols.some((col) => String(col.name) === "allow_credentials")) {
       this.ctx.storage.sql.exec("ALTER TABLE host_allowlist ADD COLUMN allow_credentials INTEGER NOT NULL DEFAULT 0");
     }
+  }
+
+  /**
+   * Split the one host list into two scopes (MCP config, sandbox egress)
+   * plus an optional sandbox method limit. DEFAULT 1 puts every existing
+   * host in both scopes, so behaviour is unchanged until an admin narrows it.
+   */
+  private migrateAddAllowlistScopes(): void {
+    const cols = new Set(Array.from(this.ctx.storage.sql.exec("PRAGMA table_info(host_allowlist)")).map((col) => String(col.name)));
+    if (!cols.has("mcp")) this.ctx.storage.sql.exec("ALTER TABLE host_allowlist ADD COLUMN mcp INTEGER NOT NULL DEFAULT 1");
+    if (!cols.has("sandbox")) this.ctx.storage.sql.exec("ALTER TABLE host_allowlist ADD COLUMN sandbox INTEGER NOT NULL DEFAULT 1");
+    if (!cols.has("methods")) this.ctx.storage.sql.exec("ALTER TABLE host_allowlist ADD COLUMN methods TEXT");
   }
 
   private seedAdmin(): void {
@@ -1083,37 +1147,39 @@ export class SharedIndex extends DurableObject<Env> {
   // ─── Host allowlist ───
 
   /**
-   * Add a host, or update its allowCredentials flag if it is already listed.
-   * Omitting allowCredentials on an existing host leaves the flag unchanged.
+   * Add a host, or update the fields given if it is already listed.
+   * Omitted fields keep their current value (new hosts: both scopes on,
+   * credentials stripped, any method). `methods: null` clears a limit.
    */
-  private addAllowlistHost(hostname: string, allowCredentials?: boolean): AllowlistEntry {
+  private addAllowlistHost(hostname: string, update: AllowlistUpdate = {}): AllowlistEntry {
     const normalized = normalizeHostname(hostname);
     if (!normalized) throw new Error("Hostname is required");
     // Bare hostnames only, or a bracketed IPv6 literal (what URL.hostname
     // returns). Rejects ports and paths, which would never match, and
     // quotes; the admin UI renders these values into HTML.
     if (!/^([a-z0-9.-]+|\[[0-9a-f:.]+\])$/.test(normalized)) throw new Error("Invalid hostname");
-    this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO host_allowlist (hostname, created_at, allow_credentials) VALUES (?, ?, ?)",
-      normalized,
-      nowEpoch(),
-      allowCredentials ? 1 : 0,
-    );
-    if (allowCredentials !== undefined) {
-      this.ctx.storage.sql.exec("UPDATE host_allowlist SET allow_credentials = ? WHERE hostname = ?", allowCredentials ? 1 : 0, normalized);
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO host_allowlist (hostname, created_at) VALUES (?, ?)", normalized, nowEpoch());
+    const sets: string[] = [];
+    const values: Array<string | number | null> = [];
+    if (update.allowCredentials !== undefined) { sets.push("allow_credentials = ?"); values.push(update.allowCredentials ? 1 : 0); }
+    if (update.mcp !== undefined) { sets.push("mcp = ?"); values.push(update.mcp ? 1 : 0); }
+    if (update.sandbox !== undefined) { sets.push("sandbox = ?"); values.push(update.sandbox ? 1 : 0); }
+    if (update.methods !== undefined) { sets.push("methods = ?"); values.push(normalizeAllowlistMethods(update.methods)?.join(",") ?? null); }
+    if (sets.length > 0) {
+      this.ctx.storage.sql.exec(`UPDATE host_allowlist SET ${sets.join(", ")} WHERE hostname = ?`, ...values, normalized);
     }
     return this.getAllowlistEntry(normalized)!;
   }
 
   private listAllowlist(): AllowlistEntry[] {
     return Array.from(
-      this.ctx.storage.sql.exec("SELECT hostname, created_at, allow_credentials FROM host_allowlist ORDER BY hostname ASC"),
+      this.ctx.storage.sql.exec(`SELECT ${ALLOWLIST_COLUMNS} FROM host_allowlist ORDER BY hostname ASC`),
     ).map(rowToAllowlistEntry);
   }
 
   private getAllowlistEntry(hostname: string): AllowlistEntry | null {
     const row = Array.from(
-      this.ctx.storage.sql.exec("SELECT hostname, created_at, allow_credentials FROM host_allowlist WHERE hostname = ?", hostname),
+      this.ctx.storage.sql.exec(`SELECT ${ALLOWLIST_COLUMNS} FROM host_allowlist WHERE hostname = ?`, hostname),
     )[0] as SqlRow | undefined;
     return row ? rowToAllowlistEntry(row) : null;
   }

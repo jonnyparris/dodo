@@ -97,10 +97,23 @@ async function proxyToSharedIndex(env: Env, path: string, init?: RequestInit): P
 const catalogHostnames = new Set(MCP_CATALOG.flatMap((entry) => entry.knownHosts ?? []).map((h) => h.toLowerCase()));
 
 async function isHostAllowed(env: Env, hostname: string): Promise<boolean> {
-  if (catalogHostnames.has(hostname)) return true;
-  const checkRes = await proxyToSharedIndex(env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
-  const checkBody = (await checkRes.json()) as { allowed: boolean };
-  return checkBody.allowed;
+  let checkBody: { allowed: boolean; listed?: boolean };
+  try {
+    const checkRes = await proxyToSharedIndex(env, `/allowlist/check?scope=mcp&hostname=${encodeURIComponent(hostname)}`);
+    if (!checkRes.ok) throw new Error(`allowlist check HTTP ${checkRes.status}`);
+    checkBody = (await checkRes.json()) as { allowed: boolean; listed?: boolean };
+  } catch (err) {
+    // SharedIndex unavailable: give catalog hosts the answer they always had
+    // before scopes (allowed without a lookup). This skips an admin's
+    // mcp: off during the outage, which is the price of not 500ing OAuth.
+    log("warn", "allowlist check failed", { hostname, error: err instanceof Error ? err.message : String(err) });
+    if (catalogHostnames.has(hostname)) return true;
+    throw err;
+  }
+  if (checkBody.allowed) return true;
+  // An admin's explicit mcp: off beats the catalog's implicit allow.
+  if (checkBody.listed) return false;
+  return catalogHostnames.has(hostname);
 }
 
 function rateLimitedResponse(result: { remaining: number; retryAfter?: number }, route: string, email: string): Response {
@@ -121,6 +134,20 @@ async function readConfig(env: Env, email: string): Promise<AppConfig> {
   const stub = getUserControlStub(env, email);
   const response = await stub.fetch("https://user-control/config");
   return (await response.json()) as AppConfig;
+}
+
+/**
+ * x-dodo-* gateway headers derived from the session owner's config, forwarded
+ * to the agent DO so the owner's model/gateway choices win over anything the
+ * calling user (or a guest) might set.
+ */
+function agentGatewayHeaders(config: AppConfig): Record<string, string> {
+  return {
+    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+    "x-dodo-gateway": config.activeGateway,
+    "x-dodo-model": config.model,
+    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+  };
 }
 
 /**
@@ -824,10 +851,7 @@ app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
       "x-dodo-session-id": sessionId,
       "x-owner-email": owner,
       "x-author-email": owner,
-      "x-dodo-ai-base-url": ownerConfigRes.aiGatewayBaseURL,
-      "x-dodo-gateway": ownerConfigRes.activeGateway,
-      "x-dodo-model": ownerConfigRes.model,
-      "x-dodo-opencode-base-url": ownerConfigRes.opencodeBaseURL,
+      ...agentGatewayHeaders(ownerConfigRes),
     },
     method: "POST",
   });
@@ -1337,10 +1361,7 @@ app.post("/api/tasks/batch-dispatch", async (c) => {
         body: JSON.stringify({ content: lines.join("\n") }),
       });
       await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
-        "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-        "x-dodo-gateway": config.activeGateway,
-        "x-dodo-model": config.model,
-        "x-dodo-opencode-base-url": config.opencodeBaseURL,
+        ...agentGatewayHeaders(config),
         "x-author-email": email,
         "x-owner-email": email,
       });
@@ -1451,10 +1472,7 @@ app.post("/api/tasks/:id/dispatch", async (c) => {
     body: JSON.stringify({ content: lines.join("\n") }),
   });
   await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
-    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-    "x-dodo-gateway": config.activeGateway,
-    "x-dodo-model": config.model,
-    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    ...agentGatewayHeaders(config),
     "x-author-email": email,
     "x-owner-email": email,
   });
@@ -2546,10 +2564,7 @@ app.post("/session/:id/message", async (c) => {
   const ownerEmail = c.get("sessionOwnerEmail") || email;
   const config = await readConfig(c.env, ownerEmail);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/message", {
-    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-    "x-dodo-gateway": config.activeGateway,
-    "x-dodo-model": config.model,
-    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    ...agentGatewayHeaders(config),
     "x-author-email": email,
     "x-owner-email": ownerEmail,
   });
@@ -2565,11 +2580,8 @@ app.post("/session/:id/prompt", async (c) => {
   const ownerEmail = c.get("sessionOwnerEmail") || email;
   const config = await readConfig(c.env, ownerEmail);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompt", {
-    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-    "x-dodo-gateway": config.activeGateway,
-    "x-dodo-model": config.model,
+    ...agentGatewayHeaders(config),
     "x-dodo-image-model": config.replicateImageModel ?? "",
-    "x-dodo-opencode-base-url": config.opencodeBaseURL,
     "x-author-email": email,
     "x-owner-email": ownerEmail,
   });

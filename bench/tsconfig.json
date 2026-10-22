@@ -1,0 +1,13 @@
+{
+  // Bench scripts run under Node (npx tsx / node --experimental-strip-types),
+  // not workerd, so they get Node types instead of workers-types. Kept as a
+  // separate project because the two type sets conflict in one program.
+  // Checked by `npm run typecheck`.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"]
+  },
+  "include": ["./**/*.ts"],
+  "exclude": []
+}

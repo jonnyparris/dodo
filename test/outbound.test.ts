@@ -23,10 +23,10 @@
  *   the provided value is not of type 'Fetcher'.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createExecutionContext } from "cloudflare:test";
+import { createExecutionContext, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { getSharedIndexStub } from "../src/auth";
-import { AllowlistOutbound, isCredentialHeader, OWNER_ID_HEADER, sanitizeEgressRequest, STRIPPED_HEADERS_HEADER } from "../src/outbound";
+import { AllowlistOutbound, BLOCKED_HEADER, isCredentialHeader, OWNER_ID_HEADER, sanitizeEgressRequest, STRIPPED_HEADERS_HEADER } from "../src/outbound";
 import { MCP_CATALOG } from "../src/mcp-catalog";
 import type { Env } from "../src/types";
 
@@ -193,3 +193,140 @@ describe("AllowlistOutbound.fetch — credential stripping end to end", () => {
     expect(upstream.redirect).toBe("manual");
   });
 });
+
+describe("allowlist scopes and method limits", () => {
+  // Real SharedIndex + real AllowlistOutbound; only the upstream fetch is stubbed.
+  const HOST = "egress-scope-test.example.org";
+  const shared = () => getSharedIndexStub(env as Env);
+  const post = async (body: Record<string, unknown>) => {
+    const res = await shared().fetch("https://shared-index/allowlist", {
+      body: JSON.stringify({ hostname: HOST, ...body }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    return (await res.json()) as Record<string, unknown>;
+  };
+  const check = async (scope?: string) => {
+    const q = scope ? `scope=${scope}&` : "";
+    return (await (await shared().fetch(`https://shared-index/allowlist/check?${q}hostname=${HOST}`)).json()) as {
+      allowed: boolean;
+      methods: string[] | null;
+    };
+  };
+  const egress = async (method: string) => {
+    let called = false;
+    vi.stubGlobal("fetch", async () => {
+      called = true;
+      return new Response("ok");
+    });
+    const outbound = new AllowlistOutbound(createExecutionContext(), env as Env);
+    const res = await outbound.fetch(new Request(`https://${HOST}/x`, { method, body: method === "GET" || method === "HEAD" ? undefined : "data" }));
+    return { res, called };
+  };
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    await shared().fetch(`https://shared-index/allowlist/${HOST}`, { method: "DELETE" });
+  });
+
+  it("a new host is in both scopes with no method limit (old behaviour)", async () => {
+    const entry = await post({});
+    expect(entry).toMatchObject({ hostname: HOST, mcp: true, sandbox: true, methods: null, allowCredentials: false });
+    expect((await check("mcp")).allowed).toBe(true);
+    expect((await check("sandbox")).allowed).toBe(true);
+    expect((await egress("POST")).called).toBe(true);
+  });
+
+  it("sandbox: false keeps the host for MCP but blocks sandbox egress", async () => {
+    await post({ sandbox: false });
+    expect((await check("mcp")).allowed).toBe(true);
+    expect((await check("sandbox")).allowed).toBe(false);
+    expect((await check()).allowed).toBe(true);
+    const { res, called } = await egress("GET");
+    expect(res.status).toBe(403);
+    expect(res.headers.get(BLOCKED_HEADER)).toBe("host");
+    expect(called).toBe(false);
+  });
+
+  it("mcp: false keeps sandbox egress but fails the MCP scope", async () => {
+    await post({ mcp: false });
+    expect((await check("mcp")).allowed).toBe(false);
+    expect((await egress("GET")).called).toBe(true);
+  });
+
+  it("removes an x-dodo-blocked header sent by the upstream", async () => {
+    await post({});
+    vi.stubGlobal("fetch", async () => new Response("ok", { headers: { [BLOCKED_HEADER]: "host", [STRIPPED_HEADERS_HEADER]: "fake" } }));
+    const outbound = new AllowlistOutbound(createExecutionContext(), env as Env);
+    const res = await outbound.fetch(new Request(`https://${HOST}/x`));
+    expect(res.status).toBe(200);
+    expect(res.headers.has(BLOCKED_HEADER)).toBe(false);
+    expect(res.headers.has(STRIPPED_HEADERS_HEADER)).toBe(false);
+    // Same on the path that strips credentials.
+    const stripped = await outbound.fetch(new Request(`https://${HOST}/x`, { headers: { authorization: "Bearer x" } }));
+    expect(stripped.headers.has(BLOCKED_HEADER)).toBe(false);
+    expect(stripped.headers.get(STRIPPED_HEADERS_HEADER)).toBe("authorization");
+  });
+
+  it("a GET/HEAD-only host refuses writes with 405 and forwards reads", async () => {
+    const entry = await post({ methods: ["head", "GET"] as never });
+    expect(entry.methods).toEqual(["GET", "HEAD"]);
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+      const { res, called } = await egress(method);
+      expect(res.status, method).toBe(405);
+      expect(res.headers.get("allow")).toBe("GET, HEAD");
+      expect(res.headers.get(BLOCKED_HEADER)).toBe("method");
+      expect(await res.text()).toContain("allows only GET, HEAD");
+      expect(called, method).toBe(false);
+    }
+    expect((await egress("GET")).called).toBe(true);
+    expect((await egress("HEAD")).called).toBe(true);
+  });
+
+  it("partial updates keep other fields; methods: null clears the limit", async () => {
+    await post({ methods: ["GET", "HEAD"], allowCredentials: true, sandbox: true });
+    const updated = await post({ mcp: false });
+    expect(updated).toMatchObject({ mcp: false, sandbox: true, allowCredentials: true, methods: ["GET", "HEAD"] });
+    const cleared = await post({ methods: null });
+    expect(cleared.methods).toBeNull();
+    expect((await egress("POST")).called).toBe(true);
+  });
+
+  it("rejects unknown methods and an empty method list without creating the host", async () => {
+    for (const methods of [["TRACE"], []]) {
+      const res = await shared().fetch("https://shared-index/allowlist", {
+        body: JSON.stringify({ hostname: HOST, methods }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      expect(res.status, JSON.stringify(methods)).toBe(400);
+    }
+    expect((await check()).allowed).toBe(false);
+  });
+
+  it("fails closed on an unknown scope", async () => {
+    await post({});
+    const res = await shared().fetch(`https://shared-index/allowlist/check?scope=Sandbox&hostname=${HOST}`);
+    expect(res.status).toBe(400);
+  });
+
+  it("migration puts rows that predate the scope columns in both scopes", async () => {
+    await post({ methods: ["GET"], mcp: false });
+    const stub = shared();
+    const row = await runInDurableObject(stub, async (instance, state) => {
+      for (const col of ["mcp", "sandbox", "methods"]) state.storage.sql.exec(`ALTER TABLE host_allowlist DROP COLUMN ${col}`);
+      (instance as unknown as { migrateAddAllowlistScopes(): void }).migrateAddAllowlistScopes();
+      return state.storage.sql.exec("SELECT mcp, sandbox, methods FROM host_allowlist WHERE hostname = ?", HOST).toArray()[0];
+    });
+    expect(row).toEqual({ mcp: 1, sandbox: 1, methods: null });
+    expect((await check("mcp")).allowed).toBe(true);
+    expect((await check("sandbox")).allowed).toBe(true);
+    // A second run (every DO start) changes nothing.
+    await post({ sandbox: false });
+    await runInDurableObject(stub, async (instance) => {
+      (instance as unknown as { migrateAddAllowlistScopes(): void }).migrateAddAllowlistScopes();
+    });
+    expect((await check("sandbox")).allowed).toBe(false);
+  });
+});
+
