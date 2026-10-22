@@ -45,7 +45,7 @@ describe("kitebuild ci_run", () => {
       return new Response(ndjson([{ t: "run", id: "r" }, { t: "stage", i: 0, status: "end", code: 0, ms: 1 }, { t: "stage", i: 1, status: "end", code: 0, ms: 1 }, { t: "done", code: 0, ms: 2, timedOut: false }]));
     }) as unknown as typeof fetch;
     const t = buildCiRunTool(env, fetcher);
-    const result = await t.execute!({ repoUrl: "https://github.com/o/r", branch: "feat/x", commands: ["npm test"] }, { toolCallId: "c", messages: [] });
+    const result = await t.execute!({ repoUrl: "https://github.com/o/r", branch: "feat/x", commands: ["npm test"] }, { toolCallId: "c", messages: [], context: {} });
     expect(sent?.url).toBe("https://kb.example/api/ci-runs");
     expect(sent?.headers.get("CF-Access-Client-Id")).toBe("id");
     expect(sent?.body.commands).toEqual(["git clone --depth 1 --branch feat/x https://github.com/o/r /tmp/repo", "npm test"]);
@@ -55,7 +55,7 @@ describe("kitebuild ci_run", () => {
 
   it("rejects credentials in the clone URL and odd branch names", async () => {
     const t = buildCiRunTool(env, (async () => new Response("")) as unknown as typeof fetch);
-    await expect(t.execute!({ repoUrl: "https://tok@github.com/o/r", branch: "main", commands: ["x"] }, { toolCallId: "c", messages: [] })).rejects.toThrow(/credentials/);
-    await expect(t.execute!({ repoUrl: "https://github.com/o/r", branch: "main; rm -rf /", commands: ["x"] }, { toolCallId: "c", messages: [] })).rejects.toThrow(/branch/);
+    await expect(t.execute!({ repoUrl: "https://tok@github.com/o/r", branch: "main", commands: ["x"] }, { toolCallId: "c", messages: [], context: {} })).rejects.toThrow(/credentials/);
+    await expect(t.execute!({ repoUrl: "https://github.com/o/r", branch: "main; rm -rf /", commands: ["x"] }, { toolCallId: "c", messages: [], context: {} })).rejects.toThrow(/branch/);
   });
 });

@@ -27,7 +27,9 @@ import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { CLOUDFLARE_AI_GATEWAY_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-ai-gateway.models";
 import { CLOUDFLARE_PROVIDER_ID, createAI } from "agents/models/pi-ai";
-import { bindingGatewayId, adaptBindingForCreateAI, gatewayMetadata } from "../cloudflare-ai";
+import { bindingGatewayId, adaptBindingForCreateAI, gatewayMetadata, workersAIOnRunPath } from "../cloudflare-ai";
+
+export { workersAIOnRunPath };
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
@@ -130,16 +132,6 @@ export function createAIGatewayId(
   return bindingGatewayId(config, env);
 }
 
-/**
- * Whether an `@cf/` model goes through createAI's Workers AI run path
- * (`env.AI.run` with the gateway option) instead of `/compat`. Opt-in via
- * WORKERS_AI_VIA_BINDING ("1"/"true") while it is A/B'd against `/compat`.
- */
-export function workersAIOnRunPath(modelId: string, env: Pick<Env, "WORKERS_AI_VIA_BINDING">): boolean {
-  if (!modelId.startsWith("@cf/")) return false;
-  const flag = env.WORKERS_AI_VIA_BINDING?.trim().toLowerCase();
-  return flag === "1" || flag === "true";
-}
 
 function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLimit?: RateLimitFetchOptions) {
   // createAI never calls fetch, so the 429 wait wraps the binding call. The

@@ -18,9 +18,9 @@
     "types": "wrangler types"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^3.0.135",
-    "@ai-sdk/openai-compatible": "^2.0.37",
-    "@ai-sdk/provider": "^4.0.31",
+    "@ai-sdk/anthropic": "^4.0.87",
+    "@ai-sdk/openai-compatible": "^3.0.77",
+    "@ai-sdk/provider": "^4.0.33",
     "@cloudflare/codemode": "^0.5.4",
     "@cloudflare/computer": "^0.5.1",
     "@cloudflare/puppeteer": "^1.4.0",
@@ -31,7 +31,7 @@
     "@hono/capnweb": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "agents": "^0.28.1",
-    "ai": "^6.0.142",
+    "ai": "^7.0.150",
     "capnweb": "^0.6.1",
     "cron-schedule": "^6.0.0",
     "hono": "^4.12.9",

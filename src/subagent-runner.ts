@@ -2,7 +2,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createAI } from "agents/models/ai-sdk";
 import { generateText, stepCountIs, wrapLanguageModel, type LanguageModel, type LanguageModelMiddleware, type ModelMessage, type ToolSet } from "ai";
-import { adaptBindingForCreateAI, bindingGatewayId, gatewayMetadata } from "./cloudflare-ai";
+import { adaptBindingForCreateAI, bindingGatewayId, gatewayMetadata, workersAIOnRunPath } from "./cloudflare-ai";
 import type { AgentProfile } from "./agent-profile";
 import {
   EXPLORE_PROFILE,
@@ -350,7 +350,7 @@ export function addAnthropicCacheMarkers(body: Record<string, unknown>): Record<
 // and this middleware adds the breakpoints as AI SDK provider options.
 
 const ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4;
-type LanguageModelV3CallOptions = Parameters<NonNullable<LanguageModelMiddleware["transformParams"]>>[0]["params"];
+type LanguageModelCallOptions = Parameters<NonNullable<LanguageModelMiddleware["transformParams"]>>[0]["params"];
 const CACHE_OPTION = { anthropic: { cacheControl: { type: "ephemeral" } } } as const;
 
 type ProviderOptionsLike = Record<string, Record<string, unknown> | undefined> | undefined;
@@ -372,7 +372,7 @@ function withCache<T extends { providerOptions?: ProviderOptionsLike }>(item: T)
  * the message's last block. Existing breakpoints are kept and counted toward
  * Anthropic's limit of 4 per request.
  */
-export function addAnthropicCacheOptions(params: LanguageModelV3CallOptions): LanguageModelV3CallOptions {
+export function addAnthropicCacheOptions(params: LanguageModelCallOptions): LanguageModelCallOptions {
   const prompt = params.prompt as Array<{ role: string; providerOptions?: ProviderOptionsLike; content: unknown }>;
   const tools = params.tools as Array<{ providerOptions?: ProviderOptionsLike }> | undefined;
   let budget = ANTHROPIC_MAX_CACHE_BREAKPOINTS;
@@ -420,11 +420,11 @@ export function addAnthropicCacheOptions(params: LanguageModelV3CallOptions): La
       }
     }
   }
-  return { ...params, prompt: out as LanguageModelV3CallOptions["prompt"], ...(outTools ? { tools: outTools as LanguageModelV3CallOptions["tools"] } : {}) };
+  return { ...params, prompt: out as LanguageModelCallOptions["prompt"], ...(outTools ? { tools: outTools as LanguageModelCallOptions["tools"] } : {}) };
 }
 
 export const anthropicCacheMiddleware: LanguageModelMiddleware = {
-  specificationVersion: "v3",
+  specificationVersion: "v4",
   transformParams: async ({ params }) => addAnthropicCacheOptions(params),
 };
 
@@ -442,6 +442,29 @@ function buildAnthropicCreateAIProvider(gatewayId: string, env: Env, sessionAffi
   // Dodo ids are `anthropic/claude-…`; Anthropic wants `claude-…`.
   const model = (modelId: string): LanguageModel =>
     wrapLanguageModel({ model: ai.routed(anthropic.languageModel(modelId.replace(/^anthropic\//, ""))), middleware: anthropicCacheMiddleware });
+  return Object.assign((modelId: string) => model(modelId), {
+    chatModel: model,
+    languageModel: (modelId: string, _cfg?: unknown) => model(modelId),
+  });
+}
+
+/**
+ * `@cf/` models through createAI's Workers AI run path over the `AI` binding
+ * (`env.AI.run` with the gateway option, plus createAI's per-model request
+ * quirks), the same leg the main session uses with WORKERS_AI_VIA_BINDING.
+ * No AI_GATEWAY_KEY. createAI's AI SDK models are LanguageModelV4, which is
+ * why this needed AI SDK 7. `maxOutputTokens` (executeSubagent) becomes
+ * `max_tokens`. A rate limit comes back as a retryable 429 (a thrown
+ * AiError 3021/3040 is turned into one by adaptBindingForCreateAI), which
+ * the AI SDK's own retries wait out, as on `/compat`.
+ */
+function buildWorkersAICreateAIProvider(gatewayId: string, env: Env, sessionAffinity?: string) {
+  const metadata = gatewayMetadata(sessionAffinity, "subagent");
+  const ai = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId, ...(metadata ? { metadata } : {}) });
+  // Same replica for every step of one subagent run, so Workers AI prefix
+  // caching works (was the x-session-affinity header on `/compat`).
+  const model = (modelId: string): LanguageModel =>
+    ai.languageModel(modelId as `@cf/${string}`, sessionAffinity ? { sessionAffinity } : undefined);
   return Object.assign((modelId: string) => model(modelId), {
     chatModel: model,
     languageModel: (modelId: string, _cfg?: unknown) => model(modelId),
@@ -488,8 +511,10 @@ export function buildProviderForModel(
   env: Env,
   sessionAffinity?: string,
 ) {
-  const gatewayId = modelId.startsWith("anthropic/") ? bindingGatewayId(config, env) : undefined;
-  if (gatewayId) return buildAnthropicCreateAIProvider(gatewayId, env, sessionAffinity);
+  const anthropic = modelId.startsWith("anthropic/");
+  const gatewayId = anthropic || workersAIOnRunPath(modelId, env) ? bindingGatewayId(config, env) : undefined;
+  if (gatewayId && anthropic) return buildAnthropicCreateAIProvider(gatewayId, env, sessionAffinity);
+  if (gatewayId) return buildWorkersAICreateAIProvider(gatewayId, env, sessionAffinity);
 
   const effectiveGateway = resolveGatewayForModel(modelId, config.activeGateway);
   const isOpencode = effectiveGateway === "opencode";
