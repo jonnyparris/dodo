@@ -9,6 +9,14 @@ export const OWNER_ID_HEADER = "x-dodo-owner-id";
  * dynamic workers. Checks the hostname against the SharedIndex allowlist and
  * blocks requests to hosts that are not explicitly allowed.
  *
+ * **Sandbox scope.** Each allowlist entry has two scopes: `mcp` (MCP server
+ * configs may point there) and `sandbox` (this entrypoint lets sandbox code
+ * reach it). Adding a host for an MCP server does not have to open it to
+ * sandbox code: set `sandbox: false`. An entry can also limit sandbox
+ * egress to some methods (`methods: ["GET", "HEAD"]`); other methods get a
+ * 405. That closes the write routes stripping cannot see on read-only
+ * hosts: a token in the query string or body, and unauthenticated writes.
+ *
  * **Per-user token injection is currently disabled.** The duck-typed wrapper
  * that injected `x-dodo-owner-id` broke `globalOutbound` (workerd rejects
  * non-ServiceStub Fetchers). Three fix attempts (PR #52/#54/#55) all failed.
@@ -43,10 +51,12 @@ export const OWNER_ID_HEADER = "x-dodo-owner-id";
  * The response carries `x-dodo-stripped-headers` so the agent can see why
  * an upstream answered 401.
  *
- * Not covered: tokens in the query string (e.g. GitLab `?private_token=`)
- * or the request body (Slack `token=`, OAuth `client_secret`), and data
- * sent without auth to a host that stores it publicly. Keep the
- * allowlist short.
+ * Not covered by stripping: tokens in the query string (e.g. GitLab
+ * `?private_token=`) or the request body (Slack `token=`, OAuth
+ * `client_secret`), and data sent without auth to a host that stores it
+ * publicly. Use the method limit for read-only hosts, `sandbox: false`
+ * for MCP-only hosts, and keep the sandbox scope short. A GET can still
+ * leak data in its URL to a host that logs it.
  *
  * Configured as a self-referencing service binding (OUTBOUND) in wrangler.jsonc
  * and passed as `globalOutbound` to DynamicWorkerExecutor.
@@ -58,15 +68,20 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
 
     const stub = getSharedIndexStub(this.env);
     const checkResponse = await stub.fetch(
-      `https://shared-index/allowlist/check?hostname=${encodeURIComponent(hostname)}`,
+      `https://shared-index/allowlist/check?scope=sandbox&hostname=${encodeURIComponent(hostname)}`,
     );
-    const { allowed, allowCredentials } = (await checkResponse.json()) as { allowed: boolean; allowCredentials?: boolean };
+    const { allowed, allowCredentials, methods } = (await checkResponse.json()) as {
+      allowed: boolean;
+      allowCredentials?: boolean;
+      methods?: string[] | null;
+    };
 
     if (!allowed) {
-      return new Response(
-        JSON.stringify({ error: `Outbound request to ${hostname} blocked — not in allowlist` }),
-        { status: 403, headers: { "content-type": "application/json" } },
-      );
+      return blocked(`Outbound request to ${hostname} blocked — not in allowlist`);
+    }
+    const method = request.method.toUpperCase();
+    if (methods && !methods.includes(method)) {
+      return blocked(`Outbound ${method} to ${hostname} blocked — host allows only ${methods.join(", ")}`, methods);
     }
 
     const { request: outboundRequest, stripped } = sanitizeEgressRequest(request, { allowCredentials: allowCredentials === true });
@@ -80,6 +95,12 @@ export class AllowlistOutbound extends WorkerEntrypoint<Env> {
     response.headers.set(STRIPPED_HEADERS_HEADER, stripped.join(", "));
     return response;
   }
+}
+
+function blocked(error: string, allowedMethods?: string[]): Response {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (allowedMethods) headers.allow = allowedMethods.join(", ");
+  return new Response(JSON.stringify({ error }), { status: allowedMethods ? 405 : 403, headers });
 }
 
 /** Response header listing the request headers AllowlistOutbound removed. */

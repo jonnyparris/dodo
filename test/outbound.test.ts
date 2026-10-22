@@ -193,3 +193,96 @@ describe("AllowlistOutbound.fetch — credential stripping end to end", () => {
     expect(upstream.redirect).toBe("manual");
   });
 });
+
+describe("allowlist scopes and method limits", () => {
+  // Real SharedIndex + real AllowlistOutbound; only the upstream fetch is stubbed.
+  const HOST = "egress-scope-test.example.org";
+  const shared = () => getSharedIndexStub(env as Env);
+  const post = async (body: Record<string, unknown>) => {
+    const res = await shared().fetch("https://shared-index/allowlist", {
+      body: JSON.stringify({ hostname: HOST, ...body }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    return (await res.json()) as Record<string, unknown>;
+  };
+  const check = async (scope?: string) => {
+    const q = scope ? `scope=${scope}&` : "";
+    return (await (await shared().fetch(`https://shared-index/allowlist/check?${q}hostname=${HOST}`)).json()) as {
+      allowed: boolean;
+      methods: string[] | null;
+    };
+  };
+  const egress = async (method: string) => {
+    let called = false;
+    vi.stubGlobal("fetch", async () => {
+      called = true;
+      return new Response("ok");
+    });
+    const outbound = new AllowlistOutbound(createExecutionContext(), env as Env);
+    const res = await outbound.fetch(new Request(`https://${HOST}/x`, { method, body: method === "GET" || method === "HEAD" ? undefined : "data" }));
+    return { res, called };
+  };
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    await shared().fetch(`https://shared-index/allowlist/${HOST}`, { method: "DELETE" });
+  });
+
+  it("a new host is in both scopes with no method limit (old behaviour)", async () => {
+    const entry = await post({});
+    expect(entry).toMatchObject({ hostname: HOST, mcp: true, sandbox: true, methods: null, allowCredentials: false });
+    expect((await check("mcp")).allowed).toBe(true);
+    expect((await check("sandbox")).allowed).toBe(true);
+    expect((await egress("POST")).called).toBe(true);
+  });
+
+  it("sandbox: false keeps the host for MCP but blocks sandbox egress", async () => {
+    await post({ sandbox: false });
+    expect((await check("mcp")).allowed).toBe(true);
+    expect((await check("sandbox")).allowed).toBe(false);
+    expect((await check()).allowed).toBe(true);
+    const { res, called } = await egress("GET");
+    expect(res.status).toBe(403);
+    expect(called).toBe(false);
+  });
+
+  it("mcp: false keeps sandbox egress but fails the MCP scope", async () => {
+    await post({ mcp: false });
+    expect((await check("mcp")).allowed).toBe(false);
+    expect((await egress("GET")).called).toBe(true);
+  });
+
+  it("a GET/HEAD-only host refuses writes with 405 and forwards reads", async () => {
+    const entry = await post({ methods: ["head", "GET"] as never });
+    expect(entry.methods).toEqual(["GET", "HEAD"]);
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+      const { res, called } = await egress(method);
+      expect(res.status, method).toBe(405);
+      expect(res.headers.get("allow")).toBe("GET, HEAD");
+      expect(await res.text()).toContain("allows only GET, HEAD");
+      expect(called, method).toBe(false);
+    }
+    expect((await egress("GET")).called).toBe(true);
+    expect((await egress("HEAD")).called).toBe(true);
+  });
+
+  it("partial updates keep other fields; methods: null clears the limit", async () => {
+    await post({ methods: ["GET", "HEAD"], allowCredentials: true, sandbox: true });
+    const updated = await post({ mcp: false });
+    expect(updated).toMatchObject({ mcp: false, sandbox: true, allowCredentials: true, methods: ["GET", "HEAD"] });
+    const cleared = await post({ methods: null });
+    expect(cleared.methods).toBeNull();
+    expect((await egress("POST")).called).toBe(true);
+  });
+
+  it("rejects unknown methods", async () => {
+    const res = await shared().fetch("https://shared-index/allowlist", {
+      body: JSON.stringify({ hostname: HOST, methods: ["TRACE"] }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+  });
+});
+

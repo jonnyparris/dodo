@@ -98,7 +98,7 @@ const catalogHostnames = new Set(MCP_CATALOG.flatMap((entry) => entry.knownHosts
 
 async function isHostAllowed(env: Env, hostname: string): Promise<boolean> {
   if (catalogHostnames.has(hostname)) return true;
-  const checkRes = await proxyToSharedIndex(env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
+  const checkRes = await proxyToSharedIndex(env, `/allowlist/check?scope=mcp&hostname=${encodeURIComponent(hostname)}`);
   const checkBody = (await checkRes.json()) as { allowed: boolean };
   return checkBody.allowed;
 }

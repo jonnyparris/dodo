@@ -30,11 +30,11 @@ async function fetchJson(path: string, init?: RequestInit): Promise<Response> {
   return response;
 }
 
-async function addAllowlistDirect(hostname: string): Promise<void> {
+async function addAllowlistDirect(hostname: string, extra: Record<string, unknown> = {}): Promise<void> {
   const testEnv = env as Env;
   const stub = testEnv.SHARED_INDEX.get(testEnv.SHARED_INDEX.idFromName("global"));
   await stub.fetch("https://shared-index/allowlist", {
-    body: JSON.stringify({ hostname }),
+    body: JSON.stringify({ hostname, ...extra }),
     headers: { "content-type": "application/json" },
     method: "POST",
   });
@@ -54,6 +54,28 @@ describe("MCP Config CRUD", () => {
     for (const hostname of hosts) {
       await addAllowlistDirect(hostname);
     }
+  });
+
+  it("only the mcp scope gates MCP configs, not the sandbox scope", async () => {
+    // Sandbox-only host: listed, but not for MCP configs.
+    await addAllowlistDirect("sandbox-only.example.com", { mcp: false });
+    const blocked = await fetchJson("/api/mcp-configs", {
+      body: JSON.stringify({ name: "Sandbox only", type: "http", url: "https://sandbox-only.example.com/mcp", enabled: true }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(blocked.status).toBe(403);
+
+    // MCP-only host: sandbox egress off, MCP configs still fine.
+    await addAllowlistDirect("mcp-only.example.com", { sandbox: false });
+    const allowed = await fetchJson("/api/mcp-configs", {
+      body: JSON.stringify({ name: "MCP only", type: "http", url: "https://mcp-only.example.com/mcp", enabled: true }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(allowed.status).toBe(201);
+    const { id } = (await allowed.json()) as { id: string };
+    await fetchJson(`/api/mcp-configs/${id}`, { method: "DELETE" });
   });
 
   it("list MCP configs → empty initially", async () => {
