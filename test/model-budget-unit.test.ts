@@ -105,6 +105,20 @@ describe("ModelBudgetBook", () => {
     expect(book.snapshot()[0].cap).toBe(40);
   });
 
+  it("a burst of 429s cuts the cap once; each new episode cuts at least 20%", () => {
+    const c = clock();
+    const book = new ModelBudgetBook(c.now);
+    for (let i = 0; i < 50; i++) book.acquire(KEY, 50, "main"); // over-sent: used can't tell us the cap
+    book.report429(KEY, 50, 5_000);
+    expect(book.snapshot()[0].cap).toBe(40);
+    book.report429(KEY, 50, 5_000);
+    book.report429(KEY, 50, 5_000);
+    expect(book.snapshot()[0].cap).toBe(40);
+    c.advance(5_000);
+    book.report429(KEY, 50, 5_000);
+    expect(book.snapshot()[0].cap).toBe(32);
+  });
+
   it("snapshot reports use, waits and 429s", () => {
     const book = new ModelBudgetBook(clock().now);
     for (let i = 0; i < 5; i++) book.acquire(KEY, 4, "subagent");
@@ -175,6 +189,33 @@ describe("budgetFetch", () => {
     const f = budgetFetch(async () => ok(), { client, key: "k", rpm: 4, priority: "subagent", maxWaitMs: 5_000, sleep: async (ms) => void waits.push(ms) });
     expect((await f("https://gw/chat")).status).toBe(200);
     expect(waits.reduce((a, b) => a + b, 0)).toBe(5_000);
+  });
+
+  it("maxWaitScope total: one allowance across every call (a pi request and its 429 resends)", async () => {
+    const book = new ModelBudgetBook(clock().now);
+    const { client } = bookClient(book);
+    for (let i = 0; i < 4; i++) book.acquire("k", 4, "main");
+    const waits: number[] = [];
+    const f = budgetFetch(async () => ok(), { client, key: "k", rpm: 4, priority: "main", maxWaitMs: 5_000, maxWaitScope: "total", sleep: async (ms) => void waits.push(ms) });
+    await f("https://gw/chat");
+    await f("https://gw/chat");
+    expect(waits.reduce((a, b) => a + b, 0)).toBe(5_000);
+  });
+
+  it("fails open when the budget call hangs", async () => {
+    const client: ModelBudgetClient = { acquire: () => new Promise(() => {}), report429: () => new Promise(() => {}) };
+    const f = budgetFetch(async () => rateLimited(), { client, key: "k", rpm: 4, priority: "main", callTimeoutMs: 20 });
+    expect((await f("https://gw/chat")).status).toBe(429);
+  });
+
+  it("honours the signal of a Request input", async () => {
+    const book = new ModelBudgetBook(clock().now);
+    const { client } = bookClient(book);
+    for (let i = 0; i < 3; i++) book.acquire("k", 4, "subagent");
+    const controller = new AbortController();
+    controller.abort();
+    const f = budgetFetch(async () => ok(), { client, key: "k", rpm: 4, priority: "subagent" });
+    await expect(f(new Request("https://gw/chat", { signal: controller.signal }))).rejects.toMatchObject({ name: "AbortError" });
   });
 
   it("fails open when the budget call throws", async () => {

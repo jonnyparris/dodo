@@ -18,10 +18,15 @@
 // configured cap. The learned cap climbs back by 10% of the configured cap
 // per quiet minute.
 //
+// Main turns are never limited by what subagents learned: subagents yield
+// first, and a main-turn 429 is waited out by src/pi/rate-limit-fetch.ts.
+//
 // The book lives in memory in the SharedIndex DO (one per deployment). If
 // that DO restarts, the window starts empty: worst case one burst of 429s,
 // which the 429 retries still absorb. Callers fail open: a budget call that
 // throws never blocks a model request.
+
+import { log } from "./logger";
 
 export type BudgetPriority = "main" | "subagent";
 
@@ -54,6 +59,8 @@ export const SUBAGENT_RESERVE = 0.25;
 const MIN_CAP_SHARE = 0.25;
 /** Raise per quiet minute, as a share of the configured rpm. */
 const RECOVERY_SHARE = 0.1;
+/** Least cut to the learned cap per 429 episode. */
+const CAP_CUT_SHARE = 0.2;
 /** Subagent hold after a 429 without Retry-After. */
 const DEFAULT_COOLDOWN_MS = 5_000;
 const MAX_COOLDOWN_MS = WINDOW_MS;
@@ -137,9 +144,14 @@ export class ModelBudgetBook {
     const now = this.now();
     const b = this.bucket(key, rpm, now);
     b.rateLimited++;
-    // The rejected request is already stamped, so the cap is below `used`.
-    const learned = Math.max(minCap(b.rpm), b.stamps.length - 1);
-    if (learned < b.cap) b.cap = learned;
+    // Shrink once per 429 episode: the 429s of one burst arrive together and
+    // must not each cut the cap. The rejected request is already stamped, so
+    // the real cap is below `used`; `used` can also include requests sent
+    // past the budget (or rejected ones), so cut by at least 20% as well.
+    if (now >= b.cooldownUntil) {
+      const learned = Math.max(minCap(b.rpm), Math.min(b.stamps.length - 1, Math.floor(b.cap * (1 - CAP_CUT_SHARE))));
+      if (learned < b.cap) b.cap = learned;
+    }
     b.lastCapChange = now;
     const hold = Math.min(MAX_COOLDOWN_MS, Math.max(1_000, retryAfterMs ?? DEFAULT_COOLDOWN_MS));
     b.cooldownUntil = Math.max(b.cooldownUntil, now + hold);
@@ -201,6 +213,7 @@ function parseOverrides(json?: string): Record<string, number> {
     }
   } catch {
     out = {};
+    log("warn", "MODEL_RPM_LIMITS is not valid JSON; using default model budgets");
   }
   overrideCache.set(json, out);
   return out;

@@ -4,7 +4,10 @@
 // explore/task subagents (src/subagent-runner.ts).
 //
 // It sits under any 429 retry wrapper, so every resend asks for its own
-// slot. Fails open: if the budget call throws, the request goes out.
+// slot. Fails open: if the budget call throws or takes longer than
+// BUDGET_CALL_TIMEOUT_MS, the request goes out. After maxWaitMs of waiting
+// the request goes out anyway: a subagent is never failed by the budget,
+// and a 429 it then gets is retried (and re-gated) by the AI SDK.
 
 import { abortableSleep, retryAfterMs, transient } from "./pi/rate-limit-fetch";
 import type { BudgetDecision, BudgetPriority } from "./model-budget";
@@ -31,12 +34,30 @@ export interface BudgetFetchOptions {
   priority: BudgetPriority;
   /** Most time spent waiting for a slot before sending anyway. */
   maxWaitMs?: number;
+  /**
+   * "request" (default): maxWaitMs applies to each fetch call. "total": to
+   * every call this wrapper makes, so one pi model request and all its 429
+   * resends share one wait allowance (the wrapper is built per request).
+   */
+  maxWaitScope?: "request" | "total";
   onWait?: (info: ModelBudgetWaitInfo) => void;
   /** For tests. */
   sleep?: (ms: number, signal?: AbortSignal | null) => Promise<void>;
+  /** For tests. Default BUDGET_CALL_TIMEOUT_MS. */
+  callTimeoutMs?: number;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("model budget call timed out")), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 const DEFAULT_MAX_WAIT_MS = 90_000;
+/** A budget call slower than this is skipped (fail open): the DO is busy or far away. */
+export const BUDGET_CALL_TIMEOUT_MS = 1_000;
 /** Spread waiters out so they don't all ask again at the same moment. */
 const WAIT_JITTER_MS = 500;
 
@@ -52,25 +73,29 @@ export function sharedIndexBudgetClient(env: Pick<Env, "SHARED_INDEX">): ModelBu
 export function budgetFetch(base: typeof fetch, options: BudgetFetchOptions): typeof fetch {
   const maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
   const sleep = options.sleep ?? abortableSleep;
+  const callTimeoutMs = options.callTimeoutMs ?? BUDGET_CALL_TIMEOUT_MS;
   const { client, key, rpm, priority } = options;
+  let waitedTotal = 0;
 
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
-    let waited = 0;
+    const signal = init?.signal ?? (typeof Request !== "undefined" && input instanceof Request ? input.signal : undefined);
+    let waited = options.maxWaitScope === "total" ? waitedTotal : 0;
     for (;;) {
-      const decision = await client.acquire(key, rpm, priority).catch(() => undefined);
+      const decision = await withTimeout(client.acquire(key, rpm, priority), callTimeoutMs).catch(() => undefined);
       if (!decision || decision.ok) break;
       const left = maxWaitMs - waited;
       if (left <= 0) break;
       const waitMs = Math.min(left, decision.waitMs + Math.random() * WAIT_JITTER_MS);
       options.onWait?.({ key, priority, waitMs, used: decision.used, limit: decision.limit });
-      await sleep(waitMs, init?.signal);
+      await sleep(waitMs, signal);
       waited += waitMs;
+      waitedTotal += waitMs;
     }
     const response = await base(input, init);
     if (response.status === 429) {
       const body = await response.clone().text().catch(() => "");
       if (transient(body)) {
-        await client.report429(key, rpm, retryAfterMs(response.headers)).catch(() => {});
+        await withTimeout(client.report429(key, rpm, retryAfterMs(response.headers)), callTimeoutMs).catch(() => {});
       }
     }
     return response;
@@ -92,6 +117,7 @@ export function withModelBudget(
     client?: ModelBudgetClient;
     onWait?: (info: ModelBudgetWaitInfo) => void;
     maxWaitMs?: number;
+    maxWaitScope?: "request" | "total";
   },
 ): typeof fetch {
   const rpm = modelRpm(args.modelId, args.env.MODEL_RPM_LIMITS);
@@ -105,5 +131,6 @@ export function withModelBudget(
     priority: args.priority,
     onWait: args.onWait,
     maxWaitMs: args.maxWaitMs,
+    maxWaitScope: args.maxWaitScope,
   });
 }

@@ -174,8 +174,13 @@ export function withRateLimitRetry(api: ProviderStreams, fetchOptions?: Paramete
   };
 }
 
-/** Longest a main turn waits for a budget slot before sending anyway (its 429 wait follows). */
-const MAIN_BUDGET_MAX_WAIT_MS = 60_000;
+/**
+ * Longest one main-turn model request (with all its 429 resends) waits for
+ * budget slots before sending anyway. With the 60s 429 wait in
+ * rate-limit-fetch.ts that is at most ~90s of waiting per request, inside
+ * the 5-minute stream idle timeout.
+ */
+export const MAIN_BUDGET_MAX_WAIT_MS = 30_000;
 
 export interface ModelBudgetStreamOptions {
   env: Pick<Env, "SHARED_INDEX" | "MODEL_RPM_LIMITS">;
@@ -201,6 +206,8 @@ export function withModelBudgetStreams(api: ProviderStreams, budget: ModelBudget
       client: budget.client,
       onWait: budget.onWait,
       maxWaitMs: MAIN_BUDGET_MAX_WAIT_MS,
+      // wrap() runs once per model request, so this is per request incl. resends.
+      maxWaitScope: "total",
     }),
   });
   return {

@@ -19,7 +19,9 @@
 //
 // Worst case: each of the harness's 4 attempts gets its own budget, so a
 // rate limit that never clears fails the turn after about 4 x 60s + 14s
-// of waiting (plus request time) instead of 14s. The wait here is in memory: if the DO is evicted during
+// of waiting (plus request time) instead of 14s. On Workers AI models the
+// shared model budget (src/model-budget-fetch.ts) can add up to 30s of
+// waiting per attempt before a send. The wait here is in memory: if the DO is evicted during
 // it, pi-durable's recovery reruns the generation (the fiber heartbeat
 // wakes it), so the cost is a restarted wait, not a stuck turn.
 
