@@ -352,10 +352,27 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     const aborted = new AbortController();
     aborted.abort();
     const res = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, { signal: aborted.signal });
-    // createAI's transport wraps the thrown abort as a CloudflareAIError, so
-    // pi-ai may report it as "error"; what matters is that nothing was sent.
-    expect(["aborted", "error"]).toContain(res.stopReason);
+    // pi-ai reports a pre-aborted call as "error" here (seen with both an
+    // AbortError and a raw reason); what matters is that nothing was sent.
+    // Live abort mid-turn on preview ends the prompt as "aborted".
+    expect(res.stopReason).not.toBe("stop");
     expect(calls).toHaveLength(1);
+  });
+
+  it("fails a binding stream that goes quiet as a retryable idle timeout, on both refs", async () => {
+    // Headers arrive, then the SSE body never sends anything.
+    const { binding } = fakeAIBinding(
+      () => new Response(new ReadableStream({ start() {} }), { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    const models = createModels();
+    setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env, { idleMs: 50 });
+    const ref = agentModelRef("anthropic/claude-sonnet-4-6", config, env);
+    for (const model of [models.getModel(ref.provider, ref.modelId)!, models.getModel("dodo-gateway", "anthropic/claude-sonnet-4-6")!]) {
+      const res = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+      expect(res.stopReason).toBe("error");
+      expect(res.errorMessage).toMatch(/idle timeout/);
+    }
   });
 
   it("waits out a 429 from the gateway and resends the binding call", async () => {

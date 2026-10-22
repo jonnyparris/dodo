@@ -75,9 +75,11 @@ export function gatewayMetadata(sessionId: string | undefined, role: "main" | "s
 
 type GatewayRun = (request: unknown, options?: { signal?: AbortSignal | null } & Record<string, unknown>) => Promise<Response>;
 
-function abortReason(signal: AbortSignal): unknown {
-  if (signal.reason !== undefined) return signal.reason;
-  const error = new Error("Request aborted");
+/** Always an AbortError, so createAI and pi-ai report "aborted", not a failure. */
+function abortReason(signal: AbortSignal): Error {
+  const reason = signal.reason as unknown;
+  if (reason instanceof Error && reason.name === "AbortError") return reason;
+  const error = new Error("Request aborted", { cause: reason });
   error.name = "AbortError";
   return error;
 }
@@ -97,12 +99,15 @@ export async function runWithLocalSignal(run: GatewayRun, request: unknown, opti
   if (!signal) return run(request, options);
   const { signal: _dropped, ...rest } = options!;
   if (signal.aborted) throw abortReason(signal);
+  // Start the call first: a synchronous throw then leaves no abort listener behind.
+  const pending = run(request, rest);
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => reject(abortReason(signal));
+    // run() may have aborted the signal synchronously; "abort" won't fire again.
+    if (signal.aborted) return onAbort();
     signal.addEventListener("abort", onAbort, { once: true });
   });
-  const pending = run(request, rest);
   let response: Response;
   try {
     response = await Promise.race([pending, aborted]);
@@ -152,8 +157,10 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
   // `env.AI` is an RPC stub: every property access, `.bind` and `.call`
   // included, becomes a remote call. So never touch methods on it; call them
   // by name through closures (seen live 2026-10-22: `.bind` sent an
-  // RpcPromise over the wire and failed to serialise). `gateway(id)` gets a
-  // plain object back, so nothing awaits or probes the RpcPromise.
+  // RpcPromise over the wire and failed to serialise). `gateway(id)` returns
+  // a plain wrapper; the underlying call is still a pipelined RPC.
+  // Two calls are adapted: `gateway(id).run` (Anthropic) and `run` (the
+  // Workers AI path for `@cf/` models when WORKERS_AI_VIA_BINDING is on).
   type Callable = Record<PropertyKey, (...args: unknown[]) => unknown>;
   const stub = binding as unknown as Callable;
   const local = (run: GatewayRun): GatewayRun => (request, options) => {
@@ -173,6 +180,9 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
           };
         };
       }
+      // Never let the adapter look thenable: `await` on it would be a remote call.
+      if (prop === "then") return undefined;
+      if (typeof prop === "symbol") return Reflect.get(target, prop, target);
       // Workers AI run path (`@cf/` models when WORKERS_AI_VIA_BINDING is
       // on): same AbortSignal problem, and the same 429 wait as the gateway
       // leg, because `/compat` waited out Workers AI 429s too.
