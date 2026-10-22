@@ -122,7 +122,7 @@ export async function runWithLocalSignal(run: GatewayRun, request: unknown, opti
 type Retry = (send: () => Promise<Response>, signal?: AbortSignal | null) => Promise<Response>;
 
 /** Workers AI rate-limit errors: 3021 (requests per minute) and 3040 (capacity), by code or by their wording. */
-const RATE_LIMIT_ERROR = /\b(3021|3040)\b|per min rate reached|capacity temporarily exceeded|too many requests/i;
+const RATE_LIMIT_ERROR = /(?:^|AiError:?\s*)(3021|3040):|per min rate reached|capacity temporarily exceeded/i;
 
 /**
  * `env.AI.run` with `returnRawResponse` should hand back a 429 as a Response,
