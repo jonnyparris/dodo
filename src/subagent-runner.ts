@@ -2,7 +2,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createAI } from "agents/models/ai-sdk";
 import { generateText, stepCountIs, wrapLanguageModel, type LanguageModel, type LanguageModelMiddleware, type ModelMessage, type ToolSet } from "ai";
-import { bindingGatewayId, gatewayMetadata } from "./cloudflare-ai";
+import { adaptBindingForCreateAI, bindingGatewayId, gatewayMetadata } from "./cloudflare-ai";
 import type { AgentProfile } from "./agent-profile";
 import {
   EXPLORE_PROFILE,
@@ -437,7 +437,7 @@ export const anthropicCacheMiddleware: LanguageModelMiddleware = {
  */
 function buildAnthropicCreateAIProvider(gatewayId: string, env: Env, sessionAffinity?: string) {
   const metadata = gatewayMetadata(sessionAffinity, "subagent");
-  const ai = createAI({ binding: env.AI, id: gatewayId, ...(metadata ? { metadata } : {}) });
+  const ai = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId, ...(metadata ? { metadata } : {}) });
   const anthropic = createAnthropic({ apiKey: "unused" });
   // Dodo ids are `anthropic/claude-…`; Anthropic wants `claude-…`.
   const model = (modelId: string): LanguageModel =>

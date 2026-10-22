@@ -22,7 +22,7 @@ import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { CLOUDFLARE_AI_GATEWAY_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-ai-gateway.models";
 import { CLOUDFLARE_PROVIDER_ID, createAI } from "agents/models/pi-ai";
-import { bindingGatewayId, bindingWithGatewayRetry, gatewayMetadata } from "../cloudflare-ai";
+import { bindingGatewayId, adaptBindingForCreateAI, gatewayMetadata } from "../cloudflare-ai";
 import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
@@ -119,7 +119,7 @@ export function createAIGatewayId(modelId: string, config: GatewayConfig, env: P
 function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLimit?: RateLimitFetchOptions) {
   // createAI never calls fetch, so the 429 wait wraps the binding call. The
   // URL is a label only: the wrapped "fetch" ignores it and calls the binding.
-  const binding = bindingWithGatewayRetry(env.AI, (run, signal) =>
+  const binding = adaptBindingForCreateAI(env.AI, (run, signal) =>
     rateLimitFetch(() => run(), rateLimit)("https://gateway.ai.cloudflare.com/universal", { signal: signal ?? undefined }),
   );
   const metadata = gatewayMetadata(config.sessionId, "main");

@@ -7,6 +7,10 @@ export function fakeAIBinding(respond: (query: Record<string, unknown>) => Respo
   const binding = {
     gateway: (gatewayId: string) => ({
       run: async (request: (typeof calls)[number]["request"], options: Record<string, unknown>) => {
+        // Like workerd without enable_abortsignal_rpc: an AbortSignal can't cross the binding.
+        if (options && Object.values(options).some((v) => v instanceof AbortSignal)) {
+          throw new Error("AbortSignal serialization is not enabled.");
+        }
         calls.push({ gatewayId, request, options });
         return respond(request.query);
       },

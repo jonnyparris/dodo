@@ -334,6 +334,25 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     expect(models.getModel(CREATE_AI_PROVIDER_ID, "anthropic/claude-sonnet-4-6")).toBeUndefined();
   });
 
+  it("keeps the caller's AbortSignal off the binding call and still honours it", async () => {
+    const { binding, calls } = fakeAIBinding(() => reply());
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    const models = createModels();
+    setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
+    const ref = agentModelRef("anthropic/claude-sonnet-4-6", config, env);
+    const model = models.getModel(ref.provider, ref.modelId)!;
+    const ok = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, { signal: new AbortController().signal });
+    expect(ok.errorMessage).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    const aborted = new AbortController();
+    aborted.abort();
+    const res = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, { signal: aborted.signal });
+    // createAI's transport wraps the thrown abort as a CloudflareAIError, so
+    // pi-ai may report it as "error"; what matters is that nothing was sent.
+    expect(["aborted", "error"]).toContain(res.stopReason);
+    expect(calls).toHaveLength(1);
+  });
+
   it("waits out a 429 from the gateway and resends the binding call", async () => {
     let n = 0;
     const { binding, calls } = fakeAIBinding(() =>

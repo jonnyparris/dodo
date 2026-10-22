@@ -68,12 +68,53 @@ export function gatewayMetadata(sessionId: string | undefined, role: "main" | "s
 
 type GatewayRun = (request: unknown, options?: { signal?: AbortSignal | null } & Record<string, unknown>) => Promise<Response>;
 
+function abortReason(signal: AbortSignal): unknown {
+  if (signal.reason !== undefined) return signal.reason;
+  const error = new Error("Request aborted");
+  error.name = "AbortError";
+  return error;
+}
+
 /**
- * The `AI` binding, with `gateway(id).run` sent through `retry`. createAI
- * never calls `fetch`, so the 429 wait in rate-limit-fetch.ts has to sit on
- * the binding instead. Everything else passes through untouched.
+ * Call the binding without handing it the AbortSignal, and apply the signal
+ * here instead. createAI passes `signal` to `env.AI.gateway(id).run`, but the
+ * binding is an RPC call and workerd refuses to serialise an AbortSignal
+ * without the `enable_abortsignal_rpc` flag ("AbortSignal serialization is
+ * not enabled", seen live on preview 2026-10-22). On abort the wait rejects
+ * and the response body stops (pipeTo cancels the source).
  */
-export function bindingWithGatewayRetry(binding: Ai, retry: (send: () => Promise<Response>, signal?: AbortSignal | null) => Promise<Response>): Ai {
+export async function runWithLocalSignal(run: GatewayRun, request: unknown, options?: Parameters<GatewayRun>[1]): Promise<Response> {
+  const signal = options?.signal ?? undefined;
+  if (!signal) return run(request, options);
+  const { signal: _dropped, ...rest } = options!;
+  if (signal.aborted) throw abortReason(signal);
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  let response: Response;
+  try {
+    response = await Promise.race([run(request, rest), aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort!);
+  }
+  if (!response.body) return response;
+  const { readable, writable } = new TransformStream();
+  response.body.pipeTo(writable, { signal }).catch(() => {});
+  return new Response(readable, response);
+}
+
+type Retry = (send: () => Promise<Response>, signal?: AbortSignal | null) => Promise<Response>;
+
+/**
+ * The `AI` binding, adapted for createAI: `gateway(id).run` keeps the
+ * AbortSignal on this side of the RPC boundary (runWithLocalSignal) and, when
+ * `retry` is given, goes through it. createAI never calls `fetch`, so the 429
+ * wait in rate-limit-fetch.ts has to sit on the binding instead. Everything
+ * else passes through untouched.
+ */
+export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
   return new Proxy(binding, {
     get(target, prop) {
       const value = Reflect.get(target, prop, target) as unknown;
@@ -88,7 +129,10 @@ export function bindingWithGatewayRetry(binding: Ai, retry: (send: () => Promise
             if (typeof member !== "function") return member;
             if (p !== "run") return (member as (...a: unknown[]) => unknown).bind(g);
             const run = (member as GatewayRun).bind(g);
-            return (request: unknown, options?: Parameters<GatewayRun>[1]) => retry(() => run(request, options), options?.signal);
+            return (request: unknown, options?: Parameters<GatewayRun>[1]) => {
+              const send = () => runWithLocalSignal(run, request, options);
+              return retry ? retry(send, options?.signal) : send();
+            };
           },
         });
       };
