@@ -98,6 +98,19 @@ jobs:
               break;
             }
 
+            // A re-run reuses the original event, so an old run could redeploy a
+            // stale commit over this PR's newer push. Skip it.
+            if (thisPr) {
+              const { data: live } = await github.rest.pulls.get({ owner, repo, pull_number: thisPr });
+              if (live.head.sha !== context.payload.pull_request.head.sha) {
+                const msg = `Not deployed: this run is for \`${context.payload.pull_request.head.sha.slice(0, 7)}\`, but #${thisPr} has moved on to \`${live.head.sha.slice(0, 7)}\`.`;
+                core.notice(msg);
+                await core.summary.addRaw(msg).write();
+                core.setOutput("deploy", "false");
+                return;
+              }
+            }
+
             const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: "open", per_page: 100 });
             const holders = prs.filter((pr) => pr.labels.some((l) => l.name === "preview-lock"));
             if (holders.length > 1) {
@@ -108,6 +121,7 @@ jobs:
             let targetPr = thisPr;
             let targetSha = "";
             let blockedBy = "";
+            let fromFork = false;
             const holder = holders.find((h) => h.number === thisPr) ? null : holders[0];
             if (holder && !force) {
               blockedBy = String(holder.number);
@@ -118,12 +132,15 @@ jobs:
                 targetSha = holder.head.sha;
               } else {
                 deploy = false;
+                fromFork = true;
               }
             } else if (holder && force) {
               core.warning(`Forced deploy over preview-lock held by #${holder.number}`);
             }
 
-            const summary = !deploy
+            const summary = fromFork
+              ? `Preview not deployed: #${blockedBy} holds \`preview-lock\`, but its head is on a fork, which this workflow cannot deploy. Remove the label or use workflow_dispatch with force.`
+              : !deploy
               ? `Preview not deployed: #${blockedBy} holds the \`preview-lock\` label and the preview serves its build.`
               : targetSha
                 ? `#${blockedBy} holds \`preview-lock\` but the preview was not serving its head, so this run deploys #${blockedBy} (\`${targetSha.slice(0, 7)}\`), not this run's ref.`
@@ -148,9 +165,9 @@ jobs:
             const { owner, repo } = context.repo;
             const marker = "<!-- dodo-preview:status -->";
             const sha = context.payload.pull_request.head.sha;
-            const body = `${marker}\nPreview not deployed: #${process.env.HOLDER} holds the \`preview-lock\` label, so ${process.env.PREVIEW_URL} keeps serving its build.\n\nThis run (\`${sha.slice(0, 7)}\`) skipped the deploy. When the label is gone, re-run this PR's deploy-preview job (the lock is read live, so a re-run works), or add \`preview-lock\` here to claim the preview.`;
+            const body = `${marker}\nPreview not deployed: #${process.env.HOLDER} holds the \`preview-lock\` label, so ${process.env.PREVIEW_URL} serves #${process.env.HOLDER}'s build, not this PR's.\n\nThis PR's \`${sha.slice(0, 7)}\` was not deployed. When the label is gone, re-run this PR's deploy-preview job (the lock is read live, so a re-run works), or add \`preview-lock\` here to claim the preview.`;
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: context.issue.number, per_page: 100 });
-            const existing = comments.find((c) => c.body && (c.body.includes(marker) || c.body.startsWith("Preview deployed:")));
+            const existing = comments.find((c) => c.user?.login === "github-actions[bot]" && c.body && (c.body.includes(marker) || c.body.includes("<!-- dodo-preview -->") || c.body.startsWith("Preview deployed:")));
             if (existing) {
               await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
             } else {
@@ -158,7 +175,12 @@ jobs:
             }
       - name: Switch to the lock holder's head
         if: steps.lock.outputs.deploy == 'true' && steps.lock.outputs.target_sha != ''
-        run: git checkout --detach "${{ steps.lock.outputs.target_sha }}"
+        env:
+          TARGET_SHA: ${{ steps.lock.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$TARGET_SHA" || { echo "::error::cannot fetch the lock holder's head $TARGET_SHA"; exit 1; }
+          git checkout --detach "$TARGET_SHA"
       - name: Resolve deployed commit
         if: steps.lock.outputs.deploy == 'true'
         id: head
@@ -281,7 +303,7 @@ jobs:
             if (targetPr) {
               const body = `${statusMarker}\nPreview deployed: ${url}\n\nServes \`${short}\` from this PR. Access-gated (same policies as prod). Load it in a Browser Run session with the Dodo service token to verify UI changes.\n\nThe preview is shared: the next PR push replaces this build, and this PR gets a new comment when that happens. Add the \`preview-lock\` label to hold it during a live check, and remove the label when you are done.${replaced}`;
               const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: targetPr, per_page: 100 });
-              const existing = comments.find((c) => c.body && (c.body.includes(statusMarker) || c.body.startsWith("Preview deployed:")));
+              const existing = comments.find((c) => c.user?.login === "github-actions[bot]" && c.body && (c.body.includes(statusMarker) || c.body.includes("<!-- dodo-preview -->") || c.body.startsWith("Preview deployed:")));
               if (existing) {
                 await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
               } else {
