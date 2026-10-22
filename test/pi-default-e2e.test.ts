@@ -319,6 +319,20 @@ describe("pi is the default engine", () => {
     throw new Error(`queued cron never ran (queue: ${JSON.stringify(queue)})`);
   });
 
+  it("an async prompt reads 'running' once its fiber starts, not 'queued' for the whole turn", async () => {
+    const id = await newSession();
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "slow async prompt" }));
+    let status = "";
+    for (let i = 0; i < 200 && status !== "running"; i++) {
+      const { prompts } = await json<{ prompts: Array<{ id: string; status: string }> }>(await call(`/session/${id}/prompts`));
+      status = prompts.find((p) => p.id === promptId)?.status ?? "";
+      if (status !== "running") await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(status).toBe("running");
+    releaseMockSlowPrompt();
+    expect((await waitForPrompt(id, promptId)).status).toBe("completed");
+  });
+
   it("while an async prompt runs, the alarm stays a 30s heartbeat (so an evicted run wakes and recovers)", async () => {
     const id = await newSession();
     const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<T>) => Promise<T>;

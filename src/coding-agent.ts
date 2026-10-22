@@ -3663,6 +3663,14 @@ export class CodingAgent extends CodingAgentBase {
       return;
     }
 
+    // The fiber body is running: say so. Without this the row stays
+    // "queued" for the whole turn, so a turn that hangs mid-run looks
+    // exactly like one whose fiber never started.
+    if (promptStatus === "queued") {
+      this.updatePrompt(promptId, { status: "running" });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+    }
+
     // Refresh the session config from the latest account config before each prompt run.
     await this.readAppConfig();
 
