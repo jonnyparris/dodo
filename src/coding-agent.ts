@@ -39,6 +39,8 @@ const NEEDS_INPUT_KEY = "needs_input";
 const COMPLETION_WEBHOOK_KEY = "completion_webhook";
 /** Set when PUT /model-override lands mid-run: rebuild the session config when the run ends. */
 const CONFIG_REFRESH_PENDING = "config_refresh_pending";
+/** The owner's default model as of the last config rebuild (the next prompt uses it unless the session has an override). */
+const OWNER_MODEL_KEY = "owner_default_model";
 /** While a person is needed, poke the browser this often (Browser Run idle keep_alive is 180 s). */
 const BROWSER_WARM_INTERVAL_SECONDS = 120;
 /** ~20 minutes of keeping the browser alive for a handoff. */
@@ -827,7 +829,9 @@ export class CodingAgent extends CodingAgentBase {
       onPromptStart: () => this.clearNeedsInput(),
       onPromptFinished: (promptId, cause) => {
         this.ringCompletionWebhook(promptId, cause.kind);
-        if (this.readMetadata(CONFIG_REFRESH_PENDING)) void this.refreshConfigAfterRun();
+        if (this.readMetadata(CONFIG_REFRESH_PENDING)) {
+          this.refreshConfigAfterRun().catch((error) => log("warn", "config refresh after run failed", { sessionId: this.sessionId(), error: String(error) }));
+        }
       },
     });
   }
@@ -5071,6 +5075,10 @@ export class CodingAgent extends CodingAgentBase {
     const modelId = pending.model ?? config?.model ?? this.env.DEFAULT_MODEL ?? "";
     const exploreModel = pending.exploreModel ?? config?.exploreModel;
     const taskModel = pending.taskModel ?? config?.taskModel;
+    // The next prompt's main model. Same as modelId when idle; while a prompt
+    // runs it can differ (override set or cleared mid-run). Clients show it
+    // as "next" so they don't have to guess the owner's default.
+    const nextModel = status === "running" ? modelOverride.model ?? this.readMetadata(OWNER_MODEL_KEY) ?? modelId : modelId;
     const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
     const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
     // Use latest assistant turn's input tokens as the best proxy for current context size
@@ -5108,6 +5116,7 @@ export class CodingAgent extends CodingAgentBase {
       totalTokenInput,
       totalTokenOutput,
       updatedAt,
+      ...(nextModel ? { nextModel } : {}),
       ...(exploreModel ? { exploreModel } : {}),
       ...(taskModel ? { taskModel } : {}),
       ...(Object.keys(modelOverride).length > 0 ? { modelOverride } : {}),
@@ -5964,6 +5973,7 @@ export class CodingAgent extends CodingAgentBase {
       taskMode: appConfig.taskMode ?? "inprocess",
     };
     this.configure(dodoConfig);
+    if (appConfig.model) this.writeMetadata(OWNER_MODEL_KEY, appConfig.model);
 
     return appConfig;
   }
@@ -6015,20 +6025,22 @@ export class CodingAgent extends CodingAgentBase {
    * started, its own readAppConfig did the job.
    */
   private async refreshConfigAfterRun(): Promise<void> {
-    this.metadataKv.delete(CONFIG_REFRESH_PENDING);
-    if (this.control.read().status === "running") return;
-    await this.refreshConfigFromOwner();
+    if (this.control.read().status === "running") return this.metadataKv.delete(CONFIG_REFRESH_PENDING);
+    // Keep the flag if the refresh fails, so the next run end retries.
+    if (await this.refreshConfigFromOwner()) this.metadataKv.delete(CONFIG_REFRESH_PENDING);
     if (this.control.read().status === "running") return;
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
   }
 
-  /** readAppConfig for display paths: a UserControl failure must not fail the request. */
-  private async refreshConfigFromOwner(): Promise<void> {
-    if (!this.readMetadata("owner_email")) return;
+  /** readAppConfig for display paths: a UserControl failure must not fail the request. False only when the refresh failed. */
+  private async refreshConfigFromOwner(): Promise<boolean> {
+    if (!this.readMetadata("owner_email")) return true; // no owner yet: nothing to refresh
     try {
       await this.readAppConfig();
+      return true;
     } catch (error) {
       log("warn", "could not refresh session config from owner", { sessionId: this.sessionId(), error: String(error) });
+      return false;
     }
   }
 

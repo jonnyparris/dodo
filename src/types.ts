@@ -187,7 +187,10 @@ export interface SessionState {
   contextWindow: number;
   createdAt: string;
   messageCount: number;
+  /** Main model: the running prompt's while one runs, else the next prompt's. */
   model: string;
+  /** The next prompt's main model. Differs from `model` only while a prompt runs and the override changed. */
+  nextModel?: string;
   ownerEmail?: string;
   sessionId: string;
   status: "idle" | "running" | "deleted";

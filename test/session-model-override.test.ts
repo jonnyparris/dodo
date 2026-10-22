@@ -56,7 +56,7 @@ async function waitForPrompt(id: string, promptId: string, ms = 3000) {
   throw new Error("prompt never finished");
 }
 
-type Session = { model: string; exploreModel?: string; taskModel?: string; modelOverride?: Record<string, string> };
+type Session = { model: string; nextModel?: string; exploreModel?: string; taskModel?: string; modelOverride?: Record<string, string> };
 
 describe("per-session model override", () => {
   it("pins the session (and its subagents) to other models without changing the owner's config", async () => {
@@ -222,6 +222,7 @@ describe("PUT /session/:id/model-override", () => {
       expect(s.model).toBe(owner);
       expect(s.contextWindow).toBe(200_000);
       expect(s.modelOverride?.model).toBe(pinned);
+      expect(s.nextModel).toBe(pinned);
       releaseMockSlowPrompt();
       await waitForPrompt(id, first.promptId);
       s = await json<Details>(await call(`/session/${id}`));
@@ -236,6 +237,7 @@ describe("PUT /session/:id/model-override", () => {
       s = await json<Details>(await call(`/session/${id}`));
       expect(s.model).toBe(pinned);
       expect(s.modelOverride).toBeUndefined();
+      expect(s.nextModel).toBe(owner);
       releaseMockSlowPrompt();
       await waitForPrompt(id, second.promptId);
 
@@ -245,6 +247,7 @@ describe("PUT /session/:id/model-override", () => {
         s = await json<Details>(await call(`/session/${id}`));
       }
       expect(s.model).toBe(owner);
+      expect(s.nextModel).toBe(owner);
       expect(s.contextWindow).toBe(200_000);
       const stub = await getAgentByName(typedEnv.CODING_AGENT as never, id);
       expect((await inDO<{ model: string }>(stub, async (agent) => agent.getConfig())).model).toBe(owner);

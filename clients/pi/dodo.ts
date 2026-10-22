@@ -30,6 +30,7 @@ interface SessionState {
   sessionId: string;
   status: "idle" | "running" | "deleted";
   model: string;
+  nextModel?: string;
   modelOverride?: { model?: string; exploreModel?: string; taskModel?: string };
   contextUsagePercent?: number;
   contextWindow?: number;
@@ -254,7 +255,7 @@ export default function dodo(pi: ExtensionAPI) {
   const notify = (msg: string, level: "info" | "warning" | "error" = "info") => ui()?.notify(msg, level);
   const note = (level: NoteEntry["level"], text: string) => pi.appendEntry<NoteEntry>("dodo-note", { level, text });
 
-  /** The owner's default model (every prompt re-reads it); the next prompt uses it unless the session has an override. */
+  /** My default model (/api/config): the next-model fallback for servers that don't report `nextModel`. */
   let defaultModel: string | undefined;
   /** The running prompt's model while one runs (plus `→ next` if the next prompt changes it), else the next prompt's. */
   const modelOf = (s?: SessionState) => formatModelLabel(modelLabel(s, defaultModel));
@@ -537,8 +538,11 @@ export default function dodo(pi: ExtensionAPI) {
     } else if (model === "default" || model === "clear") {
       model = "";
     }
-    const r = await client().request<{ modelOverride: SessionState["modelOverride"] }>(`/session/${attached.id}/model-override`, { method: "PUT", body: { model } });
-    if (state) state = { ...state, modelOverride: r.modelOverride };
+    const id = attached.id;
+    const r = await client().request<{ modelOverride: SessionState["modelOverride"] }>(`/session/${id}/model-override`, { method: "PUT", body: { model } });
+    // Re-read the details: the server resolves `model`/`nextModel` against the owner's config.
+    const fresh = await client().request<SessionState>(`/session/${id}`).catch(() => undefined);
+    if (attached?.id === id && state) state = fresh ?? { ...state, modelOverride: r.modelOverride, nextModel: undefined };
     updateStatus();
     const running = state?.status === "running" ? " The running prompt keeps its main model." : "";
     notify(model ? `Session model → ${model}.${running}` : `Session model → your default.${running}`);
