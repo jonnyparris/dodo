@@ -400,6 +400,46 @@ describe("Idle session auto-cleanup", () => {
     expect(alarmAt).not.toBeNull();
   });
 
+  it("keeps a fork of a prompted session: the fork carries its transcript, not its prompt rows", async () => {
+    // Regression: snapshot import copies messages and files but not the
+    // prompts table, so /prompts/count on the fork was 0 and the sweep
+    // soft-deleted the forked conversation 10 minutes after creation.
+    const baseId = await createSession();
+    const typedEnv = env as Env;
+    const baseAgent = typedEnv.CODING_AGENT.get(typedEnv.CODING_AGENT.idFromName(baseId));
+    const now = new Date().toISOString();
+    const imported = await baseAgent.fetch(new Request("https://coding-agent/snapshot/import", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-dodo-session-id": baseId, "x-owner-email": "dev@dodo.local" },
+      body: JSON.stringify({
+        title: null,
+        files: [],
+        messages: [
+          { id: "m-user", role: "user", content: "hello", createdAt: now, model: null, provider: null },
+          { id: "m-asst", role: "assistant", content: "hi there", createdAt: now, model: "test", provider: "test" },
+        ],
+      }),
+    }));
+    expect(imported.status).toBe(200);
+    await seedPrompt(baseId);
+
+    const forkRes = await fetchJson(`/session/${baseId}/fork`, { method: "POST" });
+    expect(forkRes.status).toBe(201);
+    const forkId = ((await forkRes.json()) as { id: string }).id;
+
+    // The fork holds the conversation but no prompt rows of its own.
+    const forkAgent = typedEnv.CODING_AGENT.get(typedEnv.CODING_AGENT.idFromName(forkId));
+    const counts = (await (await forkAgent.fetch(new Request("https://coding-agent/prompts/count"))).json()) as { count: number; messages: number };
+    expect(counts.count).toBe(0);
+    expect(counts.messages).toBeGreaterThan(0);
+
+    await backdateSession(forkId, 11 * 60);
+    await runSweep();
+
+    expect(await getSessionStatus(forkId)).toBe("idle");
+    expect(await hasPromptsFlag(forkId)).toBe(1);
+  });
+
   it("refuses to fork a soft-deleted source", async () => {
     const baseId = await createSession();
     await backdateSession(baseId, 11 * 60);

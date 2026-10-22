@@ -1479,8 +1479,12 @@ export class CodingAgent extends CodingAgentBase {
       if (request.method === "GET" && url.pathname === "/prompts/count") {
         // Lightweight count endpoint used by the UserControl idle-session
         // sweep. Full /prompts would serialise the whole list.
+        // `messages` counts transcript messages too: a fork imports the
+        // source's messages but not its prompt rows, so prompts alone
+        // reads 0 and the sweep would delete a forked conversation.
         const row = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM prompts"))[0] as SqlRow | null);
-        return Response.json({ count: Number(row?.n ?? 0) });
+        const msgRow = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM message_metadata"))[0] as SqlRow | null);
+        return Response.json({ count: Number(row?.n ?? 0), messages: Number(msgRow?.n ?? 0) });
       }
 
       if (request.method === "GET" && url.pathname === "/prompt-queue") {

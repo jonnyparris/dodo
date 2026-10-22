@@ -3840,8 +3840,8 @@ export class UserControl extends DurableObject<Env> {
 
   /**
    * Soft-delete sessions that have been idle for at least
-   * IDLE_SESSION_TTL_SECONDS *and* never received a prompt. The "no
-   * prompts" check requires a per-session cross-DO call to the
+   * IDLE_SESSION_TTL_SECONDS *and* hold no prompts and no transcript
+   * messages (a fork has messages but no prompt rows). The "empty" check requires a per-session cross-DO call to the
    * CodingAgent, so we bound the batch size to keep wake-ups cheap.
    *
    * The sweep intentionally skips sessions already in the `deleted`
@@ -3867,9 +3867,9 @@ export class UserControl extends DurableObject<Env> {
 
     for (const row of candidates) {
       const sessionId = String(row.id);
-      let promptCount: number;
+      let contentCount: number;
       try {
-        promptCount = await this.countSessionPrompts(sessionId);
+        contentCount = await this.countSessionContent(sessionId);
       } catch (err) {
         // If the CodingAgent DO is unreachable, leave the session alone —
         // better to retry next sweep than to delete blindly.
@@ -3880,7 +3880,7 @@ export class UserControl extends DurableObject<Env> {
         continue;
       }
 
-      if (promptCount > 0) {
+      if (contentCount > 0) {
         // Remember it, so this session never takes a batch slot again.
         // Without this, 25+ old prompted sessions sit at the head of the
         // ORDER BY updated_at queue and newer empty ones are never reached.
@@ -3890,7 +3890,7 @@ export class UserControl extends DurableObject<Env> {
 
       // Reuse the same soft-delete primitive as the manual DELETE path
       // so the 5-min recovery window behaves identically.
-      // Re-check the exemptions in the UPDATE itself: countSessionPrompts
+      // Re-check the exemptions in the UPDATE itself: countSessionContent
       // awaits a cross-DO call, and the session may have been forked,
       // prompted or touched in the meantime.
       const deleteExpiry = nowEpoch() + 300;
@@ -3910,11 +3910,13 @@ export class UserControl extends DurableObject<Env> {
   }
 
   /**
-   * Ask a session's CodingAgent DO how many prompts it holds. Uses the
-   * lightweight /prompts/count endpoint — a GET of /prompts would
-   * serialise the whole list, which can be 100s of rows.
+   * Ask a session's CodingAgent DO how many prompts plus transcript
+   * messages it holds. Uses the lightweight /prompts/count endpoint — a
+   * GET of /prompts would serialise the whole list, which can be 100s of
+   * rows. Messages count because a fork imports the source's transcript
+   * but not its prompt rows.
    */
-  private async countSessionPrompts(sessionId: string): Promise<number> {
+  private async countSessionContent(sessionId: string): Promise<number> {
     const agent = await getAgentByName(this.env.CODING_AGENT as never, sessionId);
     const res = await agent.fetch(
       new Request("https://coding-agent/prompts/count", { method: "GET" }),
@@ -3922,8 +3924,8 @@ export class UserControl extends DurableObject<Env> {
     if (!res.ok) {
       throw new Error(`prompt count fetch failed: ${res.status}`);
     }
-    const body = (await res.json()) as { count?: number };
-    return Number(body.count ?? 0);
+    const body = (await res.json()) as { count?: number; messages?: number };
+    return Number(body.count ?? 0) + Number(body.messages ?? 0);
   }
 
   /**
