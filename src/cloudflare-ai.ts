@@ -13,7 +13,8 @@
 // `@cf/` ids take createAI's Workers AI run path (`env.AI.run` with the
 // gateway option, plus createAI's per-model request quirks) when
 // WORKERS_AI_VIA_BINDING is on, main session only. Off by default until a
-// live A/B (bench/model-ab.ts) shows it is at least as good as `/compat`.
+// live A/B shows it is at least as good as `/compat` (run bench/model-ab.ts
+// against two deploys, one with the var set; the bench can't set it).
 //
 // Everything else on AI Gateway (OpenAI, Google, DeepSeek; `@cf/` with the
 // flag off or in explore/task subagents) stays on `/compat` with
@@ -57,7 +58,7 @@ export function bindingGatewayId(config: GatewayRouteConfig, env: Pick<Env, "AI"
   if (env.CLOUDFLARE_ACCOUNT_ID?.trim() !== accountId) {
     if (!warnedAccount) {
       warnedAccount = true;
-      log("warn", "createAI: CLOUDFLARE_ACCOUNT_ID is unset or doesn't match AI_GATEWAY_BASE_URL; Anthropic stays on /compat (no prompt caching)", {
+      log("warn", "createAI: CLOUDFLARE_ACCOUNT_ID is unset or doesn't match AI_GATEWAY_BASE_URL; createAI models (Anthropic, and @cf/ with WORKERS_AI_VIA_BINDING) stay on /compat", {
         gatewayAccount: accountId,
         accountSet: !!env.CLOUDFLARE_ACCOUNT_ID,
       });
@@ -120,6 +121,26 @@ export async function runWithLocalSignal(run: GatewayRun, request: unknown, opti
 
 type Retry = (send: () => Promise<Response>, signal?: AbortSignal | null) => Promise<Response>;
 
+/** Workers AI rate-limit errors: 3021 (requests per minute), 3040 (capacity), or plain 429 wording. */
+const RATE_LIMIT_ERROR = /\b3021\b|\b3040\b|\b429\b|rate (limit|reached)|too many requests|capacity temporarily exceeded/i;
+
+/**
+ * `env.AI.run` with `returnRawResponse` should hand back a 429 as a Response,
+ * but an `AiError` can also be thrown (3021 arrives that way on other paths;
+ * see rate-limit-fetch.ts). Turn a thrown rate limit into a 429 Response so
+ * the retry wrapper waits it out; anything else is rethrown unchanged.
+ */
+export async function runAsResponse(run: () => Promise<Response>): Promise<Response> {
+  try {
+    return await run();
+  } catch (error) {
+    const httpCode = (error as { httpCode?: unknown } | null)?.httpCode;
+    const message = error instanceof Error ? error.message : String(error);
+    if (httpCode !== 429 && !RATE_LIMIT_ERROR.test(message)) throw error;
+    return new Response(JSON.stringify({ errors: [{ message }] }), { status: 429, headers: { "content-type": "application/json" } });
+  }
+}
+
 /**
  * The `AI` binding, adapted for createAI: `gateway(id).run` keeps the
  * AbortSignal on this side of the RPC boundary (runWithLocalSignal) and, when
@@ -157,8 +178,12 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
       // leg, because `/compat` waited out Workers AI 429s too.
       if (prop === "run") {
         return (model: unknown, inputs: unknown, options?: Parameters<GatewayRun>[1]) =>
-          local((_req, opts) => stub.run(model, inputs, opts) as Promise<Response>)(undefined, options);
+          local((_req, opts) => runAsResponse(() => stub.run(model, inputs, opts) as Promise<Response>))(undefined, options);
       }
+      // createAI reads this after a run call as a fallback log id. On the stub
+      // it would be a remote property (an RpcPromise, not a string); the
+      // `cf-aig-log-id` response header carries the same id.
+      if (prop === "aiGatewayLogId") return undefined;
       const value = Reflect.get(target, prop, target) as unknown;
       return typeof value === "function" ? (...args: unknown[]) => stub[prop](...args) : value;
     },

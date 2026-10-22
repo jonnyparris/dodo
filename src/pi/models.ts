@@ -155,21 +155,7 @@ function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLim
 export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> | Model<"anthropic-messages"> | Model<WorkersAIApi> {
   const entry = CATALOG.get(modelId);
   const gatewayId = createAIGatewayId(modelId, config, env);
-  if (gatewayId && modelId.startsWith("@cf/")) {
-    // createAI's Workers AI model (api `cloudflare-ai`, run path) with Dodo's
-    // limits and prices. `reasoning: false` like the `/compat` leg: pi sends
-    // no effort, so the model keeps its own default, same as before.
-    const base = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId })(modelId) as Model<WorkersAIApi>;
-    return {
-      ...base,
-      name: modelId,
-      reasoning: false,
-      input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
-      cost: modelCost(modelId),
-      contextWindow: entry?.contextWindow ?? base.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
-      maxTokens: DEFAULT_MAX_TOKENS,
-    };
-  }
+  if (gatewayId && modelId.startsWith("@cf/")) return workersAIModel(modelId, gatewayId, env);
   if (gatewayId) {
     // createAI's catalog model (api anthropic-messages, gateway-shaped
     // baseUrl, provider `cloudflare`, id = the Dodo id) with Dodo's limits and
@@ -186,6 +172,27 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
     };
   }
   return compatModel(modelId, config);
+}
+
+/**
+ * createAI's Workers AI model (api `cloudflare-ai`, run path) with Dodo's
+ * limits and prices. `reasoning: false` like the `/compat` leg: pi sends no
+ * effort, so the model keeps its own default, same as before. The context
+ * window falls back to pi-ai's Workers AI catalog (e.g. 32k for Qwen3 30B),
+ * which also bounds `max_tokens` (withWorkersAIMaxTokens).
+ */
+function workersAIModel(modelId: string, gatewayId: string, env: Env): Model<WorkersAIApi> {
+  const entry = CATALOG.get(modelId);
+  const base = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId })(modelId) as Model<WorkersAIApi>;
+  return {
+    ...base,
+    name: modelId,
+    reasoning: false,
+    input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
+    cost: modelCost(modelId),
+    contextWindow: entry?.contextWindow ?? base.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    maxTokens: DEFAULT_MAX_TOKENS,
+  };
 }
 
 /** The OpenAI-compatible (`/compat` or OpenCode) model for a Dodo id, whatever leg new turns use. */
@@ -294,8 +301,15 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       log("warn", "pi: model rate limited, waiting", { sessionId: config.sessionId, attempt, delayMs: Math.round(delayMs), retryAfter }),
   };
   const viaCreateAI = unique.filter((id) => createAIGatewayId(id, config, env) !== undefined);
-  const gatewayId = viaCreateAI.length > 0 ? createAIGatewayId(viaCreateAI[0], config, env) : undefined;
+  // `@cf/` ids with the flag off still get a run-path entry under
+  // `cloudflare` when the binding can reach the gateway, so a turn that
+  // started on the run path (ref `cloudflare/@cf/…`) resumes after the flag
+  // is turned off. New turns use `dodo-gateway` (agentModelRef).
+  const draining = unique.filter((id) => id.startsWith("@cf/") && !viaCreateAI.includes(id));
+  const drainGatewayId = draining.length > 0 ? bindingGatewayId(config, env) : undefined;
+  const gatewayId = viaCreateAI.length > 0 ? createAIGatewayId(viaCreateAI[0], config, env) : drainGatewayId;
   const createAIModels = viaCreateAI.map((id) => dodoModel(id, config, env) as Model<"anthropic-messages"> | Model<WorkersAIApi>);
+  const drainModels = gatewayId && drainGatewayId ? draining.map((id) => workersAIModel(id, gatewayId, env)) : [];
   // Anthropic createAI models are also listed under dodo-gateway (legacy
   // refs, see below). `@cf/` ones are not: their old ref is
   // `dodo-gateway/workers-ai/@cf/…` on openai-completions, so they stay in
@@ -356,7 +370,7 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
       id: CREATE_AI_PROVIDER_ID,
       name: "Cloudflare AI (binding)",
       auth: { apiKey: { name: "Cloudflare AI (binding)", resolve: async () => ({ auth: {} }) } },
-      models: createAIModels,
+      models: [...createAIModels, ...drainModels],
       api: { "anthropic-messages": createAIStreams as ProviderStreams, [WORKERS_AI_API]: createAIStreams as ProviderStreams },
     }),
   );

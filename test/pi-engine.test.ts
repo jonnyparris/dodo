@@ -332,6 +332,9 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     expect(models.getModel(CREATE_AI_PROVIDER_ID, "anthropic/claude-sonnet-4-6")).toBeDefined();
     setDodoProvider(models, ["@cf/moonshotai/kimi-k2.6"], config, env);
     expect(models.getModel(CREATE_AI_PROVIDER_ID, "anthropic/claude-sonnet-4-6")).toBeUndefined();
+    // No binding route at all: the provider goes.
+    setDodoProvider(models, ["@cf/moonshotai/kimi-k2.6"], config, {} as never);
+    expect(models.getModel(CREATE_AI_PROVIDER_ID, "@cf/moonshotai/kimi-k2.6")).toBeUndefined();
   });
 
   it("keeps the caller's AbortSignal off the binding call and still honours it", async () => {
@@ -487,6 +490,71 @@ describe("pi gateway wire: Workers AI through createAI's run path (WORKERS_AI_VI
     expect(res.errorMessage).toBeUndefined();
     expect(runCalls).toHaveLength(2);
   }, 20_000);
+
+  it("keeps a run-path entry with the flag off, so a turn that started on the run path resumes", async () => {
+    const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    // New turns: /compat.
+    expect(agentModelRef(KIMI, config, env)).toEqual({ provider: "dodo-gateway", modelId: `workers-ai/${KIMI}` });
+    // A persisted `cloudflare/@cf/…` ref still resolves and runs on the binding.
+    const persisted = models.getModel(CREATE_AI_PROVIDER_ID, KIMI);
+    expect(persisted?.api).toBe(WORKERS_AI_API);
+    const res = await models.complete(persisted!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(runCalls).toHaveLength(1);
+  });
+
+  it("waits out a rate limit the binding throws (AiError 3021) instead of returning", async () => {
+    let n = 0;
+    const { binding, runCalls } = fakeAIBinding(
+      () => new Response("unexpected", { status: 500 }),
+      () => {
+        if (n++ === 0) throw Object.assign(new Error("AiError: 3021: inference request per min rate reached"), { httpCode: 429 });
+        return reply();
+      },
+    );
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(runCalls).toHaveLength(2);
+  }, 20_000);
+
+  it("passes other thrown binding errors through as a failed turn, without retrying", async () => {
+    const { binding, runCalls } = fakeAIBinding(
+      () => new Response("unexpected", { status: 500 }),
+      () => {
+        throw new Error("AiError: 5006: Bad input");
+      },
+    );
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.stopReason).toBe("error");
+    expect(res.errorMessage).toContain("Bad input");
+    expect(runCalls).toHaveLength(1);
+  });
+
+  it("keeps the AbortSignal off the binding call and settles an aborted run as aborted", async () => {
+    const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const model = models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!;
+    // Live signal: the fake binding throws if a signal crosses it.
+    const ok = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, { signal: new AbortController().signal });
+    expect(ok.errorMessage).toBeUndefined();
+    expect(runCalls[0]!.options.signal).toBeUndefined();
+    const aborted = new AbortController();
+    aborted.abort();
+    const res = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, { signal: aborted.signal });
+    expect(["aborted", "error"]).toContain(res.stopReason);
+    expect(runCalls).toHaveLength(1);
+  });
 
   it("clamps max_tokens to the room left in a small context window", async () => {
     const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());

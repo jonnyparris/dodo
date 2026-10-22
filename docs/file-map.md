@@ -16,7 +16,7 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `src/agent-base.ts` — `DodoAgentBase extends Agent` (agents SDK): SDK fibers (`startFiber` / `onFiberRecovered`), `_think_config` table, `migrateLegacyFiberTable` for pre-0.28 sessions
 - `src/session-lifecycle.ts` — prompt lifecycle (start, queue, abort, busy handling) driven by fibers
 - `src/pi/engine.ts` — PiEngine: the agent loop on `@earendil-works/pi-durable` (Harness on DO SQLite, `pi_` tables), SSE event bridge, transcript view. See `docs/adr/0002-pi-durable-foundation.md`
-- `src/pi/models.ts` — Dodo gateways as a pi-ai `openai-completions` provider; Anthropic on AI Gateway as a createAI provider (`cloudflare`)
+- `src/pi/models.ts` — Dodo gateways as a pi-ai `openai-completions` provider; Anthropic on AI Gateway (and `@cf/` with `WORKERS_AI_VIA_BINDING`, run path) as a createAI provider (`cloudflare`)
 - `src/cloudflare-ai.ts` — when the `AI` binding can stand in for the configured AI Gateway URL (`bindingGatewayId`), gateway log metadata, 429 wait on binding calls (main session only; subagents rely on the AI SDK's own 429 retries). Used by the createAI leg in `src/pi/models.ts` and `src/subagent-runner.ts`
 - `src/pi/tools.ts` — adapts AI SDK `tool()` objects to durable pi tools; `REPLAY_SAFE_TOOLS`
 - `src/pi/loop-guard.ts` — repeated-tool-call detection as a pi hook
