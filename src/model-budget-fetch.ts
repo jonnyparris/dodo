@@ -5,8 +5,8 @@
 //
 // It sits under any 429 retry wrapper, so every resend asks for its own
 // slot. Fails open: if the budget call throws or takes longer than
-// BUDGET_CALL_TIMEOUT_MS, the request goes out (a timed-out acquire may
-// still have taken a slot in the DO; it ages out in a minute). After maxWaitMs of waiting
+// BUDGET_CALL_TIMEOUT_MS, the request goes out. That adds at most 1s to a
+// request when the SharedIndex DO is slow. After maxWaitMs of waiting
 // the request goes out anyway: a subagent is never failed by the budget,
 // and a 429 it then gets is retried (and re-gated) by the AI SDK.
 
@@ -98,6 +98,7 @@ export function budgetFetch(base: typeof fetch, options: BudgetFetchOptions): ty
         logFailOpen(key, error);
         return undefined;
       });
+      if (decision && !decision.ok && !Number.isFinite(decision.waitMs)) logFailOpen(key, new Error(`bad waitMs ${decision.waitMs}`));
       if (!decision || decision.ok || !Number.isFinite(decision.waitMs)) break;
       const left = maxWaitMs - waited;
       if (left <= 0) break;
@@ -111,7 +112,7 @@ export function budgetFetch(base: typeof fetch, options: BudgetFetchOptions): ty
     if (response.status === 429) {
       const body = await response.clone().text().catch(() => "");
       // Not awaited: the caller's own 429 wait shouldn't start late.
-      if (transient(body)) void withTimeout(() => client.report429(key, rpm, retryAfterMs(response.headers)), callTimeoutMs).catch(() => {});
+      if (transient(body)) void withTimeout(() => client.report429(key, rpm, retryAfterMs(response.headers)), callTimeoutMs).catch((error) => logFailOpen(key, error));
     }
     return response;
   }) as typeof fetch;

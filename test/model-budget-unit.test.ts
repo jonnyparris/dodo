@@ -168,6 +168,7 @@ describe("modelRpm", () => {
     expect(modelRpm("@cf/moonshotai/kimi-k2.6", "{not json")).toBe(50);
     expect(modelRpm("@cf/moonshotai/kimi-k2.6", JSON.stringify({ "@cf/moonshotai/kimi-k2.6": 20.7 }))).toBe(20);
     expect(modelRpm("@cf/moonshotai/kimi-k2.6", JSON.stringify({ "@cf/moonshotai/kimi-k2.6": "20" }))).toBe(50);
+    expect(modelRpm("@cf/moonshotai/kimi-k2.6", JSON.stringify({ "@cf/moonshotai/kimi-k2.6": 0.5 }))).toBe(1);
   });
 });
 
@@ -229,6 +230,14 @@ describe("budgetFetch", () => {
     } as unknown as ModelBudgetClient;
     const f = budgetFetch(async () => rateLimited(), { client, key: "k", rpm: 4, priority: "main" });
     expect((await f("https://gw/chat")).status).toBe(429);
+  });
+
+  it("does not wait for report429 before returning the 429", async () => {
+    const client: ModelBudgetClient = { acquire: async () => ({ ok: true, waitMs: 0, used: 1, limit: 4, cap: 4 }), report429: () => new Promise(() => {}) };
+    const f = budgetFetch(async () => rateLimited(), { client, key: "k", rpm: 4, priority: "main", callTimeoutMs: 60_000 });
+    const started = Date.now();
+    expect((await f("https://gw/chat")).status).toBe(429);
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 
   it("fails open when the budget call hangs", async () => {

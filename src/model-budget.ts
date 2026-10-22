@@ -61,7 +61,7 @@ const MIN_CAP_SHARE = 0.25;
 const RECOVERY_SHARE = 0.1;
 /** Least cut to the learned cap per 429 episode. */
 const CAP_CUT_SHARE = 0.2;
-/** One 429 episode: later 429s inside this interval don't cut the cap again. */
+/** The cap is cut at most once per interval, however many 429s arrive (main-turn 429s count too). */
 const CUT_INTERVAL_MS = 15_000;
 /** Subagent hold after a 429 without Retry-After. */
 const DEFAULT_COOLDOWN_MS = 5_000;
@@ -220,7 +220,7 @@ function parseOverrides(json?: string): Record<string, number> {
     const parsed = JSON.parse(json) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       for (const [id, value] of Object.entries(parsed)) {
-        if (typeof value === "number" && Number.isFinite(value) && value >= 0) out[id] = Math.floor(value);
+        if (typeof value === "number" && Number.isFinite(value) && value >= 0) out[id] = value > 0 ? Math.max(1, Math.floor(value)) : 0;
         else log("warn", "MODEL_RPM_LIMITS entry ignored: rpm must be a number >= 0", { model: id });
       }
     }
