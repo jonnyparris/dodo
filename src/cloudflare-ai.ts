@@ -29,6 +29,8 @@ export interface GatewayRouteConfig {
  * Gateway, no binding, a URL that isn't AI Gateway's
  * `https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/compat`, or a
  * gateway in another account (the binding only reaches the Worker's own).
+ * Fails closed: without CLOUDFLARE_ACCOUNT_ID there is no way to tell, so
+ * the configured URL keeps going over HTTP.
  */
 export function bindingGatewayId(config: GatewayRouteConfig, env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID">): string | undefined {
   if (config.activeGateway !== "ai-gateway" || !config.aiGatewayBaseURL || !env.AI) return undefined;
@@ -43,7 +45,7 @@ export function bindingGatewayId(config: GatewayRouteConfig, env: Pick<Env, "AI"
   const match = /^\/v1\/([^/]+)\/([^/]+)\/compat$/.exec(path);
   if (!match) return undefined;
   const [, accountId, gatewayId] = match;
-  if (env.CLOUDFLARE_ACCOUNT_ID && env.CLOUDFLARE_ACCOUNT_ID !== accountId) return undefined;
+  if (!env.CLOUDFLARE_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID !== accountId) return undefined;
   return gatewayId;
 }
 

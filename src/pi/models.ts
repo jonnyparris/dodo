@@ -212,6 +212,11 @@ export function withRateLimitRetry(api: ProviderStreams, fetchOptions?: Paramete
  * Install (or replace) the Dodo gateway provider with exactly these models.
  * Models on the createAI leg go into a second provider, `cloudflare`, whose
  * streams are createAI's (no gateway key; auth is the binding).
+ *
+ * The same models are also listed under `dodo-gateway` with their old
+ * `anthropic-messages` api: a turn persisted before this change refers to
+ * them as `dodo-gateway/anthropic/…`, and pi-durable resumes it with that
+ * ref. Those streams look the model up by id and send the createAI one.
  */
 export function setDodoProvider(models: MutableModels, modelIds: readonly string[], config: GatewayConfig, env: Env): MutableModels {
   const unique = [...new Set(modelIds.filter(Boolean))];
@@ -221,6 +226,14 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
   };
   const viaCreateAI = unique.filter((id) => createAIGatewayId(id, config, env) !== undefined);
   const viaGateway = unique.filter((id) => !viaCreateAI.includes(id));
+  const gatewayId = viaCreateAI.length > 0 ? createAIGatewayId(viaCreateAI[0], config, env) : undefined;
+  const createAIModels = viaCreateAI.map((id) => dodoModel(id, config, env) as Model<"anthropic-messages">);
+  const ai = gatewayId ? createAIFor(config, env, gatewayId, rateLimitOptions) : undefined;
+  const byId = new Map(createAIModels.map((m) => [m.id, m]));
+  const legacyAnthropic: ProviderStreams | undefined = ai && {
+    stream: (model, context, options) => ai.stream(byId.get(model.id) ?? model, context, options),
+    streamSimple: (model, context, options) => ai.streamSimple(byId.get(model.id) ?? model, context, options),
+  };
   models.setProvider(
     createProvider({
       id: DODO_PROVIDER_ID,
@@ -233,24 +246,31 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
           resolve: async () => ({ auth: { apiKey: "unused", headers: gatewayHeaders(config, env) } }),
         },
       },
-      models: viaGateway.map((id) => dodoModel(id, config, env)),
+      models: [
+        ...viaGateway.map((id) => dodoModel(id, config, env)),
+        ...createAIModels.map((m) => ({ ...m, provider: DODO_PROVIDER_ID })),
+      ],
       // Waits out per-minute 429s inside the request (rate-limit-fetch.ts).
-      api: { "openai-completions": withRateLimitRetry(openAICompletionsApi(), rateLimitOptions) },
+      api: {
+        "openai-completions": withRateLimitRetry(openAICompletionsApi(), rateLimitOptions),
+        ...(legacyAnthropic ? { "anthropic-messages": legacyAnthropic } : {}),
+      },
     }),
   );
-  const gatewayId = viaCreateAI.length > 0 ? createAIGatewayId(viaCreateAI[0], config, env) : undefined;
-  if (gatewayId) {
-    const ai = createAIFor(config, env, gatewayId, rateLimitOptions);
-    models.setProvider(
-      createProvider({
-        id: CREATE_AI_PROVIDER_ID,
-        name: "Cloudflare AI (binding)",
-        auth: { apiKey: { name: "Cloudflare AI (binding)", resolve: async () => ({ auth: {} }) } },
-        models: viaCreateAI.map((id) => dodoModel(id, config, env)),
-        api: { "anthropic-messages": { stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams },
-      }),
-    );
+  if (!ai) {
+    // Nothing on the createAI leg now: drop a provider an earlier config installed.
+    models.deleteProvider(CREATE_AI_PROVIDER_ID);
+    return models;
   }
+  models.setProvider(
+    createProvider({
+      id: CREATE_AI_PROVIDER_ID,
+      name: "Cloudflare AI (binding)",
+      auth: { apiKey: { name: "Cloudflare AI (binding)", resolve: async () => ({ auth: {} }) } },
+      models: createAIModels,
+      api: { "anthropic-messages": { stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams },
+    }),
+  );
   return models;
 }
 

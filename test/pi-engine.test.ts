@@ -305,8 +305,31 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     expect(res.usage.input).toBe(12);
     expect(res.usage.cacheRead).toBe(9000);
     expect(res.usage.cacheWrite).toBe(500);
+    expect(res.usage.totalTokens).toBe(12 + 5 + 9000 + 500);
     expect(res.usage.cost.cacheRead).toBeCloseTo((9000 * 0.3) / 1e6);
     expect(res.usage.cost.cacheWrite).toBeCloseTo((500 * 3.75) / 1e6);
+  });
+
+  it("still resolves a pre-createAI dodo-gateway/anthropic ref (persisted turn) and sends it through the binding", async () => {
+    const { binding, calls } = fakeAIBinding(() => reply());
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    const models = createModels();
+    setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
+    const legacy = models.getModel("dodo-gateway", "anthropic/claude-sonnet-4-6");
+    expect(legacy?.api).toBe("anthropic-messages");
+    const res = await models.complete(legacy!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.request.query.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("drops the createAI provider when the config no longer uses it", () => {
+    const env = { AI: fakeAIBinding(() => reply()).binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    const models = createModels();
+    setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
+    expect(models.getModel(CREATE_AI_PROVIDER_ID, "anthropic/claude-sonnet-4-6")).toBeDefined();
+    setDodoProvider(models, ["@cf/moonshotai/kimi-k2.6"], config, env);
+    expect(models.getModel(CREATE_AI_PROVIDER_ID, "anthropic/claude-sonnet-4-6")).toBeUndefined();
   });
 
   it("waits out a 429 from the gateway and resends the binding call", async () => {

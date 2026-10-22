@@ -38,7 +38,7 @@ blocked, so tool validation works in production Workers.
 | Durability unit | whole turn (fiber `stashFiber` after chat) | each model step and each tool call |
 | Eviction mid-turn | replay turn from the top, repeat side effects | reattach by prompt id; read-only tools rerun, others return `interrupted` |
 | Compaction | `maybeCompactContext`, `compaction-policy`, `overflow-retry`, `own-loop-prune` | pi background/blocking compaction + overflow retry |
-| Provider | AI SDK `createOpenAICompatible` + `addAnthropicCacheMarkers` + manual affinity header | pi-ai `openai-completions` with `compat.cacheControlFormat` / `sessionAffinityFormat`; Anthropic on AI Gateway uses pi-ai `anthropic-messages` on the native `/anthropic` endpoint, because `/compat` strips `cache_control` |
+| Provider | AI SDK `createOpenAICompatible` + `addAnthropicCacheMarkers` + manual affinity header | pi-ai `openai-completions` with `compat.cacheControlFormat` / `sessionAffinityFormat`; Anthropic on AI Gateway goes through the Agents SDK `createAI` over the `AI` binding (native Messages wire, no gateway key; `src/cloudflare-ai.ts`), because `/compat` strips `cache_control` |
 | Storage | Think tables | `pi_*` tables in the same DO SQLite |
 | Tools | AI SDK `tool()` | unchanged; adapted by `src/pi/tools.ts` |
 

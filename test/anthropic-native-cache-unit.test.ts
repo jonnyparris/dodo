@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { bindingGatewayId } from "../src/cloudflare-ai";
 import { fakeAIBinding } from "./helpers/fake-ai-binding";
-import { addAnthropicCacheOptions, buildProviderForModel } from "../src/subagent-runner";
+import { addAnthropicCacheOptions, buildProviderForModel, pruneSubagentHistory } from "../src/subagent-runner";
 import type { AppConfig, Env } from "../src/types";
 
 const CC = { type: "ephemeral" };
@@ -37,7 +37,8 @@ describe("bindingGatewayId", () => {
     expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://proxy.example/v1" }, env)).toBeUndefined();
     // A custom proxy that happens to end in /compat stays on the OpenAI-compatible path.
     expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://proxy.example/v1/acc/gw/compat" }, env)).toBeUndefined();
-    // The binding only reaches the Worker's own account.
+    // The binding only reaches the Worker's own account; unknown account fails closed.
+    expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acc/gw/compat" }, { AI: {} as Ai })).toBeUndefined();
     expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/other/gw/compat" }, env)).toBeUndefined();
   });
 });
@@ -62,6 +63,31 @@ describe("addAnthropicCacheOptions", () => {
     const tools = out.tools as Array<{ providerOptions?: unknown }>;
     expect(tools[0].providerOptions).toBeUndefined();
     expect(tools[1].providerOptions).toEqual(cache);
+  });
+
+  it("marks the last cacheable part when the last message ends in reasoning", () => {
+    const out = addAnthropicCacheOptions({
+      prompt: [{ role: "assistant", content: [{ type: "text", text: "a" }, { type: "reasoning", text: "t" }] }],
+    } as never);
+    const msg = out.prompt[0] as { providerOptions?: unknown; content: Array<{ providerOptions?: unknown }> };
+    expect(msg.providerOptions).toBeUndefined();
+    expect(msg.content[0].providerOptions).toEqual(cache);
+    expect(msg.content[1].providerOptions).toBeUndefined();
+  });
+
+  it("pruned history keeps a stable prefix between cut moves, so the last-message breakpoint is read next step", () => {
+    const history = (steps: number) => [
+      { role: "user" as const, content: "find X" },
+      ...Array.from({ length: steps }, (_, i) => [
+        { role: "assistant" as const, content: `step ${i}` },
+        { role: "user" as const, content: `result ${i}` },
+      ]).flat(),
+    ];
+    // window 2: 4 and 5 groups both drop 2, so step 5 extends step 4's prompt.
+    const step4 = pruneSubagentHistory(history(4), 2);
+    const step5 = pruneSubagentHistory(history(5), 2);
+    expect(step4.length).toBeLessThan(history(4).length);
+    expect(step5.slice(0, step4.length)).toEqual(step4);
   });
 
   it("counts existing breakpoints toward Anthropic's limit of 4 and keeps them", () => {

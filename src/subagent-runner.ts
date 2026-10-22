@@ -397,8 +397,27 @@ export function addAnthropicCacheOptions(params: LanguageModelV3CallOptions): La
   const last = out.length - 1;
   if (budget > 0 && last >= 0 && last !== lastSystem) {
     const msg = out[last];
-    const partMarked = Array.isArray(msg.content) && (msg.content as Array<{ providerOptions?: ProviderOptionsLike }>).some((p) => hasAnthropicCache(p?.providerOptions));
-    if (!hasAnthropicCache(msg.providerOptions) && !partMarked) out[last] = withCache(msg);
+    const parts = Array.isArray(msg.content) ? (msg.content as Array<{ type?: string; providerOptions?: ProviderOptionsLike }>) : undefined;
+    const partMarked = parts?.some((p) => hasAnthropicCache(p?.providerOptions)) ?? false;
+    if (!hasAnthropicCache(msg.providerOptions) && !partMarked) {
+      // A message-level breakpoint lands on the last part, and reasoning
+      // parts can't carry one; mark the last part that can instead.
+      let cacheable = -1;
+      for (let i = (parts?.length ?? 0) - 1; i >= 0; i--) {
+        const type = parts![i]?.type;
+        if (type !== "reasoning" && type !== "redacted-reasoning") {
+          cacheable = i;
+          break;
+        }
+      }
+      if (parts && cacheable >= 0 && cacheable !== parts.length - 1) {
+        const marked = [...parts];
+        marked[cacheable] = withCache(parts[cacheable]);
+        out[last] = { ...msg, content: marked };
+      } else if (!parts || cacheable >= 0) {
+        out[last] = withCache(msg);
+      }
+    }
   }
   return { ...params, prompt: out as LanguageModelV3CallOptions["prompt"], ...(outTools ? { tools: outTools as LanguageModelV3CallOptions["tools"] } : {}) };
 }
