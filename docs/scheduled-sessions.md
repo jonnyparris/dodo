@@ -75,7 +75,8 @@ resolved via `resolveSessionPermission` — session owner, platform admin,
 SharedIndex grant, or a valid share cookie.
 
 **Fork sources survive the idle sweep.** The sweep soft-deletes sessions
-idle for 10+ minutes with no prompts. It skips any session named as a
+idle for 10+ minutes with no prompts and no transcript messages (a fork
+carries its source's messages but no prompt rows, so it counts as used). It skips any session named as a
 schedule's `sourceSessionId`, and any session that has ever been forked
 from (`sessions.fork_source = 1`, set by every fork path: HTTP, MCP
 `fork_session`, seed forks and scheduled forks). The flag lives in the

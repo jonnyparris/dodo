@@ -49,7 +49,7 @@ const MAX_DELAY_SECONDS = 90 * 86400;
 const MAX_SCHEDULES_PER_USER = 50;
 
 // ─── Idle-session cleanup constants ───
-/** Sessions with no prompts that have been idle longer than this get soft-deleted. */
+/** Sessions with no prompts or messages that have been idle longer than this get soft-deleted. */
 const IDLE_SESSION_TTL_SECONDS = 600; // 10 minutes
 /** How often the DO alarm re-runs the idle sweep. */
 const IDLE_SWEEP_INTERVAL_SECONDS = 300; // 5 minutes
@@ -1418,11 +1418,12 @@ export class UserControl extends DurableObject<Env> {
       this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN fork_source INTEGER NOT NULL DEFAULT 0");
     } catch { /* column already exists */ }
 
-    // has_prompts = 1 once the session is known to hold a prompt. Set when
+    // has_prompts = 1 once the session is known to hold a prompt or a
+    // transcript (a fork imports messages but no prompt rows). Set when
     // the CodingAgent reports status 'running' (user / queue prompts; cron,
     // watchdog and other syncIndex:false sources don't report it) and, for
     // everything else including rows that predate the column, by the idle
-    // sweep after it counts prompts. The sweep filters on it in SQL, so prompted sessions stop
+    // sweep after it counts prompts and messages. The sweep filters on it in SQL, so prompted sessions stop
     // taking batch slots and newer empty sessions get reached.
     try {
       this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN has_prompts INTEGER NOT NULL DEFAULT 0");
@@ -3773,8 +3774,8 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Alarm handler. Serves two buckets of work:
    *   1. Scheduled-session fires (overdue rows in scheduled_sessions).
-   *   2. Idle-session sweep — soft-deletes sessions with no prompts that
-   *      have been idle for more than IDLE_SESSION_TTL_SECONDS.
+   *   2. Idle-session sweep — soft-deletes sessions with no prompts or
+   *      transcript messages that have been idle for more than IDLE_SESSION_TTL_SECONDS.
    *
    * The DO input gate serialises alarm() with fetch handlers, so a
    * concurrent DELETE can't interleave between rows. The per-iteration
@@ -3840,8 +3841,8 @@ export class UserControl extends DurableObject<Env> {
 
   /**
    * Soft-delete sessions that have been idle for at least
-   * IDLE_SESSION_TTL_SECONDS *and* never received a prompt. The "no
-   * prompts" check requires a per-session cross-DO call to the
+   * IDLE_SESSION_TTL_SECONDS *and* hold no prompts and no transcript
+   * messages (a fork has messages but no prompt rows). The "empty" check requires a per-session cross-DO call to the
    * CodingAgent, so we bound the batch size to keep wake-ups cheap.
    *
    * The sweep intentionally skips sessions already in the `deleted`
@@ -3867,20 +3868,20 @@ export class UserControl extends DurableObject<Env> {
 
     for (const row of candidates) {
       const sessionId = String(row.id);
-      let promptCount: number;
+      let contentCount: number;
       try {
-        promptCount = await this.countSessionPrompts(sessionId);
+        contentCount = await this.countSessionContent(sessionId);
       } catch (err) {
         // If the CodingAgent DO is unreachable, leave the session alone —
         // better to retry next sweep than to delete blindly.
-        log("warn", "idle-sweep: failed to count prompts", {
+        log("warn", "idle-sweep: failed to count session content", {
           sessionId,
           err: err instanceof Error ? err.message : String(err),
         });
         continue;
       }
 
-      if (promptCount > 0) {
+      if (contentCount > 0) {
         // Remember it, so this session never takes a batch slot again.
         // Without this, 25+ old prompted sessions sit at the head of the
         // ORDER BY updated_at queue and newer empty ones are never reached.
@@ -3890,7 +3891,7 @@ export class UserControl extends DurableObject<Env> {
 
       // Reuse the same soft-delete primitive as the manual DELETE path
       // so the 5-min recovery window behaves identically.
-      // Re-check the exemptions in the UPDATE itself: countSessionPrompts
+      // Re-check the exemptions in the UPDATE itself: countSessionContent
       // awaits a cross-DO call, and the session may have been forked,
       // prompted or touched in the meantime.
       const deleteExpiry = nowEpoch() + 300;
@@ -3910,11 +3911,13 @@ export class UserControl extends DurableObject<Env> {
   }
 
   /**
-   * Ask a session's CodingAgent DO how many prompts it holds. Uses the
-   * lightweight /prompts/count endpoint — a GET of /prompts would
-   * serialise the whole list, which can be 100s of rows.
+   * Ask a session's CodingAgent DO how many prompts plus transcript
+   * messages it holds. Uses the lightweight /prompts/count endpoint — a
+   * GET of /prompts would serialise the whole list, which can be 100s of
+   * rows. Messages count because a fork imports the source's transcript
+   * but not its prompt rows.
    */
-  private async countSessionPrompts(sessionId: string): Promise<number> {
+  private async countSessionContent(sessionId: string): Promise<number> {
     const agent = await getAgentByName(this.env.CODING_AGENT as never, sessionId);
     const res = await agent.fetch(
       new Request("https://coding-agent/prompts/count", { method: "GET" }),
@@ -3922,8 +3925,8 @@ export class UserControl extends DurableObject<Env> {
     if (!res.ok) {
       throw new Error(`prompt count fetch failed: ${res.status}`);
     }
-    const body = (await res.json()) as { count?: number };
-    return Number(body.count ?? 0);
+    const body = (await res.json()) as { count?: number; messages?: number };
+    return Number(body.count ?? 0) + Number(body.messages ?? 0);
   }
 
   /**
