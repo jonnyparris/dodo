@@ -126,7 +126,7 @@ function makeDodo(base: string) {
   const auth: Record<string, string> = id && secret ? { "CF-Access-Client-Id": id, "CF-Access-Client-Secret": secret } : {};
   if (!id) console.warn("No Access service token found: requests go out unauthenticated.");
 
-  async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async function req<T>(method: string, path: string, body?: unknown, opts: { timeoutMs?: number; retries?: number } = {}): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       try {
         const res = await fetch(`${base}${path}`, {
@@ -134,7 +134,7 @@ function makeDodo(base: string) {
           headers: { ...auth, ...(body !== undefined ? { "content-type": "application/json" } : {}), "user-agent": "dodo-model-ab/1" },
           body: body !== undefined ? JSON.stringify(body) : undefined,
           redirect: "manual",
-          signal: AbortSignal.timeout(120_000),
+          signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000),
         });
         const text = await res.text();
         if (!res.ok) throw new Error(`${method} ${path} → ${res.status}: ${text.slice(0, 300)}`);
@@ -143,13 +143,13 @@ function makeDodo(base: string) {
         // Retry network blips, not HTTP errors. Never re-send a POST that timed
         // out: it may have landed (a second prompt run, billed twice).
         const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
-        if (attempt >= 3 || (err instanceof Error && /→ \d{3}/.test(err.message)) || (timedOut && method === "POST")) throw err;
+        if (attempt >= (opts.retries ?? 3) || (err instanceof Error && /→ \d{3}/.test(err.message)) || (timedOut && method === "POST")) throw err;
         await sleep(3000);
       }
     }
   }
   return {
-    get: <T>(p: string) => req<T>("GET", p),
+    get: <T>(p: string, opts?: { timeoutMs?: number; retries?: number }) => req<T>("GET", p, undefined, opts),
     post: <T>(p: string, b: unknown = {}) => req<T>("POST", p, b),
     del: (p: string) => req<unknown>("DELETE", p),
   };
@@ -179,7 +179,8 @@ async function prepareSession(dodo: Dodo, task: Task): Promise<string> {
 /**
  * Save what the session was doing at timeout, before the abort and the session
  * delete wipe it: pi live tasks + transcript (engine?detail=1), prompt history,
- * messages. Best effort: each endpoint is written or its error is.
+ * messages. Best effort: each endpoint is written or its error is. Short
+ * timeout, no retries: the agent keeps running (and billing) until the abort.
  */
 async function saveTimeoutEvidence(dodo: Dodo, sessionId: string, runDir: string): Promise<void> {
   const dir = join(runDir, "timeout");
@@ -192,7 +193,7 @@ async function saveTimeoutEvidence(dodo: Dodo, sessionId: string, runDir: string
   await Promise.all(
     endpoints.map(async ([file, path]) => {
       try {
-        writeFileSync(join(dir, file), JSON.stringify(await dodo.get<unknown>(path), null, 1));
+        writeFileSync(join(dir, file), JSON.stringify(await dodo.get<unknown>(path, { timeoutMs: 30_000, retries: 0 }), null, 1));
       } catch (err) {
         writeFileSync(join(dir, file), JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
       }
