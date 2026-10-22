@@ -45,7 +45,7 @@ export async function lookupMcpHostScope(env: Env, hostname: string, timeoutMs?:
     return { allowed: body.allowed === true, listed: body.listed === true };
   };
   if (timeoutMs === undefined) return read();
-  // The race covers the body read too; abort() releases the request.
+  // The race bounds the whole read, body included; abort() is best effort.
   let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([
     read(),
@@ -71,7 +71,7 @@ export async function lookupMcpHostScope(env: Env, hostname: string, timeoutMs?:
 const REVOKED_CACHE_TTL_MS = 30_000;
 const FAILED_LOOKUP_TTL_MS = 5_000;
 const LOOKUP_TIMEOUT_MS = 2_000;
-/** Hosts come from user configs, so this is a backstop, not an LRU. */
+/** Hosts come from user configs, so this is a backstop against unbounded growth. */
 const MAX_CACHED_HOSTS = 1_000;
 const revokedCache = new Map<string, { revoked: boolean; at: number; failedAt?: number }>();
 /** One lookup per host at a time; concurrent callers share it. */
@@ -135,7 +135,15 @@ async function refreshRevoked(env: Env, hostname: string): Promise<boolean> {
 }
 
 function remember(hostname: string, entry: { revoked: boolean; at: number; failedAt?: number }): void {
-  if (revokedCache.size >= MAX_CACHED_HOSTS && !revokedCache.has(hostname)) revokedCache.clear();
+  if (revokedCache.size >= MAX_CACHED_HOSTS && !revokedCache.has(hostname)) {
+    // Evict the oldest allowed host; keep known revocations so the outage
+    // fallback still has them. Only revocations left: evict the oldest.
+    let victim: string | undefined;
+    for (const [host, e] of revokedCache) {
+      if (!e.revoked) { victim = host; break; }
+    }
+    revokedCache.delete(victim ?? revokedCache.keys().next().value!);
+  }
   revokedCache.set(hostname, entry);
 }
 

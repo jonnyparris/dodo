@@ -141,6 +141,35 @@ describe("isMcpHostRevoked cache", () => {
     }
   });
 
+  it("keeps known revocations when the host cap evicts", async () => {
+    const revokedHost = uniqueHost("keep");
+    const answerEnv = {
+      ...typedEnv,
+      SHARED_INDEX: {
+        idFromName: () => ({}),
+        get: () => ({
+          fetch: async (u: string) => {
+            const host = new URL(u).searchParams.get("hostname");
+            return Response.json(host === revokedHost ? { allowed: false, listed: true } : { allowed: false, listed: false });
+          },
+        }),
+      },
+    } as unknown as Env;
+    expect(await isMcpHostRevoked(answerEnv, `https://${revokedHost}/mcp`)).toBe(true);
+    for (let i = 0; i < 1_100; i++) await isMcpHostRevoked(answerEnv, `https://filler-${i}.example.com/mcp`);
+    const t0 = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(t0 + 60_000);
+    const brokenEnv = {
+      ...typedEnv,
+      SHARED_INDEX: { idFromName: () => ({}), get: () => ({ fetch: async () => { throw new Error("down"); } }) },
+    } as unknown as Env;
+    try {
+      expect(await isMcpHostRevoked(brokenEnv, `https://${revokedHost}/mcp`)).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("shares one lookup between concurrent callers", async () => {
     let calls = 0;
     const countingEnv = {
