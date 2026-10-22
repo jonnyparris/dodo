@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/types";
 import { createModelOverrideStore, modelOverridePatch, withModelOverride } from "../src/session-model-override";
 import { aigMetadataHeader } from "../src/subagent-runner";
+import { releaseMockSlowPrompt, resetMockAgentic } from "./helpers/agentic-mock";
 
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/pi/models", async () => await import("./helpers/pi-models-mock"));
@@ -34,6 +35,15 @@ async function newSession(): Promise<string> {
   const res = await call("/session", { method: "POST" });
   expect(res.status).toBe(201);
   return (await json<{ id: string }>(res)).id;
+}
+
+async function waitForStatus(id: string, promptId: string, want: string, ms = 5000) {
+  for (let i = 0; i < ms / 10; i++) {
+    const { prompts } = await json<{ prompts: Array<{ id: string; status: string }> }>(await call(`/session/${id}/prompts`));
+    if (prompts.find((x) => x.id === promptId)?.status === want) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`prompt never reached ${want}`);
 }
 
 async function waitForPrompt(id: string, promptId: string, ms = 3000) {
@@ -190,6 +200,57 @@ describe("PUT /session/:id/model-override", () => {
       expect(cfg.exploreModel).toBe(owner.exploreModel);
     } finally {
       await send("/api/config", { model: before.model, exploreModel: before.exploreModel ?? "", taskModel: before.taskModel ?? "" }, "PUT");
+    }
+  });
+
+  it("mid-run: details keep the running model, the override shows as pending, and a cleared override is gone once idle", async () => {
+    type Details = Session & { status: string; contextWindow: number };
+    const before = await json<{ model: string }>(await call("/api/config"));
+    const owner = "anthropic/claude-haiku-4-5";
+    const pinned = "anthropic/claude-sonnet-4-6";
+    await send("/api/config", { model: owner }, "PUT");
+    resetMockAgentic();
+    try {
+      const id = await newSession();
+
+      // Set the override while a prompt runs on the owner's model.
+      const first = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "slow async prompt" }));
+      await waitForStatus(id, first.promptId, "running");
+      expect((await send(`/session/${id}/model-override`, { model: pinned }, "PUT")).status).toBe(200);
+      let s = await json<Details>(await call(`/session/${id}`));
+      expect(s.status).toBe("running");
+      expect(s.model).toBe(owner);
+      expect(s.contextWindow).toBe(200_000);
+      expect(s.modelOverride?.model).toBe(pinned);
+      releaseMockSlowPrompt();
+      await waitForPrompt(id, first.promptId);
+      s = await json<Details>(await call(`/session/${id}`));
+      expect(s.model).toBe(pinned);
+      expect(s.contextWindow).toBe(1_000_000);
+
+      // Clear it while a prompt runs on the override.
+      resetMockAgentic();
+      const second = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "slow async prompt" }));
+      await waitForStatus(id, second.promptId, "running");
+      await send(`/session/${id}/model-override`, { model: "" }, "PUT");
+      s = await json<Details>(await call(`/session/${id}`));
+      expect(s.model).toBe(pinned);
+      expect(s.modelOverride).toBeUndefined();
+      releaseMockSlowPrompt();
+      await waitForPrompt(id, second.promptId);
+
+      // Idle again: back on the owner's model without another prompt.
+      for (let i = 0; i < 100 && s.model !== owner; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+        s = await json<Details>(await call(`/session/${id}`));
+      }
+      expect(s.model).toBe(owner);
+      expect(s.contextWindow).toBe(200_000);
+      const stub = await getAgentByName(typedEnv.CODING_AGENT as never, id);
+      expect((await inDO<{ model: string }>(stub, async (agent) => agent.getConfig())).model).toBe(owner);
+    } finally {
+      releaseMockSlowPrompt();
+      await send("/api/config", { model: before.model }, "PUT");
     }
   });
 
