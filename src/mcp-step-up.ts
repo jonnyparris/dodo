@@ -101,15 +101,15 @@ export function issuersMatch(a: string, b: string): boolean {
  *   point the card at http://localhost.
  * - The authorization server behind the link (`linkIssuer`, from the
  *   discovery the failed `auth()` just saved) must be the one that issued
- *   the current grant (`grantIssuer`, SDK-stamped on saved tokens). That
+ *   the current grant (`grantIssuer`, see below). That
  *   stops a server from swapping `authorization_servers` mid-session to
  *   send the person to another host. Its endpoints may live on any https
  *   origin: the metadata comes from the issuer itself.
- * No grant issuer → refused. That covers tokens saved before the SDK
- * stamped them, and tokens whose stamp came from the SDK's upgrade path
- * (the first auth() after the upgrade stamps them with whatever AS it just
- * discovered, possibly a swapped one). `DodoOAuthClientProvider` flags that
- * stamp and the hub passes no grant issuer until the server is reconnected.
+ * `grantIssuer` is Dodo's pin from the last code exchange
+ * (`DodoOAuthClientProvider`), not the SDK's stamp on the tokens: the SDK
+ * stamps pre-upgrade tokens with whatever AS its next auth() discovers.
+ * No grant issuer (no code exchange since the pin shipped) → refused until
+ * the server is reconnected.
  */
 export function isTrustedAuthUrl(authUrl: string, issuers: { grantIssuer?: string; linkIssuer?: string } = {}): boolean {
   let u: URL;

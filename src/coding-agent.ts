@@ -5606,16 +5606,14 @@ export class CodingAgent extends CodingAgentBase {
         return undefined;
       }
     };
-    // Which authorization server issued the current grant. Read *before*
-    // the call, from the tokens only: a failed auth() against a different
-    // AS re-registers there (new clientId), after which the provider's
-    // client info describes the new AS and would vouch for its link.
-    // A grant whose issuer came from the SDK's upgrade stamp has no trusted
-    // issuer: the stamp names whatever AS that auth() discovered (see
-    // src/mcp-oauth-provider.ts). Treat it as unstamped until a reconnect.
-    const dodoProvider = provider instanceof DodoOAuthClientProvider ? provider : undefined;
-    const unverified = dodoProvider ? (await safe(() => dodoProvider.issuerUnverified())) === true : false;
-    const grantIssuer = unverified ? undefined : (await safe(provider?.tokens))?.issuer;
+    // Which authorization server issued the current grant: Dodo's pin from
+    // the last code exchange (src/mcp-oauth-provider.ts), read *before* the
+    // call. Not the SDK's stamp on the tokens: the SDK stamps pre-upgrade
+    // tokens with whatever AS its next auth() discovers, and not the client
+    // info: a failed auth() against another AS re-registers there and the
+    // provider's client info then describes that AS. No pin (grant from
+    // before the pin, or another provider) → no card until a reconnect.
+    const grantIssuer = provider instanceof DodoOAuthClientProvider ? await provider.pinnedIssuer() : undefined;
     try {
       const result = await this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
       const clean = stripStepUpMarker(result);

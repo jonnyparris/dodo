@@ -40,6 +40,7 @@ const BASE = "user:read account:read";
 const WRITE = "workers_scripts:write";
 
 type Hub = {
+  removeMcpServer(id: string): Promise<void>;
   addMcpServer(name: string, url: string, opts: { callbackHost: string; callbackPath: string }): Promise<{ id: string; state: string; authUrl?: string }>;
   getMcpServers(): Promise<{ servers: Record<string, { state?: string; auth_url?: string | null }> }>;
   callOAuthTool(serverId: string, name: string, args: unknown): Promise<unknown>;
@@ -59,6 +60,8 @@ function fakeServer() {
   const tokenOrigins: string[] = [];
   /** Knobs for restart tests: list failures, and a /mcp that never answers. */
   const knobs = { failToolsList: false, hang: null as Promise<void> | null };
+  /** Origin of each dynamic client registration. */
+  const registerOrigins: string[] = [];
   const json = (o: unknown, headers: Record<string, string> = {}) =>
     new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json", ...headers } });
   const challenge = (status: number, scope: string, error?: string) =>
@@ -85,6 +88,7 @@ function fakeServer() {
     if (url.pathname.startsWith("/.well-known/")) return new Response("not found", { status: 404 });
     if (url.pathname === "/register") {
       const body = (await req.json()) as Record<string, unknown>;
+      registerOrigins.push(o);
       // A different AS registers its own client (new clientId on the provider).
       return new Response(JSON.stringify({ ...body, client_id: url.origin === PHISH ? "phish-client" : "client-1" }), { status: 201, headers: { "content-type": "application/json" } });
     }
@@ -131,7 +135,9 @@ function fakeServer() {
     }
     return new Response("?", { status: 404 });
   };
-  return { fetchImpl, codes, tokenRequests, tokenOrigins, knobs, as };
+  /** Expire every access token: the next call gets a 401 and auth() tries a refresh. */
+  const expireAll = () => tokens.clear();
+  return { fetchImpl, codes, tokenRequests, tokenOrigins, registerOrigins, knobs, as, expireAll };
 }
 
 async function waitForState(hub: Hub, id: string, state: string): Promise<void> {
@@ -318,17 +324,18 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     expect(stepUpOf(again)).toBeUndefined();
     expect(String(again)).toMatch(/Unauthorized/);
     expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
-    // The stamped grant's refresh token never went to the swapped AS: the
-    // SDK drops tokens whose issuer stamp names another AS before refresh.
-    fake.tokenRequests.forEach((p, i) => {
-      if (fake.tokenOrigins[i] === PHISH) expect(p.get("refresh_token")).toBeNull();
-    });
     // Read calls still work on the real grant.
     fake.as.current = S;
     expect(((await hub.callOAuthTool(id, "forge", {})) as { content?: unknown }).content).toEqual([{ type: "text", text: "hi" }]);
   });
 
-  /** Strip the SEP-2352 issuer stamp from the stored grant (pre-upgrade storage). */
+  /** Drop Dodo's issuer pin: a grant from before the pin shipped. */
+  async function dropPin(hub: Hub, owner: string, id: string): Promise<void> {
+    await runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) => {
+      await state.storage.delete(`/${owner}/${id}/dodo_issuer_pin`);
+    });
+  }
+  /** Also strip the SDK's SEP-2352 issuer stamps: storage from before the SDK upgrade. */
   async function unstamp(hub: Hub, owner: string, id: string): Promise<void> {
     await runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) => {
       const keys = await state.storage.list<Record<string, unknown>>({ prefix: `/${owner}/${id}/` });
@@ -339,40 +346,65 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
       }
     });
   }
-  const unverifiedFlag = (hub: Hub, owner: string, id: string) =>
+  const pinOf = (hub: Hub, owner: string, id: string) =>
     runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) =>
-      (await state.storage.get(`/${owner}/${id}/dodo_issuer_unverified`)) !== undefined);
+      ((await state.storage.get(`/${owner}/${id}/dodo_issuer_pin`)) as { issuer?: string } | undefined)?.issuer);
+
+  it("the code exchange pins the authorization server", async () => {
+    const { hub, id, owner } = await connected();
+    expect(await pinOf(hub, owner, id)).toBe(S);
+  });
 
   it("a pre-upgrade grant stamped by a swapped authorization server never gets a card", async () => {
     const { fake, hub, id, owner } = await connected();
+    await dropPin(hub, owner, id);
     await unstamp(hub, owner, id);
     fake.as.current = PHISH;
     // First call: the SDK stamps the unstamped grant with the AS it just
-    // discovered (the phishing one). No grant issuer yet → no card.
+    // discovered (the phishing one).
     const first = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
     expect(stepUpOf(first)).toBeUndefined();
-    expect(await unverifiedFlag(hub, owner, id)).toBe(true);
-    // Second call: before the fix the grant now "came from" the phishing AS,
-    // so its link matched and raised the card.
+    // Second call: before the pin, the grant's stamp now named the phishing
+    // AS, so its link matched and raised the card.
     const second = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
     expect(stepUpOf(second)).toBeUndefined();
     expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
+    expect(await pinOf(hub, owner, id)).toBeUndefined();
   });
 
-  it("an upgrade stamp from the real authorization server also waits for a reconnect", async () => {
-    const { hub, id, owner } = await connected();
-    await unstamp(hub, owner, id);
-    // The stamp could have come from any AS, so even the real one gets no
-    // card until the server is reconnected from Settings (fresh grant).
-    const first = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
-    expect(stepUpOf(first)).toBeUndefined();
-    expect(await unverifiedFlag(hub, owner, id)).toBe(true);
-    const second = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
-    expect(stepUpOf(second)).toBeUndefined();
-    // A fresh connect (new grant) is not flagged.
-    const fresh = await connected();
-    expect(stepUpOf(await fresh.hub.callOAuthTool(fresh.id, "execute", { code: "write" }))).toBeTruthy();
-    expect(await unverifiedFlag(fresh.hub, fresh.owner, fresh.id)).toBe(false);
+  it("a grant without a pin gets no card until the server is reconnected", async () => {
+    const { fake, hub, id, owner, callbackUrl } = await connected();
+    // Already stamped by the SDK (as in prod since agents 0.28), but no pin.
+    await dropPin(hub, owner, id);
+    const res = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
+    expect(stepUpOf(res)).toBeUndefined();
+    expect(String(res)).toMatch(/Unauthorized/);
+    // Reconnect from Settings = remove + add: fresh code exchange, new pin.
+    await hub.removeMcpServer(id);
+    const callbackPath = new URL(callbackUrl).pathname;
+    const again = await hub.addMcpServer("Fake CF API", MCP_URL, { callbackHost: "https://dodo.test", callbackPath });
+    fake.codes.set("code-again", BASE);
+    expect((await callback(hub, callbackUrl, again.authUrl!, "code-again")).status).toBe(302);
+    await waitForState(hub, again.id, "ready");
+    expect(await pinOf(hub, owner, again.id)).toBe(S);
+    expect(stepUpOf(await hub.callOAuthTool(again.id, "execute", { code: "write" }))).toBeTruthy();
+  });
+
+  it("an expired grant on a swapped authorization server: no refresh token leaves, no card", async () => {
+    const { fake, hub, id, owner } = await connected();
+    fake.as.current = PHISH;
+    fake.expireAll();
+    const before = fake.tokenRequests.length;
+    const res = await hub.callOAuthTool(id, "forge", {}).then((r) => r, (e: unknown) => e);
+    expect(stepUpOf(res)).toBeUndefined();
+    // auth() did run against the phishing AS (it registered a client there)...
+    expect(fake.registerOrigins).toContain(PHISH);
+    // ...but the SDK dropped the grant (stamped for S) before refreshing,
+    // so no refresh token went to any token endpoint.
+    expect(fake.tokenRequests.slice(before).filter((p) => p.get("refresh_token"))).toEqual([]);
+    expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
+    // A refresh is not a code exchange: the pin stays on the real AS.
+    expect(await pinOf(hub, owner, id)).toBe(S);
   });
 
   it("a restart reconnect that ends at 'connected' is parked again so the link completes", async () => {
