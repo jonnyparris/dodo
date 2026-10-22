@@ -10,7 +10,7 @@ describe("adaptBindingForCreateAI", () => {
   });
 
   it("returns undefined for aiGatewayLogId instead of reading the stub", () => {
-    const { binding } = fakeAIBinding(() => new Response("{}"));
+    const binding = { aiGatewayLogId: "log-1" } as unknown as Ai;
     expect((adaptBindingForCreateAI(binding) as unknown as { aiGatewayLogId: unknown }).aiGatewayLogId).toBeUndefined();
   });
 
@@ -39,6 +39,11 @@ describe("adaptBindingForCreateAI", () => {
 });
 
 describe("runAsResponse", () => {
+  it("turns a thrown httpCode 429 into a 429 Response", async () => {
+    const res = await runAsResponse(() => Promise.reject(Object.assign(new Error("x"), { httpCode: 429 })));
+    expect(res.status).toBe(429);
+  });
+
   it("rethrows errors that aren't rate limits", async () => {
     await expect(runAsResponse(() => Promise.reject(new Error("boom 3021 later")))).rejects.toThrow("boom");
   });
