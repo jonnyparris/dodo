@@ -57,14 +57,76 @@ jobs:
         with:
           ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha }}
           fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
       - name: Guard against production bindings
         run: |
           set -euo pipefail
           cfg=wrangler.preview.jsonc
           test -f "$cfg" || { echo "::error::$cfg not found"; exit 1; }
           fail=0
-          if grep -nE '"bucket_name"[[:space:]]*:[[:space:]]*"(dodo-workspaces|dodo-fork-snapshots)"' "$cfg"; then
-            echo "::error file=$cfg::$cfg binds a production R2 bucket to the preview worker"
+          # The deployed worker's R2 bindings come from each binding's
+          # `bucket_name`, so parse the config as JSONC instead of grepping a
+          # single literal spelling: a value wrapped onto the next line, or
+          # split from its key by a comment, must not bypass the guard.
+          # `preview_bucket_name` is not checked: wrangler uses it only for
+          # `wrangler dev`, never for the deployed bindings.
+          if ! CFG="$cfg" node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+
+          const production = new Set(["dodo-workspaces", "dodo-fork-snapshots"]);
+          const cfg = process.env.CFG;
+
+          const source = readFileSync(cfg, "utf8");
+          let json = "";
+          let inString = false;
+          let lineComment = false;
+          let blockComment = false;
+          for (let i = 0; i < source.length; i++) {
+            const ch = source[i];
+            const next = source[i + 1];
+            if (lineComment) {
+              if (ch === "\n") { lineComment = false; json += ch; }
+              continue;
+            }
+            if (blockComment) {
+              if (ch === "*" && next === "/") { blockComment = false; i++; }
+              continue;
+            }
+            if (inString) {
+              json += ch;
+              if (ch === "\\") { json += next ?? ""; i++; }
+              else if (ch === '"') inString = false;
+              continue;
+            }
+            if (ch === '"') { inString = true; json += ch; continue; }
+            if (ch === "/" && next === "/") { lineComment = true; i++; continue; }
+            if (ch === "/" && next === "*") { blockComment = true; i++; continue; }
+            json += ch;
+          }
+
+          let config;
+          try {
+            config = JSON.parse(json);
+          } catch (err) {
+            console.log(`::error file=${cfg}::${cfg} is not valid JSONC: ${err.message}`);
+            process.exit(1);
+          }
+
+          const buckets = Array.isArray(config.r2_buckets) ? config.r2_buckets : [];
+          const offenders = buckets
+            .map((b) => (b && typeof b.bucket_name === "string" ? b.bucket_name : null))
+            .filter((name) => name !== null && production.has(name));
+          if (offenders.length === 0) process.exit(0);
+          for (const name of offenders) {
+            console.log(`::error file=${cfg}::${cfg} binds the production R2 bucket ${JSON.stringify(name)} to the preview worker`);
+          }
+          process.exit(1);
+          NODE
+          then
             fail=1
           fi
           # Empty `"crons": []` is required (it clears the deployed schedule);
@@ -78,11 +140,6 @@ jobs:
             echo "Refusing to deploy: the preview worker must stay detached from production storage and schedules."
             exit 1
           fi
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
       - name: Install
         run: npm ci
       - name: Deploy preview
