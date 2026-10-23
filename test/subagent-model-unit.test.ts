@@ -6,7 +6,7 @@
  * spinning up a provider / real LLM.
  */
 import { describe, expect, it } from "vitest";
-import { resolveSubagentModel } from "../src/subagent-runner";
+import { resolveSubagentModel, subagentMaxRetries } from "../src/subagent-runner";
 
 const MAIN_ANTHROPIC = "anthropic/claude-opus-4-7";
 const MAIN_OPENAI = "openai/gpt-5.4";
@@ -112,5 +112,17 @@ describe("resolveSubagentModel — cross-gateway scenarios", () => {
       "@cf/moonshotai/kimi-k2.6", // ai-gateway model
     );
     expect(result).toBe("anthropic/claude-haiku-4-5");
+  });
+});
+
+describe("subagentMaxRetries", () => {
+  it("gives Workers AI models enough retries to outlast a per-minute 429 window", () => {
+    expect(subagentMaxRetries("@cf/deepseek-ai/deepseek-v4.1-flash-1017")).toBe(5);
+    expect(subagentMaxRetries("@cf/zai-org/glm-5.3-flash")).toBe(5);
+  });
+
+  it("keeps the AI SDK default for hosted third-party models", () => {
+    expect(subagentMaxRetries("anthropic/claude-haiku-4-5")).toBe(2);
+    expect(subagentMaxRetries("openai/gpt-4.1-mini")).toBe(2);
   });
 });
