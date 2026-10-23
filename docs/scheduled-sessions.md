@@ -69,10 +69,13 @@ Create a scheduled new-session job.
 | `intervalSeconds`  | ≥ 300 (5 minutes)                   |
 | `cron` gap         | next-3-match gap ≥ 300s             |
 
-**Fork source permission:** if `source: "fork"`, the caller must have
-write access on the source session at create time. Fork sources are
-resolved via `resolveSessionPermission` — session owner, platform admin,
-SharedIndex grant, or a valid share cookie.
+**Fork source ownership:** if `source: "fork"`, the caller must own the
+source session, and it must not be deleted. The schedule lives in the
+caller's UserControl DO and each fire looks the source up there.
+Responses: 403 with no access or read-only access; 400 with write access
+but not owner (platform admins get no exception); 400 if the source is
+soft-deleted. To schedule work on a shared session, fork it first and
+schedule from your copy.
 
 **Fork sources survive the idle sweep.** The sweep soft-deletes sessions
 idle for 10+ minutes with no prompts and no transcript messages (a fork

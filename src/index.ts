@@ -2060,10 +2060,14 @@ app.post("/api/scheduled-sessions", async (c) => {
     return c.json({ error: "Invalid JSON body" }, 400);
   }
 
-  // Fork-source permission check at CREATE time — matches the posture of
-  // /session/:id/cron (source is owned or shared at schedule time). If the
-  // source is later unshared/deleted, the fire will fail and the schedule
-  // will eventually stall.
+  // Fork-source checks at CREATE time. The schedule lives in the caller's
+  // UserControl DO and forkScheduledSession only looks the source up in
+  // that same DO, so the caller must OWN the source: write access on a
+  // shared session would create a schedule that fails every fire with
+  // source_session_missing. If the source is later deleted, the fire will
+  // fail and the schedule will eventually stall. (The DO re-checks
+  // ownership, which also covers platform admins: resolveSessionPermission
+  // reports them as owner of any session.)
   if (parsed.source === "fork") {
     const sourceSessionId = typeof parsed.sourceSessionId === "string" ? parsed.sourceSessionId : "";
     if (!sourceSessionId) {
@@ -2075,6 +2079,11 @@ app.post("/api/scheduled-sessions", async (c) => {
     }
     if ((PERMISSION_LEVELS[perm.permission] ?? -1) < (PERMISSION_LEVELS.write ?? 999)) {
       return c.json({ error: "Insufficient permission on source session" }, 403);
+    }
+    if (perm.ownerEmail !== email) {
+      return c.json({
+        error: "Scheduled forks can only use a session you own as the source. Fork the shared session first, then schedule from your copy.",
+      }, 400);
     }
   }
 

@@ -477,6 +477,110 @@ describe("Scheduled session permissions", () => {
     expect(body.error).toMatch(/Source session not found or access denied/);
   });
 
+  it("rejects fork source shared with write access but owned by someone else", async () => {
+    // The schedule lives in the caller's UserControl DO and the fire only
+    // looks the source up there, so a shared source would fail every fire
+    // with source_session_missing. Reject at create time instead.
+    const typedEnv = env as Env;
+    const bobEmail = "bob@example.com";
+    const callerEmail = "dev@dodo.local";
+    const bobSessionId = "22222222-aaaa-bbbb-cccc-000000000002";
+    const bobStub = typedEnv.USER_CONTROL.get(typedEnv.USER_CONTROL.idFromName(bobEmail));
+    const registerRes = await bobStub.fetch("https://user-control/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-owner-email": bobEmail },
+      body: JSON.stringify({ id: bobSessionId, ownerEmail: bobEmail, createdBy: bobEmail }),
+    });
+    expect(registerRes.ok).toBe(true);
+    const shared = typedEnv.SHARED_INDEX.get(typedEnv.SHARED_INDEX.idFromName("global"));
+    const grantRes = await shared.fetch("https://shared-index/permissions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionId: bobSessionId,
+        ownerEmail: bobEmail,
+        granteeEmail: callerEmail,
+        permission: "readwrite",
+        grantedBy: bobEmail,
+      }),
+    });
+    expect(grantRes.status).toBe(201);
+
+    const res = await fetchJson("/api/scheduled-sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        description: "fork of a shared session",
+        prompt: "x",
+        type: "delayed",
+        delayInSeconds: 300,
+        source: "fork",
+        sourceSessionId: bobSessionId,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toMatch(/session you own/);
+
+    // Nothing was stored in the caller's DO.
+    const list = await fetchJson("/api/scheduled-sessions");
+    const { scheduledSessions } = await list.json() as { scheduledSessions: Array<{ sourceSessionId: string | null }> };
+    expect(scheduledSessions.some((s) => s.sourceSessionId === bobSessionId)).toBe(false);
+
+    await shared.fetch(`https://shared-index/sessions/${encodeURIComponent(bobSessionId)}/cleanup`, { method: "DELETE" });
+  });
+
+  it("UserControl refuses a fork schedule whose source is not in its own DO", async () => {
+    // Defence in depth for callers that pass the route check without owning
+    // the source, e.g. platform admins (resolveSessionPermission treats them
+    // as owner of every session). Test HTTP auth is always dev@dodo.local,
+    // so this drives the DO directly rather than the admin route path.
+    const typedEnv = env as Env;
+    const stub = typedEnv.USER_CONTROL.get(typedEnv.USER_CONTROL.idFromName("carol@example.com"));
+    const res = await stub.fetch("https://user-control/scheduled-sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-owner-email": "carol@example.com" },
+      body: JSON.stringify({
+        description: "fork of someone else's session",
+        prompt: "x",
+        type: "delayed",
+        delayInSeconds: 300,
+        source: "fork",
+        sourceSessionId: "11111111-aaaa-bbbb-cccc-000000000001",
+        createdBy: "carol@example.com",
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toMatch(/session you own/);
+  });
+
+  it("rejects fork of the caller's own soft-deleted session", async () => {
+    const created = await fetchJson("/session", { method: "POST" });
+    expect(created.status).toBe(201);
+    const { id } = await created.json() as { id: string };
+    const typedEnv = env as Env;
+    const stub = typedEnv.USER_CONTROL.get(typedEnv.USER_CONTROL.idFromName("dev@dodo.local"));
+    const del = await stub.fetch(`https://user-control/sessions/${encodeURIComponent(id)}/soft-delete`, { method: "POST" });
+    expect(del.ok).toBe(true);
+
+    const res = await fetchJson("/api/scheduled-sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        description: "fork of a deleted session",
+        prompt: "x",
+        type: "delayed",
+        delayInSeconds: 300,
+        source: "fork",
+        sourceSessionId: id,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toMatch(/Source session is deleted/);
+  });
+
   it("accepts a fresh scheduled session with no source", async () => {
     const res = await fetchJson("/api/scheduled-sessions", {
       method: "POST",
