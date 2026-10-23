@@ -207,6 +207,8 @@ class LiveView {
   text = "";
   tool: { name: string; input: string; started: number } | undefined;
   header = "";
+  /** Set by a `model_wait` frame: the turn is queued for a Workers AI budget slot. */
+  wait: { model: string; until: number } | undefined;
   tui: TUI | undefined;
 
   render(width: number): string[] {
@@ -219,6 +221,11 @@ class LiveView {
       const secs = ((Date.now() - this.tool.started) / 1000).toFixed(0);
       lines.push(truncateToWidth(`  ⚙ ${this.tool.name} ${this.tool.input} · ${secs}s`, width));
     }
+    // Past `until` the budget wait is over and the request is in flight, so the line goes away
+    // (a further wait sends a new model_wait frame).
+    const waitMs = this.wait ? this.wait.until - Date.now() : 0;
+    if (waitMs <= 0) this.wait = undefined;
+    else lines.push(truncateToWidth(`  ⏳ waiting for model capacity (${this.wait!.model}) · ~${Math.max(1, Math.round(waitMs / 1000))}s`, width));
     return lines;
   }
   invalidate(): void {}
@@ -281,7 +288,7 @@ export default function dodo(pi: ExtensionAPI) {
         live.tui = tui;
         return live;
       });
-      ticker = setInterval(() => live.tool && live.refresh(), 1000);
+      ticker = setInterval(() => (live.tool || live.wait) && live.refresh(), 1000);
     } else {
       u.setWidget("dodo-live", undefined);
       if (ticker) clearInterval(ticker);
@@ -335,13 +342,26 @@ export default function dodo(pi: ExtensionAPI) {
         else {
           flushLiveText();
           live.tool = undefined;
+          live.wait = undefined;
           pendingTools.clear();
           showLive(false);
         }
         if (type === "ready") void catchUp(sessionId).catch(() => {});
         return;
       }
+      case "model_wait": {
+        // The server holds this turn until a model-budget slot frees up; show
+        // a countdown instead of a silent stall. Cleared when the countdown
+        // ends, or earlier by text, a tool call, an assistant message, an error or idle.
+        const d = data as { model?: unknown; waitMs?: unknown } | null;
+        const ms = Math.max(1000, Number(d?.waitMs) || 0);
+        live.wait = { model: clean(typeof d?.model === "string" && d.model ? d.model : modelOf(state)), until: Date.now() + ms };
+        showLive(true);
+        live.refresh();
+        return;
+      }
       case "text_delta": {
+        live.wait = undefined;
         live.text += clean((data as { delta: string }).delta);
         showLive(true);
         live.refresh();
@@ -350,6 +370,7 @@ export default function dodo(pi: ExtensionAPI) {
       case "tool_call": {
         const d = data as { toolCallId: string; toolName: string; input: unknown };
         flushLiveText();
+        live.wait = undefined;
         const t = { name: clean(d.toolName), input: clean(summariseInput(d.input)), started: Date.now() };
         pendingTools.set(d.toolCallId, t);
         live.tool = t;
@@ -369,11 +390,16 @@ export default function dodo(pi: ExtensionAPI) {
       }
       case "message": {
         const m = data as ChatMessage;
-        if (m.role === "assistant") live.text = "";
+        if (m.role === "assistant") {
+          live.text = "";
+          live.wait = undefined;
+        }
         renderMessage(m, sessionId);
         return;
       }
       case "error_message":
+        live.wait = undefined;
+        live.refresh();
         note("error", clean((data as { message: string }).message ?? ""));
         return;
       case "needs_input": {
