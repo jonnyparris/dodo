@@ -47,7 +47,8 @@ let stuckEntered = false;
 export const mockStuckPromptEntered = () => stuckEntered;
 /** Let a "stuck model prompt" request finish (it ignores aborts). */
 export function releaseMockStuckPrompt(): void {
-  stuckReleased = true;
+  // Only while one waits: a stray release must not make the next one return at once.
+  if (stuckEntered) stuckReleased = true;
 }
 async function waitForStuckRelease(): Promise<void> {
   stuckEntered = true;

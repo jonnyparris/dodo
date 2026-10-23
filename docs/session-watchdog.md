@@ -186,5 +186,6 @@ After an abort (user, guard, or watchdog), `PiEngine.run` waits at most
 `src/pi/engine.ts`, not a Worker var), then stops waiting, detaches its
 event stream and logs `pi: run did not settle after abort`. Known gap: a
 model request or tool that ignores the abort signal keeps pi's run alive.
-A prompt sent meanwhile queues in pi and stays queued even after the stuck
-run ends, until the stall guard fails it (15 minutes by default).
+A prompt sent meanwhile queues in pi behind it. After the stuck run ends,
+pi sometimes runs the queued prompt and sometimes leaves it queued until
+the stall guard fails it (15 minutes by default).

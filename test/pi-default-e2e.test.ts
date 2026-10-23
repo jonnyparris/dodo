@@ -426,18 +426,25 @@ describe("pi is the default engine", () => {
       expect(runs[0]?.ms).toBeLessThan(2_000);
 
       // Known gap, pinned here (same on the engine before this bound): a
-      // prompt sent while the orphan is stuck queues in pi and doesn't run,
-      // even after the orphan ends. Only the turn stall guard ends it. When
-      // that's fixed, flip this.
-      await inDO(await agent(id), async (instance) => { instance.turnStallLimitsOverride = { idleMs: 1500, longMs: 1500 }; });
+      // prompt sent while the orphan is stuck queues in pi. After the orphan
+      // ends, pi sometimes runs it and sometimes leaves it queued until the
+      // turn stall guard fails it (both seen in this test). When that's
+      // fixed, tighten this.
+      await inDO(await agent(id), async (instance) => { instance.turnStallLimitsOverride = { idleMs: 3000, longMs: 3000 }; });
       nextId = (await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "after the stuck abort" }))).promptId;
-      await expect(waitForPrompt(id, nextId, 1000)).rejects.toThrow("prompt never finished");
+      expect(await pollPromptStatus(id, nextId, "running")).toBe("running");
+      await new Promise((r) => setTimeout(r, 500));
+      const { prompts } = await json<{ prompts: Array<{ id: string; status: string }> }>(await call(`/session/${id}/prompts`));
+      expect(prompts.find((p) => p.id === nextId)?.status).toBe("running");
+      expect(mockStuckPromptEntered()).toBe(true);
       releaseMockStuckPrompt();
-      const next = await waitForPrompt(id, nextId, 5000);
-      expect(next.status).toBe("failed");
-      expect(next.error).toContain("Turn stalled");
+      const next = await waitForPrompt(id, nextId, 8000);
+      if (next.status === "failed") expect(next.error).toContain("Turn stalled");
+      else expect(next.status).toBe("completed");
     } finally {
       releaseMockStuckPrompt();
+      // Normally it has finished by now; this covers an early failure.
+      if (nextId) await call(`/session/${id}/abort`, { method: "POST" });
       await inDO(await agent(id), async (instance) => {
         instance.piAbortGraceMsOverride = null;
         instance.turnStallLimitsOverride = null;
