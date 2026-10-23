@@ -22,6 +22,7 @@ import { execFileSync, spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text, type TUI, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { formatModelLabel, modelLabel } from "./model-label";
 
 // ─── Types (Dodo's HTTP/SSE shapes) ───
 
@@ -29,6 +30,7 @@ interface SessionState {
   sessionId: string;
   status: "idle" | "running" | "deleted";
   model: string;
+  nextModel?: string;
   modelOverride?: { model?: string; exploreModel?: string; taskModel?: string };
   contextUsagePercent?: number;
   contextWindow?: number;
@@ -253,9 +255,10 @@ export default function dodo(pi: ExtensionAPI) {
   const notify = (msg: string, level: "info" | "warning" | "error" = "info") => ui()?.notify(msg, level);
   const note = (level: NoteEntry["level"], text: string) => pi.appendEntry<NoteEntry>("dodo-note", { level, text });
 
-  /** The model the next prompt runs on: the session override, else the owner's default (every prompt re-reads it). */
+  /** My default model (/api/config): the next-model fallback for servers that don't report `nextModel`. */
   let defaultModel: string | undefined;
-  const modelOf = (s?: SessionState) => s?.modelOverride?.model ?? defaultModel ?? s?.model ?? "?";
+  /** The running prompt's model while one runs (plus `→ next` if the next prompt changes it), else the next prompt's. */
+  const modelOf = (s?: SessionState) => formatModelLabel(modelLabel(s, defaultModel));
 
   function updateStatus(): void {
     if (!attached) {
@@ -535,8 +538,11 @@ export default function dodo(pi: ExtensionAPI) {
     } else if (model === "default" || model === "clear") {
       model = "";
     }
-    const r = await client().request<{ modelOverride: SessionState["modelOverride"] }>(`/session/${attached.id}/model-override`, { method: "PUT", body: { model } });
-    if (state) state = { ...state, modelOverride: r.modelOverride };
+    const id = attached.id;
+    const r = await client().request<{ modelOverride: SessionState["modelOverride"] }>(`/session/${id}/model-override`, { method: "PUT", body: { model } });
+    // Re-read the details: the server resolves `model`/`nextModel` against the owner's config.
+    const fresh = await client().request<SessionState>(`/session/${id}`).catch(() => undefined);
+    if (attached?.id === id && state) state = fresh ?? { ...state, modelOverride: r.modelOverride, nextModel: undefined };
     updateStatus();
     const running = state?.status === "running" ? " The running prompt keeps its main model." : "";
     notify(model ? `Session model → ${model}.${running}` : `Session model → your default.${running}`);
@@ -646,12 +652,14 @@ export default function dodo(pi: ExtensionAPI) {
             if (!attached) return notify("Not attached. /dodo to pick a session.");
             state = await client().request<SessionState>(`/session/${attached.id}`);
             updateStatus();
-            const o = state.modelOverride;
+            const m = modelLabel(state, defaultModel);
+            const running = state.status === "running";
             return notify(
               [
                 `Session ${attached.id}`,
                 `Status: ${state.status}`,
-                `Model: ${modelOf(state)}${o?.model ? " (session override)" : " (your default)"}`,
+                running ? `Model: ${m.current} (this prompt)` : `Model: ${m.current} (${m.nextSource})`,
+                ...(m.next ? [`Next prompt: ${m.next} (${m.nextSource})`] : []),
                 `Context: ${state.contextUsagePercent ?? "?"}% of ${state.contextWindow ?? "?"}`,
                 `Tokens: ${state.totalTokenInput ?? 0} in / ${state.totalTokenOutput ?? 0} out`,
               ].join("\n"),
