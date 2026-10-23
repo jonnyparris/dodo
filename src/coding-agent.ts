@@ -96,6 +96,7 @@ import {
   type WatchdogConfig,
 } from "./watchdog";
 import { evaluateSession } from "./watchdog-policy";
+import { createTurnStallGuard, TurnStallError, turnStallLimitsFromEnv, type TurnStallEvent, type TurnStallGuard, type TurnStallLimits } from "./turn-stall-guard";
 import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 
 type FiberPromptPayload = { promptId: string; content: string; images?: Array<{ data: string; mediaType: string; name?: string }>; authorEmail?: string; title: string };
@@ -3694,14 +3695,13 @@ export class CodingAgent extends CodingAgentBase {
 
     this.markPromptRunning(promptId);
 
-    // Refresh the session config from the latest account config. Not a
-    // prompt start: spawnPrompt already applied the override, and a run
-    // recovered after eviction (or retried) keeps the models it started on.
-    await this.readAppConfig();
-
     // Chat completed before an eviction: just finalize.
     const snapshot = resume ?? (fiber?.snapshot as PromptFiberSnapshot | null | undefined);
     if (snapshot?.chatCompleted) {
+      // Refresh the session config from the latest account config. Not a
+      // prompt start: spawnPrompt already applied the override, and a run
+      // recovered after eviction (or retried) keeps the models it started on.
+      await this.readAppConfig();
       await this.finalizePromptFromFiber(promptId, title, snapshot);
       return;
     }
@@ -3712,9 +3712,24 @@ export class CodingAgent extends CodingAgentBase {
     const signal = this._fiberAbortController.signal;
     const controller = this._fiberAbortController;
     fiber?.signal.addEventListener("abort", () => controller.abort(), { once: true });
+    // A turn that stops making progress (before the first model request,
+    // or anywhere else) fails instead of holding the session. See
+    // src/turn-stall-guard.ts.
+    const stall = this.startTurnStallGuard(promptId, controller);
     try {
-      await this.migrateThinkSessionToPi();
-      const result = await this.runPiChat(content, { promptId, authorEmail, signal, images });
+      const result = await stall.run((async () => {
+        // Refresh the session config from the latest account config. Not a
+        // prompt start: spawnPrompt already applied the override, and a run
+        // recovered after eviction (or retried) keeps the models it started on.
+        stall.touch("read_config");
+        await this.readAppConfig();
+        if (signal.aborted) throw signal.reason;
+        stall.touch("migrate_think");
+        await this.migrateThinkSessionToPi();
+        if (signal.aborted) throw signal.reason;
+        return this.runPiChat(content, { promptId, authorEmail, signal, images, stall });
+      })());
+      stall.stop();
 
       // Guard: treat empty LLM response as a failure — UNLESS the prompt
       // was aborted, in which case the empty result is expected and
@@ -3763,6 +3778,16 @@ export class CodingAgent extends CodingAgentBase {
         tokenOutput: result.tokenOutput,
       });
     } catch (error) {
+      // A stall aborts the controller too, but nobody marked the prompt:
+      // fail it, unless a user abort got there first.
+      const stalled = error instanceof TurnStallError ? error : stall.fired;
+      if (stalled) {
+        const statusRow = Array.from(this.ctx.storage.sql.exec<{ status: string }>("SELECT status FROM prompts WHERE id = ?", promptId))[0];
+        if (statusRow && statusRow.status !== "queued" && statusRow.status !== "running") return;
+        this.emitEvent({ data: { message: stalled.message }, type: "error_message" });
+        await this.finishPrompt(promptId, { error: stalled.message, status: "failed" });
+        return;
+      }
       // Don't report abort-caused errors as failures — the abort handler already
       // marked the prompt as aborted.
       if (signal.aborted) return;
@@ -3771,11 +3796,50 @@ export class CodingAgent extends CodingAgentBase {
       // lifecycle.finish dispatches the prompt-error notification per policy
       await this.finishPrompt(promptId, { error: message, status: "failed" });
     } finally {
-      this._fiberAbortController = null;
+      stall.stop();
+      // A queued prompt may already have started its own fiber (and controller).
+      if (this._fiberAbortController === controller) this._fiberAbortController = null;
       await this.syncSessionIndex({ status: "idle", title });
       this.emitEvent({ data: this.listPrompts(), type: "prompt" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
     }
+  }
+
+  /** Test hook: overrides the env-derived turn stall limits. */
+  turnStallLimitsOverride: TurnStallLimits | null = null;
+  private _lastActivityTouch = 0;
+
+  /**
+   * Start the turn stall guard for one prompt. On a stall it logs and
+   * aborts the turn's controller (which aborts the pi run); runFiberPrompt
+   * fails the prompt. Progress also keeps the session's `updated_at`
+   * fresh (at most every 30s), so the opt-in session watchdog measures
+   * time since the last progress, not time since the prompt was sent.
+   */
+  private startTurnStallGuard(promptId: string, controller: AbortController): TurnStallGuard {
+    const limits = this.turnStallLimitsOverride ?? turnStallLimitsFromEnv(this.env);
+    return createTurnStallGuard({
+      limits,
+      signal: controller.signal,
+      onProgress: () => {
+        const now = Date.now();
+        if (now - this._lastActivityTouch < 30_000) return;
+        this._lastActivityTouch = now;
+        this.control.touchUpdated();
+      },
+      onStall: (err) => {
+        log("error", "turn stalled, failing the prompt", {
+          sessionId: this.sessionId(),
+          promptId,
+          phase: err.info.phase,
+          idleSeconds: Math.round(err.info.idleMs / 1000),
+          limitSeconds: Math.round(err.info.limitMs / 1000),
+          openTools: err.info.openTools,
+          events: err.info.events,
+        });
+        controller.abort(err);
+      },
+    });
   }
 
   /**
@@ -4636,20 +4700,34 @@ export class CodingAgent extends CodingAgentBase {
    */
   private async runPiChat(
     userContent: string,
-    options: { promptId: string; authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }> },
+    options: { promptId: string; authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }>; stall?: TurnStallGuard },
   ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string; steps: number; toolCalls: string[] }> {
+    const stall = options.stall;
+    // After a stall (or user abort) the turn's caller has moved on; a setup
+    // step that finishes late must not go on to touch per-turn state.
+    const bail = () => {
+      if (options.signal?.aborted) throw options.signal.reason ?? new Error("aborted");
+    };
+    stall?.touch("connect_mcp");
     await this.connectMcpServers();
+    bail();
+    stall?.touch("warm_context");
     await this.warmTurnContext();
-    this._toolAttachments.clear();
-    this._toolCallNames.clear();
+    bail();
+    stall?.touch("build_tools");
     const tools = await buildToolsExtension(this.getTools(), {
       onCall: (name) => this._toolCallNames.add(name),
       extra: this.piNativeTools(),
     });
+    bail();
+    this._toolAttachments.clear();
+    this._toolCallNames.clear();
     const result = await this.piEngine().run({
       promptId: options.promptId,
       tools,
       signal: options.signal,
+      onPhase: stall ? (phase) => stall.touch(phase) : undefined,
+      onEvent: stall ? (event) => stall.event(event as TurnStallEvent) : undefined,
       prepare: async () => {
         const { userMsgId, userMsg } = await this.prepareUserTurn(userContent, options);
         return {

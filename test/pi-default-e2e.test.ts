@@ -356,6 +356,64 @@ describe("pi is the default engine", () => {
     expect((await waitForPrompt(id, promptId)).status).toBe("aborted");
   });
 
+  it("a turn that hangs before its first model request fails with the step it hung in, and the session takes the next prompt", async () => {
+    const id = await newSession();
+    const inDO = runInDurableObject as unknown as (stub: unknown, fn: (instance: any) => Promise<void>) => Promise<void>;
+    let restore: (() => void) | undefined;
+    let releaseHung: (() => void) | undefined;
+    await inDO(await agent(id), async (instance) => {
+      instance.turnStallLimitsOverride = { idleMs: 300, longMs: 300 };
+      // Stub a setup step (not connectMcpServers: the first request's owner
+      // check calls that synchronously). Never settles and ignores the
+      // abort: what an unbounded fetch does.
+      const original = instance.warmTurnContext;
+      instance.warmTurnContext = () => new Promise<void>((resolve) => {
+        releaseHung = resolve;
+      });
+      restore = () => {
+        instance.warmTurnContext = original;
+        instance.turnStallLimitsOverride = null;
+      };
+    });
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "hello" }));
+    const failed = await waitForPrompt(id, promptId, 5000);
+    expect(failed.status).toBe("failed");
+    expect(failed.error).toContain("Turn stalled");
+    expect(failed.error).toContain("warm_context");
+    const session = await json<{ status: string; activePromptId?: string | null }>(await call(`/session/${id}`));
+    expect(session.status).toBe("idle");
+
+    // The hung step finishing late must not carry on with the dead turn.
+    await inDO(await agent(id), async () => releaseHung?.());
+    await new Promise((r) => setTimeout(r, 300));
+    expect((await messages(id)).filter((m) => m.role === "user")).toEqual([]);
+
+    await inDO(await agent(id), async () => restore?.());
+    const next = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "after the stall" }));
+    expect((await waitForPrompt(id, next.promptId, 5000)).status).toBe("completed");
+  });
+
+  it("turn progress keeps the session's updated_at fresh, so the opt-in watchdog measures silence, not turn length", async () => {
+    const id = await newSession();
+    const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<T>) => Promise<T>;
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "slow async prompt" }));
+    const old = new Date(Date.now() - 3_600_000).toISOString();
+    try {
+      expect(await pollPromptStatus(id, promptId, "running")).toBe("running");
+      await inDO(await agent(id), async (instance, state) => {
+        state.storage.sql.exec("UPDATE metadata SET value = ? WHERE key = 'updated_at'", old);
+        instance._lastActivityTouch = 0;
+      });
+    } finally {
+      releaseMockSlowPrompt();
+    }
+    expect((await waitForPrompt(id, promptId)).status).toBe("completed");
+    const updatedAt = await inDO(await agent(id), async (_i, state) =>
+      String(Array.from(state.storage.sql.exec("SELECT value FROM metadata WHERE key = 'updated_at'"))[0]?.value),
+    );
+    expect(Date.parse(updatedAt)).toBeGreaterThan(Date.now() - 60_000);
+  });
+
   it("while an async prompt runs, the alarm stays a 30s heartbeat (so an evicted run wakes and recovers)", async () => {
     const id = await newSession();
     const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any, state: DurableObjectState) => Promise<T>) => Promise<T>;
