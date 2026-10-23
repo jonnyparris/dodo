@@ -27,6 +27,10 @@ on:
         description: Branch or ref to deploy as preview
         required: true
         default: main
+      force:
+        description: Deploy even if a pull request holds the preview-lock label
+        type: boolean
+        default: false
   # pull_request_target, not pull_request. For pull_request_target GitHub runs
   # this workflow file from the base branch, so the guard below is supplied by
   # main and cannot be removed by the pull request it checks. The deploy still
@@ -34,7 +38,12 @@ on:
   pull_request_target:
     branches:
       - main
-    types: [opened, synchronize, reopened]
+    # `labeled` lets a PR claim the preview: adding the `preview-lock` label
+    # deploys that PR's head and holds the slot (see "Check preview lock").
+    types: [opened, synchronize, reopened, labeled]
+
+env:
+  PREVIEW_URL: https://dodo-preview.jonnyparris.club
 
 jobs:
   deploy-preview:
@@ -42,27 +51,166 @@ jobs:
     timeout-minutes: 20
     # pull_request_target exposes repository secrets to fork pull requests, so
     # only same-repo branches run here. Fork pull requests get no repo secret
-    # and could not deploy anyway.
-    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
-    # The repo's default workflow token is read-only, so the "Comment preview
-    # URL on PR" step needs an explicit grant to reach the issues REST
-    # endpoints (REST issue comments cover pull requests too).
+    # and could not deploy anyway. Only the preview-lock label triggers a
+    # labeled run; other labels are noise.
+    if: >-
+      (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event.action != 'labeled' || github.event.label.name == 'preview-lock')
+    # dodo-preview is one worker, so deploys must not interleave: runs queue
+    # instead of racing. GitHub keeps one pending run per group, so a newer
+    # run cancels an older *pending* one. If that cancelled run was a
+    # preview-lock claim, the next run deploys the lock holder instead (see
+    # "Check preview lock"), so the claim is not lost.
+    concurrency:
+      group: dodo-preview
+      cancel-in-progress: false
+    # The repo's default workflow token is read-only, so the comment steps
+    # need an explicit grant to reach the issues REST endpoints (REST issue
+    # comments cover pull requests too).
     permissions:
       contents: read
       issues: write
       pull-requests: write
+      # The preview's current owner is recorded as a GitHub deployment
+      # (environment `dodo-preview`, payload {pr, sha}), so the next run
+      # knows whose build it replaces.
+      deployments: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha }}
           fetch-depth: 0
+      - name: Check preview lock
+        # One preview slot is shared by every PR. A PR labelled
+        # `preview-lock` holds it: other PRs' runs do not deploy their own
+        # build (the check stays green, the PR gets a comment and the run
+        # summary says so) until the label is removed. Remove the label when
+        # your live check is done.
+        #
+        # If the preview is not serving the holder's head yet (its claim run
+        # was cancelled while pending, or it pushed while another deploy was
+        # queued), this run deploys the holder's head instead of skipping.
+        id: lock
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const thisPr = context.payload.pull_request?.number ?? null;
+            const force = context.payload.inputs?.force === true || context.payload.inputs?.force === "true";
+
+            // What the preview serves now: the newest dodo-preview deployment
+            // whose latest status is success. Hand deploys with wrangler are
+            // not recorded here.
+            let current = { pr: null, sha: "" };
+            const { data: deps } = await github.rest.repos.listDeployments({ owner, repo, environment: "dodo-preview", per_page: 10 });
+            for (const d of deps) {
+              const { data: st } = await github.rest.repos.listDeploymentStatuses({ owner, repo, deployment_id: d.id, per_page: 1 });
+              if (st[0]?.state !== "success") continue;
+              let p = d.payload ?? {};
+              if (typeof p === "string") { try { p = JSON.parse(p); } catch { p = {}; } }
+              current = { pr: p.pr ?? null, sha: d.sha };
+              break;
+            }
+
+            // A re-run reuses the original event, so an old run could redeploy a
+            // stale commit over this PR's newer push. Skip it.
+            if (thisPr) {
+              const { data: live } = await github.rest.pulls.get({ owner, repo, pull_number: thisPr });
+              if (live.head.sha !== context.payload.pull_request.head.sha) {
+                const msg = `Not deployed: this run is for \`${context.payload.pull_request.head.sha.slice(0, 7)}\`, but #${thisPr} has moved on to \`${live.head.sha.slice(0, 7)}\`.`;
+                core.notice(msg);
+                await core.summary.addRaw(msg).write();
+                core.setOutput("deploy", "false");
+                return;
+              }
+            }
+
+            const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: "open", per_page: 100 });
+            const holders = prs.filter((pr) => pr.labels.some((l) => l.name === "preview-lock"));
+            if (holders.length > 1) {
+              core.warning(`Several PRs hold preview-lock (#${holders.map((h) => h.number).join(", #")}); the last one deployed wins.`);
+            }
+
+            let deploy = true;
+            let targetPr = thisPr;
+            let targetSha = "";
+            let blockedBy = "";
+            let fromFork = false;
+            // With several holders, keep the one already serving if any.
+            const holder = holders.find((h) => h.number === thisPr)
+              ? null
+              : (holders.find((h) => h.number === current.pr) ?? holders[0]);
+            if (holder && !force) {
+              blockedBy = String(holder.number);
+              if (current.pr === holder.number && current.sha === holder.head.sha) {
+                deploy = false;
+              } else if (holder.head.repo?.full_name === `${owner}/${repo}`) {
+                targetPr = holder.number;
+                targetSha = holder.head.sha;
+              } else {
+                deploy = false;
+                fromFork = true;
+              }
+            } else if (holder && force) {
+              core.warning(`Forced deploy over preview-lock held by #${holder.number}`);
+            }
+
+            const summary = fromFork
+              ? `Preview not deployed: #${blockedBy} holds \`preview-lock\`, but its head is on a fork, which this workflow cannot deploy. Remove the label or use workflow_dispatch with force.`
+              : !deploy
+              ? `Preview not deployed: #${blockedBy} holds the \`preview-lock\` label and the preview serves its build.`
+              : targetSha
+                ? `#${blockedBy} holds \`preview-lock\` but the preview was not serving its head, so this run deploys #${blockedBy} (\`${targetSha.slice(0, 7)}\`), not this run's ref.`
+                : `Deploying ${thisPr ? `#${thisPr}` : "the requested ref"} to ${process.env.PREVIEW_URL}.`;
+            core.notice(summary);
+            await core.summary.addRaw(summary).write();
+
+            core.setOutput("deploy", String(deploy));
+            core.setOutput("blocked_by", blockedBy);
+            core.setOutput("target_pr", targetPr ? String(targetPr) : "");
+            core.setOutput("target_sha", targetSha);
+            core.setOutput("prev_pr", current.pr ? String(current.pr) : "");
+            core.setOutput("prev_sha", current.sha);
+      - name: Comment that the preview is locked
+        if: steps.lock.outputs.blocked_by != '' && github.event_name == 'pull_request_target'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          HOLDER: ${{ steps.lock.outputs.blocked_by }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const marker = "<!-- dodo-preview:status -->";
+            const sha = context.payload.pull_request.head.sha;
+            const body = `${marker}\nPreview not deployed: #${process.env.HOLDER} holds the \`preview-lock\` label, so ${process.env.PREVIEW_URL} is reserved for it.\n\nThis PR's \`${sha.slice(0, 7)}\` was not deployed. When the label is gone, re-run this PR's deploy-preview job (the lock is read live; a re-run of an older commit is skipped, so push or re-run the latest), or add \`preview-lock\` here once it is free.`;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: context.issue.number, per_page: 100 });
+            const existing = comments.find((c) => c.user?.login === "github-actions[bot]" && c.body && (c.body.includes(marker) || c.body.includes("<!-- dodo-preview -->") || c.body.startsWith("Preview deployed:")));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: context.issue.number, body });
+            }
+      - name: Switch to the lock holder's head
+        if: steps.lock.outputs.deploy == 'true' && steps.lock.outputs.target_sha != ''
+        env:
+          TARGET_SHA: ${{ steps.lock.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$TARGET_SHA" || { echo "::error::cannot fetch the lock holder's head $TARGET_SHA"; exit 1; }
+          git checkout --detach "$TARGET_SHA"
+      - name: Resolve deployed commit
+        if: steps.lock.outputs.deploy == 'true'
+        id: head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Setup Node
+        if: steps.lock.outputs.deploy == 'true'
         uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
           cache: npm
       - name: Guard against production bindings
+        if: steps.lock.outputs.deploy == 'true'
         run: |
           set -euo pipefail
           cfg=wrangler.preview.jsonc
@@ -141,42 +289,114 @@ jobs:
             exit 1
           fi
       - name: Install
+        if: steps.lock.outputs.deploy == 'true'
         run: npm ci
+      - name: Open the deployment record
+        # Recorded before the deploy as in_progress and marked success or
+        # failure after, so the next run reads only builds that went live.
+        if: steps.lock.outputs.deploy == 'true'
+        id: record
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          SHA: ${{ steps.head.outputs.sha }}
+          TARGET_PR: ${{ steps.lock.outputs.target_pr }}
+        with:
+          script: |
+            const pr = process.env.TARGET_PR ? Number(process.env.TARGET_PR) : null;
+            const sha = process.env.SHA;
+            const { data: dep } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: sha,
+              environment: "dodo-preview",
+              auto_merge: false,
+              required_contexts: [],
+              description: pr ? `PR #${pr}` : `manual: ${context.payload.inputs?.ref ?? sha}`,
+              payload: { pr, sha },
+            });
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: dep.id,
+              state: "in_progress",
+              log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            core.setOutput("id", String(dep.id));
       - name: Deploy preview
+        if: steps.lock.outputs.deploy == 'true'
+        id: deploy
         run: npx wrangler deploy --config wrangler.preview.jsonc
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      - name: Comment preview URL on PR
-        # Best-effort: the job grants issues/pull-requests write above, but a
-        # comment failure (token scope, API blip) must not colour the
-        # deploy-preview check red - the check reports whether the preview
-        # worker deployed.
-        if: github.event_name == 'pull_request_target'
+      - name: Close the deployment record
+        if: always() && steps.record.outputs.id != ''
         continue-on-error: true
         uses: actions/github-script@v7
+        env:
+          DEPLOYMENT_ID: ${{ steps.record.outputs.id }}
+          OUTCOME: ${{ steps.deploy.outcome }}
         with:
           script: |
-            const url = "https://dodo-preview.jonnyparris.club";
-            const body = `Preview deployed: ${url}\n\nAccess-gated (same policies as prod). Load it in a Browser Run session with the Dodo service token to verify UI changes.`;
-            const { data: comments } = await github.rest.issues.listComments({
+            await github.rest.repos.createDeploymentStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              deployment_id: Number(process.env.DEPLOYMENT_ID),
+              state: process.env.OUTCOME === "success" ? "success" : "failure",
+              environment_url: process.env.PREVIEW_URL,
+              log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
-            const existing = comments.find((c) => c.body && c.body.includes("Preview deployed:"));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
+      - name: Comment preview URL on PR, tell the replaced PR
+        # Best-effort: a comment failure (token scope, API blip) must not
+        # colour the deploy-preview check red - the check reports whether the
+        # preview worker deployed.
+        if: steps.deploy.outcome == 'success'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          SHA: ${{ steps.head.outputs.sha }}
+          TARGET_PR: ${{ steps.lock.outputs.target_pr }}
+          PREV_PR: ${{ steps.lock.outputs.prev_pr }}
+          PREV_SHA: ${{ steps.lock.outputs.prev_sha }}
+        with:
+          script: |
+            const url = process.env.PREVIEW_URL;
+            const statusMarker = "<!-- dodo-preview:status -->";
+            const replacedMarker = "<!-- dodo-preview:replaced -->";
+            const { owner, repo } = context.repo;
+            const sha = process.env.SHA;
+            const short = sha.slice(0, 7);
+            const targetPr = process.env.TARGET_PR ? Number(process.env.TARGET_PR) : null;
+            const prevPr = process.env.PREV_PR ? Number(process.env.PREV_PR) : null;
+            const prevSha = process.env.PREV_SHA || "";
+            const source = targetPr ? `#${targetPr}` : `\`${context.payload.inputs?.ref ?? short}\` (manual run)`;
+            const replaced = prevSha && prevSha !== sha
+              ? `\n\nReplaced \`${prevSha.slice(0, 7)}\`${prevPr ? ` from #${prevPr}` : ""}.`
+              : "";
+
+            if (targetPr) {
+              const body = `${statusMarker}\nPreview deployed: ${url}\n\nServes \`${short}\` from this PR. Access-gated (same policies as prod). Load it in a Browser Run session with the Dodo service token to verify UI changes.\n\nThe preview is shared: the next PR push replaces this build, and this PR gets a new comment when that happens. Add the \`preview-lock\` label to hold it during a live check, and remove the label when you are done.${replaced}`;
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: targetPr, per_page: 100 });
+              const existing = comments.find((c) => c.user?.login === "github-actions[bot]" && c.body && (c.body.includes(statusMarker) || c.body.includes("<!-- dodo-preview -->") || c.body.startsWith("Preview deployed:")));
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number: targetPr, body });
+              }
+            }
+
+            // Tell the PR whose build was just replaced, so a pending live
+            // check there does not silently test someone else's code. A new
+            // comment, not an edit: edits send no notification.
+            if (prevPr && prevPr !== targetPr && prevSha !== sha) {
+              const { data: prev } = await github.rest.pulls.get({ owner, repo, pull_number: prevPr });
+              if (prev.state === "open") {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: prevPr,
+                  body: `${replacedMarker}\nPreview replaced: ${url} now serves \`${short}\` from ${source}, not this PR's \`${prevSha.slice(0, 7)}\`.\n\nA live check on this PR that started before now is no longer testing this branch. Re-run this PR's deploy-preview job to take the preview back, or add the \`preview-lock\` label to deploy it and hold it.`,
+                });
+              }
             }
