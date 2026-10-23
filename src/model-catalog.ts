@@ -43,6 +43,7 @@ export const FALLBACK_MODELS = [
  *  endpoint. These only work when `activeGateway === "ai-gateway"`. */
 export const WORKERS_AI_MODELS = [
   { id: "@cf/zai-org/glm-5.3-flash", name: "GLM-5.3 Flash (Workers AI)", provider: "Workers AI", costInput: 0.15, costOutput: 0.5, contextWindow: 1_048_576 },
+  { id: "@cf/deepseek-ai/deepseek-v4.1-flash-1017", name: "DeepSeek V4.1 Flash 1017 (Workers AI)", provider: "Workers AI", costInput: 0.3, costOutput: 1.2, contextWindow: 1_048_576 },
   { id: "@cf/moonshotai/kimi-k2.6", name: "Kimi K2.6 (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 262_144 },
   { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B A4B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 256_000 },
   { id: "@cf/meta/llama-4-scout-17b-16e-instruct", name: "Llama 4 Scout 17B (Workers AI)", provider: "Workers AI", costInput: null, costOutput: null, contextWindow: 131_072 },
@@ -86,6 +87,7 @@ const VISION_CAPABLE_MODEL_PATTERNS = [
   // Workers AI models whose catalog entry has `vision: true` (checked 2026-10-17).
   /^@cf\/zai-org\/glm-5\.3-flash$/,
   /^@cf\/moonshotai\/kimi-k2\.6$/,
+  /^@cf\/deepseek-ai\/deepseek-v4\.1-flash-1017$/, // vision: true (checked 2026-10-21)
   /^@cf\/google\/gemma-4-/,
 ];
 
