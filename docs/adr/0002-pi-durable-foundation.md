@@ -146,7 +146,8 @@ existing workspace instead of cloning.
   URL/credential changes apply without reopening. Model and gateway stay
   fixed while a prompt runs (`readAppConfig` keepRunning,
   `ensureThinkConfig`), so the running turn's model ref stays registered; a
-  change applies from the next prompt.
+  change applies from the next prompt. The previous model stays registered
+  too, for a background compaction that outlasts its prompt.
 
 ## Pi 1.4 / agents 0.30 (2026-10)
 

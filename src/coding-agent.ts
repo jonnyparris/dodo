@@ -623,7 +623,7 @@ export class CodingAgent extends CodingAgentBase {
   private _toolCallNames: Set<string> = new Set();
   private _piEngine: PiEngine | null = null;
   /** Model access for the pi engine, built for one gateway config. */
-  private _piModels: { key: string; models: Models } | undefined;
+  private _piModels: { key: string; model: string; ids: string[]; models: Models } | undefined;
   /** Last known pi transcript length, for the sync messageCount() read. */
   private _piMessageCount = 0;
   private readonly presence = new PresenceTracker();
@@ -4437,16 +4437,20 @@ export class CodingAgent extends CodingAgentBase {
       // pi calls this at every model use; rebuild only when the config
       // changes. Model and gateway don't change while a prompt runs
       // (readAppConfig keepRunning, ensureThinkConfig), so the running turn's
-      // model stays registered; the next prompt picks up a new one.
+      // model stays registered; the next prompt picks up a new one. The
+      // previous model stays registered too: a background compaction started
+      // on it can outlast its prompt and asks for it again.
       models: () => {
         const config = this.piGatewayConfig();
-        const key = JSON.stringify(config);
+        const cached = this._piModels;
+        const ids = !cached ? [config.model] : cached.model === config.model ? cached.ids : [config.model, cached.model];
+        const key = JSON.stringify([config, ids]);
         if (this._piModels?.key === key) return this._piModels.models;
-        const models = setDodoProvider(createModels(), [config.model], config, this.env, {
+        const models = setDodoProvider(createModels(), ids, config, this.env, {
           // The UI shows "waiting for model capacity" instead of a silent stall.
           onBudgetWait: (info) => this.emitEvent({ type: "model_wait", data: { model: config.model, waitMs: Math.round(info.waitMs), used: info.used, limit: info.limit } }),
         });
-        this._piModels = { key, models };
+        this._piModels = { key, model: config.model, ids, models };
         return models;
       },
       modelRef: () => {
