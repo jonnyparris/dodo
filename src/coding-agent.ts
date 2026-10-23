@@ -624,8 +624,6 @@ export class CodingAgent extends CodingAgentBase {
   private _piEngine: PiEngine | null = null;
   /** Model access for the pi engine, built for one gateway config. */
   private _piModels: { key: string; models: Models } | undefined;
-  /** Every model id the pi engine has served in this isolate (see piEngine().models). */
-  private readonly _piModelIds = new Set<string>();
   /** Last known pi transcript length, for the sync messageCount() read. */
   private _piMessageCount = 0;
   private readonly presence = new PresenceTracker();
@@ -4436,17 +4434,15 @@ export class CodingAgent extends CodingAgentBase {
   private piEngine(): PiEngine {
     this._piEngine ??= new PiEngine({
       storage: this.ctx.storage,
-      // pi calls this at every model use; rebuild only when the config changes.
-      // Models this isolate already served stay registered: a turn keeps the
-      // model it started on (its agent ref is fixed at run start), so a model
-      // switch mid-run must not unregister it.
+      // pi calls this at every model use; rebuild only when the config
+      // changes. Model and gateway don't change while a prompt runs
+      // (readAppConfig keepRunning, ensureThinkConfig), so the running turn's
+      // model stays registered; the next prompt picks up a new one.
       models: () => {
         const config = this.piGatewayConfig();
-        this._piModelIds.add(config.model);
-        const ids = [...this._piModelIds];
-        const key = JSON.stringify([config, ids]);
+        const key = JSON.stringify(config);
         if (this._piModels?.key === key) return this._piModels.models;
-        const models = setDodoProvider(createModels(), ids, config, this.env, {
+        const models = setDodoProvider(createModels(), [config.model], config, this.env, {
           // The UI shows "waiting for model capacity" instead of a silent stall.
           onBudgetWait: (info) => this.emitEvent({ type: "model_wait", data: { model: config.model, waitMs: Math.round(info.waitMs), used: info.used, limit: info.limit } }),
         });

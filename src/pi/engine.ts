@@ -150,7 +150,7 @@ const SETTINGS: HarnessSettings = {
 export interface PiParkedTask {
   id: string;
   kind: string;
-  /** Background work (e.g. compaction): `Conversation.abort()` doesn't reach it. */
+  /** Background work (e.g. compaction): a plain `Conversation.abort()` doesn't reach it. */
   background: boolean;
 }
 
@@ -454,16 +454,18 @@ export class PiEngine {
 
   /**
    * Abort parked work: the conversation's turn (cascades to its tool calls)
-   * when any of it is parked, and each parked background task by id, since
-   * `Conversation.abort()` stops at background boundaries. `root.abort()`
-   * also waits for the conversation to go idle, so callers bound this.
+   * when any of it is parked, and each parked background task by id (not
+   * `abort({ background: true })`, which would also stop healthy background
+   * work). All start at once, so their marking commits are queued on pi's
+   * line before anything run() submits next; `root.abort()` then waits for
+   * the conversation to go idle, so callers bound the wait.
    */
   private async clearParked(harness: Harness, root: Awaited<ReturnType<PiEngine["root"]>>, tasks: PiParkedTask[]): Promise<void> {
     const failed = (what: string) => (err: unknown) => this.host.log("warn", `pi: abort of parked ${what} failed`, { error: String(err) });
-    for (const t of tasks.filter((t) => t.background)) {
-      await harness.abortTask(t.id as never, this.ctx).catch(failed(t.kind));
-    }
-    if (tasks.some((t) => !t.background)) await root.abort(this.ctx).catch(failed("turn"));
+    await Promise.all([
+      ...tasks.filter((t) => t.background).map((t) => harness.abortTask(t.id as never, this.ctx).catch(failed(t.kind))),
+      ...(tasks.some((t) => !t.background) ? [root.abort(this.ctx).catch(failed("turn"))] : []),
+    ]);
   }
 
   /** Translate pi agent events into Dodo's SSE protocol. */

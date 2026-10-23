@@ -143,9 +143,10 @@ existing workspace instead of cloning.
 - `HarnessOptions.models` as a function shipped in pi-durable 1.4.0. Dodo
   passes one (`PiEngineHost.models()`); CodingAgent rebuilds its `Models` only
   when the gateway config changes, and pi reads it at every model request, so
-  credentials/routing changes apply without reopening. A running turn keeps
-  the model it started on (its agent ref is fixed at run start), so every
-  model id the isolate has served stays registered.
+  URL/credential changes apply without reopening. Model and gateway stay
+  fixed while a prompt runs (`readAppConfig` keepRunning,
+  `ensureThinkConfig`), so the running turn's model ref stays registered; a
+  change applies from the next prompt.
 
 ## Pi 1.4 / agents 0.30 (2026-10)
 
@@ -158,9 +159,9 @@ existing workspace instead of cloning.
   tasks after open: a recovered prompt whose own run is parked is aborted and
   fails with `PiTaskParkedError` (clear message, user resends); otherwise
   (a new prompt, or only background work such as compaction parked) the
-  parked work is aborted and the prompt runs. Background tasks are aborted by
-  id (`Conversation.abort()` doesn't reach them); every abort is bounded at
-  30 s. Not `retryTask()`: the same step would most likely crash again.
+  parked work is aborted and the prompt runs. Parked background tasks are
+  aborted by id, so healthy background work keeps running; every clear is
+  bounded at 30 s. Not `retryTask()`: the same step would most likely crash again.
   `onReport` now logs the typed `info`.
 - **createAI (agents ≥0.29).** No more universal endpoint. Main-session
   Anthropic models resolve by AI Gateway's catalog spelling
