@@ -30,6 +30,16 @@ describe("MCP_CATALOG", () => {
     expect(entry?.knownHosts).toContain("websearch-staging.mcp.cloudflare.com");
   });
 
+  it("includes the Cloudflare API MCP as an OAuth entry that steers users to a narrow grant", () => {
+    const entry = MCP_CATALOG.find((e) => e.id === "cloudflare-api");
+    expect(entry).toBeDefined();
+    expect(entry?.url).toBe("https://mcp.cloudflare.com/mcp");
+    expect(entry?.auth_type).toBe("oauth");
+    expect(entry?.knownHosts).toEqual(["mcp.cloudflare.com"]);
+    // Step-up makes Minimal / Read only usable; the guide must say so.
+    expect(entry?.setupGuide).toMatch(/Minimal or Read only/);
+  });
+
   it("does NOT include github as an OAuth catalog entry — GitHub's MCP server doesn't support DCR", () => {
     // Documented in mcp-catalog.ts. api.githubcopilot.com returns
     // "Incompatible auth server: does not support dynamic client

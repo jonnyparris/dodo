@@ -1195,7 +1195,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     return jsonFetch(env, "agent", "/messages", { sessionId, depth });
   });
 
-  server.tool("get_prompts", "Get prompt history for a session. `needsInput` is set when the agent stopped for a person (login, CAPTCHA, decision): { kind, reason, liveView, at }.", {
+  server.tool("get_prompts", "Get prompt history for a session. `needsInput` is set when the agent stopped for a person (login, CAPTCHA, decision, OAuth re-approval): { kind, reason, liveView, at, oauthServerId? }. oauthServerId = an OAuth MCP server waiting for the owner to approve more access; the owner opens the link from the Dodo UI (or GET /api/mcp/oauth-servers → authUrl), then replies.", {
     sessionId: z.string().describe("Session ID"),
   }, async ({ sessionId }) => {
     const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");

@@ -798,7 +798,24 @@ function renderNeedsInput(state){
   if(!state){bar.hidden=true;return}
   $("needs-input-text").textContent=`Dodo needs you: ${state.reason||"see the last message"}`;
   $("needs-input-live").hidden=!state.liveView;
+  const auth=$("needs-input-auth");
+  if(auth){const sid=state.oauthServerId||"";auth.hidden=!sid;auth.onclick=sid?()=>openOAuthApproval(sid):null}
   bar.hidden=false;
+}
+// The needs-input card only carries the hub server id (share viewers can
+// read it). The link comes from GET /api/mcp/oauth-servers, which reads the
+// *caller's* hub, so only the session owner gets one. Open the tab first,
+// synchronously, so the popup blocker allows it, then point it at the link.
+async function openOAuthApproval(serverId){
+  const w=window.open("","_blank");
+  try{
+    const {servers}=await api("/api/mcp/oauth-servers");
+    const s=(servers||[]).find(x=>x.id===serverId);
+    const u=s&&/^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1|\[::1\])[:/])/i.test(s.authUrl||"")?s.authUrl:"";
+    if(!u){w?.close();toast(!s?"Only the session owner can approve this access.":s.state==="ready"?"Nothing to approve: this server is already connected. Reply done.":`This server is ${s.state}. Check it in Settings → Integrations.`,"warning");return}
+    if(!w){toast("Popup blocked. Allow popups for this site and try again.","error");return}
+    w.opener=null;w.location.href=u;
+  }catch(e){w?.close();toast(`Could not load the approval link: ${e.message}`,"error")}
 }
 async function loadNeedsInput(){
   if(!currentSession){renderNeedsInput(null);return}
