@@ -68,9 +68,16 @@
   // FORK_SNAPSHOTS points at a preview-only bucket so fork / seed / bench
   // flows work on preview. Crons are off here, so the 1-hour TTL sweep in
   // UserControl never runs; the bucket has an R2 lifecycle rule that
-  // deletes objects after 1 day instead. WORKSPACE_BUCKET stays unbound
-  // (attachments degrade to null on preview).
+  // deletes objects after 1 day instead.
+  //
+  // WORKSPACE_BUCKET points at a preview-only bucket so attachments, task
+  // scratch files and skill assets work on preview. All keys are per
+  // session or per user, so nothing needs to be seeded from prod. The
+  // bucket has an R2 lifecycle rule that deletes objects after 7 days
+  // (long enough for a multi-day test run; an expired attachment just
+  // 404s, the same as having no bucket).
   "r2_buckets": [
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-preview-workspaces" },
     { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-preview-fork-snapshots" }
   ],
   "browser": {
