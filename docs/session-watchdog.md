@@ -185,5 +185,5 @@ After an abort (user, guard, or watchdog), `PiEngine.run` waits at most
 30 seconds (`PI_ABORT_GRACE_MS`) for pi to settle the run, then stops
 waiting, detaches its event stream and logs `pi: run did not settle after
 abort`. Known gap: a model request or tool that ignores the abort signal
-keeps pi's run alive, and pi queues the session's next prompt behind it
-until it ends.
+keeps pi's run alive. A prompt sent meanwhile queues in pi and, in tests,
+stays queued even after the stuck run ends, until the stall guard fails it.

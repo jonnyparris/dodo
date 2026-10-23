@@ -357,9 +357,11 @@ export class PiEngine {
   /**
    * After an abort, give pi `graceMs` to settle the submission (the abort
    * cascades through tools, so it normally takes well under a second). If it
-   * doesn't, stop waiting and return undefined: the prompt is already failed
-   * or aborted and the session idle, so holding run() and the event stream
-   * open for a run that may never end only leaks them.
+   * doesn't, stop waiting and return undefined: the caller has already
+   * failed or aborted the prompt, so holding run() and the event stream open
+   * for a run that may never end only leaks them. This does not end pi's run:
+   * a model request or tool that ignores the abort keeps it alive, and a
+   * submission made meanwhile queues in pi (see test/pi-default-e2e.test.ts).
    */
   private async waitAfterAbort(
     submission: Submission,
