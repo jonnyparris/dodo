@@ -1,8 +1,12 @@
 // Anthropic models on AI Gateway go through the Agents SDK's `createAI`
 // (agents/models/pi-ai for the main session, agents/models/ai-sdk `routed`
-// for explore/task subagents). Both call AI Gateway through the `AI` binding
-// (`env.AI.gateway(id).run`, the universal endpoint), so this leg needs no
-// AI_GATEWAY_KEY and no hand-built gateway URL or cf-aig-* headers.
+// for explore/task subagents). Both call AI Gateway through the `AI` binding,
+// so this leg needs no AI_GATEWAY_KEY and no hand-built gateway URL or
+// cf-aig-* headers. Since agents 0.29 createAI no longer uses the universal
+// endpoint: the main session's catalog models run on `env.AI.run` under AI
+// Gateway's catalog id (`anthropic/claude-sonnet-4.6`, Anthropic-native
+// body), and the subagents' `routed` models go to the provider-native path
+// (`env.AI.fetch` to `/ai-gateway/gateways/{id}/anthropic/v1/messages`).
 //
 // Replaces PR #110's special case, which pointed pi-ai / @ai-sdk/anthropic at
 // the gateway's `/anthropic` URL with `cf-aig-authorization`. The reason for
@@ -137,7 +141,7 @@ export async function runWithLocalSignal(run: GatewayRun, request: unknown, opti
   return new Response(readable, response);
 }
 
-/** `model` is the Workers AI model id on the run path (for the per-model budget); undefined on `gateway(id).run`. */
+/** `model` is the model id on `run` (the per-model budget only counts `@cf/` ones); undefined on `gateway(id).run`. */
 type Retry = (send: () => Promise<Response>, signal?: AbortSignal | null, model?: string) => Promise<Response>;
 
 /** Workers AI rate-limit errors: 3021 (requests per minute) and 3040 (capacity), by code or by their wording. */
@@ -161,12 +165,14 @@ export async function runAsResponse(run: () => Promise<Response>): Promise<Respo
 }
 
 /**
- * The `AI` binding, adapted for createAI: `gateway(id).run` (Anthropic) and
- * `run` (Workers AI run path) keep the AbortSignal on this side of the RPC
- * boundary (runWithLocalSignal) and, when `retry` is given, go through it.
- * `run` also turns a thrown rate limit into a 429 (runAsResponse). createAI
- * never calls `fetch`, so the 429 wait in rate-limit-fetch.ts has to sit on
- * the binding instead. `then` and `aiGatewayLogId` read as undefined (on the
+ * The `AI` binding, adapted for createAI: `run` (Anthropic catalog models
+ * and the Workers AI run path) and `gateway(id).run` (Dodo's own `/compat`
+ * leg) keep the AbortSignal on this side of the RPC boundary
+ * (runWithLocalSignal) and, when `retry` is given, go through it. `run` also
+ * turns a thrown rate limit into a 429 (runAsResponse). createAI never calls
+ * the global `fetch`, so the 429 wait in rate-limit-fetch.ts has to sit on
+ * the binding instead. `fetch` (provider-native path, stream resume) keeps
+ * the signal local too. `then` and `aiGatewayLogId` read as undefined (on the
  * stub they'd be remote calls); everything else passes through.
  */
 export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
@@ -175,8 +181,9 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
   // by name through closures (seen live 2026-10-22: `.bind` sent an
   // RpcPromise over the wire and failed to serialise). `gateway(id)` returns
   // a plain wrapper; the underlying call is still a pipelined RPC.
-  // Two calls are adapted: `gateway(id).run` (Anthropic) and `run` (the
-  // Workers AI path for `@cf/` models when WORKERS_AI_VIA_BINDING is on).
+  // Three calls are adapted: `run` (Anthropic catalog models, and the
+  // Workers AI path for `@cf/` models when WORKERS_AI_VIA_BINDING is on),
+  // `gateway(id).run` and `fetch`.
   type Callable = Record<PropertyKey, (...args: unknown[]) => unknown>;
   const stub = binding as unknown as Callable;
   const local = (run: GatewayRun, model?: string): GatewayRun => (request, options) => {
@@ -205,6 +212,12 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
       if (prop === "run") {
         return (model: unknown, inputs: unknown, options?: Parameters<GatewayRun>[1]) =>
           local((_req, opts) => runAsResponse(() => stub.run(model, inputs, opts) as Promise<Response>), typeof model === "string" ? model : undefined)(undefined, options);
+      }
+      // createAI resumes a dropped catalog stream with a GET over the
+      // binding's fetch, passing the signal: same RPC problem.
+      if (prop === "fetch") {
+        return (input: unknown, init?: Parameters<GatewayRun>[1]) =>
+          runWithLocalSignal((req, opts) => stub.fetch(req, opts) as Promise<Response>, input, init);
       }
       // createAI reads this after a run call as a fallback log id. On the stub
       // it would be a remote property (an RpcPromise, not a string); the
