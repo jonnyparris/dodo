@@ -267,7 +267,8 @@ describe("buildProviderForModel routing", () => {
       };
       const { binding, runCalls } = fakeAIBinding(() => anthropicReply(), () => completion({ content: "ok" }));
       for (const [cfg, env] of [
-        [config, flagged(binding, "0")],
+        // COMPAT_VIA_BINDING=0: /compat over HTTP, so captureFetch sees it.
+        [config, { ...flagged(binding, "0"), COMPAT_VIA_BINDING: "0" } as unknown as Env],
         [{ ...config, activeGateway: "opencode" } as AppConfig, flagged(binding)],
         [config, { ...flagged(binding), CLOUDFLARE_ACCOUNT_ID: undefined } as unknown as Env],
       ] as const) {
