@@ -201,8 +201,6 @@ export class PiEngine {
   private database: DurableObjectSqliteDatabase | undefined;
   private readonly registry = createRegistry();
   private readonly ctx: Context = BACKGROUND_CONTEXT;
-  /** Called when pi parks a task (crash-loop guard). */
-  private readonly parkListeners = new Set<(task: PiParkedTask) => void>();
 
   constructor(private readonly host: PiEngineHost) {
     this.registry.install(
@@ -270,9 +268,9 @@ export class PiEngine {
     if ("reason" in info) fields.reason = info.reason;
     if (info.type === "host_error") fields.callback = info.callback;
     if (info.type === "task_parked") {
+      // run() finds the parked task through inspect() (parkedTasks) and fails
+      // or clears it. Parks are only counted at open, before any turn waits.
       this.host.log("error", "pi: task parked by the crash-loop guard", fields);
-      const task = { id: String(info.task.id), kind: info.task.kind };
-      for (const listener of this.parkListeners) listener(task);
       return;
     }
     const level = info.type === "session_failed" || info.type === "task_faulted" ? "error" : "warn";
@@ -343,9 +341,13 @@ export class PiEngine {
         await this.abortParked(root, submission, parkedAtStart);
       }
       // A new prompt: the park is left over from an earlier turn (whose
-      // prompt already failed or gave up). Abort it so this prompt can run.
+      // prompt already failed or gave up). Abort it so this prompt can run;
+      // the new input queues behind the aborting run. An abort-marked task is
+      // no longer blocked, so the re-check is empty unless the abort failed.
       this.host.log("warn", "pi: aborting work parked by an earlier turn", { tasks: parkedAtStart });
-      await root.abort(this.ctx);
+      await root.abort(this.ctx).catch((err) => this.host.log("warn", "pi: abort of parked work failed", { error: String(err) }));
+      const still = await this.parkedTasks();
+      if (still.length > 0) throw new PiTaskParkedError(still, PI_RESTART_LIMIT);
     }
     if (!submission) {
       bail();
@@ -380,31 +382,18 @@ export class PiEngine {
     const onAbort = () => {
       void root.abort(this.ctx).catch(() => {});
     };
-    // A park reported while this turn waits (a reopen after a storage error
-    // counted the last restart).
-    let onParked: ((task: PiParkedTask) => void) | undefined;
-    const parked = new Promise<PiParkedTask>((resolve) => {
-      onParked = resolve;
-      this.parkListeners.add(resolve);
-    });
+
     input.signal?.addEventListener("abort", onAbort, { once: true });
     // Aborted between submit and here: the listener won't fire for a past abort.
     if (input.signal?.aborted) onAbort();
     let settled: Awaited<ReturnType<Submission["wait"]>>;
     try {
       const waitCtx = input.signal ? withAbortSignal(input.signal, this.ctx) : this.ctx;
-      const waiting = submission.wait(waitCtx).catch(async (err) => {
+      settled = await submission.wait(waitCtx).catch(async (err) => {
         if (input.signal?.aborted) return submission.wait(this.ctx);
         throw err;
       });
-      const first = await Promise.race([waiting.then((s) => ({ settled: s })), parked.then((task) => ({ parked: task }))]);
-      if ("parked" in first) {
-        waiting.catch(() => {});
-        await this.abortParked(root, submission, [first.parked]);
-      }
-      settled = (first as { settled: Awaited<ReturnType<Submission["wait"]>> }).settled;
     } finally {
-      if (onParked) this.parkListeners.delete(onParked);
       input.signal?.removeEventListener("abort", onAbort);
       await stream.stop().catch(() => {});
     }

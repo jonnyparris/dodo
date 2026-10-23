@@ -151,7 +151,9 @@ describe("PiEngine", () => {
   });
 
   /**
-   * Simulate the DO being reset mid-task `PI_RESTART_LIMIT` times: a clean
+   * Simulate the DO being reset mid-task `PI_RESTART_LIMIT` times. Writes
+   * pi-durable's internal `pi_tasks` table (schema v2, JSON `record` with
+   * `state.status` and `restarts`): revisit on a pi upgrade. A clean
    * close() writes running tasks back as pending without counting, so put
    * them back to running with one restart short of the limit; the next open
    * counts the last one and parks them.
@@ -236,7 +238,7 @@ describe("PiEngine", () => {
       await enteredP;
       await first.close();
       await running;
-      crashLoop(state.storage);
+      expect(crashLoop(state.storage)).toBeGreaterThan(0);
 
       // Some other open (GET /messages, the engine view) counts the last restart and parks it.
       const second = new PiEngine(host(state.storage, faux, []));
