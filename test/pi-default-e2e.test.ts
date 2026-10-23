@@ -15,7 +15,7 @@ vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/pi/models", async () => await import("./helpers/pi-models-mock"));
 
 import worker from "../src/index";
-import { seenContexts } from "./helpers/pi-models-mock";
+import { mockStuckPromptEntered, releaseMockStuckPrompt, seenContexts } from "./helpers/pi-models-mock";
 
 const BASE = "https://dodo.example";
 const typedEnv = env as unknown as Env;
@@ -391,6 +391,47 @@ describe("pi is the default engine", () => {
     await inDO(await agent(id), async () => restore?.());
     const next = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "after the stall" }));
     expect((await waitForPrompt(id, next.promptId, 5000)).status).toBe("completed");
+  });
+
+  it("a pi run that never settles after an abort is let go after the grace period", async () => {
+    const id = await newSession();
+    const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any) => Promise<T>) => Promise<T>;
+    const runs: Array<{ promptId: string; status?: string; reason?: string; ms?: number }> = [];
+    await inDO(await agent(id), async (instance) => {
+      instance.piAbortGraceMsOverride = 300;
+      const engine = instance.piEngine();
+      const run = engine.run.bind(engine);
+      engine.run = async (input: { promptId: string; signal?: AbortSignal }) => {
+        const record: (typeof runs)[number] = { promptId: input.promptId };
+        runs.push(record);
+        let abortedAt = 0;
+        input.signal?.addEventListener("abort", () => { abortedAt = Date.now(); }, { once: true });
+        const result = await run(input as never);
+        Object.assign(record, { status: result.status, reason: result.reason, ms: abortedAt ? Date.now() - abortedAt : undefined });
+        return result;
+      };
+    });
+    // The model request ignores the abort: pi's run can't settle.
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "stuck model prompt" }));
+    try {
+      for (let i = 0; i < 300 && !mockStuckPromptEntered(); i++) await new Promise((r) => setTimeout(r, 10));
+      expect(mockStuckPromptEntered()).toBe(true);
+      expect(runs.map((r) => r.promptId)).toEqual([promptId]);
+      expect((await call(`/session/${id}/abort`, { method: "POST" })).status).toBe(200);
+      expect((await waitForPrompt(id, promptId)).status).toBe("aborted");
+      // run() returns on its own after the grace period, not when the model does.
+      for (let i = 0; i < 300 && runs[0]?.status === undefined; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(runs[0]).toMatchObject({ promptId, status: "unanswered", reason: "abort_timeout" });
+      expect(runs[0]?.ms).toBeLessThan(2_000);
+    } finally {
+      releaseMockStuckPrompt();
+    }
+    // Known gap: while the orphan is still stuck, pi queues the next
+    // submission behind it (checked by hand, also with close + reopen). Once
+    // it ends, the session works again.
+    const next = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "after the stuck abort" }));
+    expect((await waitForPrompt(id, next.promptId, 5000)).status).toBe("completed");
+    await inDO(await agent(id), async (instance) => { instance.piAbortGraceMsOverride = null; });
   });
 
   it("turn progress keeps the session's updated_at fresh, so the opt-in watchdog measures silence, not turn length", async () => {
