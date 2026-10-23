@@ -27,7 +27,7 @@ import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { CLOUDFLARE_AI_GATEWAY_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-ai-gateway.models";
 import { CLOUDFLARE_PROVIDER_ID, createAI } from "agents/models/pi-ai";
-import { bindingGatewayId, adaptBindingForCreateAI, gatewayMetadata } from "../cloudflare-ai";
+import { bindingGatewayId, adaptBindingForCreateAI, gatewayMetadata, workersAIOnRunPath } from "../cloudflare-ai";
 import { contextWindowFor, FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
@@ -35,6 +35,9 @@ import { log } from "../logger";
 import { type ModelBudgetClient, type ModelBudgetWaitInfo, withModelBudget } from "../model-budget-fetch";
 import { rateLimitFetch, type RateLimitFetchOptions } from "./rate-limit-fetch";
 import { type StreamIdleTimeoutInfo, withStreamIdleTimeout } from "./stream-idle-timeout";
+
+// Moved to cloudflare-ai.ts (the subagents use it too); re-exported for existing callers.
+export { workersAIOnRunPath };
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
 /** The `api` createAI gives Workers AI models (its run path, not a wire format). */
@@ -130,16 +133,6 @@ export function createAIGatewayId(
   return bindingGatewayId(config, env);
 }
 
-/**
- * Whether an `@cf/` model goes through createAI's Workers AI run path
- * (`env.AI.run` with the gateway option) instead of `/compat`. Opt-in via
- * WORKERS_AI_VIA_BINDING ("1"/"true") while it is A/B'd against `/compat`.
- */
-export function workersAIOnRunPath(modelId: string, env: Pick<Env, "WORKERS_AI_VIA_BINDING">): boolean {
-  if (!modelId.startsWith("@cf/")) return false;
-  const flag = env.WORKERS_AI_VIA_BINDING?.trim().toLowerCase();
-  return flag === "1" || flag === "true";
-}
 
 function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLimit?: RateLimitFetchOptions, budget?: ModelBudgetStreamOptions) {
   // createAI never calls fetch, so the 429 wait wraps the binding call. The

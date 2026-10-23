@@ -4,13 +4,14 @@
  * cache_control markers. These tests pin the routing, the absence of gateway
  * keys, the log metadata and the cache breakpoints.
  */
-import { generateText, jsonSchema, tool } from "ai";
+import { generateText, jsonSchema, stepCountIs, tool } from "ai";
 import { generateStructured } from "../src/structured-output";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { bindingGatewayId, runWithLocalSignal } from "../src/cloudflare-ai";
 import { fakeAIBinding } from "./helpers/fake-ai-binding";
-import { addAnthropicCacheOptions, buildProviderForModel, pruneSubagentHistory } from "../src/subagent-runner";
+import { addAnthropicCacheOptions, buildProviderForModel, pruneSubagentHistory, runSubagentForProfile } from "../src/subagent-runner";
+import { EXPLORE_PROFILE } from "../src/agent-profile";
 import type { AppConfig, Env } from "../src/types";
 
 const CC = { type: "ephemeral" };
@@ -175,6 +176,106 @@ describe("buildProviderForModel routing", () => {
     await generateText({ model: buildProviderForModel("anthropic/claude-haiku-4-5", config, envWith(undefined as unknown as Ai)).chatModel("anthropic/claude-haiku-4-5"), prompt: "hi" });
     expect(calls[0].url).toBe("https://gateway.ai.cloudflare.com/v1/acc/gw/compat/chat/completions");
     expect(bindingCalls).toHaveLength(0);
+  });
+
+  describe("@cf/ models with WORKERS_AI_VIA_BINDING", () => {
+    const KIMI = "@cf/moonshotai/kimi-k2.6";
+    const flagged = (AI: Ai, flag = "1") => ({ ...envWith(AI), WORKERS_AI_VIA_BINDING: flag }) as unknown as Env;
+    const completion = (message: Record<string, unknown>, finish = "stop") =>
+      new Response(
+        JSON.stringify({
+          id: "c1", object: "chat.completion", created: 1, model: KIMI,
+          choices: [{ index: 0, message: { role: "assistant", ...message }, finish_reason: finish }],
+          usage: { prompt_tokens: 40, completion_tokens: 2, total_tokens: 42 },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+
+    it("runs a tool loop through env.AI.run with no gateway key, session affinity, metadata and max_tokens", async () => {
+      const fetchCalls = captureFetch({});
+      let step = 0;
+      const { binding, calls, runCalls } = fakeAIBinding(
+        () => new Response("unexpected", { status: 500 }),
+        () =>
+          step++ === 0
+            ? completion({ content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "grep", arguments: "{}" } }] }, "tool_calls")
+            : completion({ content: "found it" }),
+      );
+      const grep = tool({ description: "g", inputSchema: jsonSchema({ type: "object", properties: {} }), execute: async () => "a.ts:1" });
+      const res = await generateText({
+        model: buildProviderForModel(KIMI, config, flagged(binding), "sess-1").chatModel(KIMI),
+        system: "SYS",
+        prompt: "find it",
+        tools: { grep },
+        maxOutputTokens: 4000,
+        stopWhen: stepCountIs(5),
+      });
+
+      expect(res.text).toBe("found it");
+      expect(res.steps).toHaveLength(2);
+      expect(fetchCalls).toHaveLength(0);
+      expect(calls).toHaveLength(0);
+      expect(runCalls).toHaveLength(2);
+      for (const c of runCalls) {
+        expect(c.model).toBe(KIMI);
+        expect(JSON.stringify(c)).not.toContain("aig-key");
+        expect(c.options.gateway).toMatchObject({ id: "gw", metadata: { dodo_session: "sess-1", dodo_role: "subagent" } });
+        expect(c.options.extraHeaders).toMatchObject({ "x-session-affinity": "sess-1" });
+        expect(c.inputs.max_tokens).toBe(4000);
+      }
+      // Second step carries the tool call and its result back. A tool-only
+      // assistant turn goes out with "" content, not null (Workers AI 400s on null).
+      const msgs = runCalls[1].inputs.messages as Array<Record<string, unknown>>;
+      const assistant = msgs.find((m) => m.role === "assistant")!;
+      expect(assistant.content).toBe("");
+      expect(msgs.find((m) => m.role === "tool")).toMatchObject({ tool_call_id: "call_1" });
+    });
+
+    it("runs a whole explore subagent on the run path: transcript keeps tool inputs, max_tokens is the subagent cap", async () => {
+      let step = 0;
+      const { binding, runCalls } = fakeAIBinding(
+        () => new Response("unexpected", { status: 500 }),
+        () =>
+          step++ === 0
+            ? completion({ content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "grep", arguments: '{"q":"x"}' } }] }, "tool_calls")
+            : completion({ content: "found it" }),
+      );
+      const grep = tool({ description: "g", inputSchema: jsonSchema({ type: "object", properties: { q: { type: "string" } } }), execute: async () => "a.ts:1" });
+      const out = await runSubagentForProfile(EXPLORE_PROFILE, {
+        prompt: "find x",
+        model: KIMI,
+        config,
+        env: flagged(binding),
+        toolset: { grep },
+        sessionAffinity: "sess-1",
+        resultSchemaName: undefined,
+      });
+      expect(out.finalText).toBe("found it");
+      expect(out.toolCalls).toEqual(["grep"]);
+      expect(out.transcript).toContainEqual({ role: "tool", content: 'grep: {"q":"x"}' });
+      expect(runCalls).toHaveLength(2);
+      expect(runCalls[0].inputs.max_tokens).toBe(4000);
+    });
+
+    it("stays on /compat with the flag off, on OpenCode, or without a reachable binding", async () => {
+      const reply = {
+        id: "1", object: "chat.completion", created: 1, model: "m",
+        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+      const { binding, runCalls } = fakeAIBinding(() => anthropicReply(), () => completion({ content: "ok" }));
+      for (const [cfg, env] of [
+        [config, flagged(binding, "0")],
+        [{ ...config, activeGateway: "opencode" } as AppConfig, flagged(binding)],
+        [config, { ...flagged(binding), CLOUDFLARE_ACCOUNT_ID: undefined } as unknown as Env],
+      ] as const) {
+        const calls = captureFetch(reply);
+        await generateText({ model: buildProviderForModel(KIMI, cfg, env).chatModel(KIMI), prompt: "hi" });
+        expect(calls).toHaveLength(1);
+        expect(calls[0].body.model).toBe(`workers-ai/${KIMI}`);
+      }
+      expect(runCalls).toHaveLength(0);
+    });
   });
 
   it("runs the structured coercion pass through the binding", async () => {

@@ -43,7 +43,7 @@ export const REPLAY_SAFE_TOOLS: ReadonlySet<string> = new Set([
 type AiTool = {
   description?: string;
   inputSchema?: unknown;
-  execute?: (input: unknown, options: { toolCallId: string; messages: unknown[]; abortSignal?: AbortSignal }) => unknown;
+  execute?: (input: unknown, options: { toolCallId: string; messages: unknown[]; abortSignal?: AbortSignal; context: Record<string, unknown> }) => unknown;
   toModelOutput?: (options: { toolCallId: string; input: unknown; output: unknown }) => unknown;
 };
 
@@ -125,6 +125,8 @@ export async function adaptTool(name: string, tool: AiTool, options: AdaptOption
         toolCallId: api.callId,
         messages: [],
         abortSignal: context.abortSignal,
+        // AI SDK 7 makes the per-call tool context required; Dodo's tools take none.
+        context: {},
       });
       if (tool.toModelOutput) {
         const { content, isError } = modelOutputToContent(

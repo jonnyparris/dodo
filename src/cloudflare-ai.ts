@@ -12,16 +12,16 @@
 //
 // `@cf/` ids take createAI's Workers AI run path (`env.AI.run` with the
 // gateway option, plus createAI's per-model request quirks) when
-// WORKERS_AI_VIA_BINDING is on, main session only. Off by default until a
+// WORKERS_AI_VIA_BINDING is on: the main session through
+// agents/models/pi-ai, explore/task subagents through agents/models/ai-sdk
+// (LanguageModelV4, so the subagents need AI SDK 7). Off by default until a
 // live A/B shows it is at least as good as `/compat` (run bench/model-ab.ts
 // against two deploys, one with the var set; the bench can't set it).
 //
 // Everything else on AI Gateway (OpenAI, Google, DeepSeek; `@cf/` with the
-// flag off or in explore/task subagents) stays on `/compat` with
-// AI_GATEWAY_KEY: createAI has no `/compat` route, Google and DeepSeek are
-// not in pi-ai's gateway catalog, moving OpenAI to the Responses wire needs
-// its own A/B, and createAI's AI SDK models are LanguageModelV4, which
-// AI SDK 6 (the subagents' `ai`) rejects.
+// flag off) stays on `/compat` with AI_GATEWAY_KEY: createAI has no
+// `/compat` route, Google and DeepSeek are not in pi-ai's gateway catalog,
+// and moving OpenAI to the Responses wire needs its own A/B.
 
 import { log } from "./logger";
 import type { Env } from "./types";
@@ -66,6 +66,18 @@ export function bindingGatewayId(config: GatewayRouteConfig, env: Pick<Env, "AI"
     return undefined;
   }
   return gatewayId;
+}
+
+/**
+ * Whether an `@cf/` model goes through createAI's Workers AI run path
+ * (`env.AI.run` with the gateway option) instead of `/compat`, main session and explore/task
+ * subagents alike. Opt-in via
+ * WORKERS_AI_VIA_BINDING ("1"/"true") while it is A/B'd against `/compat`.
+ */
+export function workersAIOnRunPath(modelId: string, env: Pick<Env, "WORKERS_AI_VIA_BINDING">): boolean {
+  if (!modelId.startsWith("@cf/")) return false;
+  const flag = env.WORKERS_AI_VIA_BINDING?.trim().toLowerCase();
+  return flag === "1" || flag === "true";
 }
 
 /** AI Gateway log metadata for one Dodo request (scalars only: the gateway rejects nested values). */
