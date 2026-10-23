@@ -13,6 +13,7 @@ import { log } from "./logger";
 import { resolveMcpCallbackHost } from "./mcp-callback";
 import { createDodoMcpServer } from "./mcp";
 import { MCP_CATALOG } from "./mcp-catalog";
+import { lookupMcpHostScope, type McpHostScope } from "./mcp-host-scope";
 import { createDodoCodeModeMcpServer } from "./mcp-codemode";
 import { AllowlistOutbound } from "./outbound";
 import { errorLimiter, maybeCleanupRateLimiters, messageLimiter, promptLimiter, shareLimiter } from "./rate-limit";
@@ -97,11 +98,9 @@ async function proxyToSharedIndex(env: Env, path: string, init?: RequestInit): P
 const catalogHostnames = new Set(MCP_CATALOG.flatMap((entry) => entry.knownHosts ?? []).map((h) => h.toLowerCase()));
 
 async function isHostAllowed(env: Env, hostname: string): Promise<boolean> {
-  let checkBody: { allowed: boolean; listed?: boolean };
+  let checkBody: McpHostScope;
   try {
-    const checkRes = await proxyToSharedIndex(env, `/allowlist/check?scope=mcp&hostname=${encodeURIComponent(hostname)}`);
-    if (!checkRes.ok) throw new Error(`allowlist check HTTP ${checkRes.status}`);
-    checkBody = (await checkRes.json()) as { allowed: boolean; listed?: boolean };
+    checkBody = await lookupMcpHostScope(env, hostname);
   } catch (err) {
     // SharedIndex unavailable: give catalog hosts the answer they always had
     // before scopes (allowed without a lookup). This skips an admin's

@@ -52,6 +52,7 @@ import { getAgentByName } from "agents";
 import { z } from "zod";
 import { getSharedIndexStub, getUserControlStub, resolveAdminEmail } from "./auth";
 import { HttpMcpClient, type McpClientConfig } from "./mcp-client";
+import { isMcpHostRevoked, mcpHostRevokedMessage } from "./mcp-host-scope";
 import type { Env } from "./types";
 
 const MIN_POLL_INTERVAL_SECONDS = 1;
@@ -1510,6 +1511,11 @@ export class ChatMonitorAgent extends DurableObject<Env> {
     afterIso: string | null,
   ): Promise<ChatMessage[]> {
     const cfg = await this.getCfPortalConfig(ownerEmail);
+    // Checked before the retry below so a revoked host doesn't also burn a
+    // forced token refresh.
+    if (cfg.url && (await isMcpHostRevoked(this.env, cfg.url))) {
+      throw new Error(mcpHostRevokedMessage(cfg.url));
+    }
     try {
       return await this.fetchMessagesOnce(ownerEmail, spaceId, cfg, false);
     } catch (err) {
