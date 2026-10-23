@@ -19,9 +19,10 @@
 // against two deploys, one with the var set; the bench can't set it).
 //
 // Everything else on AI Gateway (OpenAI, Google, DeepSeek; `@cf/` with the
-// flag off) stays on `/compat` with AI_GATEWAY_KEY: createAI has no
-// `/compat` route, Google and DeepSeek are not in pi-ai's gateway catalog,
-// and moving OpenAI to the Responses wire needs its own A/B.
+// flag off) stays on the `/compat` wire, main session and subagents alike,
+// but goes over the binding's universal endpoint too (compatBindingFetch,
+// provider "compat"), so it needs no AI_GATEWAY_KEY either.
+// COMPAT_VIA_BINDING=0 sends `/compat` over HTTP with the key again.
 
 import { log } from "./logger";
 import type { Env } from "./types";
@@ -213,4 +214,62 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
       return typeof value === "function" ? (...args: unknown[]) => stub[prop](...args) : value;
     },
   });
+}
+
+/** Request headers the binding leg never forwards: auth is the binding, and the rest are per-hop. */
+const COMPAT_DROPPED_HEADERS = new Set(["authorization", "x-api-key", "cf-aig-authorization", "host", "content-length", "connection", "accept-encoding"]);
+
+/**
+ * Whether `/compat` calls should go over the `AI` binding (no AI_GATEWAY_KEY).
+ * On whenever the binding reaches the configured gateway (bindingGatewayId);
+ * `COMPAT_VIA_BINDING=0` turns it off and sends `/compat` over HTTP with the key again.
+ */
+export function compatBindingGatewayId(config: GatewayRouteConfig, env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID" | "COMPAT_VIA_BINDING">): string | undefined {
+  if (env.COMPAT_VIA_BINDING?.trim() === "0") return undefined;
+  return bindingGatewayId(config, env);
+}
+
+/**
+ * A `fetch` that sends AI Gateway `/compat` requests through the `AI` binding's
+ * universal endpoint (`env.AI.gateway(id).run({ provider: "compat", ... })`)
+ * instead of over HTTP, so they need no AI_GATEWAY_KEY. Same endpoint, same
+ * request body and response stream: only the transport and the auth change.
+ * Checked live 2026-10-22 (dodo-aig-probe): OpenAI, Workers AI and Google
+ * ids stream over it, and cf-aig-metadata / x-session-affinity still reach
+ * the gateway log. Requests succeed and are billed without the key
+ * (unified billing), as on the Anthropic leg.
+ *
+ * Other URLs and methods go to `base` unchanged; a non-JSON `/compat` body throws. The AbortSignal stays
+ * on this side of the RPC boundary (runWithLocalSignal); cancelling the body
+ * reaches upstream (the gateway logs 499, measured on the same probe).
+ */
+export function compatBindingFetch(binding: Ai, gatewayId: string, compatBaseUrl: string, base: typeof fetch = fetch): typeof fetch {
+  const prefix = `${compatBaseUrl.replace(/\/+$/, "")}/`;
+  type Callable = Record<PropertyKey, (...args: unknown[]) => unknown>;
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    // Decide before building a Request: that would consume a Request input's body.
+    const url = input instanceof Request ? input.url : String(input);
+    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    if (!url.startsWith(prefix) || method !== "POST") return base(input, init);
+    const request = new Request(input, init);
+    const endpoint = url.slice(prefix.length);
+    // Read outside the try, so a read error surfaces as itself, not as "not JSON". Callers (pi-ai, the AI SDK) send string bodies.
+    const text = await request.text();
+    let query: unknown;
+    try {
+      query = JSON.parse(text);
+    } catch {
+      // pi-ai and the AI SDK always send JSON. Over HTTP this would go without the key, so fail loudly instead.
+      throw new TypeError(`compatBindingFetch: ${endpoint} body is not JSON`);
+    }
+    const headers: Record<string, string> = {};
+    request.headers.forEach((value, key) => {
+      if (!COMPAT_DROPPED_HEADERS.has(key.toLowerCase())) headers[key] = value;
+    });
+    // Call by name: `env.AI` is an RPC stub (see adaptBindingForCreateAI).
+    const gateway = (binding as unknown as Callable).gateway(gatewayId) as Callable;
+    const run: GatewayRun = (req, options) => gateway.run(req, options) as Promise<Response>;
+    const signal = init?.signal ?? request.signal;
+    return runWithLocalSignal(run, { provider: "compat", endpoint, headers, query }, signal ? { signal } : undefined);
+  }) as typeof fetch;
 }

@@ -9,6 +9,8 @@ export interface Env {
   AI_GATEWAY_BASE_URL: string;
   AI_GATEWAY_DEFAULT_MODEL?: string;
   AI_GATEWAY_KEY?: string;
+  /** "0" sends AI Gateway `/compat` calls over HTTP with AI_GATEWAY_KEY instead of the `AI` binding (src/cloudflare-ai.ts compatBindingFetch). */
+  COMPAT_VIA_BINDING?: string;
   ALLOW_UNAUTHENTICATED_DEV?: string;
   ASSETS?: Fetcher;
   ARTIFACTS: Artifacts;
