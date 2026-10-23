@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { entriesToMessages, PiEngine, type PiEngineHost } from "../src/pi/engine";
 import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "../src/pi/tools";
-import { agentModelRef, CREATE_AI_PROVIDER_ID, createAIGatewayId, dodoModel, gatewayHeaders, modelCost, setDodoProvider } from "../src/pi/models";
+import { agentModelRef, CREATE_AI_PROVIDER_ID, createAIGatewayId, dodoModel, gatewayHeaders, modelCost, setDodoProvider, WORKERS_AI_API, workersAIOnRunPath } from "../src/pi/models";
 import { fakeAIBinding } from "./helpers/fake-ai-binding";
 import { calculateCost, createModels } from "@earendil-works/pi-ai/models";
 import type { StreamOptions } from "@earendil-works/pi-ai";
@@ -359,6 +359,11 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     expect(models.getModel(CREATE_AI_PROVIDER_ID, "anthropic/claude-sonnet-4-6")).toBeDefined();
     setDodoProvider(models, ["@cf/moonshotai/kimi-k2.6"], config, env);
     expect(models.getModel(CREATE_AI_PROVIDER_ID, "anthropic/claude-sonnet-4-6")).toBeUndefined();
+    // Only the /compat drain entry for @cf/ refs is left (see the run-path tests).
+    expect(models.getModel(CREATE_AI_PROVIDER_ID, "@cf/moonshotai/kimi-k2.6")?.api).toBe("openai-completions");
+    // Nothing that could have a cloudflare/ ref: the provider goes.
+    setDodoProvider(models, ["openai/gpt-5.4"], config, env);
+    expect(models.getModel(CREATE_AI_PROVIDER_ID, "@cf/moonshotai/kimi-k2.6")).toBeUndefined();
   });
 
   it("keeps the caller's AbortSignal off the binding call and still honours it", async () => {
@@ -412,6 +417,285 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     expect(res.errorMessage).toBeUndefined();
     expect(calls).toHaveLength(2);
   }, 20_000);
+});
+
+describe("pi gateway wire: Workers AI through createAI's run path (WORKERS_AI_VIA_BINDING)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const KIMI = "@cf/moonshotai/kimi-k2.6";
+  const config = { activeGateway: "ai-gateway" as const, opencodeBaseURL: "", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acct/gw/compat", sessionId: "sess-7" };
+  const chunks = (events: Array<Record<string, unknown>>, status = 200, headers: Record<string, string> = {}) =>
+    new Response(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join("") + "data: [DONE]\n\n", {
+      status,
+      headers: { "content-type": "text/event-stream", ...headers },
+    });
+  const reply = () =>
+    chunks([
+      { id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "hello" } }] },
+      { id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      // include_usage: the totals come in a final chunk with no choices.
+      { id: "c1", object: "chat.completion.chunk", choices: [], usage: { prompt_tokens: 40, completion_tokens: 2, total_tokens: 42 } },
+    ]);
+
+  it("is opt-in: without the flag (or with it off) @cf/ ids stay on /compat", () => {
+    const env = { AI: fakeAIBinding(() => new Response("")).binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
+    expect(workersAIOnRunPath(KIMI, {})).toBe(false);
+    expect(workersAIOnRunPath(KIMI, { WORKERS_AI_VIA_BINDING: "0" })).toBe(false);
+    expect(workersAIOnRunPath("anthropic/claude-sonnet-4-6", { WORKERS_AI_VIA_BINDING: "1" })).toBe(false);
+    expect(createAIGatewayId(KIMI, config, env)).toBeUndefined();
+    expect(dodoModel(KIMI, config, env).api).toBe("openai-completions");
+  });
+
+  it("routes @cf/ ids through createAI when on, and keeps the /compat entry for persisted refs", () => {
+    const env = { AI: fakeAIBinding(() => new Response("")).binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "true" } as never;
+    expect(createAIGatewayId(KIMI, config, env)).toBe("gw");
+    const m = dodoModel(KIMI, config, env);
+    expect(m.api).toBe(WORKERS_AI_API);
+    expect(m.provider).toBe(CREATE_AI_PROVIDER_ID);
+    expect(m.id).toBe(KIMI);
+    expect(m.reasoning).toBe(false);
+    expect(m.contextWindow).toBe(262_144);
+    expect(agentModelRef(KIMI, config, env)).toEqual({ provider: CREATE_AI_PROVIDER_ID, modelId: KIMI });
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    expect(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)?.api).toBe(WORKERS_AI_API);
+    expect(models.getModel("dodo-gateway", `workers-ai/${KIMI}`)?.api).toBe("openai-completions");
+    // OpenCode, no binding, or a gateway the binding can't reach: /compat.
+    expect(dodoModel(KIMI, { ...config, activeGateway: "opencode", opencodeBaseURL: "https://oc/compat" }, env).api).toBe("openai-completions");
+    expect(dodoModel(KIMI, config, { WORKERS_AI_VIA_BINDING: "1", CLOUDFLARE_ACCOUNT_ID: "acct" } as never).api).toBe("openai-completions");
+    expect(dodoModel(KIMI, { ...config, aiGatewayBaseURL: "https://proxy.example/compat" }, env).api).toBe("openai-completions");
+  });
+
+  it("calls env.AI.run with the gateway, session metadata and affinity, no gateway key, and Workers AI quirks", async () => {
+    const fetched: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      fetched.push(String(input));
+      return new Response("unexpected", { status: 500 });
+    });
+    const { binding, calls, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+    const env = { AI: binding, AI_GATEWAY_KEY: "gw-key", CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const ref = agentModelRef(KIMI, config, env);
+    const res = await models.complete(
+      models.getModel(ref.provider, ref.modelId)!,
+      {
+        systemPrompt: "You are Dodo.",
+        messages: [
+          { role: "user", content: "read it", timestamp: 0 },
+          // A tool-only assistant turn: /compat sent `content: null`, which
+          // Workers AI's text-only models 400 on. The run path sends "".
+          {
+            role: "assistant",
+            content: [{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "a" } }],
+            api: WORKERS_AI_API,
+            provider: CREATE_AI_PROVIDER_ID,
+            model: KIMI,
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+            stopReason: "toolUse",
+            timestamp: 1,
+          },
+          { role: "toolResult", toolCallId: "call_1", toolName: "read", content: [{ type: "text", text: "contents" }], isError: false, timestamp: 2 },
+        ],
+        tools: [{ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } } } as never }],
+      },
+      { sessionId: "sess-7" },
+    );
+    expect(res.errorMessage).toBeUndefined();
+    expect(res.stopReason).toBe("stop");
+    expect(fetched).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(runCalls).toHaveLength(1);
+    const c = runCalls[0]!;
+    expect(c.model).toBe(KIMI);
+    expect(JSON.stringify(c)).not.toContain("gw-key");
+    expect(c.options.returnRawResponse).toBe(true);
+    expect(c.options.gateway).toMatchObject({ id: "gw", metadata: { dodo_session: "sess-7", dodo_role: "main" } });
+    expect(c.options.extraHeaders).toMatchObject({ "x-session-affinity": "sess-7" });
+    expect(c.inputs.model).toBeUndefined();
+    expect(c.inputs.stream).toBe(true);
+    // A cap like pi-ai's own leg: the model's maxTokens, clamped to the room left in the context.
+    expect(c.inputs.max_tokens).toBe(32_000);
+    const assistant = (c.inputs.messages as Array<Record<string, unknown>>).find((m) => m.role === "assistant")!;
+    expect(assistant.content).toBe("");
+    expect((c.inputs.tools as unknown[]).length).toBe(1);
+    expect(res.usage.input).toBe(40);
+    expect(res.usage.output).toBe(2);
+  });
+
+  it("waits out a 429 on the run path and resends", async () => {
+    let n = 0;
+    const { binding, runCalls } = fakeAIBinding(
+      () => new Response("unexpected", { status: 500 }),
+      () => (n++ === 0 ? new Response(JSON.stringify({ errors: [{ message: "Capacity temporarily exceeded" }] }), { status: 429, headers: { "content-type": "application/json", "retry-after": "0" } }) : reply()),
+    );
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(runCalls).toHaveLength(2);
+  }, 20_000);
+
+  for (const [label, env] of [
+    ["the flag is off", { CLOUDFLARE_ACCOUNT_ID: "acct" }],
+    ["the binding can't reach the gateway", { WORKERS_AI_VIA_BINDING: "1" }],
+  ] as const) {
+    it(`resumes a persisted cloudflare/@cf/ ref on /compat when ${label}`, async () => {
+      const seen: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = new Request(input, init);
+        seen.push({ url: req.url, headers: req.headers, body: (await req.json()) as Record<string, unknown> });
+        return reply();
+      });
+      const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+      const e = { AI: binding, AI_GATEWAY_KEY: "gw-key", ...env } as never;
+      const models = createModels();
+      setDodoProvider(models, [KIMI], config, e);
+      // New turns: /compat.
+      expect(agentModelRef(KIMI, config, e)).toEqual({ provider: "dodo-gateway", modelId: `workers-ai/${KIMI}` });
+      // A turn that started on the run path still resolves, and goes to /compat.
+      const persisted = models.getModel(CREATE_AI_PROVIDER_ID, KIMI);
+      expect(persisted).toBeDefined();
+      const res = await models.complete(persisted!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+      expect(res.errorMessage).toBeUndefined();
+      expect(runCalls).toHaveLength(0);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.url).toBe(`${config.aiGatewayBaseURL}/chat/completions`);
+      expect(seen[0]!.body.model).toBe(`workers-ai/${KIMI}`);
+      expect(seen[0]!.headers.get("cf-aig-authorization")).toBe("Bearer gw-key");
+      expect(seen[0]!.headers.get("authorization")).toBeNull();
+    });
+  }
+
+  it("waits out a rate limit the binding throws (AiError 3021) instead of returning", async () => {
+    let n = 0;
+    const { binding, runCalls } = fakeAIBinding(
+      () => new Response("unexpected", { status: 500 }),
+      () => {
+        if (n++ === 0) throw Object.assign(new Error("AiError: 3021: inference request per min rate reached"), { httpCode: 429 });
+        return reply();
+      },
+    );
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(runCalls).toHaveLength(2);
+  }, 20_000);
+
+  it("takes a shared model-budget slot per send on the run path, 429 resends included, and reports the 429", async () => {
+    let n = 0;
+    const { binding, runCalls } = fakeAIBinding(
+      () => new Response("unexpected", { status: 500 }),
+      () => (n++ === 0 ? new Response(JSON.stringify({ errors: [{ message: "Capacity temporarily exceeded" }] }), { status: 429, headers: { "content-type": "application/json", "retry-after": "0" } }) : reply()),
+    );
+    const acquired: Array<[string, string]> = [];
+    const reported: string[] = [];
+    let denyFirst = true;
+    const waits: number[] = [];
+    const SHARED_INDEX = {
+      idFromName: () => "global",
+      get: () => ({
+        modelBudgetAcquire: async (key: string, _rpm: number, priority: string) => {
+          acquired.push([key, priority]);
+          if (denyFirst) {
+            denyFirst = false;
+            return { ok: false, waitMs: 1, used: 1, limit: 1 };
+          }
+          return { ok: true, waitMs: 0, used: 1, limit: 10 };
+        },
+        modelBudgetReport429: async (key: string) => {
+          reported.push(key);
+        },
+      }),
+    };
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1", SHARED_INDEX } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env, { onBudgetWait: (info) => waits.push(info.waitMs) });
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(runCalls).toHaveLength(2);
+    // One denied + one granted before the first send, one granted before the resend. Same key as /compat.
+    expect(acquired).toEqual([
+      [`ai-gateway:${KIMI}`, "main"],
+      [`ai-gateway:${KIMI}`, "main"],
+      [`ai-gateway:${KIMI}`, "main"],
+    ]);
+    expect(waits).toHaveLength(1);
+    await vi.waitFor(() => expect(reported).toEqual([`ai-gateway:${KIMI}`]));
+  }, 20_000);
+
+  it("a drained cloudflare/@cf/ ref on /compat takes the same budget slot", async () => {
+    vi.stubGlobal("fetch", async () => reply());
+    const acquired: Array<[string, string]> = [];
+    const SHARED_INDEX = {
+      idFromName: () => "global",
+      get: () => ({
+        modelBudgetAcquire: async (key: string, _rpm: number, priority: string) => {
+          acquired.push([key, priority]);
+          return { ok: true, waitMs: 0, used: 1, limit: 10 };
+        },
+        modelBudgetReport429: async () => {},
+      }),
+    };
+    const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+    const env = { AI: binding, AI_GATEWAY_KEY: "gw-key", CLOUDFLARE_ACCOUNT_ID: "acct", SHARED_INDEX } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(runCalls).toHaveLength(0);
+    expect(acquired).toEqual([[`ai-gateway:${KIMI}`, "main"]]);
+  });
+
+  it("passes other thrown binding errors through as a failed turn, without retrying", async () => {
+    const { binding, runCalls } = fakeAIBinding(
+      () => new Response("unexpected", { status: 500 }),
+      () => {
+        throw new Error("AiError: 5006: Bad input");
+      },
+    );
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.stopReason).toBe("error");
+    expect(res.errorMessage).toContain("Bad input");
+    expect(runCalls).toHaveLength(1);
+  });
+
+  it("keeps the AbortSignal off the binding call and settles an aborted run as aborted", async () => {
+    const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const model = models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!;
+    // Live signal: the fake binding throws if a signal crosses it.
+    const ok = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, { signal: new AbortController().signal });
+    expect(ok.errorMessage).toBeUndefined();
+    expect(runCalls[0]!.options.signal).toBeUndefined();
+    const aborted = new AbortController();
+    aborted.abort();
+    const res = await models.complete(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, { signal: aborted.signal });
+    expect(["aborted", "error"]).toContain(res.stopReason);
+    expect(runCalls).toHaveLength(1);
+  });
+
+  it("clamps max_tokens to the room left in a small context window", async () => {
+    const { binding, runCalls } = fakeAIBinding(() => new Response("unexpected", { status: 500 }), () => reply());
+    const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct", WORKERS_AI_VIA_BINDING: "1" } as never;
+    const models = createModels();
+    // Not in Dodo's catalog: pi-ai's Workers AI catalog says 32,768 tokens.
+    setDodoProvider(models, ["@cf/qwen/qwen3-30b-a3b-fp8"], config, env);
+    const m = models.getModel(CREATE_AI_PROVIDER_ID, "@cf/qwen/qwen3-30b-a3b-fp8")!;
+    expect(m.contextWindow).toBe(32_768);
+    await models.complete(m, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    const cap = runCalls[0]!.inputs.max_tokens as number;
+    expect(cap).toBeGreaterThan(20_000);
+    expect(cap).toBeLessThan(32_768 - 4096);
+  });
 });
 
 describe("pi gateway wire", () => {

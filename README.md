@@ -334,12 +334,12 @@ Dodo doesn't bundle a model. Set the model and gateway in the UI (Settings) or w
 
 | Gateway | Setup |
 |---|---|
-| **AI Gateway** | Secret `AI_GATEWAY_KEY`, var `AI_GATEWAY_BASE_URL`. Workers AI models (`@cf/…`) go through the same gateway. Anthropic models go through the `AI` binding instead (createAI, no key) when the URL is a gateway in the Worker's own account (`CLOUDFLARE_ACCOUNT_ID`). |
+| **AI Gateway** | Secret `AI_GATEWAY_KEY`, var `AI_GATEWAY_BASE_URL`. Workers AI models (`@cf/…`) go through the same gateway. Anthropic models go through the `AI` binding instead (createAI, no key) when the URL is a gateway in the Worker's own account (`CLOUDFLARE_ACCOUNT_ID`). Var `WORKERS_AI_VIA_BINDING=1` (opt-in, being A/B tested) sends `@cf/…` main-session models through the binding too, on createAI's Workers AI run path. |
 | **OpenCode** | Secret `OPENCODE_GATEWAY_TOKEN`. Models fill in automatically. |
 
 Model ids look like `anthropic/claude-sonnet-4-6` or `@cf/zai-org/glm-5.3-flash`. The picker only offers models the active gateway can route.
 
-**Verified on pi-durable:** GLM 5.3 Flash (the default, with vision), Kimi K2.6 and Gemma on Workers AI. **Known issue:** tool calls on the text-only Workers AI models `gpt-oss-120b` and `qwen2.5-coder-32b` fail with a 400 (they reject array user content).
+**Verified on pi-durable:** GLM 5.3 Flash (the default, with vision), Kimi K2.6 and Gemma on Workers AI. **Known issue:** tool calls on the text-only Workers AI models `gpt-oss-120b` and `qwen2.5-coder-32b` fail with a 400 on `/compat` (they reject array user content and `null` assistant content). With `WORKERS_AI_VIA_BINDING=1`, createAI's request quirks fix this: gpt-oss-120b and Qwen3 30B completed tool turns on preview (2026-10-22).
 
 </details>
 

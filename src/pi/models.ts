@@ -12,8 +12,13 @@
 // `cache_control` marker (measured 2026-10-21, PR #110), so on `/compat`
 // every Anthropic turn paid full input price for the whole prefix. Those
 // models are registered under createAI's own provider id (`cloudflare`).
+//
+// With WORKERS_AI_VIA_BINDING on, `@cf/` models go through createAI too, on
+// its Workers AI run path (`env.AI.run` + per-model request quirks), main
+// session only. Off by default until the live A/B says so.
 
-import type { Model, ProviderStreams } from "@earendil-works/pi-ai";
+import type { Api, Model, ProviderStreams, TranscriptContext } from "@earendil-works/pi-ai";
+import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import { createProvider, type MutableModels } from "@earendil-works/pi-ai/models";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
@@ -32,6 +37,9 @@ import { rateLimitFetch, type RateLimitFetchOptions } from "./rate-limit-fetch";
 import { type StreamIdleTimeoutInfo, withStreamIdleTimeout } from "./stream-idle-timeout";
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
+/** The `api` createAI gives Workers AI models (its run path, not a wire format). */
+export const WORKERS_AI_API = "cloudflare-ai";
+type WorkersAIApi = typeof WORKERS_AI_API;
 /** Provider id of models that go through createAI (Anthropic on AI Gateway). */
 export const CREATE_AI_PROVIDER_ID = CLOUDFLARE_PROVIDER_ID;
 const DEFAULT_MAX_TOKENS = 32_000;
@@ -112,26 +120,60 @@ function inGatewayCatalog(modelId: string): boolean {
  * reach. Otherwise undefined, and the model stays on the OpenAI-compatible
  * path (uncached for Anthropic on `/compat`).
  */
-export function createAIGatewayId(modelId: string, config: GatewayConfig, env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID">): string | undefined {
-  if (!modelId.startsWith("anthropic/") || !inGatewayCatalog(modelId)) return undefined;
+export function createAIGatewayId(
+  modelId: string,
+  config: GatewayConfig,
+  env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID" | "WORKERS_AI_VIA_BINDING">,
+): string | undefined {
+  const anthropic = modelId.startsWith("anthropic/") && inGatewayCatalog(modelId);
+  if (!anthropic && !workersAIOnRunPath(modelId, env)) return undefined;
   return bindingGatewayId(config, env);
 }
 
-function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLimit?: RateLimitFetchOptions) {
+/**
+ * Whether an `@cf/` model goes through createAI's Workers AI run path
+ * (`env.AI.run` with the gateway option) instead of `/compat`. Opt-in via
+ * WORKERS_AI_VIA_BINDING ("1"/"true") while it is A/B'd against `/compat`.
+ */
+export function workersAIOnRunPath(modelId: string, env: Pick<Env, "WORKERS_AI_VIA_BINDING">): boolean {
+  if (!modelId.startsWith("@cf/")) return false;
+  const flag = env.WORKERS_AI_VIA_BINDING?.trim().toLowerCase();
+  return flag === "1" || flag === "true";
+}
+
+function createAIFor(config: GatewayConfig, env: Env, gatewayId: string, rateLimit?: RateLimitFetchOptions, budget?: ModelBudgetStreamOptions) {
   // createAI never calls fetch, so the 429 wait wraps the binding call. The
   // URL is a label only: the wrapped "fetch" ignores it and calls the binding.
-  const binding = adaptBindingForCreateAI(env.AI, (run, signal) =>
-    rateLimitFetch(() => run(), rateLimit)("https://gateway.ai.cloudflare.com/universal", { signal: signal ?? undefined }),
-  );
+  // On the Workers AI run path each send (429 resends included) also takes a
+  // slot from the shared per-model budget, as withModelBudgetStreams does on
+  // /compat: same key, so main turns and subagents share one book. Built per
+  // `run` call (createAI makes one per model request), so maxWaitScope
+  // "total" covers one request and its resends.
+  const binding = adaptBindingForCreateAI(env.AI, (run, signal, model) => {
+    const send: typeof fetch = () => run();
+    const gated =
+      budget && model
+        ? withModelBudget(send, {
+            env: budget.env,
+            gateway: budget.gateway,
+            modelId: model,
+            priority: "main",
+            client: budget.client,
+            onWait: budget.onWait,
+            maxWaitMs: MAIN_BUDGET_MAX_WAIT_MS,
+            maxWaitScope: "total",
+          })
+        : send;
+    return rateLimitFetch(gated, rateLimit)("https://gateway.ai.cloudflare.com/universal", { signal: signal ?? undefined });
+  });
   const metadata = gatewayMetadata(config.sessionId, "main");
   return createAI({ binding, id: gatewayId, ...(metadata ? { metadata } : {}) });
 }
 
 /** The pi-ai model for one Dodo model id on the configured gateway. */
-export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> | Model<"anthropic-messages"> {
-  const isOpencode = config.activeGateway === "opencode";
-  const anthropic = modelId.startsWith("anthropic/");
+export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> | Model<"anthropic-messages"> | Model<WorkersAIApi> {
   const gatewayId = createAIGatewayId(modelId, config, env);
+  if (gatewayId && modelId.startsWith("@cf/")) return workersAIModel(modelId, gatewayId, env);
   if (gatewayId) {
     // createAI's catalog model (api anthropic-messages, gateway-shaped
     // baseUrl, provider `cloudflare`, id = the Dodo id) with Dodo's limits and
@@ -148,6 +190,34 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
       maxTokens: DEFAULT_MAX_TOKENS,
     };
   }
+  return compatModel(modelId, config);
+}
+
+/**
+ * createAI's Workers AI model (api `cloudflare-ai`, run path) with Dodo's
+ * limits and prices. `reasoning: false` like the `/compat` leg: pi sends no
+ * effort, so the model keeps its own default, same as before. The context
+ * window falls back to pi-ai's Workers AI catalog (e.g. 32k for Qwen3 30B),
+ * which also bounds `max_tokens` (withWorkersAIMaxTokens).
+ */
+function workersAIModel(modelId: string, gatewayId: string, env: Env): Model<WorkersAIApi> {
+  const base = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId })(modelId) as Model<WorkersAIApi>;
+  return {
+    ...base,
+    name: modelId,
+    reasoning: false,
+    input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
+    cost: modelCost(modelId),
+    contextWindow: CATALOG.has(modelId) || !base.contextWindow ? contextWindowFor(modelId) : base.contextWindow,
+    maxTokens: DEFAULT_MAX_TOKENS,
+  };
+}
+
+/** The OpenAI-compatible (`/compat` or OpenCode) model for a Dodo id, whatever leg new turns use. */
+function compatModel(modelId: string, config: GatewayConfig): Model<"openai-completions"> {
+  const isOpencode = config.activeGateway === "opencode";
+  const entry = CATALOG.get(modelId);
+  const anthropic = modelId.startsWith("anthropic/");
   return {
     id: resolveWireModelId(modelId, config.activeGateway),
     name: modelId,
@@ -197,6 +267,26 @@ export function gatewayHeaders(config: GatewayConfig, env: Env): Record<string, 
         ...aigMetadataHeader(config.sessionId, "main"),
         Authorization: null,
       };
+}
+
+/**
+ * createAI's chat-completions wire sends `max_tokens` only when the caller
+ * passes `maxTokens`, and pi-durable doesn't. pi-ai's own openai-completions
+ * leg fills it from the model (clamped to the room left in the context), so
+ * on `/compat` every turn had a cap. Without one Workers AI uses its own
+ * small default: on preview gpt-oss-120b stopped with `length` and an empty
+ * answer (2026-10-22). Fill it the way pi-ai does, Workers AI models only.
+ */
+export function withWorkersAIMaxTokens(api: ProviderStreams): ProviderStreams {
+  const fill = <O extends { maxTokens?: number } | undefined>(model: Model<Api>, context: TranscriptContext, options: O): O =>
+    model.api !== WORKERS_AI_API || options?.maxTokens !== undefined
+      ? options
+      : ({ ...options, maxTokens: clampMaxTokensToContext(model, context, model.maxTokens) } as O);
+  return {
+    ...api,
+    stream: (model, context, options) => api.stream(model, context, fill(model, context, options)),
+    streamSimple: (model, context, options) => api.streamSimple(model, context, fill(model, context, options)),
+  };
 }
 
 /**
@@ -274,8 +364,9 @@ export interface DodoProviderOptions {
  * them as `dodo-gateway/anthropic/…`, and pi-durable resumes it with that
  * ref. Those streams look the model up by id and send the createAI one.
  *
- * Workers AI models on `openai-completions` also take a slot from the shared
- * per-model budget (model-budget.ts); the createAI leg is Anthropic only.
+ * Workers AI models take a slot from the shared per-model budget
+ * (model-budget.ts) on both legs: `openai-completions` (/compat) and the
+ * createAI run path (WORKERS_AI_VIA_BINDING).
  */
 export function setDodoProvider(
   models: MutableModels,
@@ -290,10 +381,22 @@ export function setDodoProvider(
       log("warn", "pi: model rate limited, waiting", { sessionId: config.sessionId, attempt, delayMs: Math.round(delayMs), retryAfter }),
   };
   const viaCreateAI = unique.filter((id) => createAIGatewayId(id, config, env) !== undefined);
-  const viaGateway = unique.filter((id) => !viaCreateAI.includes(id));
+  // `@cf/` ids not on the run path (flag off, or the binding can't reach the
+  // gateway) still get an entry under `cloudflare`, so a turn that started
+  // on the run path (ref `cloudflare/@cf/…`) resumes after a rollback. That
+  // entry is a /compat model: turning the flag off moves in-flight turns
+  // back to /compat too. New turns use `dodo-gateway` (agentModelRef).
+  const draining = unique.filter((id) => id.startsWith("@cf/") && !viaCreateAI.includes(id));
   const gatewayId = viaCreateAI.length > 0 ? createAIGatewayId(viaCreateAI[0], config, env) : undefined;
-  const createAIModels = viaCreateAI.map((id) => dodoModel(id, config, env) as Model<"anthropic-messages">);
-  const ai = gatewayId ? createAIFor(config, env, gatewayId, rateLimitOptions) : undefined;
+  const createAIModels = viaCreateAI.map((id) => dodoModel(id, config, env) as Model<"anthropic-messages"> | Model<WorkersAIApi>);
+  const drainModels = draining.map((id): Model<"openai-completions"> => ({ ...compatModel(id, config), id, provider: CREATE_AI_PROVIDER_ID }));
+  // Anthropic createAI models are also listed under dodo-gateway (legacy
+  // refs, see below). `@cf/` ones are not: their old ref is
+  // `dodo-gateway/workers-ai/@cf/…` on openai-completions, so they stay in
+  // the /compat list too and a persisted turn resumes on `/compat` as it started.
+  const legacyAliased = createAIModels.filter((m): m is Model<"anthropic-messages"> => m.api === "anthropic-messages");
+  const viaCompat = unique.filter((id) => !legacyAliased.some((m) => m.id === id));
+
   const byId = new Map(createAIModels.map((m) => [m.id, m]));
   // The dodo-gateway auth resolver adds the gateway key headers to every
   // call; createAI would forward them as extra headers. Drop them here.
@@ -309,13 +412,24 @@ export function setDodoProvider(
       opts.onBudgetWait?.(info);
     },
   };
+  const ai = gatewayId ? createAIFor(config, env, gatewayId, rateLimitOptions, budget) : undefined;
   const idleOptions = {
     idleMs: opts.idleMs,
     onTimeout: (info: StreamIdleTimeoutInfo) => log("warn", "pi: model stream idle, failing the request for retry", { sessionId: config.sessionId, ...info }),
   };
   // Every leg fails a request that goes quiet as retryable (stream-idle-timeout.ts).
   const createAIStreams: ProviderStreams | undefined =
-    ai && withStreamIdleTimeout({ stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams, idleOptions);
+    ai && withStreamIdleTimeout(withWorkersAIMaxTokens({ stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams), idleOptions);
+  const compatStreams = withStreamIdleTimeout(withModelBudgetStreams(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), budget), idleOptions);
+  // Drained `cloudflare/@cf/…` refs: send the /compat model (wire id
+  // `workers-ai/@cf/…`) with the gateway auth the `cloudflare` provider
+  // doesn't resolve.
+  const drainAuth = <O extends { headers?: Record<string, string | null>; apiKey?: string } | undefined>(options: O): O =>
+    ({ ...options, apiKey: "unused", headers: { ...options?.headers, ...gatewayHeaders(config, env) } }) as O;
+  const drainStreams: ProviderStreams = {
+    stream: (model, context, options) => compatStreams.stream(compatModel(model.id, config), context, drainAuth(options)),
+    streamSimple: (model, context, options) => compatStreams.streamSimple(compatModel(model.id, config), context, drainAuth(options)),
+  };
   const legacyAnthropic: ProviderStreams | undefined = createAIStreams && {
     stream: (model, context, options) => createAIStreams.stream(byId.get(model.id) ?? model, context, keyless(options)),
     streamSimple: (model, context, options) => createAIStreams.streamSimple(byId.get(model.id) ?? model, context, keyless(options)),
@@ -333,19 +447,21 @@ export function setDodoProvider(
         },
       },
       models: [
-        ...viaGateway.map((id) => dodoModel(id, config, env)),
-        ...createAIModels.map((m) => ({ ...m, provider: DODO_PROVIDER_ID })),
+        // `@cf/` ids on the run path keep their /compat entry here for
+        // persisted `dodo-gateway/workers-ai/@cf/…` refs.
+        ...viaCompat.map((id): Model<"openai-completions"> | Model<"anthropic-messages"> => compatModel(id, config)),
+        ...legacyAliased.map((m) => ({ ...m, provider: DODO_PROVIDER_ID })),
       ],
       // Waits out per-minute 429s inside the request (rate-limit-fetch.ts)
       // and fails a request that goes quiet as retryable (stream-idle-timeout.ts).
       api: {
         // Workers AI models also take a slot from the shared per-model budget (model-budget.ts).
-        "openai-completions": withStreamIdleTimeout(withModelBudgetStreams(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), budget), idleOptions),
+        "openai-completions": compatStreams,
         ...(legacyAnthropic ? { "anthropic-messages": legacyAnthropic } : {}),
       },
     }),
   );
-  if (!ai) {
+  if (!ai && drainModels.length === 0) {
     // Nothing on the createAI leg now: drop a provider an earlier config installed.
     models.deleteProvider(CREATE_AI_PROVIDER_ID);
     return models;
@@ -355,14 +471,17 @@ export function setDodoProvider(
       id: CREATE_AI_PROVIDER_ID,
       name: "Cloudflare AI (binding)",
       auth: { apiKey: { name: "Cloudflare AI (binding)", resolve: async () => ({ auth: {} }) } },
-      models: createAIModels,
-      api: { "anthropic-messages": createAIStreams as ProviderStreams },
+      models: [...createAIModels, ...drainModels],
+      api: {
+        ...(createAIStreams ? { "anthropic-messages": createAIStreams, [WORKERS_AI_API]: createAIStreams } : {}),
+        "openai-completions": drainStreams,
+      },
     }),
   );
   return models;
 }
 
-export function agentModelRef(modelId: string, config: GatewayConfig, env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID">): { provider: string; modelId: string } {
+export function agentModelRef(modelId: string, config: GatewayConfig, env: Pick<Env, "AI" | "CLOUDFLARE_ACCOUNT_ID" | "WORKERS_AI_VIA_BINDING">): { provider: string; modelId: string } {
   // Must match the provider/id setDodoProvider() registers the model under.
   if (createAIGatewayId(modelId, config, env)) return { provider: CREATE_AI_PROVIDER_ID, modelId };
   return { provider: DODO_PROVIDER_ID, modelId: resolveWireModelId(modelId, config.activeGateway) };

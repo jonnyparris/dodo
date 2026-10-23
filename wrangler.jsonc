@@ -172,5 +172,9 @@
     // only go through the AI binding when this matches the account in
     // AI_GATEWAY_BASE_URL. Unset or different → they stay on /compat.
     "CLOUDFLARE_ACCOUNT_ID": "4b430e167a301330d13a9bb42f3986a2"
+    // Opt-in (A/B): "1" sends @cf/ main-session models through the AI
+    // binding on createAI's Workers AI run path instead of /compat. Same
+    // account gate as above. Unset → /compat.
+    // "WORKERS_AI_VIA_BINDING": "1"
   }
 }
