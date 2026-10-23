@@ -110,6 +110,60 @@ describe("sync /message through the session lifecycle", () => {
     }
   });
 
+  it("an abort while start() is still syncing the index stops the run before the model is called", async () => {
+    resetMockAgentic();
+    const id = await newSession();
+    const stub = await getAgentByName(typedEnv.CODING_AGENT as never, id);
+    // Abort from inside start()'s "running" index sync, after the active prompt is set.
+    await inDO(stub, async (agent) => {
+      const orig = agent.syncSessionIndex.bind(agent);
+      agent.__indexPatches = [];
+      let aborted = false;
+      agent.syncSessionIndex = async (patch: { status: string }) => {
+        agent.__indexPatches.push(patch.status);
+        if (patch.status === "running" && !aborted) {
+          aborted = true;
+          await agent.handleAbort();
+        }
+        return orig(patch);
+      };
+    });
+    const res = await send(`/session/${id}/message`, { content: "hello there" });
+    expect(res.status).toBe(409);
+    const body = await json<{ aborted?: boolean; promptId: string }>(res);
+    expect(body.aborted).toBe(true);
+    expect((await prompts(id)).find((p) => p.id === body.promptId)?.status).toBe("aborted");
+    expect(await inDO(stub, async (agent) => agent.control.readActivePromptId())).toBeNull();
+    // The model never ran: no messages in the transcript.
+    const { messages } = await json<{ messages: unknown[] }>(await call(`/session/${id}/messages`));
+    expect(messages).toHaveLength(0);
+    // The index ends idle: the run's own idle sync comes after start()'s "running" one.
+    const patches = await inDO<string[]>(stub, async (agent) => agent.__indexPatches);
+    expect(patches.at(-1)).toBe("idle");
+    expect(patches.lastIndexOf("idle")).toBeGreaterThan(patches.indexOf("running"));
+  });
+
+  it("a finish that throws after a completed run still returns the answer and releases the session", async () => {
+    resetMockAgentic();
+    const id = await newSession();
+    const stub = await getAgentByName(typedEnv.CODING_AGENT as never, id);
+    await inDO(stub, async (agent) => {
+      const lifecycle = agent.sessionLifecycle;
+      const orig = lifecycle.finish;
+      lifecycle.finish = async (...args: unknown[]) => {
+        lifecycle.finish = orig;
+        throw new Error("finish exploded");
+      };
+    });
+    const res = await send(`/session/${id}/message`, { content: "hello there" });
+    expect(res.status).toBe(200);
+    const body = await json<{ promptId: string; message: { content?: string } }>(res);
+    expect(body.message).toBeTruthy();
+    expect((await prompts(id)).find((p) => p.id === body.promptId)?.status).toBe("completed");
+    expect(await inDO(stub, async (agent) => agent.control.readActivePromptId())).toBeNull();
+    expect(await inDO<string>(stub, async (agent) => agent.control.readStatus())).toBe("idle");
+  });
+
   it("a restart fails an inline prompt nobody will finish, and drains the queue; fiber-backed prompts are left alone", async () => {
     resetMockAgentic();
     const id = await newSession();
@@ -130,10 +184,28 @@ describe("sync /message through the session lifecycle", () => {
       agent.control.endPrompt();
     });
 
+    // Fiber started but its id not yet on the prompt row: also left to fiber recovery.
+    await inDO(stub, async (agent) => {
+      agent.control.beginPrompt("fiber-no-id", "t");
+      agent.ctx.storage.sql.exec("INSERT INTO prompts (id, session_id, content, status, created_at, updated_at) VALUES ('fiber-no-id', ?, 'x', 'queued', 0, 0)", id);
+      agent.ctx.storage.sql.exec("INSERT INTO cf_agents_fibers (fiber_id, name, status, metadata_json, created_at) VALUES ('fib_2', 'runFiberPrompt', 'interrupted', ?, 0)", JSON.stringify({ promptId: "fiber-no-id" }));
+      await agent.failInterruptedInlinePrompt();
+    });
+    expect(await inDO(stub, async (agent) => agent.control.readActivePromptId())).toBe("fiber-no-id");
+    await inDO(stub, async (agent) => {
+      agent.ctx.storage.sql.exec("DELETE FROM cf_agents_fibers WHERE fiber_id = 'fib_2'");
+      agent.ctx.storage.sql.exec("UPDATE prompts SET status = 'completed' WHERE id = 'fiber-no-id'");
+      agent.control.endPrompt();
+    });
+
     // An inline run left behind by the old instance, with a prompt queued behind it.
     await inDO(stub, async (agent) => {
       agent.control.beginPrompt("inline-orphan", "t");
       agent.ctx.storage.sql.exec("INSERT INTO prompts (id, session_id, content, status, created_at, updated_at) VALUES ('inline-orphan', ?, 'x', 'running', 0, 0)", id);
+      // A terminal fiber for it won't finish it either.
+      agent.ctx.storage.sql.exec("INSERT INTO cf_agents_fibers (fiber_id, name, status, metadata_json, created_at) VALUES ('fib_3', 'runFiberPrompt', 'completed', ?, 0)", JSON.stringify({ promptId: "inline-orphan" }));
+      // A live fiber row with malformed metadata doesn't break the lookup.
+      agent.ctx.storage.sql.exec("INSERT INTO cf_agents_fibers (fiber_id, name, status, metadata_json, created_at) VALUES ('fib_4', 'other', 'interrupted', 'not json', 0)");
     });
     const queued = await json<{ position?: number }>(await send(`/session/${id}/prompt`, { content: "queued behind the orphan" }));
     expect(queued.position).toBe(1);
@@ -142,6 +214,7 @@ describe("sync /message through the session lifecycle", () => {
     const orphan = (await prompts(id)).find((p) => p.id === "inline-orphan");
     expect(orphan?.status).toBe("failed");
     expect(orphan?.error).toMatch(/restarted/);
+    await inDO(stub, async (agent) => agent.ctx.storage.sql.exec("DELETE FROM cf_agents_fibers WHERE fiber_id IN ('fib_3', 'fib_4')"));
     await waitFor(async () => (await prompts(id)).filter((p) => p.status === "completed").length >= 3, "the queued prompt to drain");
     await waitFor(async () => (await inDO(stub, async (agent) => agent.control.readActivePromptId())) === null, "the session to go idle");
   });

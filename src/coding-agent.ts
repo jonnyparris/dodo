@@ -1370,7 +1370,7 @@ export class CodingAgent extends CodingAgentBase {
    */
   private async failInterruptedInlinePrompt(): Promise<void> {
     const promptId = this.control.readActivePromptId();
-    if (!promptId || this.readPromptFiberId(promptId)) return;
+    if (!promptId || this.readPromptFiberId(promptId) || this.hasFiberForPrompt(promptId)) return;
     log("warn", "failing an inline prompt interrupted by a restart", { sessionId: this.sessionId(), promptId });
     try {
       await this.finishPrompt(promptId, { error: "Interrupted: the session restarted while this prompt was running", status: "failed" });
@@ -3255,13 +3255,24 @@ export class CodingAgent extends CodingAgentBase {
       return Response.json({ error: "Unable to start the message" }, { status: 500 });
     }
     const promptId = started.promptId;
+    const aborted = () => Response.json({ error: "Prompt aborted", aborted: true, promptId, sessionId }, { status: 409 });
+    // start() awaits the session index sync after setting the active prompt.
+    // An abort in that window finished the prompt before our controller
+    // existed: don't run it.
+    if (this.control.readActivePromptId() !== promptId) {
+      // start()'s "running" index sync may have landed after the abort's "idle" one.
+      // Unless a queued prompt has started since: then the index is right.
+      if (!this.control.readActivePromptId()) await this.syncSessionIndex({ status: "idle" }).catch(() => {});
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      return aborted();
+    }
     this.markPromptRunning(promptId);
 
     // handleAbort() (and the watchdog) abort this controller via lifecycle.abortActive.
     const controller = new AbortController();
     this._fiberAbortController = controller;
     const signal = controller.signal;
-    const aborted = () => Response.json({ error: "Prompt aborted", aborted: true, promptId, sessionId }, { status: 409 });
 
     try {
       // Inside the try, so a UserControl failure here still sets the session idle.
@@ -3289,7 +3300,32 @@ export class CodingAgent extends CodingAgentBase {
 
       // The answer goes out before finish, which may start a queued prompt.
       this.emitEvent({ data: assistantRecord, type: "message" });
-      await this.finishPrompt(promptId, { resultMessageId: result.assistantMessageId, status: "completed", text: result.text });
+      try {
+        await this.finishPrompt(promptId, { resultMessageId: result.assistantMessageId, status: "completed", text: result.text });
+      } catch (error) {
+        // The answer is stored and sent, so the caller still gets it. If finish
+        // threw before it released the session, release it here.
+        log("error", "sync message: finish after a completed run failed", { sessionId, promptId, error: String(error) });
+        // Best effort only: nothing here may fall through to the outer catch,
+        // which would mark the delivered answer failed.
+        try {
+          if (this.control.readActivePromptId() === promptId) {
+            try {
+              this.updatePrompt(promptId, { status: "completed", resultMessageId: result.assistantMessageId });
+            } catch (e) {
+              log("error", "sync message: could not mark the prompt completed", { sessionId, promptId, error: String(e) });
+            }
+            this.control.endPrompt();
+            await this.syncSessionIndex({ status: "idle" }).catch(() => {});
+            this.ringCompletionWebhook(promptId, "completed");
+          }
+          this.afterRunIdle(); // flag-guarded: a no-op unless a config refresh is pending
+          // finish may have thrown before (or while) draining the queue.
+          if (!this.control.readActivePromptId()) void this.drainOneQueuedPrompt().catch(() => {});
+        } catch (e) {
+          log("error", "sync message: could not release the session after a failed finish", { sessionId, promptId, error: String(e) });
+        }
+      }
 
       return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, promptId, sessionId, steps: result.steps, toolCalls: result.toolCalls });
     } catch (error) {
@@ -3977,6 +4013,24 @@ export class CodingAgent extends CodingAgentBase {
       });
     }
     return state;
+  }
+
+  /** A live SDK fiber was started for this prompt (its fiber_id may not be on the prompt row yet). */
+  private hasFiberForPrompt(promptId: string): boolean {
+    const sql = this.ctx.storage.sql;
+    try {
+      if (!sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cf_agents_fibers'").toArray().length) return false;
+      // Only fibers the SDK will still recover; a terminal one will never finish the prompt.
+      return sql.exec(
+        "SELECT 1 FROM cf_agents_fibers WHERE status IN ('pending', 'running', 'interrupted') AND (CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.promptId') END) = ? LIMIT 1",
+        promptId,
+      ).toArray().length > 0;
+    } catch (error) {
+      // Can't tell: leave the prompt alone rather than fail a live one (if the
+      // table stays unreadable, the session stays busy until someone aborts).
+      log("warn", "could not read the fiber table", { sessionId: this.sessionId(), promptId, error: String(error) });
+      return true;
+    }
   }
 
   /** Read the fiber_id from a prompt row. */
