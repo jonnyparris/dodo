@@ -427,14 +427,20 @@ describe("pi is the default engine", () => {
 
       // Known gap, pinned here (same on the engine before this bound): a
       // prompt sent while the orphan is stuck queues in pi and doesn't run,
-      // even after the orphan ends. When that's fixed, flip this.
+      // even after the orphan ends. Only the turn stall guard ends it. When
+      // that's fixed, flip this.
+      await inDO(await agent(id), async (instance) => { instance.turnStallLimitsOverride = { idleMs: 1500, longMs: 1500 }; });
       nextId = (await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "after the stuck abort" }))).promptId;
       await expect(waitForPrompt(id, nextId, 1000)).rejects.toThrow("prompt never finished");
+      releaseMockStuckPrompt();
+      const next = await waitForPrompt(id, nextId, 5000);
+      expect(next.status).toBe("failed");
+      expect(next.error).toContain("Turn stalled");
     } finally {
       releaseMockStuckPrompt();
-      if (nextId) await call(`/session/${id}/abort`, { method: "POST" });
       await inDO(await agent(id), async (instance) => {
         instance.piAbortGraceMsOverride = null;
+        instance.turnStallLimitsOverride = null;
         delete instance.piEngine().run; // drop the own-property wrapper; the prototype method is back
       });
     }

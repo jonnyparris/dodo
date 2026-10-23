@@ -201,16 +201,19 @@ describe("PiEngine", () => {
         signal: controller.signal,
         abortGraceMs: 200,
       });
-      await enteredP;
-      const abortedAt = Date.now();
-      controller.abort();
-      const result = await running;
-      expect(result.status).toBe("unanswered");
-      expect(result.reason).toBe("abort_timeout");
-      expect(Date.now() - abortedAt).toBeLessThan(10_000);
-      expect(logs.map((l) => l.message)).toContain("pi: run did not settle after abort");
-      release();
-      await engine.close();
+      try {
+        await enteredP;
+        const abortedAt = Date.now();
+        controller.abort();
+        const result = await running;
+        expect(result.status).toBe("unanswered");
+        expect(result.reason).toBe("abort_timeout");
+        expect(Date.now() - abortedAt).toBeLessThan(10_000);
+        expect(logs.map((l) => l.message)).toContain("pi: run did not settle after abort");
+      } finally {
+        release();
+        await engine.close();
+      }
     });
   });
 });

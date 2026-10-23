@@ -50,10 +50,10 @@ export function releaseMockStuckPrompt(): void {
   stuckReleased = true;
 }
 async function waitForStuckRelease(): Promise<void> {
-  stuckReleased = false;
   stuckEntered = true;
   for (let i = 0; i < 30_000 && !stuckReleased; i++) await new Promise<void>((resolve) => setTimeout(resolve, 1));
   stuckEntered = false;
+  stuckReleased = false;
 }
 
 export function setDodoProvider(models: MutableModels, modelIds: readonly string[], config: RealModels.GatewayConfig, _env: unknown): MutableModels {
