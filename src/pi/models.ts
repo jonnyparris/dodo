@@ -178,7 +178,7 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
       reasoning: false,
       input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
       cost: modelCost(modelId),
-      // Dodo's catalog (or pi-ai's Workers AI list) first, then createAI's own entry.
+      // Dodo's catalog first, then createAI's own entry, then contextWindowFor's fallbacks.
       contextWindow: CATALOG.has(modelId) || !base.contextWindow ? contextWindowFor(modelId) : base.contextWindow,
       maxTokens: DEFAULT_MAX_TOKENS,
     };
@@ -429,8 +429,9 @@ export function setDodoProvider(
   // Every leg fails a request that goes quiet as retryable (stream-idle-timeout.ts).
   const createAIStreams: ProviderStreams | undefined =
     ai && withStreamIdleTimeout(withWorkersAIMaxTokens({ stream: ai.stream, streamSimple: ai.streamSimple } as ProviderStreams), idleOptions);
-  // withCompatBinding is outermost of the fetch wrappers: it swaps the base
-  // fetch for the binding, and the budget and 429 wait run inside it.
+  // withCompatBinding is the outermost stream wrapper, so its binding fetch
+  // is the base: at request time the 429 wait and the budget wrap the
+  // binding call (each resend takes a slot, then goes over the binding).
   const compatStreams = withStreamIdleTimeout(
     withCompatBinding(withModelBudgetStreams(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), budget), config, env),
     idleOptions,

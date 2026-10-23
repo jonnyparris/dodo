@@ -655,6 +655,35 @@ describe("pi gateway wire: Workers AI through createAI's run path (WORKERS_AI_VI
     expect(acquired).toEqual([[`ai-gateway:${KIMI}`, "main"]]);
   });
 
+  it("a drained cloudflare/@cf/ ref goes over the binding by default, keyless, with the budget slot", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("HTTP fetch not expected: /compat should go over the binding");
+    });
+    const acquired: Array<[string, string]> = [];
+    const SHARED_INDEX = {
+      idFromName: () => "global",
+      get: () => ({
+        modelBudgetAcquire: async (key: string, _rpm: number, priority: string) => {
+          acquired.push([key, priority]);
+          return { ok: true, waitMs: 0, used: 1, limit: 10 };
+        },
+        modelBudgetReport429: async () => {},
+      }),
+    };
+    const { binding, calls, runCalls } = fakeAIBinding(() => reply(), () => new Response("unexpected", { status: 500 }));
+    const env = { AI: binding, AI_GATEWAY_KEY: "gw-key", CLOUDFLARE_ACCOUNT_ID: "acct", SHARED_INDEX } as never;
+    const models = createModels();
+    setDodoProvider(models, [KIMI], config, env);
+    const res = await models.complete(models.getModel(CREATE_AI_PROVIDER_ID, KIMI)!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+    expect(res.errorMessage).toBeUndefined();
+    expect(runCalls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].request.provider).toBe("compat");
+    expect(calls[0].request.query.model).toBe(`workers-ai/${KIMI}`);
+    expect(JSON.stringify(calls[0])).not.toContain("gw-key");
+    expect(acquired).toEqual([[`ai-gateway:${KIMI}`, "main"]]);
+  });
+
   it("a drained cloudflare/@cf/ ref on /compat takes the same budget slot", async () => {
     vi.stubGlobal("fetch", async () => reply());
     const acquired: Array<[string, string]> = [];

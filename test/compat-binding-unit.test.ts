@@ -133,6 +133,30 @@ describe("subagents on /compat", () => {
     }
   });
 
+  it("@cf/ over the binding still takes a subagent slot from the shared model budget", async () => {
+    const http = captureFetch();
+    const acquired: Array<[string, string]> = [];
+    const SHARED_INDEX = {
+      idFromName: () => "global",
+      get: () => ({
+        modelBudgetAcquire: async (key: string, _rpm: number, priority: string) => {
+          acquired.push([key, priority]);
+          return { ok: true, waitMs: 0, used: 1, limit: 10 };
+        },
+        modelBudgetReport429: async () => {},
+      }),
+    };
+    const { binding, calls } = fakeAIBinding(() => json(completion));
+    const id = "@cf/moonshotai/kimi-k2.6";
+    const env = envWith(binding, { SHARED_INDEX } as unknown as Partial<Env>);
+    const res = await generateText({ model: buildProviderForModel(id, config, env, "sess-1").chatModel(id), prompt: "hi" });
+    expect(res.text).toBe("ok");
+    expect(http).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].request.provider).toBe("compat");
+    expect(acquired).toEqual([[`ai-gateway:${id}`, "subagent"]]);
+  });
+
   it("use HTTP with the key when COMPAT_VIA_BINDING=0 or the binding can't reach the gateway", async () => {
     const http = captureFetch();
     const { binding, calls } = fakeAIBinding(() => json(completion));
