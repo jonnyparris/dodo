@@ -437,6 +437,8 @@ describe("pi is the default engine", () => {
       const { prompts } = await json<{ prompts: Array<{ id: string; status: string }> }>(await call(`/session/${id}/prompts`));
       expect(prompts.find((p) => p.id === nextId)?.status).toBe("running");
       expect(mockStuckPromptEntered()).toBe(true);
+      // Held behind the orphan: its model request hasn't been made.
+      expect(seenContexts.some((c) => JSON.stringify(c.messages).includes("after the stuck abort"))).toBe(false);
       releaseMockStuckPrompt();
       const next = await waitForPrompt(id, nextId, 8000);
       if (next.status === "failed") expect(next.error).toContain("Turn stalled");
@@ -444,7 +446,7 @@ describe("pi is the default engine", () => {
     } finally {
       releaseMockStuckPrompt();
       // Normally it has finished by now; this covers an early failure.
-      if (nextId) await call(`/session/${id}/abort`, { method: "POST" });
+      if (nextId) await call(`/session/${id}/abort`, { method: "POST" }).catch(() => {});
       await inDO(await agent(id), async (instance) => {
         instance.piAbortGraceMsOverride = null;
         instance.turnStallLimitsOverride = null;
