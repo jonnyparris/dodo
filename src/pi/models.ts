@@ -21,7 +21,7 @@ import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.mode
 import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
-import { FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
+import { contextWindowFor, FALLBACK_MODELS, modelSupportsVision, WORKERS_AI_MODELS } from "../model-catalog";
 import { aigMetadataHeader, anthropicGatewayBaseUrl, resolveWireModelId } from "../subagent-runner";
 import type { Env } from "../types";
 import { log } from "../logger";
@@ -32,7 +32,6 @@ import { type StreamIdleTimeoutInfo, withStreamIdleTimeout } from "./stream-idle
 export { anthropicGatewayBaseUrl };
 
 export const DODO_PROVIDER_ID = "dodo-gateway";
-const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 32_000;
 
 export interface GatewayConfig {
@@ -43,7 +42,7 @@ export interface GatewayConfig {
   sessionId?: string;
 }
 
-const CATALOG = new Map<string, { contextWindow: number; costInput: number | null; costOutput: number | null }>(
+const CATALOG = new Map<string, { costInput: number | null; costOutput: number | null }>(
   [...FALLBACK_MODELS, ...WORKERS_AI_MODELS].map((m) => [m.id, m]),
 );
 
@@ -95,7 +94,6 @@ export function modelCost(modelId: string): ModelCost {
 /** The pi-ai model for one Dodo model id on the configured gateway. */
 export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Model<"openai-completions"> | Model<"anthropic-messages"> {
   const isOpencode = config.activeGateway === "opencode";
-  const entry = CATALOG.get(modelId);
   const anthropic = modelId.startsWith("anthropic/");
   const nativeAnthropicUrl = anthropic ? anthropicGatewayBaseUrl(config) : undefined;
   if (nativeAnthropicUrl) {
@@ -110,7 +108,7 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
       reasoning: false,
       input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
       cost: modelCost(modelId),
-      contextWindow: entry?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+      contextWindow: contextWindowFor(modelId),
       maxTokens: DEFAULT_MAX_TOKENS,
     };
   }
@@ -123,7 +121,7 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
     reasoning: false,
     input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
     cost: modelCost(modelId),
-    contextWindow: entry?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    contextWindow: contextWindowFor(modelId),
     maxTokens: DEFAULT_MAX_TOKENS,
     compat: {
       // Both gateways are unified OpenAI-compatible endpoints in front of

@@ -23,7 +23,7 @@ import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
 import { createModelOverrideStore, type ModelOverrideStore, modelOverridePatch, modelOverrideValueSchema, withModelOverride } from "./session-model-override";
 import { log } from "./logger";
 import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
-import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
+import { contextWindowFor, DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH } from "./model-catalog";
 import { dispatchNotification } from "./notify";
 import { entriesToMessages, PiEngine, type PiUserContent } from "./pi/engine";
 import { agentModelRef, setDodoProvider } from "./pi/models";
@@ -100,17 +100,6 @@ import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 
 type FiberPromptPayload = { promptId: string; content: string; images?: Array<{ data: string; mediaType: string; name?: string }>; authorEmail?: string; title: string };
 
-/**
- * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
- *
- * Derived from the shared model catalog in model-catalog.ts so the two lists
- * cannot drift. If a model is missing from the catalog but used at runtime,
- * DEFAULT_CONTEXT_WINDOW applies. See issue #34.
- */
-const CONTEXT_WINDOW_TOKENS: Record<string, number> = Object.fromEntries(
-  [...FALLBACK_MODELS, ...WORKERS_AI_MODELS].map((m) => [m.id, m.contextWindow]),
-);
-const DEFAULT_CONTEXT_WINDOW = 128_000;
 /** Budget factor — use 80% of context window for messages, leave 20% for response. */
 const CONTEXT_BUDGET_FACTOR = 0.8;
 
@@ -5113,7 +5102,7 @@ export class CodingAgent extends CodingAgentBase {
     // runs it can differ (override set or cleared mid-run). Clients show it
     // as "next" so they don't have to guess the owner's default.
     const nextModel = status === "running" ? modelOverride.model ?? this.readMetadata(OWNER_MODEL_KEY) ?? modelId : modelId;
-    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const contextWindow = contextWindowFor(modelId);
     const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
     // Use latest assistant turn's input tokens as the best proxy for current context size
     const latestAssistant = (Array.from(this.ctx.storage.sql.exec(

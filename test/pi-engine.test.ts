@@ -10,6 +10,8 @@ import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "..
 import { agentModelRef, anthropicGatewayBaseUrl, anthropicGatewayStreams, dodoModel, gatewayHeaders, modelCost, setDodoProvider } from "../src/pi/models";
 import { calculateCost, createModels } from "@earendil-works/pi-ai/models";
 import type { StreamOptions } from "@earendil-works/pi-ai";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 
 function host(storage: DurableObjectStorage, faux: ReturnType<typeof fauxProvider>, events: Array<{ type: string; data: unknown }>): PiEngineHost {
   return {
@@ -216,6 +218,30 @@ describe("pi adapters", () => {
     // Callers get a copy, not pi-ai's shared catalog object.
     modelCost("openai/gpt-5.4").input = 999;
     expect(modelCost("openai/gpt-5.4").input).toBe(2.5);
+  });
+
+  it("caps max_tokens to a Workers AI model's real window when Dodo's catalog doesn't list it", async () => {
+    // Qwen3 30B isn't in Dodo's catalog. It used to get the 128k default, so
+    // /compat sent max_tokens 32000 on top of the prompt into a 32,768 window
+    // and Workers AI 400'd the first turn (preview, 2026-10-22).
+    const config = { activeGateway: "ai-gateway" as const, opencodeBaseURL: "", aiGatewayBaseURL: "https://gw/v1" };
+    const m = dodoModel("@cf/qwen/qwen3-30b-a3b-fp8", config, {} as never);
+    expect(m.contextWindow).toBe(32_768);
+    expect(dodoModel("@cf/qwen/qwen2.5-coder-32b-instruct", config, {} as never).contextWindow).toBe(32_768); // Dodo's catalog
+    expect(dodoModel("@cf/acme/not-a-model", config, {} as never).contextWindow).toBe(128_000); // neither catalog
+
+    let body: { max_tokens?: number; max_completion_tokens?: number } | undefined;
+    const capture = (async (_url: unknown, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ error: { message: "stop here" } }), { status: 400, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const prompt = "word ".repeat(4000);
+    const context = normalizeContext({ messages: [{ role: "user", content: prompt, timestamp: 0 }] });
+    await openAICompletionsApi().streamSimple(m as never, context, { apiKey: "k", fetch: capture }).result();
+    const cap = body?.max_tokens ?? body?.max_completion_tokens;
+    expect(cap).toBeDefined();
+    expect(cap!).toBeLessThan(32_000);
+    expect(cap! + prompt.length / 4).toBeLessThan(32_768);
   });
 
   it("charges the long-context tier past 272k input tokens on GPT-5.4", () => {
