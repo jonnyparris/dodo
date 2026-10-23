@@ -319,23 +319,30 @@ describe("PUT /session/:id/model-override", () => {
       const id = await newSession();
       const stub = await getAgentByName(typedEnv.CODING_AGENT as never, id);
       const pending = send(`/session/${id}/message`, { content: "slow async prompt" });
-      // Poll the control status directly: GET /session reads a sync run as
-      // idle (it has no active prompt id), which would mask the mid-run path.
       const status = () => inDO<string>(stub, async (agent) => agent.control.readStatus());
+      const configModel = () => inDO<string>(stub, async (agent) => agent.getConfig()?.model);
       for (let i = 0; i < 500 && (await status()) !== "running"; i++) await new Promise((r) => setTimeout(r, 10));
-      expect(await status()).toBe("running");
+      // A GET mid-run (the web UI does one per SSE message) must not read the
+      // sync run as idle: it has no active prompt id.
+      expect((await json<Details>(await call(`/session/${id}`))).status).toBe("running");
+      // A second sync message can't start a run on top (it would rebuild the config).
+      expect((await send(`/session/${id}/message`, { content: "second" })).status).toBe(409);
       await send(`/session/${id}/model-override`, { model: pinned }, "PUT");
       expect(await inDO(stub, async (agent) => agent.readMetadata("config_refresh_pending"))).toBe("1");
+      await inDO(stub, async (agent) => agent.readAppConfig()); // a git op / facet spawn mid-run
+      expect(await configModel()).toBe(owner);
       releaseMockSlowPrompt();
-      expect((await pending).status).toBe(200);
-      let s = await json<Details>(await call(`/session/${id}`));
-      for (let i = 0; i < 100 && s.model !== pinned; i++) {
+      const res = await pending;
+      expect(res.status).toBe(200);
+      expect((await json<{ message: { model?: string } }>(res)).message.model).toBe(owner);
+      for (let i = 0; i < 300 && (await configModel()) !== pinned; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(await configModel()).toBe(pinned);
+      expect(await status()).toBe("idle");
+      for (let i = 0; i < 100 && (await inDO(stub, async (agent) => agent.readMetadata("config_refresh_pending"))) !== null; i++) {
         await new Promise((r) => setTimeout(r, 10));
-        s = await json<Details>(await call(`/session/${id}`));
       }
-      expect(s.status).toBe("idle");
-      expect(s.model).toBe(pinned);
       expect(await inDO(stub, async (agent) => agent.readMetadata("config_refresh_pending"))).toBeNull();
+      expect((await json<Details>(await call(`/session/${id}`))).model).toBe(pinned);
     } finally {
       releaseMockSlowPrompt();
       await send("/api/config", { model: before.model }, "PUT");

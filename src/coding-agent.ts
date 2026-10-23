@@ -566,6 +566,13 @@ export class CodingAgent extends CodingAgentBase {
   /** AbortController for the currently running fiber prompt. Signalled by handleAbort(). */
   private _fiberAbortController: AbortController | null = null;
   /**
+   * A sync /message run is in flight. It has no active prompt id, so without
+   * this the details reconcile would flip its "running" status to idle on the
+   * first GET, and mid-run config paths would treat the session as idle.
+   * In memory on purpose: a sync run doesn't survive eviction.
+   */
+  private _syncRunActive = false;
+  /**
    * Cached project-instructions content (AGENTS.md / CLAUDE.md) loaded from
    * the workspace. Warmed by `warmProjectInstructions()` at the top of
    * `onChatMessage()`, consumed synchronously by `getSystemPrompt()`.
@@ -3218,21 +3225,26 @@ export class CodingAgent extends CodingAgentBase {
     // This is the only path that doesn't go through SessionLifecycle (sync semantics
     // mean we don't spawn a fiber); status/title management is done by hand using the
     // typed control plane.
-    if (this.control.readActivePromptId()) {
+    if (this.control.readActivePromptId() || this._syncRunActive) {
       return Response.json({ error: "A prompt is already running" }, { status: 409 });
     }
 
     const existingTitle = this.control.readTitle();
     const title = existingTitle ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
     if (!existingTitle) this.control.setTitle(title);
+    // Before status goes "running": ensureThinkConfig leaves a running
+    // session's config alone.
+    this.ensureThinkConfig(request);
     this.control.setStatus("running");
     await this.syncSessionIndex({ status: "running", title });
+    // After syncSessionIndex: if that throws, the flag must not stick.
+    this._syncRunActive = true;
 
     const notifyOwner = this.control.readOwnerEmail() ?? undefined;
 
-    this.ensureThinkConfig(request);
-    await this.readAppConfig({ promptStart: true });
     try {
+      // Inside the try, so a UserControl failure here still sets the session idle.
+      await this.readAppConfig({ promptStart: true });
       await this.migrateThinkSessionToPi();
       const result = await this.runPiChat(input.content, { promptId: `sync_${crypto.randomUUID()}`, authorEmail: authorEmail ?? undefined, images: input.images });
 
@@ -3240,6 +3252,7 @@ export class CodingAgent extends CodingAgentBase {
       if (!result.text && !result.assistantMessageId) {
         const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
         this.control.setStatus("idle");
+        this._syncRunActive = false;
         await this.syncSessionIndex({ status: "idle", title });
         this.afterRunIdle();
         this.emitEvent({ data: { message }, type: "error_message" });
@@ -3255,6 +3268,7 @@ export class CodingAgent extends CodingAgentBase {
       );
 
       this.control.setStatus("idle");
+      this._syncRunActive = false;
       await this.syncSessionIndex({ status: "idle", title });
       this.afterRunIdle();
       this.emitEvent({ data: assistantRecord, type: "message" });
@@ -3264,6 +3278,7 @@ export class CodingAgent extends CodingAgentBase {
       return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, sessionId, steps: result.steps, toolCalls: result.toolCalls });
     } catch (error) {
       this.control.setStatus("idle");
+      this._syncRunActive = false;
       await this.syncSessionIndex({ status: "idle", title });
       this.afterRunIdle();
       const message = error instanceof Error ? error.message : "Unknown LLM failure";
@@ -5059,7 +5074,7 @@ export class CodingAgent extends CodingAgentBase {
     const activePromptId = snap.activePromptId;
     let status: SessionState["status"] = snap.status;
     // Reconcile stale "running" status when no prompt is active
-    if (status === "running" && !activePromptId) {
+    if (status === "running" && !activePromptId && !this._syncRunActive) {
       this.control.setStatus("idle");
       status = "idle";
       // Fire-and-forget sync to UserControl
@@ -5942,10 +5957,11 @@ export class CodingAgent extends CodingAgentBase {
    * Rebuild the session config from the owner's live config plus the session
    * model override. `promptStart` is for the calls that begin a run. Any
    * other call while a prompt runs (facet spawn, git commit/pull, eviction
-   * recovery) keeps the running prompt's models and gateway, so the details
-   * and the answer's model attribution stay on what the prompt runs on; a
-   * mid-run override applies from the next prompt (and the details once the
-   * run ends, via CONFIG_REFRESH_PENDING).
+   * recovery) keeps the running prompt's models and gateway in the session
+   * config, so the details and the answer's model attribution stay on what
+   * the prompt runs on. A mid-run override applies from the next prompt, and
+   * to the details once the run ends (CONFIG_REFRESH_PENDING). Facets spawned
+   * mid-run still get it: facetParentConfig layers the override on top.
    */
   private async readAppConfig(opts: { promptStart?: boolean } = {}): Promise<AppConfig> {
     const ownerEmail = this.readMetadata("owner_email");
@@ -6042,9 +6058,13 @@ export class CodingAgent extends CodingAgentBase {
    * started, its own readAppConfig did the job.
    */
   private async refreshConfigAfterRun(): Promise<void> {
-    if (this.control.read().status === "running") return this.metadataKv.delete(CONFIG_REFRESH_PENDING);
-    // Keep the flag if the refresh fails, so the next run end retries.
-    if (await this.refreshConfigFromOwner()) this.metadataKv.delete(CONFIG_REFRESH_PENDING);
+    // Another run started first (a queued prompt, image generation): keep the
+    // flag, so that run's end applies it. Image generation never calls
+    // readAppConfig, so it doesn't apply the override itself.
+    if (this.control.read().status === "running") return;
+    // Keep the flag if the refresh fails (the next run end retries), or if a
+    // run started during it (the refresh then kept that run's models).
+    if ((await this.refreshConfigFromOwner()) && this.control.read().status !== "running") this.metadataKv.delete(CONFIG_REFRESH_PENDING);
     if (this.control.read().status === "running") return;
     this.emitEvent({ data: this.readSessionDetails(), type: "state" });
   }
@@ -6052,7 +6072,7 @@ export class CodingAgent extends CodingAgentBase {
   /** The session just went idle (async finish or the sync /message path): apply a config refresh queued by a mid-run PUT /model-override. */
   private afterRunIdle(): void {
     if (!this.readMetadata(CONFIG_REFRESH_PENDING)) return;
-    this.refreshConfigAfterRun().catch((error) => log("warn", "config refresh after run failed", { sessionId: this.sessionId(), error: String(error) }));
+    this.ctx.waitUntil(this.refreshConfigAfterRun().catch((error) => log("warn", "config refresh after run failed", { sessionId: this.sessionId(), error: String(error) })));
   }
 
   /** readAppConfig for display paths: a UserControl failure must not fail the request. False only when the refresh failed. */
