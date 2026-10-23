@@ -17,8 +17,15 @@
  * `verify` command (for example: copy the agent's file into a checkout and run
  * a hidden test). Exit code 0 = pass.
  *
+ * Any run that doesn't complete keeps the session's engine detail, prompts and
+ * messages in <run dir>/<task>-<arm>/<status>/ (timeout, failed, aborted, or
+ * error when the harness itself failed, polling included), saved before the
+ * abort and the session delete.
+ *
  * Run (Node 24 strips the types itself):
- *   node bench/model-ab.ts bench/model-ab.example.json [--base https://dodo.example.com] [--tasks explore,refactor] [--keep] [--out bench/out]
+ *   node bench/model-ab.ts bench/model-ab.example.json [--base https://dodo.example.com] [--tasks explore,refactor] [--keep] [--out bench/out | --run-dir dir]
+ *
+ * Unattended, on every new Workers AI model: bench/model-watch.ts.
  *
  * Auth to Dodo: Access service token from DODO_ACCESS_CLIENT_ID +
  * DODO_ACCESS_CLIENT_SECRET, or the macOS keychain item "dodo-smoke-access"
@@ -96,7 +103,7 @@ interface RunResult {
 // ─── CLI ───
 
 function parseArgs(argv: string[]) {
-  const args = { spec: "", base: "", tasks: [] as string[], arms: [] as string[], keep: false, out: "bench/out" };
+  const args = { spec: "", base: "", tasks: [] as string[], arms: [] as string[], keep: false, out: "bench/out", runDir: "" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--base") args.base = argv[++i]!;
@@ -104,10 +111,11 @@ function parseArgs(argv: string[]) {
     else if (a === "--arms") args.arms = argv[++i]!.split(",");
     else if (a === "--keep") args.keep = true;
     else if (a === "--out") args.out = argv[++i]!;
+    else if (a === "--run-dir") args.runDir = argv[++i]!;
     else if (!args.spec) args.spec = a;
   }
   if (!args.spec) {
-    console.error("usage: node bench/model-ab.ts <spec.json> [--base URL] [--tasks a,b] [--arms x,y] [--keep] [--out dir]");
+    console.error("usage: node bench/model-ab.ts <spec.json> [--base URL] [--tasks a,b] [--arms x,y] [--keep] [--out dir | --run-dir dir]");
     process.exit(2);
   }
   return args;
@@ -129,7 +137,7 @@ function makeDodo(base: string) {
   const auth: Record<string, string> = id && secret ? { "CF-Access-Client-Id": id, "CF-Access-Client-Secret": secret } : {};
   if (!id) console.warn("No Access service token found: requests go out unauthenticated.");
 
-  async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async function req<T>(method: string, path: string, body?: unknown, opts: { timeoutMs?: number; retries?: number } = {}): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       try {
         const res = await fetch(`${base}${path}`, {
@@ -137,19 +145,22 @@ function makeDodo(base: string) {
           headers: { ...auth, ...(body !== undefined ? { "content-type": "application/json" } : {}), "user-agent": "dodo-model-ab/1" },
           body: body !== undefined ? JSON.stringify(body) : undefined,
           redirect: "manual",
+          signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000),
         });
         const text = await res.text();
         if (!res.ok) throw new Error(`${method} ${path} → ${res.status}: ${text.slice(0, 300)}`);
         return (text ? JSON.parse(text) : {}) as T;
       } catch (err) {
-        // Retry network blips, not HTTP errors.
-        if (attempt >= 3 || (err instanceof Error && /→ \d{3}/.test(err.message))) throw err;
+        // Retry network blips, not HTTP errors. Never re-send a POST that timed
+        // out: it may have landed (a second prompt run, billed twice).
+        const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+        if (attempt >= (opts.retries ?? 3) || (err instanceof Error && /→ \d{3}/.test(err.message)) || (timedOut && method === "POST")) throw err;
         await sleep(3000);
       }
     }
   }
   return {
-    get: <T>(p: string) => req<T>("GET", p),
+    get: <T>(p: string, opts?: { timeoutMs?: number; retries?: number }) => req<T>("GET", p, undefined, opts),
     post: <T>(p: string, b: unknown = {}) => req<T>("POST", p, b),
     del: (p: string) => req<unknown>("DELETE", p),
   };
@@ -169,21 +180,63 @@ function expandEnv(value: string): string {
   });
 }
 
-async function prepareSession(dodo: Dodo, task: Task): Promise<string> {
-  if (task.fork) return (await dodo.post<{ id: string }>(`/session/${expandEnv(task.fork)}/fork`)).id;
+/** Fork or create the run's session. `onId` gets the id before the clone, so a failed clone still leaves an id to clean up. */
+async function prepareSession(dodo: Dodo, task: Task, onId: (id: string) => void): Promise<void> {
+  if (task.fork) return onId((await dodo.post<{ id: string }>(`/session/${expandEnv(task.fork)}/fork`)).id);
   const { id } = await dodo.post<{ id: string }>("/session");
+  onId(id);
   if (task.clone) await dodo.post(`/session/${id}/git/clone`, { url: task.clone.url, dir: task.clone.dir, branch: task.clone.branch });
-  return id;
 }
 
-async function waitForPrompt(dodo: Dodo, sessionId: string, promptId: string, timeoutMs: number): Promise<string> {
+/**
+ * Save what the session was doing when a run didn't complete, before the abort
+ * and the session delete wipe it: pi live tasks + transcript
+ * (engine?detail=1), prompt history, messages. Goes to <runDir>/<reason>/.
+ * Best effort: each endpoint is written or its error is. Short timeout, no
+ * retries: the agent may still be running (and billing) until the abort.
+ */
+async function saveEvidence(dodo: Dodo, sessionId: string, runDir: string, reason: string): Promise<void> {
+  const dir = join(runDir, reason);
+  mkdirSync(dir, { recursive: true });
+  const endpoints: Array<[string, string]> = [
+    ["engine.json", `/session/${sessionId}/engine?detail=1`],
+    ["prompts.json", `/session/${sessionId}/prompts`],
+    ["messages.json", `/session/${sessionId}/messages`],
+  ];
+  await Promise.all(
+    endpoints.map(async ([file, path]) => {
+      try {
+        writeFileSync(join(dir, file), JSON.stringify(await dodo.get<unknown>(path, { timeoutMs: 30_000, retries: 0 }), null, 1));
+      } catch (err) {
+        writeFileSync(join(dir, file), JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      }
+    }),
+  );
+}
+
+async function waitForPrompt(dodo: Dodo, sessionId: string, promptId: string, timeoutMs: number, runDir: string): Promise<string> {
   const deadline = Date.now() + timeoutMs;
+  let failures = 0;
   while (Date.now() < deadline) {
     await sleep(10_000);
+    try {
+      const { prompts } = await dodo.get<{ prompts: Array<{ id: string; status: string }> }>(`/session/${sessionId}/prompts`);
+      failures = 0;
+      const p = prompts.find((x) => x.id === promptId);
+      if (p && !["queued", "running"].includes(p.status)) return p.status;
+    } catch (err) {
+      // One slow or 5xx poll must not end a 30-minute run.
+      if (++failures >= 6) throw err;
+    }
+  }
+  // One last look before aborting: the deadline may have passed while this
+  // process was suspended (laptop asleep) and the prompt finished meanwhile.
+  try {
     const { prompts } = await dodo.get<{ prompts: Array<{ id: string; status: string }> }>(`/session/${sessionId}/prompts`);
     const p = prompts.find((x) => x.id === promptId);
     if (p && !["queued", "running"].includes(p.status)) return p.status;
-  }
+  } catch {}
+  await saveEvidence(dodo, sessionId, runDir, "timeout").catch((err) => log(`${sessionId}: could not save timeout evidence: ${(err as Error).message}`));
   await dodo.post(`/session/${sessionId}/abort`).catch(() => {});
   return "timeout";
 }
@@ -195,8 +248,11 @@ async function lastAssistantText(dodo: Dodo, sessionId: string): Promise<string>
 
 async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir: string): Promise<RunResult> {
   const result: RunResult = { task: task.id, arm: armName, sessionId: "", models: arm, status: "error", wallSeconds: 0, tokenInput: 0, tokenOutput: 0, answer: "" };
+  const runDir = join(outDir, `${task.id}-${armName}`);
   try {
-    result.sessionId = await prepareSession(dodo, task);
+    await prepareSession(dodo, task, (id) => {
+      result.sessionId = id;
+    });
     const t0 = Date.now();
     const sent = await dodo.post<{ promptId: string }>(`/session/${result.sessionId}/prompt`, {
       content: task.prompt,
@@ -205,8 +261,12 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
       ...(arm.taskModel ? { taskModel: arm.taskModel } : {}),
     });
     log(`${task.id}/${armName}: ${result.sessionId} prompt ${sent.promptId}`);
-    result.status = await waitForPrompt(dodo, result.sessionId, sent.promptId, (task.timeoutMinutes ?? 30) * 60_000);
+    result.status = await waitForPrompt(dodo, result.sessionId, sent.promptId, (task.timeoutMinutes ?? 30) * 60_000, runDir);
     result.wallSeconds = Math.round((Date.now() - t0) / 1000);
+    // failed / aborted: keep the evidence too (timeout already saved its own).
+    if (result.status !== "completed" && result.status !== "timeout") {
+      await saveEvidence(dodo, result.sessionId, runDir, result.status).catch((err) => log(`${result.sessionId}: could not save ${result.status} evidence: ${(err as Error).message}`));
+    }
 
     const s = await dodo.get<{ model: string; exploreModel?: string; taskModel?: string; totalTokenInput: number; totalTokenOutput: number }>(`/session/${result.sessionId}`);
     result.sessionModels = { model: s.model, exploreModel: s.exploreModel, taskModel: s.taskModel };
@@ -214,7 +274,6 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
     result.tokenOutput = s.totalTokenOutput;
     result.answer = await lastAssistantText(dodo, result.sessionId);
 
-    const runDir = join(outDir, `${task.id}-${armName}`);
     mkdirSync(runDir, { recursive: true });
     writeFileSync(join(runDir, "answer.md"), result.answer);
     for (const path of task.collect ?? []) {
@@ -227,27 +286,44 @@ async function runOne(dodo: Dodo, task: Task, armName: string, arm: Arm, outDir:
         log(`${task.id}/${armName}: could not collect ${path}: ${(err as Error).message}`);
       }
     }
-    if (task.verify) {
-      const v = spawnSync("sh", ["-c", task.verify], {
-        encoding: "utf8",
-        env: { ...process.env, BENCH_TASK: task.id, BENCH_ARM: armName, BENCH_SESSION: result.sessionId, BENCH_OUT: resolve(runDir), BENCH_ANSWER: resolve(runDir, "answer.md") },
-        timeout: 15 * 60_000,
-      });
-      const output = `${v.stdout ?? ""}${v.stderr ?? ""}`;
-      writeFileSync(join(runDir, "verify.log"), output);
-      result.verify = { passed: v.status === 0, output: output.trim().split("\n").slice(-8).join("\n") };
-    }
-    log(`${task.id}/${armName}: ${result.status} in ${result.wallSeconds}s${result.verify ? `, verify ${result.verify.passed ? "PASS" : "FAIL"}` : ""}`);
+    log(`${task.id}/${armName}: ${result.status} in ${result.wallSeconds}s`);
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err);
     log(`${task.id}/${armName}: ERROR ${result.error}`);
+    // Keep the evidence (polling died, a GET failed...), then don't leave the
+    // agent running (and billing) until cleanup.
+    if (result.sessionId) {
+      await saveEvidence(dodo, result.sessionId, runDir, "error").catch((err) => log(`${result.sessionId}: could not save error evidence: ${(err as Error).message}`));
+      await dodo.post(`/session/${result.sessionId}/abort`).catch(() => {});
+    }
   }
   return result;
+}
+
+/** The environment minus credentials: verify runs tests the model under test wrote. */
+function verifyEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const k of ["CLOUDFLARE_API_TOKEN", "DODO_ACCESS_CLIENT_ID", "DODO_ACCESS_CLIENT_SECRET"]) delete env[k];
+  return env;
+}
+
+function runVerify(task: Task, result: RunResult, outDir: string) {
+  const runDir = join(outDir, `${task.id}-${result.arm}`);
+  const v = spawnSync("sh", ["-c", task.verify!], {
+    encoding: "utf8",
+    env: { ...verifyEnv(), BENCH_TASK: task.id, BENCH_ARM: result.arm, BENCH_SESSION: result.sessionId, BENCH_OUT: resolve(runDir), BENCH_ANSWER: resolve(runDir, "answer.md") },
+    timeout: 15 * 60_000,
+  });
+  const output = `${v.stdout ?? ""}${v.stderr ?? ""}`;
+  writeFileSync(join(runDir, "verify.log"), output);
+  result.verify = { passed: v.status === 0, output: output.trim().split("\n").slice(-8).join("\n") };
+  log(`${task.id}/${result.arm}: verify ${result.verify.passed ? "PASS" : "FAIL"}`);
 }
 
 // ─── AI Gateway cost ───
 
 interface GatewayLog extends GatewayUsageLog {
+  id?: string;
   model: string;
   cost?: number;
   tokens_out: number | null;
@@ -267,11 +343,15 @@ async function gatewayStats(sessionId: string, gateway: string): Promise<Gateway
     url.searchParams.set("search", sessionId);
     url.searchParams.set("per_page", "50");
     url.searchParams.set("page", String(page));
-    const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+    const res = await fetch(url, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000) });
     if (!res.ok) throw new Error(`AI Gateway logs → ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const body = (await res.json()) as { result: GatewayLog[]; result_info?: { total_count?: number } };
-    logs.push(...body.result);
-    if (body.result.length < 50) break;
+    const before = logs.length;
+    for (const l of body.result) if (!l.id || !logs.some((x) => x.id === l.id)) logs.push(l);
+    const total = body.result_info?.total_count;
+    // Stop on an empty page, a page with nothing new (pages shifting or `page` ignored), total reached, or a short page.
+    if (body.result.length === 0 || logs.length === before || (total !== undefined ? logs.length >= total : body.result.length < 50)) break;
+    if (page === 99) log(`AI Gateway logs for ${sessionId}: stopped at 99 pages, cost is a lower bound`);
   }
   const stats: GatewayStats = { requests: 0, errors: 0, tokensIn: 0, tokensInCached: 0, tokensInCacheWrite: 0, tokensOut: 0, cost: 0, byRole: {} };
   for (const l of logs) {
@@ -343,7 +423,8 @@ async function main() {
   const gateway = spec.gateway ?? process.env.AI_GATEWAY_ID ?? "";
   const armNames = args.arms.length ? args.arms : Object.keys(spec.arms);
   const tasks = args.tasks.length ? spec.tasks.filter((t) => args.tasks.includes(t.id)) : spec.tasks;
-  const outDir = join(args.out, new Date().toISOString().replace(/[:.]/g, "-"));
+  // --run-dir: write exactly here (bench/model-watch.ts uses it). --out: a new timestamped dir under it.
+  const outDir = args.runDir || join(args.out, new Date().toISOString().replace(/[:.]/g, "-"));
   mkdirSync(outDir, { recursive: true });
   const dodo = makeDodo(base);
   log(`${base}: ${tasks.length} task(s) × ${armNames.length} arm(s) → ${outDir}`);
@@ -353,6 +434,10 @@ async function main() {
   // share a per-model rate limit and finish in about the same wall time.
   for (const task of tasks) {
     const batch = await Promise.all(armNames.map((a) => runOne(dodo, task, a, spec.arms[a]!, outDir)));
+    // Verify after the whole batch, one at a time: verifiers share one checkout,
+    // and a blocking verify mid-batch would stall the other arms' polling and
+    // inflate their wall time.
+    for (const r of batch) if (task.verify && !r.error) runVerify(task, r, outDir);
     results.push(...batch);
     writeFileSync(join(outDir, "results.json"), JSON.stringify(results, null, 1));
   }
