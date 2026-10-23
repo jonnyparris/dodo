@@ -168,6 +168,9 @@
     // `wrangler secret put`) — without all three the cloudflare-logs
     // helpers return an empty result.
     "DODO_WORKER_NAME": "dodo",
+    // Also gates the createAI leg (src/cloudflare-ai.ts): Anthropic models
+    // only go through the AI binding when this matches the account in
+    // AI_GATEWAY_BASE_URL. Unset or different → they stay on /compat.
     "CLOUDFLARE_ACCOUNT_ID": "4b430e167a301330d13a9bb42f3986a2"
   }
 }

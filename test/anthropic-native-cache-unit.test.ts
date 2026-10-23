@@ -1,62 +1,81 @@
 /**
- * Anthropic subagent calls on AI Gateway go to the native Messages endpoint
- * because the unified `/compat` endpoint drops cache_control markers.
- * These tests pin the routing, the auth headers and the cache breakpoints.
+ * Anthropic subagent calls on AI Gateway go through createAI over the `AI`
+ * binding (native Messages wire) because the unified `/compat` endpoint drops
+ * cache_control markers. These tests pin the routing, the absence of gateway
+ * keys, the log metadata and the cache breakpoints.
  */
 import { generateText, jsonSchema, tool } from "ai";
 import { generateStructured } from "../src/structured-output";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import {
-  addAnthropicMessagesCacheMarkers,
-  anthropicNativeBaseURL,
-  buildProviderForModel,
-  pruneSubagentHistory,
-} from "../src/subagent-runner";
+import { bindingGatewayId, runWithLocalSignal } from "../src/cloudflare-ai";
+import { fakeAIBinding } from "./helpers/fake-ai-binding";
+import { addAnthropicCacheOptions, buildProviderForModel, pruneSubagentHistory } from "../src/subagent-runner";
 import type { AppConfig, Env } from "../src/types";
 
 const CC = { type: "ephemeral" };
 
-describe("addAnthropicMessagesCacheMarkers", () => {
-  it("marks system, last tool and the last block of the last message", () => {
-    const out = addAnthropicMessagesCacheMarkers({
-      model: "claude-haiku-4-5",
-      system: "You are a search assistant.",
-      tools: [{ name: "grep" }, { name: "read" }],
-      messages: [
+const anthropicReply = (extra: Record<string, unknown> = {}) =>
+  new Response(
+    JSON.stringify({
+      id: "msg_1", type: "message", role: "assistant", model: "claude-haiku-4-5",
+      content: [{ type: "text", text: "ok" }], stop_reason: "end_turn",
+      usage: { input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 4000 },
+      ...extra,
+    }),
+    { headers: { "content-type": "application/json" } },
+  );
+
+describe("bindingGatewayId", () => {
+  const env = { AI: {} as Ai, CLOUDFLARE_ACCOUNT_ID: "acc" };
+  it("reads the gateway id from an AI Gateway /compat URL in the Worker's account", () => {
+    expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acc/gw/compat/" }, env)).toBe("gw");
+  });
+  it("is undefined off AI Gateway, without a binding, for other URLs, or for another account", () => {
+    expect(bindingGatewayId({ activeGateway: "opencode", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acc/gw/compat" }, env)).toBeUndefined();
+    expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acc/gw/compat" }, { AI: undefined as unknown as Ai })).toBeUndefined();
+    expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://proxy.example/v1" }, env)).toBeUndefined();
+    // A custom proxy that happens to end in /compat stays on the OpenAI-compatible path.
+    expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://proxy.example/v1/acc/gw/compat" }, env)).toBeUndefined();
+    // The binding only reaches the Worker's own account; unknown account fails closed.
+    expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acc/gw/compat" }, { AI: {} as Ai })).toBeUndefined();
+    expect(bindingGatewayId({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/other/gw/compat" }, env)).toBeUndefined();
+  });
+});
+
+describe("addAnthropicCacheOptions", () => {
+  const cache = { anthropic: { cacheControl: CC } };
+  it("marks the system message, the last tool and the last message", () => {
+    const out = addAnthropicCacheOptions({
+      prompt: [
+        { role: "system", content: "SYS" },
         { role: "user", content: [{ type: "text", text: "find X" }] },
-        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "grep", input: {} }] },
-        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "hits" }] },
+        { role: "user", content: [{ type: "text", text: "more" }] },
       ],
-    });
-    expect(out.system).toEqual([{ type: "text", text: "You are a search assistant.", cache_control: CC }]);
-    const tools = out.tools as Array<Record<string, unknown>>;
-    expect(tools[0].cache_control).toBeUndefined();
-    expect(tools[1].cache_control).toEqual(CC);
-    const msgs = out.messages as Array<{ content: Array<Record<string, unknown>> }>;
-    expect(msgs[0].content[0].cache_control).toBeUndefined();
-    expect(msgs[2].content[0].cache_control).toEqual(CC);
+      tools: [
+        { type: "function", name: "a", inputSchema: {} },
+        { type: "function", name: "b", inputSchema: {} },
+      ],
+    } as never);
+    expect(out.prompt[0].providerOptions).toEqual(cache);
+    expect(out.prompt[1].providerOptions).toBeUndefined();
+    expect(out.prompt[2].providerOptions).toEqual(cache);
+    const tools = out.tools as Array<{ providerOptions?: unknown }>;
+    expect(tools[0].providerOptions).toBeUndefined();
+    expect(tools[1].providerOptions).toEqual(cache);
   });
 
-  it("wraps string message content and skips thinking blocks", () => {
-    const out = addAnthropicMessagesCacheMarkers({
-      messages: [
-        { role: "user", content: "hi" },
-      ],
-    });
-    expect((out.messages as Array<{ content: unknown }>)[0].content).toEqual([{ type: "text", text: "hi", cache_control: CC }]);
-
-    const out2 = addAnthropicMessagesCacheMarkers({
-      messages: [
-        { role: "assistant", content: [{ type: "text", text: "a" }, { type: "thinking", thinking: "t" }] },
-      ],
-    });
-    const blocks = (out2.messages as Array<{ content: Array<Record<string, unknown>> }>)[0].content;
-    expect(blocks[0].cache_control).toEqual(CC);
-    expect(blocks[1].cache_control).toBeUndefined();
+  it("marks the last cacheable part when the last message ends in reasoning", () => {
+    const out = addAnthropicCacheOptions({
+      prompt: [{ role: "assistant", content: [{ type: "text", text: "a" }, { type: "reasoning", text: "t" }] }],
+    } as never);
+    const msg = out.prompt[0] as { providerOptions?: unknown; content: Array<{ providerOptions?: unknown }> };
+    expect(msg.providerOptions).toBeUndefined();
+    expect(msg.content[0].providerOptions).toEqual(cache);
+    expect(msg.content[1].providerOptions).toBeUndefined();
   });
 
-  it("keeps the last-message breakpoint on pruned history, whose prefix is stable between cut moves", () => {
+  it("pruned history keeps a stable prefix between cut moves, so the last-message breakpoint is read next step", () => {
     const history = (steps: number) => [
       { role: "user" as const, content: "find X" },
       ...Array.from({ length: steps }, (_, i) => [
@@ -69,73 +88,34 @@ describe("addAnthropicMessagesCacheMarkers", () => {
     const step5 = pruneSubagentHistory(history(5), 2);
     expect(step4.length).toBeLessThan(history(4).length);
     expect(step5.slice(0, step4.length)).toEqual(step4);
-    const out = addAnthropicMessagesCacheMarkers({ system: "SYS", messages: step4 });
-    const last = (out.messages as Array<{ content: Array<Record<string, unknown>> }>).at(-1);
-    expect(last?.content.at(-1)?.cache_control).toEqual(CC);
   });
 
-  it("counts markers nested in tool_result content toward the 4-breakpoint limit", () => {
-    const marked = { type: "text", text: "x", cache_control: CC };
-    const out = addAnthropicMessagesCacheMarkers({
-      system: "SYS",
-      tools: [{ name: "grep" }],
-      messages: [
-        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [marked, marked] }] },
-        { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: [marked] }] },
+  it("counts existing breakpoints toward Anthropic's limit of 4 and keeps them", () => {
+    const marked = { type: "text", text: "x", providerOptions: cache };
+    const out = addAnthropicCacheOptions({
+      prompt: [
+        { role: "system", content: "SYS" },
+        { role: "user", content: [marked, marked, marked] },
+        { role: "user", content: [{ type: "text", text: "last" }] },
       ],
-    });
+      tools: [{ type: "function", name: "a", inputSchema: {} }],
+    } as never);
     // 3 existing + system = 4; tools and the last message stay unmarked.
-    expect((out.system as Array<Record<string, unknown>>)[0].cache_control).toEqual(CC);
-    expect((out.tools as Array<Record<string, unknown>>)[0].cache_control).toBeUndefined();
-    const messages = out.messages as Array<{ content: Array<Record<string, unknown>> }>;
-    expect(messages[1].content[0].cache_control).toBeUndefined();
-    expect(JSON.stringify(out).split('"cache_control"').length - 1).toBe(4);
-  });
-
-  it("does not double-mark a last tool_result whose inner content is already marked", () => {
-    const out = addAnthropicMessagesCacheMarkers({
-      messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "x", cache_control: CC }] }] }],
-    });
-    const block = (out.messages as Array<{ content: Array<Record<string, unknown>> }>)[0].content[0];
-    expect(block.cache_control).toBeUndefined();
-  });
-
-  it("never exceeds 4 breakpoints and leaves existing markers alone", () => {
-    const marked = { type: "text", text: "x", cache_control: CC };
-    const out = addAnthropicMessagesCacheMarkers({
-      system: [marked, marked, marked],
-      tools: [{ name: "a" }],
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const tools = out.tools as Array<Record<string, unknown>>;
-    expect(tools[0].cache_control).toEqual(CC); // 4th and last slot
-    expect((out.messages as Array<{ content: unknown }>)[0].content).toBe("hi");
-  });
-});
-
-describe("anthropicNativeBaseURL", () => {
-  it("maps an AI Gateway /compat URL to the native anthropic endpoint", () => {
-    expect(
-      anthropicNativeBaseURL({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acc/gw/compat/" }),
-    ).toBe("https://gateway.ai.cloudflare.com/v1/acc/gw/anthropic/v1");
-  });
-  it("is undefined off AI Gateway or for non-/compat URLs", () => {
-    expect(anthropicNativeBaseURL({ activeGateway: "opencode", aiGatewayBaseURL: "https://x/v1/a/g/compat" })).toBeUndefined();
-    expect(anthropicNativeBaseURL({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://proxy.example/v1" })).toBeUndefined();
-    // A custom proxy that happens to end in /compat stays on the OpenAI-compatible path.
-    expect(anthropicNativeBaseURL({ activeGateway: "ai-gateway", aiGatewayBaseURL: "https://proxy.example/compat" })).toBeUndefined();
+    expect(out.prompt[0].providerOptions).toEqual(cache);
+    expect((out.tools as Array<{ providerOptions?: unknown }>)[0].providerOptions).toBeUndefined();
+    expect(out.prompt[2].providerOptions).toBeUndefined();
   });
 });
 
 describe("buildProviderForModel routing", () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  const env = { AI_GATEWAY_KEY: "aig-key", OPENCODE_GATEWAY_TOKEN: "oc" } as unknown as Env;
   const config = {
     activeGateway: "ai-gateway",
     aiGatewayBaseURL: "https://gateway.ai.cloudflare.com/v1/acc/gw/compat",
     opencodeBaseURL: "https://opencode.example/v1",
   } as unknown as AppConfig;
+  const envWith = (AI: Ai) => ({ AI, AI_GATEWAY_KEY: "aig-key", OPENCODE_GATEWAY_TOKEN: "oc", CLOUDFLARE_ACCOUNT_ID: "acc" }) as unknown as Env;
 
   function captureFetch(response: unknown) {
     const calls: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
@@ -148,64 +128,65 @@ describe("buildProviderForModel routing", () => {
 
   const tools = { grep: tool({ description: "g", inputSchema: jsonSchema({ type: "object", properties: {} }) }) };
 
-  it("sends anthropic/* on AI Gateway to the native endpoint with cache markers and no x-api-key", async () => {
-    const calls = captureFetch({
-      id: "msg_1", type: "message", role: "assistant", model: "claude-haiku-4-5",
-      content: [{ type: "text", text: "ok" }], stop_reason: "end_turn",
-      usage: { input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 4000 },
-    });
-    const provider = buildProviderForModel("anthropic/claude-haiku-4-5", config, env, "sess-1");
-    await generateText({ model: provider.chatModel("anthropic/claude-haiku-4-5"), system: "SYS", prompt: "hi", tools });
+  it("sends anthropic/* on AI Gateway through the AI binding with cache markers and no gateway key", async () => {
+    const fetchCalls = captureFetch({});
+    const { binding, calls } = fakeAIBinding(() => anthropicReply());
+    const provider = buildProviderForModel("anthropic/claude-haiku-4-5", config, envWith(binding), "sess-1");
+    const res = await generateText({ model: provider.chatModel("anthropic/claude-haiku-4-5"), system: "SYS", prompt: "hi", tools });
 
+    expect(res.text).toBe("ok");
+    expect(fetchCalls).toHaveLength(0);
     expect(calls).toHaveLength(1);
     const [c] = calls;
-    expect(c.url).toBe("https://gateway.ai.cloudflare.com/v1/acc/gw/anthropic/v1/messages");
-    expect(c.headers.get("cf-aig-authorization")).toBe("Bearer aig-key");
-    expect(c.headers.has("x-api-key")).toBe(false);
-    expect(JSON.parse(c.headers.get("cf-aig-metadata") ?? "{}")).toEqual({ dodo_session: "sess-1", dodo_role: "subagent" });
-    expect(c.body.model).toBe("claude-haiku-4-5");
-    expect((c.body.system as Array<Record<string, unknown>>).at(-1)?.cache_control).toEqual(CC);
-    expect((c.body.tools as Array<Record<string, unknown>>).at(-1)?.cache_control).toEqual(CC);
-    const last = (c.body.messages as Array<{ content: Array<Record<string, unknown>> }>).at(-1);
+    expect(c.gatewayId).toBe("gw");
+    expect(c.request.provider).toBe("anthropic");
+    expect(c.request.endpoint).toBe("v1/messages");
+    const headerNames = Object.keys(c.request.headers).map((h) => h.toLowerCase());
+    expect(headerNames).not.toContain("x-api-key");
+    expect(headerNames).not.toContain("cf-aig-authorization");
+    expect(JSON.stringify(c)).not.toContain("aig-key");
+    expect((c.options.gateway as { metadata?: unknown }).metadata).toEqual({ dodo_session: "sess-1", dodo_role: "subagent" });
+    const body = c.request.query;
+    expect(body.model).toBe("claude-haiku-4-5");
+    expect((body.system as Array<Record<string, unknown>>).at(-1)?.cache_control).toEqual(CC);
+    expect((body.tools as Array<Record<string, unknown>>).at(-1)?.cache_control).toEqual(CC);
+    const last = (body.messages as Array<{ content: Array<Record<string, unknown>> }>).at(-1);
     expect(last?.content.at(-1)?.cache_control).toEqual(CC);
   });
 
-  it("keeps non-Anthropic models and the OpenCode gateway on the OpenAI-compatible path", async () => {
+  it("keeps non-Anthropic models, the OpenCode gateway, and a binding-less env on the OpenAI-compatible path", async () => {
     const completion = {
       id: "1", object: "chat.completion", created: 1, model: "m",
       choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     };
+    const { binding, calls: bindingCalls } = fakeAIBinding(() => anthropicReply());
     let calls = captureFetch(completion);
-    await generateText({ model: buildProviderForModel("@cf/moonshotai/kimi-k2.6", config, env).chatModel("@cf/moonshotai/kimi-k2.6"), prompt: "hi" });
+    await generateText({ model: buildProviderForModel("@cf/moonshotai/kimi-k2.6", config, envWith(binding)).chatModel("@cf/moonshotai/kimi-k2.6"), prompt: "hi" });
     expect(calls[0].url).toBe("https://gateway.ai.cloudflare.com/v1/acc/gw/compat/chat/completions");
+    expect(calls[0].headers.get("cf-aig-authorization")).toBe("Bearer aig-key");
 
     calls = captureFetch(completion);
     const oc = { ...config, activeGateway: "opencode" } as AppConfig;
-    await generateText({ model: buildProviderForModel("anthropic/claude-haiku-4-5", oc, env).chatModel("anthropic/claude-haiku-4-5"), prompt: "hi" });
+    await generateText({ model: buildProviderForModel("anthropic/claude-haiku-4-5", oc, envWith(binding)).chatModel("anthropic/claude-haiku-4-5"), prompt: "hi" });
     expect(calls[0].url).toBe("https://opencode.example/v1/chat/completions");
+
+    calls = captureFetch(completion);
+    await generateText({ model: buildProviderForModel("anthropic/claude-haiku-4-5", config, envWith(undefined as unknown as Ai)).chatModel("anthropic/claude-haiku-4-5"), prompt: "hi" });
+    expect(calls[0].url).toBe("https://gateway.ai.cloudflare.com/v1/acc/gw/compat/chat/completions");
+    expect(bindingCalls).toHaveLength(0);
   });
 
-  it("runs the structured coercion pass through the native endpoint", async () => {
-    const calls: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
-    vi.stubGlobal("fetch", async (url: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      calls.push({ url: String(url), headers: new Headers(init?.headers), body });
+  it("runs the structured coercion pass through the binding", async () => {
+    const { binding, calls } = fakeAIBinding((body) => {
       // @ai-sdk/anthropic either asks for native JSON output or forces a `json` tool.
-      const tools = (body.tools as Array<{ name: string }> | undefined) ?? [];
-      const content = tools.some((t) => t.name === "json")
+      const forced = ((body.tools as Array<{ name: string }> | undefined) ?? []).some((t) => t.name === "json");
+      const content = forced
         ? [{ type: "tool_use", id: "t1", name: "json", input: { answer: "42" } }]
         : [{ type: "text", text: JSON.stringify({ answer: "42" }) }];
-      return new Response(
-        JSON.stringify({
-          id: "msg_1", type: "message", role: "assistant", model: "claude-haiku-4-5", content,
-          stop_reason: content[0].type === "tool_use" ? "tool_use" : "end_turn",
-          usage: { input_tokens: 5, output_tokens: 3 },
-        }),
-        { headers: { "content-type": "application/json" } },
-      );
+      return anthropicReply({ content, stop_reason: forced ? "tool_use" : "end_turn", usage: { input_tokens: 5, output_tokens: 3 } });
     });
-    const provider = buildProviderForModel("anthropic/claude-haiku-4-5", config, env, "sess-1");
+    const provider = buildProviderForModel("anthropic/claude-haiku-4-5", config, envWith(binding), "sess-1");
     const out = await generateStructured<{ answer: string }>({
       modelId: "anthropic/claude-haiku-4-5",
       model: provider.chatModel("anthropic/claude-haiku-4-5"),
@@ -215,8 +196,33 @@ describe("buildProviderForModel routing", () => {
     });
     expect(out).toMatchObject({ ok: true, data: { answer: "42" } });
     expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe("https://gateway.ai.cloudflare.com/v1/acc/gw/anthropic/v1/messages");
-    expect(calls[0].headers.has("x-api-key")).toBe(false);
-    expect(calls[0].headers.get("cf-aig-authorization")).toBe("Bearer aig-key");
+    expect(calls[0].request.provider).toBe("anthropic");
+  });
+});
+
+describe("runWithLocalSignal", () => {
+  it("rejects as AbortError when run() aborts the signal synchronously, and cancels the late body", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    let resolveLate!: (r: Response) => void;
+    const run = () => {
+      controller.abort("stop");
+      return new Promise<Response>((r) => (resolveLate = r));
+    };
+    await expect(runWithLocalSignal(run, {}, { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    resolveLate(new Response(new ReadableStream({ cancel: () => void (cancelled = true) })));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(cancelled).toBe(true);
+  });
+
+  it("never passes the signal to the binding call", async () => {
+    let seen: Record<string, unknown> | undefined;
+    const run = async (_req: unknown, options?: Record<string, unknown>) => {
+      seen = options;
+      return new Response("ok");
+    };
+    const res = await runWithLocalSignal(run, {}, { signal: new AbortController().signal, gateway: { id: "gw" } });
+    expect(await res.text()).toBe("ok");
+    expect(seen).toEqual({ gateway: { id: "gw" } });
   });
 });

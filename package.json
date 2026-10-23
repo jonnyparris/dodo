@@ -20,6 +20,7 @@
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.135",
     "@ai-sdk/openai-compatible": "^2.0.37",
+    "@ai-sdk/provider": "^4.0.31",
     "@cloudflare/codemode": "^0.5.4",
     "@cloudflare/computer": "^0.5.1",
     "@cloudflare/puppeteer": "^1.4.0",

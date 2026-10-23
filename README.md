@@ -334,7 +334,7 @@ Dodo doesn't bundle a model. Set the model and gateway in the UI (Settings) or w
 
 | Gateway | Setup |
 |---|---|
-| **AI Gateway** | Secret `AI_GATEWAY_KEY`, var `AI_GATEWAY_BASE_URL`. Workers AI models (`@cf/…`) go through the same gateway. |
+| **AI Gateway** | Secret `AI_GATEWAY_KEY`, var `AI_GATEWAY_BASE_URL`. Workers AI models (`@cf/…`) go through the same gateway. Anthropic models go through the `AI` binding instead (createAI, no key) when the URL is a gateway in the Worker's own account (`CLOUDFLARE_ACCOUNT_ID`). |
 | **OpenCode** | Secret `OPENCODE_GATEWAY_TOKEN`. Models fill in automatically. |
 
 Model ids look like `anthropic/claude-sonnet-4-6` or `@cf/zai-org/glm-5.3-flash`. The picker only offers models the active gateway can route.
