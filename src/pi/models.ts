@@ -209,7 +209,6 @@ function workersAIModel(modelId: string, gatewayId: string, env: Env): Model<Wor
 /** The OpenAI-compatible (`/compat` or OpenCode) model for a Dodo id, whatever leg new turns use. */
 function compatModel(modelId: string, config: GatewayConfig): Model<"openai-completions"> {
   const isOpencode = config.activeGateway === "opencode";
-  const entry = CATALOG.get(modelId);
   const anthropic = modelId.startsWith("anthropic/");
   return {
     id: resolveWireModelId(modelId, config.activeGateway),

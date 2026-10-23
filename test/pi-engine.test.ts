@@ -10,7 +10,6 @@ import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "..
 import { agentModelRef, CREATE_AI_PROVIDER_ID, createAIGatewayId, dodoModel, gatewayHeaders, modelCost, setDodoProvider, WORKERS_AI_API, workersAIOnRunPath } from "../src/pi/models";
 import { fakeAIBinding } from "./helpers/fake-ai-binding";
 import { calculateCost, createModels } from "@earendil-works/pi-ai/models";
-import type { StreamOptions } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 
