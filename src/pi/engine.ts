@@ -150,6 +150,8 @@ const SETTINGS: HarnessSettings = {
 export interface PiParkedTask {
   id: string;
   kind: string;
+  /** Background work (e.g. compaction): `Conversation.abort()` doesn't reach it. */
+  background: boolean;
 }
 
 /**
@@ -171,8 +173,20 @@ export class PiTaskParkedError extends Error {
   }
 }
 
-/** After aborting a parked turn, how long to wait for its submission to settle before giving up on it. */
+/** How long clearing parked work (abort, then the turn's submission settling) may take before run() moves on. */
 const PARKED_ABORT_SETTLE_MS = 30_000;
+
+/** Wait for `work`, at most `ms`. Never rejects. */
+async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    work.catch(() => {}),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+}
 
 function textOf(message: AssistantMessage | UserMessage | undefined): string {
   if (!message) return "";
@@ -287,7 +301,7 @@ export class PiEngine {
     const live = await harness.inspect(this.ctx);
     return live.tasks
       .filter((t) => t.state.kind === "blocked" && t.state.reason === "restart_limit")
-      .map((t) => ({ id: String(t.record.id), kind: t.record.kind }));
+      .map((t) => ({ id: String(t.record.id), kind: t.record.kind, background: t.record.background === true }));
   }
 
   private async root() {
@@ -336,16 +350,24 @@ export class PiEngine {
     // turn would sit until the turn stall guard (15 min).
     const parkedAtStart = await this.parkedTasks();
     if (parkedAtStart.length > 0) {
-      if (submission) {
+      const turnParked = parkedAtStart.some((t) => !t.background);
+      if (submission && turnParked) {
         // Reattaching to this prompt's own run: it is what crash-looped.
-        await this.abortParked(root, submission, parkedAtStart);
+        this.host.log("error", "pi: failing the turn, its work was parked by the crash-loop guard", { tasks: parkedAtStart });
+        const turn = submission;
+        await settleWithin(
+          this.clearParked(harness, root, parkedAtStart).then(() => turn.wait(this.ctx)),
+          PARKED_ABORT_SETTLE_MS,
+        );
+        throw new PiTaskParkedError(parkedAtStart, PI_RESTART_LIMIT);
       }
-      // A new prompt: the park is left over from an earlier turn (whose
-      // prompt already failed or gave up). Abort it so this prompt can run;
-      // the new input queues behind the aborting run. An abort-marked task is
-      // no longer blocked, so the re-check is empty unless the abort failed.
-      this.host.log("warn", "pi: aborting work parked by an earlier turn", { tasks: parkedAtStart });
-      await root.abort(this.ctx).catch((err) => this.host.log("warn", "pi: abort of parked work failed", { error: String(err) }));
+      // A new prompt (the park is left over from an earlier turn, whose
+      // prompt already failed or gave up), or only background work parked:
+      // abort it so this prompt can run. A new input queues behind the
+      // aborting run. An abort-marked task is no longer blocked, so the
+      // re-check is empty unless the abort didn't commit.
+      this.host.log("warn", "pi: aborting parked work", { tasks: parkedAtStart, recovered });
+      await settleWithin(this.clearParked(harness, root, parkedAtStart), PARKED_ABORT_SETTLE_MS);
       const still = await this.parkedTasks();
       if (still.length > 0) throw new PiTaskParkedError(still, PI_RESTART_LIMIT);
     }
@@ -431,21 +453,17 @@ export class PiEngine {
   }
 
   /**
-   * Abort a turn pi parked, wait (bounded) for its submission to settle so
-   * the conversation is free for the next prompt, and fail the turn.
+   * Abort parked work: the conversation's turn (cascades to its tool calls)
+   * when any of it is parked, and each parked background task by id, since
+   * `Conversation.abort()` stops at background boundaries. `root.abort()`
+   * also waits for the conversation to go idle, so callers bound this.
    */
-  private async abortParked(root: Awaited<ReturnType<PiEngine["root"]>>, submission: Submission, tasks: PiParkedTask[]): Promise<never> {
-    this.host.log("error", "pi: failing the turn, its work was parked by the crash-loop guard", { tasks });
-    await root.abort(this.ctx).catch((err) => this.host.log("warn", "pi: abort of parked turn failed", { error: String(err) }));
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      submission.wait(this.ctx).catch(() => {}),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, PARKED_ABORT_SETTLE_MS);
-      }),
-    ]);
-    if (timer) clearTimeout(timer);
-    throw new PiTaskParkedError(tasks, PI_RESTART_LIMIT);
+  private async clearParked(harness: Harness, root: Awaited<ReturnType<PiEngine["root"]>>, tasks: PiParkedTask[]): Promise<void> {
+    const failed = (what: string) => (err: unknown) => this.host.log("warn", `pi: abort of parked ${what} failed`, { error: String(err) });
+    for (const t of tasks.filter((t) => t.background)) {
+      await harness.abortTask(t.id as never, this.ctx).catch(failed(t.kind));
+    }
+    if (tasks.some((t) => !t.background)) await root.abort(this.ctx).catch(failed("turn"));
   }
 
   /** Translate pi agent events into Dodo's SSE protocol. */

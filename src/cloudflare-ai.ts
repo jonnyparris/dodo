@@ -213,8 +213,11 @@ export function adaptBindingForCreateAI(binding: Ai, retry?: Retry): Ai {
         return (model: unknown, inputs: unknown, options?: Parameters<GatewayRun>[1]) =>
           local((_req, opts) => runAsResponse(() => stub.run(model, inputs, opts) as Promise<Response>), typeof model === "string" ? model : undefined)(undefined, options);
       }
-      // createAI resumes a dropped catalog stream with a GET over the
-      // binding's fetch, passing the signal: same RPC problem.
+      // createAI's provider-native path (subagents' `routed` Anthropic) and
+      // its resume of a dropped catalog stream use the binding's fetch,
+      // passing the signal: same RPC problem. No 429 wait here (no `retry`):
+      // subagents rely on the AI SDK's retries, and a resume continues a
+      // stream the 429 wait already let through.
       if (prop === "fetch") {
         return (input: unknown, init?: Parameters<GatewayRun>[1]) =>
           runWithLocalSignal((req, opts) => stub.fetch(req, opts) as Promise<Response>, input, init);

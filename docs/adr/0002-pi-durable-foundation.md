@@ -143,7 +143,9 @@ existing workspace instead of cloning.
 - `HarnessOptions.models` as a function shipped in pi-durable 1.4.0. Dodo
   passes one (`PiEngineHost.models()`); CodingAgent rebuilds its `Models` only
   when the gateway config changes, and pi reads it at every model request, so
-  a mid-run model change applies at the next step without reopening.
+  credentials/routing changes apply without reopening. A running turn keeps
+  the model it started on (its agent ref is fixed at run start), so every
+  model id the isolate has served stays registered.
 
 ## Pi 1.4 / agents 0.30 (2026-10)
 
@@ -151,12 +153,15 @@ existing workspace instead of cloning.
   v2 on first open; 1.3 cannot open them. A deploy can't go back past this
   version without losing every session's transcript.
 - **Crash-loop guard.** A task the DO is reset under 5 times without progress
-  (`settings.restartLimit`, `PI_RESTART_LIMIT`) is parked. `PiEngine.run()`
-  checks for parked tasks after open and listens for `task_parked` reports:
-  a recovered prompt whose run is parked is aborted and fails with
-  `PiTaskParkedError` (clear message, user resends); a new prompt aborts work
-  an earlier turn left parked, then runs. Not `retryTask()`: the same step
-  would most likely crash again. `onReport` now logs the typed `info`.
+  (`settings.restartLimit`, `PI_RESTART_LIMIT`) is parked, and reported once,
+  at the open that counts it. `PiEngine.run()` checks `inspect()` for parked
+  tasks after open: a recovered prompt whose own run is parked is aborted and
+  fails with `PiTaskParkedError` (clear message, user resends); otherwise
+  (a new prompt, or only background work such as compaction parked) the
+  parked work is aborted and the prompt runs. Background tasks are aborted by
+  id (`Conversation.abort()` doesn't reach them); every abort is bounded at
+  30 s. Not `retryTask()`: the same step would most likely crash again.
+  `onReport` now logs the typed `info`.
 - **createAI (agents ≥0.29).** No more universal endpoint. Main-session
   Anthropic models resolve by AI Gateway's catalog spelling
   (`anthropic/claude-sonnet-4.6`, `createAISpecifier()`) and run on
