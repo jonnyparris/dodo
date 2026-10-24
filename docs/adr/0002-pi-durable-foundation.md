@@ -140,5 +140,34 @@ existing workspace instead of cloning.
   test on `~/dev/pi` branch `fix/ai-no-placeholder-bearer`. pi's contribution
   gate requires an issue in the reporter's own words and a maintainer `lgtm`
   before a PR — not filed by an agent.
-- `HarnessOptions.models` as a function is unreleased (>1.3.0); Dodo mutates
-  one `Models` until it ships.
+- `HarnessOptions.models` as a function shipped in pi-durable 1.4.0. Dodo
+  passes one (`PiEngineHost.models()`); CodingAgent rebuilds its `Models` only
+  when the gateway config changes, and pi reads it at every model request, so
+  URL/credential changes apply without reopening. Model and gateway stay
+  fixed while a prompt runs (`readAppConfig` keepRunning,
+  `ensureThinkConfig`), so the running turn's model ref stays registered; a
+  change applies from the next prompt. The previous model stays registered
+  too, for a background compaction that outlasts its prompt.
+
+## Pi 1.4 / agents 0.30 (2026-10)
+
+- **No rollback.** pi-durable 1.4 migrates the `pi_` SQLite tables to schema
+  v2 on first open; 1.3 cannot open them. A deploy can't go back past this
+  version without losing every session's transcript.
+- **Crash-loop guard.** A task the DO is reset under 5 times without progress
+  (`settings.restartLimit`, `PI_RESTART_LIMIT`) is parked, and reported once,
+  at the open that counts it. `PiEngine.run()` checks `inspect()` for parked
+  tasks after open: a recovered prompt whose own run is parked is aborted and
+  fails with `PiTaskParkedError` (clear message, user resends); otherwise
+  (a new prompt, or only background work such as compaction parked) the
+  parked work is aborted and the prompt runs. Parked background tasks are
+  aborted by id, so healthy background work keeps running; every clear is
+  bounded at 30 s. Not `retryTask()`: the same step would most likely crash again.
+  `onReport` now logs the typed `info`.
+- **createAI (agents ≥0.29).** No more universal endpoint. Main-session
+  Anthropic models resolve by AI Gateway's catalog spelling
+  (`anthropic/claude-sonnet-4.6`, `createAISpecifier()`) and run on
+  `env.AI.run`; Dodo keeps its own id (`anthropic/claude-sonnet-4-6`) on the
+  model so persisted `cloudflare/…` refs still resolve. Subagents' `routed`
+  Anthropic models go to the provider-native path over `env.AI.fetch`, which
+  `adaptBindingForCreateAI` now wraps (AbortSignal kept local).

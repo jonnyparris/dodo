@@ -28,6 +28,7 @@ import { contextWindowFor, DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt,
 import { dispatchNotification } from "./notify";
 import { entriesToMessages, PiEngine, type PiUserContent } from "./pi/engine";
 import { agentModelRef, setDodoProvider } from "./pi/models";
+import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { buildToolsExtension } from "./pi/tools";
 import type { Browser } from "agents/browser";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
@@ -614,6 +615,8 @@ export class CodingAgent extends CodingAgentBase {
    *  brains nudge themselves if they didn't call chat_reply). */
   private _toolCallNames: Set<string> = new Set();
   private _piEngine: PiEngine | null = null;
+  /** Model access for the pi engine, built for one gateway config. */
+  private _piModels: { key: string; model: string; ids: string[]; models: Models } | undefined;
   /** Last known pi transcript length, for the sync messageCount() read. */
   private _piMessageCount = 0;
   private readonly presence = new PresenceTracker();
@@ -4503,12 +4506,24 @@ export class CodingAgent extends CodingAgentBase {
   private piEngine(): PiEngine {
     this._piEngine ??= new PiEngine({
       storage: this.ctx.storage,
-      configureModels: (models) => {
+      // pi calls this at every model use; rebuild only when the config
+      // changes. Model and gateway don't change while a prompt runs
+      // (readAppConfig keepRunning, ensureThinkConfig), so the running turn's
+      // model stays registered; the next prompt picks up a new one. The
+      // previous model stays registered too: a background compaction started
+      // on it can outlast its prompt and asks for it again.
+      models: () => {
         const config = this.piGatewayConfig();
-        setDodoProvider(models, [config.model], config, this.env, {
+        const cached = this._piModels;
+        const ids = !cached ? [config.model] : cached.model === config.model ? cached.ids : [config.model, cached.model];
+        const key = JSON.stringify([config, ids]);
+        if (this._piModels?.key === key) return this._piModels.models;
+        const models = setDodoProvider(createModels(), ids, config, this.env, {
           // The UI shows "waiting for model capacity" instead of a silent stall.
           onBudgetWait: (info) => this.emitEvent({ type: "model_wait", data: { model: config.model, waitMs: Math.round(info.waitMs), used: info.used, limit: info.limit } }),
         });
+        this._piModels = { key, model: config.model, ids, models };
+        return models;
       },
       modelRef: () => {
         const config = this.piGatewayConfig();

@@ -20,7 +20,7 @@
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage, ImageContent, TextContent, UserMessage } from "@earendil-works/pi-ai";
-import { createModels, type MutableModels } from "@earendil-works/pi-ai/models";
+import type { Models } from "@earendil-works/pi-ai/models";
 import {
   type AgentEvent,
   AssistantEntry,
@@ -30,6 +30,7 @@ import {
   type Extension,
   Harness,
   type HarnessSettings,
+  type ReportInfo,
   section,
   type Submission,
   watchEvents,
@@ -87,11 +88,12 @@ export interface PiEngineHost {
   /** The DO's storage (`ctx.storage`). */
   storage: DurableObjectStorage;
   /**
-   * Refresh model access on the shared Models collection (e.g. after a
-   * model/gateway change). Called before every run. pi-durable > 1.3.0
-   * accepts a function for `models`; until then we mutate one collection.
+   * Current model access (catalog, credentials, request transforms). pi calls
+   * this at each use (every generation, compaction, hook and tool), so a
+   * model/gateway change applies at the next request without reopening the
+   * Harness. Cheap to call: the host should cache by config.
    */
-  configureModels(models: MutableModels): void;
+  models(): Models;
   /** Current model ref for the conversation. */
   modelRef(): { provider: string; modelId: string };
   /** Current system prompt. Rendered before each model request. */
@@ -130,13 +132,61 @@ export interface PiTurnResult {
   reason?: string;
 }
 
+/** pi-durable's default `settings.restartLimit`. Dodo keeps it. */
+export const PI_RESTART_LIMIT = 5;
+
 const SETTINGS: HarnessSettings = {
   retry: { maxRetries: 3 },
   compaction: { enabled: true },
   // DO SQLite is local; 250 ms keeps write volume modest while streaming.
   progress: { partialIntervalMs: 250, outputIntervalMs: 250 },
   toolExecution: "parallel",
+  // A task the DO is reset under this many times without progress is parked;
+  // run() fails the turn (PiTaskParkedError) instead of waiting on it.
+  restartLimit: PI_RESTART_LIMIT,
 };
+
+/** A task pi's crash-loop guard parked (cut off `restartLimit` times without progress). */
+export interface PiParkedTask {
+  id: string;
+  kind: string;
+  /** Background work (e.g. compaction): a plain `Conversation.abort()` doesn't reach it. */
+  background: boolean;
+}
+
+/**
+ * The turn's work was parked by pi's crash-loop guard: the Durable Object was
+ * reset that many times mid-task without the task making progress. The turn
+ * is aborted rather than retried, since the same step would most likely
+ * crash again.
+ */
+export class PiTaskParkedError extends Error {
+  readonly tasks: PiParkedTask[];
+  constructor(tasks: PiParkedTask[], restartLimit: number) {
+    super(
+      `This turn was stopped: the session restarted ${restartLimit} times while running it without making progress ` +
+        `(${tasks.map((t) => t.kind).join(", ")}). A step is probably crashing or overloading the worker. ` +
+        "Send the prompt again to retry, or break the work into smaller steps.",
+    );
+    this.name = "PiTaskParkedError";
+    this.tasks = tasks;
+  }
+}
+
+/** How long clearing parked work (abort, then the turn's submission settling) may take before run() moves on. */
+const PARKED_ABORT_SETTLE_MS = 30_000;
+
+/** Wait for `work`, at most `ms`. Never rejects. */
+async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    work.catch(() => {}),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+}
 
 function textOf(message: AssistantMessage | UserMessage | undefined): string {
   if (!message) return "";
@@ -165,7 +215,6 @@ export class PiEngine {
   private database: DurableObjectSqliteDatabase | undefined;
   private readonly registry = createRegistry();
   private readonly ctx: Context = BACKGROUND_CONTEXT;
-  private readonly models: MutableModels = createModels();
 
   constructor(private readonly host: PiEngineHost) {
     this.registry.install(
@@ -189,7 +238,6 @@ export class PiEngine {
 
   /** Open (once) and return the Harness. */
   async open(): Promise<Harness> {
-    this.host.configureModels(this.models);
     if (this.harness) return this.harness;
     if (!this.opening) {
       this.opening = (async () => {
@@ -198,11 +246,10 @@ export class PiEngine {
         const harness = await Harness.open(
           storage,
           {
-            models: this.models,
+            models: () => this.host.models(),
             registry: this.registry,
             settings: SETTINGS,
-            onReport: (error) =>
-              this.host.log("warn", "pi-durable report", { error: error instanceof Error ? error.message : String(error) }),
+            onReport: (error, info) => this.report(error, info),
           },
           this.ctx,
         );
@@ -223,6 +270,38 @@ export class PiEngine {
       });
     }
     return this.opening;
+  }
+
+  private report(error: unknown, info: ReportInfo): void {
+    const fields: Record<string, unknown> = { type: info.type, error: error instanceof Error ? error.message : String(error) };
+    if ("task" in info && info.task) {
+      fields.taskId = String(info.task.id);
+      fields.taskKind = info.task.kind;
+    }
+    if ("extension" in info && info.extension) fields.extension = info.extension;
+    if ("reason" in info) fields.reason = info.reason;
+    if (info.type === "host_error") fields.callback = info.callback;
+    if (info.type === "task_parked") {
+      // run() finds the parked task through inspect() (parkedTasks) and fails
+      // or clears it. Parks are only counted at open, before any turn waits.
+      this.host.log("error", "pi: task parked by the crash-loop guard", fields);
+      return;
+    }
+    const level = info.type === "session_failed" || info.type === "task_faulted" ? "error" : "warn";
+    this.host.log(level, "pi-durable report", fields);
+  }
+
+  /**
+   * Tasks pi's crash-loop guard has parked. pi reports a park once, when the
+   * open that counts the last restart happens, so a later open (another
+   * isolate) only finds it here.
+   */
+  async parkedTasks(): Promise<PiParkedTask[]> {
+    const harness = await this.open();
+    const live = await harness.inspect(this.ctx);
+    return live.tasks
+      .filter((t) => t.state.kind === "blocked" && t.state.reason === "restart_limit")
+      .map((t) => ({ id: String(t.record.id), kind: t.record.kind, background: t.record.background === true }));
   }
 
   private async root() {
@@ -266,6 +345,32 @@ export class PiEngine {
       submission = await harness.submission(existing.submission_id as never, this.ctx);
       recovered = submission !== undefined;
     }
+    // pi parks a task the DO was reset under `restartLimit` times without
+    // progress. A parked task never runs again by itself, so without this the
+    // turn would sit until the turn stall guard (15 min).
+    const parkedAtStart = await this.parkedTasks();
+    if (parkedAtStart.length > 0) {
+      const turnParked = parkedAtStart.some((t) => !t.background);
+      if (submission && turnParked) {
+        // Reattaching to this prompt's own run: it is what crash-looped.
+        this.host.log("error", "pi: failing the turn, its work was parked by the crash-loop guard", { tasks: parkedAtStart });
+        const turn = submission;
+        await settleWithin(
+          this.clearParked(harness, root, parkedAtStart).then(() => turn.wait(this.ctx)),
+          PARKED_ABORT_SETTLE_MS,
+        );
+        throw new PiTaskParkedError(parkedAtStart, PI_RESTART_LIMIT);
+      }
+      // A new prompt (the park is left over from an earlier turn, whose
+      // prompt already failed or gave up), or only background work parked:
+      // abort it so this prompt can run. A new input queues behind the
+      // aborting run. An abort-marked task is no longer blocked, so the
+      // re-check is empty unless the abort didn't commit.
+      this.host.log("warn", "pi: aborting parked work", { tasks: parkedAtStart, recovered });
+      await settleWithin(this.clearParked(harness, root, parkedAtStart), PARKED_ABORT_SETTLE_MS);
+      const still = await this.parkedTasks();
+      if (still.length > 0) throw new PiTaskParkedError(still, PI_RESTART_LIMIT);
+    }
     if (!submission) {
       bail();
       input.onPhase?.("prepare");
@@ -299,6 +404,7 @@ export class PiEngine {
     const onAbort = () => {
       void root.abort(this.ctx).catch(() => {});
     };
+
     input.signal?.addEventListener("abort", onAbort, { once: true });
     // Aborted between submit and here: the listener won't fire for a past abort.
     if (input.signal?.aborted) onAbort();
@@ -344,6 +450,22 @@ export class PiEngine {
       recovered,
       status: "done",
     };
+  }
+
+  /**
+   * Abort parked work: the conversation's turn (cascades to its tool calls)
+   * when any of it is parked, and each parked background task by id (not
+   * `abort({ background: true })`, which would also stop healthy background
+   * work). All start at once, so their marking commits are queued on pi's
+   * line before anything run() submits next; `root.abort()` then waits for
+   * the conversation to go idle, so callers bound the wait.
+   */
+  private async clearParked(harness: Harness, root: Awaited<ReturnType<PiEngine["root"]>>, tasks: PiParkedTask[]): Promise<void> {
+    const failed = (what: string) => (err: unknown) => this.host.log("warn", `pi: abort of parked ${what} failed`, { error: String(err) });
+    await Promise.all([
+      ...tasks.filter((t) => t.background).map((t) => harness.abortTask(t.id as never, this.ctx).catch(failed(t.kind))),
+      ...(tasks.some((t) => !t.background) ? [root.abort(this.ctx).catch(failed("turn"))] : []),
+    ]);
   }
 
   /** Translate pi agent events into Dodo's SSE protocol. */
