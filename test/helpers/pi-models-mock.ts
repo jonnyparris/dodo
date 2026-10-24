@@ -1,6 +1,7 @@
 // pi-engine twin of agentic-mock: the same deterministic model behaviour
 // ("<gateway>:<prompt>" echo, "This should fail" → gateway error, "slow async
-// prompt" → wait for release/abort), served through pi-ai so sessions on the
+// prompt" → wait for release/abort, "stuck model prompt" → ignore the abort
+// and wait for releaseMockStuckPrompt()), served through pi-ai so sessions on the
 // pi engine run end to end without network.
 //
 // Used as: vi.mock("../src/pi/models", async () => await import("./helpers/pi-models-mock"));
@@ -38,6 +39,24 @@ function lastUserText(context: TranscriptContext): string {
   return "";
 }
 
+// Flag-and-yield, not a stored resolver: see the note in agentic-mock.ts on
+// the DO input gate.
+let stuckReleased = false;
+let stuckEntered = false;
+/** A "stuck model prompt" request is in flight. */
+export const mockStuckPromptEntered = () => stuckEntered;
+/** Let a "stuck model prompt" request finish (it ignores aborts). */
+export function releaseMockStuckPrompt(): void {
+  // Only while one waits: a stray release must not make the next one return at once.
+  if (stuckEntered) stuckReleased = true;
+}
+async function waitForStuckRelease(): Promise<void> {
+  stuckEntered = true;
+  for (let i = 0; i < 30_000 && !stuckReleased; i++) await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  stuckEntered = false;
+  stuckReleased = false;
+}
+
 export function setDodoProvider(models: MutableModels, modelIds: readonly string[], config: RealModels.GatewayConfig, _env: unknown): MutableModels {
   const gateway = config.activeGateway ?? "opencode";
   const ids = [...new Set(modelIds.filter(Boolean).map((id) => resolveWireModelId(id, config.activeGateway)))];
@@ -48,6 +67,10 @@ export function setDodoProvider(models: MutableModels, modelIds: readonly string
     const prompt = lastUserText(context);
     if (prompt.includes("This should fail") || prompt.includes("This will fail")) {
       return fauxAssistantMessage("", { stopReason: "error", errorMessage: "Gateway timeout" });
+    }
+    if (prompt.includes("stuck model prompt")) {
+      await waitForStuckRelease();
+      return fauxAssistantMessage("", { stopReason: "aborted" });
     }
     if (prompt.includes("slow async prompt")) {
       try {

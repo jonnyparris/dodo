@@ -114,6 +114,8 @@ export interface PiTurnInput {
   onPhase?: (phase: string) => void;
   /** Every pi agent event of the turn, before Dodo translates it. For the turn stall guard. */
   onEvent?: (event: AgentEvent) => void;
+  /** How long to wait for pi to settle after an abort before giving up. Default PI_ABORT_GRACE_MS. */
+  abortGraceMs?: number;
 }
 
 export interface PiTurnResult {
@@ -129,6 +131,12 @@ export interface PiTurnResult {
   status: "done" | "unanswered";
   reason?: string;
 }
+
+/**
+ * After an abort (user or turn stall guard), how long run() waits for pi to
+ * settle the submission before it stops waiting and returns unanswered.
+ */
+export const PI_ABORT_GRACE_MS = 30_000;
 
 const SETTINGS: HarnessSettings = {
   retry: { maxRetries: 3 },
@@ -302,11 +310,11 @@ export class PiEngine {
     input.signal?.addEventListener("abort", onAbort, { once: true });
     // Aborted between submit and here: the listener won't fire for a past abort.
     if (input.signal?.aborted) onAbort();
-    let settled: Awaited<ReturnType<Submission["wait"]>>;
+    let settled: Awaited<ReturnType<Submission["wait"]>> | undefined;
     try {
       const waitCtx = input.signal ? withAbortSignal(input.signal, this.ctx) : this.ctx;
       settled = await submission.wait(waitCtx).catch(async (err) => {
-        if (input.signal?.aborted) return submission.wait(this.ctx);
+        if (input.signal?.aborted) return this.waitAfterAbort(submission, input.promptId, input.abortGraceMs ?? PI_ABORT_GRACE_MS);
         throw err;
       });
     } finally {
@@ -314,9 +322,9 @@ export class PiEngine {
       await stream.stop().catch(() => {});
     }
 
-    if (settled.status !== "done" || settled.type !== "input") {
-      const reason = settled.status === "unanswered" ? settled.reason : settled.status;
-      const detail = settled.status === "unanswered" && settled.detail !== undefined ? JSON.stringify(settled.detail) : "";
+    if (!settled || settled.status !== "done" || settled.type !== "input") {
+      const reason = !settled ? "abort_timeout" : settled.status === "unanswered" ? settled.reason : settled.status;
+      const detail = settled?.status === "unanswered" && settled.detail !== undefined ? JSON.stringify(settled.detail) : "";
       return {
         assistantMessageId: "",
         text: "",
@@ -344,6 +352,33 @@ export class PiEngine {
       recovered,
       status: "done",
     };
+  }
+
+  /**
+   * After an abort, give pi `graceMs` to settle the submission (the abort
+   * cascades through tools, so it normally takes well under a second). If it
+   * doesn't, stop waiting and return undefined: the caller has already
+   * failed or aborted the prompt, so holding run() and the event stream open
+   * for a run that may never end only leaks them. This does not end pi's run:
+   * a model request or tool that ignores the abort keeps it alive, and a
+   * submission made meanwhile queues in pi (see test/pi-default-e2e.test.ts).
+   */
+  private async waitAfterAbort(
+    submission: Submission,
+    promptId: string,
+    graceMs: number,
+  ): Promise<Awaited<ReturnType<Submission["wait"]>> | undefined> {
+    const grace = new AbortController();
+    const timer = setTimeout(() => grace.abort(new Error("abort grace elapsed")), graceMs);
+    try {
+      return await submission.wait(withAbortSignal(grace.signal, this.ctx));
+    } catch (err) {
+      if (!grace.signal.aborted) throw err;
+      this.host.log("warn", "pi: run did not settle after abort", { promptId, submissionId: submission.id, graceMs });
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** Translate pi agent events into Dodo's SSE protocol. */

@@ -15,7 +15,7 @@ vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/pi/models", async () => await import("./helpers/pi-models-mock"));
 
 import worker from "../src/index";
-import { seenContexts } from "./helpers/pi-models-mock";
+import { mockStuckPromptEntered, releaseMockStuckPrompt, seenContexts } from "./helpers/pi-models-mock";
 
 const BASE = "https://dodo.example";
 const typedEnv = env as unknown as Env;
@@ -391,6 +391,68 @@ describe("pi is the default engine", () => {
     await inDO(await agent(id), async () => restore?.());
     const next = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "after the stall" }));
     expect((await waitForPrompt(id, next.promptId, 5000)).status).toBe("completed");
+  });
+
+  it("a pi run that never settles after an abort is let go after the grace period", async () => {
+    const id = await newSession();
+    const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any) => Promise<T>) => Promise<T>;
+    const runs: Array<{ promptId: string; status?: string; reason?: string; ms?: number }> = [];
+    await inDO(await agent(id), async (instance) => {
+      instance.piAbortGraceMsOverride = 300;
+      const engine = instance.piEngine();
+      const run = engine.run.bind(engine);
+      engine.run = async (input: { promptId: string; signal?: AbortSignal }) => {
+        const record: (typeof runs)[number] = { promptId: input.promptId };
+        runs.push(record);
+        let abortedAt = 0;
+        input.signal?.addEventListener("abort", () => { abortedAt = Date.now(); }, { once: true });
+        const result = await run(input as never);
+        Object.assign(record, { status: result.status, reason: result.reason, ms: abortedAt ? Date.now() - abortedAt : undefined });
+        return result;
+      };
+    });
+    // The model request ignores the abort: pi's run can't settle.
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "stuck model prompt" }));
+    let nextId = "";
+    try {
+      for (let i = 0; i < 300 && !mockStuckPromptEntered(); i++) await new Promise((r) => setTimeout(r, 10));
+      expect(mockStuckPromptEntered()).toBe(true);
+      expect(runs.map((r) => r.promptId)).toEqual([promptId]);
+      expect((await call(`/session/${id}/abort`, { method: "POST" })).status).toBe(200);
+      expect((await waitForPrompt(id, promptId)).status).toBe("aborted");
+      // run() returns on its own after the grace period, not when the model does.
+      for (let i = 0; i < 300 && runs[0]?.status === undefined; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(runs[0]).toMatchObject({ promptId, status: "unanswered", reason: "abort_timeout" });
+      expect(runs[0]?.ms).toBeLessThan(2_000);
+
+      // Known gap, pinned here (same on the engine before this bound): a
+      // prompt sent while the orphan is stuck queues in pi. After the orphan
+      // ends, pi sometimes runs it and sometimes leaves it queued until the
+      // turn stall guard fails it (both seen in this test). When that's
+      // fixed, tighten this.
+      await inDO(await agent(id), async (instance) => { instance.turnStallLimitsOverride = { idleMs: 3000, longMs: 3000 }; });
+      nextId = (await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "after the stuck abort" }))).promptId;
+      expect(await pollPromptStatus(id, nextId, "running")).toBe("running");
+      await new Promise((r) => setTimeout(r, 500));
+      const { prompts } = await json<{ prompts: Array<{ id: string; status: string }> }>(await call(`/session/${id}/prompts`));
+      expect(prompts.find((p) => p.id === nextId)?.status).toBe("running");
+      expect(mockStuckPromptEntered()).toBe(true);
+      // Held behind the orphan: its model request hasn't been made.
+      expect(seenContexts.some((c) => JSON.stringify(c.messages).includes("after the stuck abort"))).toBe(false);
+      releaseMockStuckPrompt();
+      const next = await waitForPrompt(id, nextId, 8000);
+      if (next.status === "failed") expect(next.error).toContain("Turn stalled");
+      else expect(next.status).toBe("completed");
+    } finally {
+      releaseMockStuckPrompt();
+      // Normally it has finished by now; this covers an early failure.
+      if (nextId) await call(`/session/${id}/abort`, { method: "POST" }).catch(() => {});
+      await inDO(await agent(id), async (instance) => {
+        instance.piAbortGraceMsOverride = null;
+        instance.turnStallLimitsOverride = null;
+        delete instance.piEngine().run; // drop the own-property wrapper; the prototype method is back
+      });
+    }
   });
 
   it("turn progress keeps the session's updated_at fresh, so the opt-in watchdog measures silence, not turn length", async () => {
