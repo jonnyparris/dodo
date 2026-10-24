@@ -337,15 +337,15 @@ describe("SessionLifecycle.abortActive", () => {
 
 describe("SOURCE_POLICIES (invariants)", () => {
   it("every PromptSource has a policy entry", () => {
-    const sources: Array<string> = ["user", "watchdog", "cron", "queue", "goal-autocontinue", "image-gen"];
+    const sources: Array<string> = ["user", "watchdog", "cron", "queue", "goal-autocontinue", "image-gen", "message"];
     for (const s of sources) {
       expect(SOURCE_POLICIES[s as keyof typeof SOURCE_POLICIES]).toBeDefined();
     }
   });
 
-  it("image-gen is the only synchronous source", () => {
+  it("image-gen and sync /message are the only synchronous sources", () => {
     for (const [source, policy] of Object.entries(SOURCE_POLICIES)) {
-      if (source === "image-gen") expect(policy.synchronous).toBe(true);
+      if (source === "image-gen" || source === "message") expect(policy.synchronous).toBe(true);
       else expect(policy.synchronous).toBeFalsy();
     }
   });
@@ -353,7 +353,7 @@ describe("SOURCE_POLICIES (invariants)", () => {
   it("user is the only source that queues on busy", () => {
     for (const [source, policy] of Object.entries(SOURCE_POLICIES)) {
       if (source === "user") expect(policy.onBusy).toBe("queue");
-      else if (source === "image-gen") expect(policy.onBusy).toBe("reject");
+      else if (source === "image-gen" || source === "message") expect(policy.onBusy).toBe("reject");
       else expect(policy.onBusy).toBe("skip");
     }
   });
