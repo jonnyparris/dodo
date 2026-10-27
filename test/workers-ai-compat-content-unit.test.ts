@@ -2,8 +2,9 @@
  * Workers AI's `/compat` schema validates `content` as a string per message
  * and rejects two shapes pi-ai sends: `content: null` on a tool-only assistant
  * turn, and `content: [...]` on a turn with more than one block. On AI Gateway
- * `jp-gw` those 400'd 30 `@cf/openai/gpt-oss-120b` turns on 2026-10-22, every
- * one past the first, while the first turn of the same session succeeded.
+ * `jp-gw` those were every `@cf/openai/gpt-oss-120b` 400 in the gateway's
+ * request log from 2026-10-22 to 2026-10-25, each one past the first turn,
+ * while the first turn of the same session succeeded.
  * These tests pin the rewrite and that the `/compat` leg applies it to `@cf/`
  * models only, and leaves arrays alone for a vision model.
  */

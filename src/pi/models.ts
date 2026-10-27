@@ -317,11 +317,12 @@ const DROPPED_ATTACHMENT_NOTE = "[attachment removed from context — this model
  * - `content: [...]` on a turn with more than one block. A text-only model
  *   answers the same 400.
  *
- * On `jp-gw` these failed 30 `@cf/openai/gpt-oss-120b` turns on 2026-10-22 —
- * every turn past the first, while the first turn of the same session, model
- * and gateway succeeded. Vision `@cf/` models keep arrays (glm-5.3-flash
- * parses them: its own 400 was an image-count limit), so `acceptsImages`
- * decides whether an array collapses to its text.
+ * On `jp-gw` these were every `@cf/openai/gpt-oss-120b` 400 in the gateway's
+ * request log between 2026-10-22 and 2026-10-25 (20 of the 28 Workers AI 400s
+ * it kept there), each on a turn past the first, while the first turn of the
+ * same session, model and gateway succeeded. Vision `@cf/` models keep arrays
+ * (glm-5.3-flash parses them: its own 400 was an image-count limit), so
+ * `acceptsImages` decides whether an array collapses to its text.
  */
 export function stringMessageContent(payload: unknown, acceptsImages: boolean): unknown {
   if (!payload || typeof payload !== "object") return payload;
