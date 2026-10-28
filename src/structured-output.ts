@@ -199,21 +199,26 @@ export async function generateStructured<T>(
       // `generateObject` is deprecated in AI SDK 7; `generateText` with
       // `Output.object` sends the same JSON response format and runs the
       // same parse + schema check. A parse or schema failure throws
-      // `NoObjectGeneratedError` (with `text` and `usage`) from inside
-      // generateText; an empty or truncated reply leaves no output, and
-      // reading `result.output` then throws `NoOutputGeneratedError`.
+      // `NoObjectGeneratedError` (with `text`) from inside generateText;
+      // an empty reply that didn't finish with `stop` leaves no output,
+      // and reading `result.output` then throws `NoOutputGeneratedError`.
+      // Usage is counted in `onStepEnd`, which runs before the parse, so
+      // failed attempts are billed too.
       const result = await generateText({
         model: options.model,
         output: Output.object({ schema: options.schema }),
         prompt,
         system: options.system,
         abortSignal: signal,
+        onStepEnd: (step) => {
+          tokenInput += step.usage?.inputTokens ?? 0;
+          tokenOutput += step.usage?.outputTokens ?? 0;
+        },
       });
-      tokenInput += result.usage?.inputTokens ?? 0;
-      tokenOutput += result.usage?.outputTokens ?? 0;
+      const data = result.output as T;
       return {
         ok: true,
-        data: result.output as T,
+        data,
         mode,
         attempts,
         tokenInput,
@@ -224,11 +229,6 @@ export async function generateStructured<T>(
         error instanceof Error ? error.message : String(error);
       lastError = message;
       rawText = extractRawText(error);
-      // A failed attempt still cost tokens; the SDK puts them on the error.
-      if (NoObjectGeneratedError.isInstance(error)) {
-        tokenInput += error.usage?.inputTokens ?? 0;
-        tokenOutput += error.usage?.outputTokens ?? 0;
-      }
       if (attempts > maxRetries) break;
       // Append the validation error to the prompt so the model can
       // self-correct on the next attempt. Limit to ~1KB so a wall of
@@ -237,7 +237,7 @@ export async function generateStructured<T>(
         options.prompt,
         "",
         "Previous attempt failed to produce a valid response:",
-        truncate(message, 800),
+        truncate(retryDetail(error, message), 800),
         "",
         "Try again, this time matching the requested schema exactly.",
       ].join("\n");
@@ -268,6 +268,18 @@ function extractRawText(error: unknown): string {
     if (typeof text === "string") return text;
   }
   return "";
+}
+
+/**
+ * The error text to feed back on a retry. `NoObjectGeneratedError`'s own
+ * message is generic ("response did not match schema"); the field-level
+ * detail (JSON parse or Zod issue) is on `cause`.
+ */
+function retryDetail(error: unknown, message: string): string {
+  if (NoObjectGeneratedError.isInstance(error) && error.cause instanceof Error) {
+    return `${message}\n${error.cause.message}`;
+  }
+  return message;
 }
 
 function truncate(text: string, max: number): string {

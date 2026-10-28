@@ -41,6 +41,8 @@ describe("generateStructured", () => {
     const retryPrompt = JSON.stringify(model.doGenerateCalls[1].prompt);
     expect(retryPrompt).toContain("Previous attempt failed to produce a valid response");
     expect(retryPrompt).toContain("did not match schema");
+    // The Zod issue (field + expected type) reaches the model, not just the generic message.
+    expect(retryPrompt).toMatch(/answer[\s\S]*expected string|expected string[\s\S]*answer/);
   });
 
   it("returns the model's raw text when every attempt fails", async () => {
@@ -54,6 +56,13 @@ describe("generateStructured", () => {
     const empty = { ...reply(""), content: [], finishReason: { unified: "length" as const, raw: "length" } };
     const model = new MockLanguageModelV4({ doGenerate: empty });
     const out = await generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q", maxRetries: 0 });
-    expect(out).toMatchObject({ ok: false, attempts: 1, rawText: "" });
+    expect(out).toMatchObject({ ok: false, attempts: 1, rawText: "", tokenInput: 10, tokenOutput: 5 });
+  });
+
+  it("returns the truncated text when the reply hits the length limit mid-JSON", async () => {
+    const cut = { ...reply('{"answer":"4'), finishReason: { unified: "length" as const, raw: "length" } };
+    const model = new MockLanguageModelV4({ doGenerate: cut });
+    const out = await generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q", maxRetries: 0 });
+    expect(out).toMatchObject({ ok: false, attempts: 1, rawText: '{"answer":"4', tokenInput: 10, tokenOutput: 5 });
   });
 });
