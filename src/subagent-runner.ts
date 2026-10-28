@@ -822,10 +822,10 @@ async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentRes
     let structured: SubagentStructured | undefined;
     if (input.resultSchemaName && result.text.trim().length > 0) {
       // One coercion pass over the subagent's free-form final text.
-      // We deliberately don't pipe the schema into the multi-step loop
-      // (the AI SDK can't combine `tools` + `generateObject`), so the
-      // subagent does its tool-driven investigation first and a small
-      // structured pass distils the summary into the requested shape.
+      // We deliberately don't pipe the schema into the multi-step loop:
+      // the subagent does its tool-driven investigation in free form
+      // first, and a small structured pass (`generateStructured`)
+      // distils the summary into the requested shape.
       // The extra call is one round-trip; tokens used are accounted
       // for separately on `structured.tokenInput`/`tokenOutput`.
       structured = await coerceStructured({
