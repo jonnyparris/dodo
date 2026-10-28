@@ -2,8 +2,8 @@
  * Typed result schemas for subagent / one-shot LLM calls.
  *
  * Replaces "ask the model in JSON-ish freeform and regex-parse" with
- * a single helper that uses the AI SDK's `generateObject` against a
- * caller-supplied schema, with a one-shot validation-retry loop on
+ * a single helper that uses the AI SDK's `generateText` with an
+ * `Output.object` spec against a caller-supplied schema, with a one-shot validation-retry loop on
  * schema-validation failure.
  *
  * Companion to `agent-profile.ts` (Steal #1) and the workflow runner
@@ -12,12 +12,12 @@
  * into structured-output mode and the caller gets back the parsed
  * value alongside the conversational text.
  */
-import { generateObject, type LanguageModel } from "ai";
+import { generateText, NoObjectGeneratedError, Output, type LanguageModel } from "ai";
 import type { z } from "zod";
 
 /**
- * Provider-side JSON-mode capability. The AI SDK's `generateObject`
- * works against every provider, but performance and reliability vary:
+ * Provider-side JSON-mode capability. The AI SDK's structured output
+ * (`generateText({ output })`) works against every provider, but performance and reliability vary:
  *
  * - `native` — model has a first-class JSON / response-format mode that
  *   the SDK can wire up directly. Fast, no extra round-trips. Use this
@@ -152,7 +152,7 @@ export type GenerateStructuredResult<T> =
  * The function is small on purpose — it owns the retry loop and the
  * provider-mode selection, and delegates everything else to the AI SDK.
  *
- * Why not surface `generateObject`'s raw `mode` argument? Because the
+ * Why not let callers pick the structured-output mode? Because the
  * mode is a function of the model id (which the caller already passes
  * in) and a fixed capability map. Letting callers override the mode
  * leaks provider knowledge into every call site for no real win — the
@@ -178,7 +178,7 @@ export async function generateStructured<T>(
   while (attempts <= maxRetries) {
     attempts += 1;
     try {
-      // AI SDK v6+ has no explicit `mode` arg on generateObject —
+      // The AI SDK has no explicit `mode` arg on structured output —
       // the provider's structured-output path is selected automatically
       // from the model's reported capabilities. Our own `mode` value
       // stays useful as metadata on the result (it tells callers what
@@ -196,20 +196,24 @@ export async function generateStructured<T>(
           tokenOutput,
         };
       }
-      const result = await generateObject({
+      // `generateObject` is deprecated in AI SDK 7; `generateText` with
+      // `Output.object` sends the same JSON response format and runs the
+      // same parse + schema check. A parse or schema failure throws
+      // `NoObjectGeneratedError` (with `text` and `usage`) from inside
+      // generateText; an empty or truncated reply leaves no output, and
+      // reading `result.output` then throws `NoOutputGeneratedError`.
+      const result = await generateText({
         model: options.model,
-        schema: options.schema,
+        output: Output.object({ schema: options.schema }),
         prompt,
         system: options.system,
         abortSignal: signal,
       });
       tokenInput += result.usage?.inputTokens ?? 0;
       tokenOutput += result.usage?.outputTokens ?? 0;
-      // generateObject already runs the schema parser; reaching here
-      // means validation passed. Surface the typed object directly.
       return {
         ok: true,
-        data: result.object as T,
+        data: result.output as T,
         mode,
         attempts,
         tokenInput,
@@ -220,6 +224,11 @@ export async function generateStructured<T>(
         error instanceof Error ? error.message : String(error);
       lastError = message;
       rawText = extractRawText(error);
+      // A failed attempt still cost tokens; the SDK puts them on the error.
+      if (NoObjectGeneratedError.isInstance(error)) {
+        tokenInput += error.usage?.inputTokens ?? 0;
+        tokenOutput += error.usage?.outputTokens ?? 0;
+      }
       if (attempts > maxRetries) break;
       // Append the validation error to the prompt so the model can
       // self-correct on the next attempt. Limit to ~1KB so a wall of
