@@ -468,7 +468,8 @@ function buildAnthropicCreateAIProvider(gatewayId: string, env: Env, sessionAffi
  * share one book, and a 429 (thrown or returned) is reported back to it.
  * createAI never calls fetch, so the budget sits on the binding's retry
  * hook, like createAIFor in pi/models.ts. The AI SDK's retries call `run`
- * again, so every resend asks for its own slot.
+ * again, so every resend asks for its own slot (Workers AI counts it too).
+ * Same wait as the `/compat` leg: up to 90s per send, then it goes anyway.
  */
 function buildWorkersAICreateAIProvider(gatewayId: string, config: AppConfig, env: Env, sessionAffinity?: string) {
   const metadata = gatewayMetadata(sessionAffinity, "subagent");
