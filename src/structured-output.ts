@@ -12,19 +12,23 @@
  * into structured-output mode and the caller gets back the parsed
  * value alongside the conversational text.
  */
-import { generateText, NoObjectGeneratedError, Output, type LanguageModel } from "ai";
+import { generateText, type LanguageModel, NoObjectGeneratedError, NoOutputGeneratedError, Output } from "ai";
 import type { z } from "zod";
 
 /**
  * Provider-side JSON-mode capability. The AI SDK's structured output
- * (`generateText({ output })`) works against every provider, but performance and reliability vary:
+ * (`generateText({ output })`) works against every provider, but
+ * performance and reliability vary. Whenever it calls the model, Dodo
+ * sends the same request (a JSON response format with the schema); the provider package picks
+ * how to honour it, so the mode is an expectation label, not a switch:
  *
  * - `native` — model has a first-class JSON / response-format mode that
  *   the SDK can wire up directly. Fast, no extra round-trips. Use this
  *   path whenever the schema is supported.
  * - `tool` — provider supports tool-calling but not response-format.
- *   The SDK simulates JSON mode by wrapping the call in a single
- *   tool call; same correctness, slightly slower.
+ *   The provider package may simulate JSON mode with a single forced
+ *   tool call (e.g. @ai-sdk/anthropic's `json` tool), or the model
+ *   just follows the schema in text; same contract, less reliable.
  * - `unsupported` — neither path is reliable; callers must fall back
  *   to free-form generation + manual JSON parsing.
  *
@@ -177,6 +181,7 @@ export async function generateStructured<T>(
 
   while (attempts <= maxRetries) {
     attempts += 1;
+    let finishReason: string | undefined;
     try {
       // The AI SDK has no explicit `mode` arg on structured output —
       // the provider's structured-output path is selected automatically
@@ -202,8 +207,8 @@ export async function generateStructured<T>(
       // `NoObjectGeneratedError` (with `text`) from inside generateText;
       // an empty reply that didn't finish with `stop` leaves no output,
       // and reading `result.output` then throws `NoOutputGeneratedError`.
-      // Usage is counted in `onStepEnd`, which runs before the parse, so
-      // failed attempts are billed too.
+      // Usage and finish reason are read in `onStepEnd`, which runs
+      // before the parse, so failed attempts are billed too.
       const result = await generateText({
         model: options.model,
         output: Output.object({ schema: options.schema }),
@@ -211,6 +216,7 @@ export async function generateStructured<T>(
         system: options.system,
         abortSignal: signal,
         onStepEnd: (step) => {
+          finishReason = step.finishReason;
           tokenInput += step.usage?.inputTokens ?? 0;
           tokenOutput += step.usage?.outputTokens ?? 0;
         },
@@ -227,17 +233,19 @@ export async function generateStructured<T>(
     } catch (error) {
       const message =
         error instanceof Error ? error.message : String(error);
-      lastError = message;
+      lastError = NoOutputGeneratedError.isInstance(error)
+        ? `model returned no text (finish reason: ${finishReason ?? "unknown"})`
+        : message;
       rawText = extractRawText(error);
       if (attempts > maxRetries) break;
       // Append the validation error to the prompt so the model can
-      // self-correct on the next attempt. Limit to ~1KB so a wall of
-      // diagnostic text doesn't blow the prompt cache.
+      // self-correct on the next attempt. `retryDetail` caps it at ~800
+      // chars so a wall of diagnostic text doesn't blow the prompt cache.
       prompt = [
         options.prompt,
         "",
         "Previous attempt failed to produce a valid response:",
-        truncate(retryDetail(error, message), 800),
+        retryDetail(error, lastError),
         "",
         "Try again, this time matching the requested schema exactly.",
       ].join("\n");
@@ -271,15 +279,27 @@ function extractRawText(error: unknown): string {
 }
 
 /**
- * The error text to feed back on a retry. `NoObjectGeneratedError`'s own
- * message is generic ("response did not match schema"); the field-level
- * detail (JSON parse or Zod issue) is on `cause`.
+ * The error text to feed back on a retry, capped at ~800 chars.
+ * `NoObjectGeneratedError`'s own message is generic ("response did not
+ * match schema"); the field-level detail is on `cause`, whose message is
+ * "… Text/Value: <the reply>.\nError message: <the issue>". Put the issue
+ * first and a short head of the reply after it, so a long reply can't
+ * push the issue past the cap. `lastIndexOf`: a raw reply (parse-failure
+ * form) may itself contain the marker; the SDK's own one comes last.
  */
 function retryDetail(error: unknown, message: string): string {
-  if (NoObjectGeneratedError.isInstance(error) && error.cause instanceof Error) {
-    return `${message}\n${error.cause.message}`;
+  if (NoObjectGeneratedError.isInstance(error)) {
+    const lines = [message];
+    if (error.cause instanceof Error) {
+      const cause = error.cause.message;
+      const marker = "\nError message: ";
+      const at = cause.lastIndexOf(marker);
+      lines.push(truncate(at >= 0 ? cause.slice(at + marker.length) : cause, 400));
+    }
+    if (error.text) lines.push(`Your reply began: ${truncate(error.text, 300)}`);
+    return truncate(lines.join("\n"), 800);
   }
-  return message;
+  return truncate(message, 800);
 }
 
 function truncate(text: string, max: number): string {

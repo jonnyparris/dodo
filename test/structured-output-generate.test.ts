@@ -38,6 +38,9 @@ describe("generateStructured", () => {
     const model = new MockLanguageModelV4({ doGenerate: [reply('{"answer":1}', 7, 3), reply('{"answer":"ok"}', 11, 4)] });
     const out = await generateStructured({ modelId: "@cf/zai-org/glm-4.7-flash", model, schema, prompt: "q" });
     expect(out).toEqual({ ok: true, data: { answer: "ok" }, mode: "tool", attempts: 2, tokenInput: 18, tokenOutput: 7 });
+    // "tool" is a label: the request is still a JSON response format, no tools.
+    expect(model.doGenerateCalls[0].tools).toBeUndefined();
+    expect(model.doGenerateCalls[0].responseFormat).toMatchObject({ type: "json" });
     const retryPrompt = JSON.stringify(model.doGenerateCalls[1].prompt);
     expect(retryPrompt).toContain("Previous attempt failed to produce a valid response");
     expect(retryPrompt).toContain("did not match schema");
@@ -56,7 +59,34 @@ describe("generateStructured", () => {
     const empty = { ...reply(""), content: [], finishReason: { unified: "length" as const, raw: "length" } };
     const model = new MockLanguageModelV4({ doGenerate: empty });
     const out = await generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q", maxRetries: 0 });
-    expect(out).toMatchObject({ ok: false, attempts: 1, rawText: "", tokenInput: 10, tokenOutput: 5 });
+    expect(out).toMatchObject({ ok: false, attempts: 1, rawText: "", lastError: "model returned no text (finish reason: length)", tokenInput: 10, tokenOutput: 5 });
+  });
+
+  it("tells the model on retry that its last reply was empty", async () => {
+    const empty = { ...reply(""), content: [], finishReason: { unified: "length" as const, raw: "length" } };
+    const model = new MockLanguageModelV4({ doGenerate: [empty, reply('{"answer":"ok"}')] });
+    const out = await generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q" });
+    expect(out).toMatchObject({ ok: true, attempts: 2 });
+    expect(JSON.stringify(model.doGenerateCalls[1].prompt)).toContain("model returned no text (finish reason: length)");
+  });
+
+  it("shows the model the start of an unparseable reply and the parse error", async () => {
+    const model = new MockLanguageModelV4({ doGenerate: [reply("Here is the JSON you asked for"), reply('{"answer":"ok"}')] });
+    await generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q" });
+    const retryPrompt = JSON.stringify(model.doGenerateCalls[1].prompt);
+    expect(retryPrompt).toContain("could not parse");
+    expect(retryPrompt).toContain("Your reply began: Here is the JSON you asked for");
+  });
+
+  it("keeps the schema issue in the retry prompt when the bad reply is long", async () => {
+    const long = JSON.stringify({ answer: 1, filler: "x".repeat(2000) });
+    const model = new MockLanguageModelV4({ doGenerate: [reply(long), reply('{"answer":"ok"}')] });
+    const out = await generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q" });
+    expect(out.ok).toBe(true);
+    const retryPrompt = JSON.stringify(model.doGenerateCalls[1].prompt);
+    expect(retryPrompt).toContain("expected string");
+    // Only a short head of the echoed reply, after the issue.
+    expect(retryPrompt).not.toContain("x".repeat(400));
   });
 
   it("returns the truncated text when the reply hits the length limit mid-JSON", async () => {
