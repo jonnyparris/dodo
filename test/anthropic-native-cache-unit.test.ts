@@ -259,6 +259,74 @@ describe("buildProviderForModel routing", () => {
       expect(runCalls[0].inputs.max_tokens).toBe(4000);
     });
 
+    it("takes a subagent slot from the shared model budget per send, AI SDK retries included, and reports the 429", async () => {
+      let n = 0;
+      const { binding, runCalls } = fakeAIBinding(
+        () => new Response("unexpected", { status: 500 }),
+        () =>
+          n++ === 0
+            ? new Response(JSON.stringify({ errors: [{ message: "3040: Capacity temporarily exceeded" }] }), { status: 429, headers: { "content-type": "application/json", "retry-after": "0" } })
+            : completion({ content: "ok" }),
+      );
+      const acquired: Array<[string, string]> = [];
+      const reported: string[] = [];
+      let denyFirst = true;
+      const SHARED_INDEX = {
+        idFromName: () => "global",
+        get: () => ({
+          modelBudgetAcquire: async (key: string, _rpm: number, priority: string) => {
+            acquired.push([key, priority]);
+            if (denyFirst) {
+              denyFirst = false;
+              return { ok: false, waitMs: 1, used: 1, limit: 1 };
+            }
+            return { ok: true, waitMs: 0, used: 1, limit: 10 };
+          },
+          modelBudgetReport429: async (key: string) => {
+            reported.push(key);
+          },
+        }),
+      };
+      const env = { ...flagged(binding), SHARED_INDEX, MODEL_RPM_LIMITS: JSON.stringify({ [KIMI]: 10 }) } as unknown as Env;
+      const res = await generateText({ model: buildProviderForModel(KIMI, config, env, "sess-1").chatModel(KIMI), prompt: "hi", maxRetries: 2 });
+      expect(res.text).toBe("ok");
+      expect(runCalls).toHaveLength(2);
+      // One denied + one granted before the first send, one granted before the retry. Same key as /compat and main turns.
+      expect(acquired).toEqual([
+        [`ai-gateway:${KIMI}`, "subagent"],
+        [`ai-gateway:${KIMI}`, "subagent"],
+        [`ai-gateway:${KIMI}`, "subagent"],
+      ]);
+      await vi.waitFor(() => expect(reported).toEqual([`ai-gateway:${KIMI}`]));
+    }, 20_000);
+
+    it("a thrown rate limit on the run path is reported to the budget too", async () => {
+      let n = 0;
+      const { binding, runCalls } = fakeAIBinding(
+        () => new Response("unexpected", { status: 500 }),
+        () => {
+          if (n++ === 0) throw new Error("AiError: 3021: inference request per min rate reached");
+          return completion({ content: "ok" });
+        },
+      );
+      const reported: string[] = [];
+      const SHARED_INDEX = {
+        idFromName: () => "global",
+        get: () => ({
+          modelBudgetAcquire: async () => ({ ok: true, waitMs: 0, used: 1, limit: 10 }),
+          modelBudgetReport429: async (key: string) => {
+            reported.push(key);
+          },
+        }),
+      };
+      const env = { ...flagged(binding), SHARED_INDEX, MODEL_RPM_LIMITS: JSON.stringify({ [KIMI]: 10 }) } as unknown as Env;
+      const res = await generateText({ model: buildProviderForModel(KIMI, config, env, "sess-1").chatModel(KIMI), prompt: "hi", maxRetries: 2 });
+      expect(res.text).toBe("ok");
+      // The thrown call is recorded too: one failed send, one retry.
+      expect(runCalls).toHaveLength(2);
+      await vi.waitFor(() => expect(reported).toEqual([`ai-gateway:${KIMI}`]));
+    }, 20_000);
+
     it("stays on /compat with the flag off, on OpenCode, or without a reachable binding", async () => {
       const reply = {
         id: "1", object: "chat.completion", created: 1, model: "m",
