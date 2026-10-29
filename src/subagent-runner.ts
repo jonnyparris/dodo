@@ -461,10 +461,31 @@ function buildAnthropicCreateAIProvider(gatewayId: string, env: Env, sessionAffi
  * the AI SDK's own retries (maxRetries) handle, as on `/compat`. Unlike the
  * main session there is no rateLimitFetch wait on the binding: subagents
  * never had one on `/compat` either.
+ *
+ * Each send takes a subagent slot from the shared per-model budget first
+ * (model-budget.ts), as the `/compat` leg below does: same key
+ * (`<activeGateway>:<model>`), so main turns and subagents on either leg
+ * share one book, and a 429 (thrown or returned) is reported back to it.
+ * createAI never calls fetch, so the budget sits on the binding's retry
+ * hook, like createAIFor in pi/models.ts. The AI SDK's retries call `run`
+ * again, so every resend asks for its own slot (Workers AI counts it too).
+ * Same wait as the `/compat` leg: up to 90s per send, then it goes anyway.
  */
-function buildWorkersAICreateAIProvider(gatewayId: string, env: Env, sessionAffinity?: string) {
+function buildWorkersAICreateAIProvider(gatewayId: string, config: AppConfig, env: Env, sessionAffinity?: string) {
   const metadata = gatewayMetadata(sessionAffinity, "subagent");
-  const ai = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId, ...(metadata ? { metadata } : {}) });
+  const binding = adaptBindingForCreateAI(env.AI, (run, signal, model) => {
+    const send: typeof fetch = () => run();
+    if (!model) return send("https://gateway.ai.cloudflare.com/universal");
+    // The URL is a label only: `send` ignores it and calls the binding.
+    return withModelBudget(send, {
+      env,
+      gateway: config.activeGateway,
+      modelId: model,
+      priority: "subagent",
+      onWait: (info) => log("info", "subagent: waiting for model capacity", { sessionId: sessionAffinity, ...info, waitMs: Math.round(info.waitMs) }),
+    })("https://gateway.ai.cloudflare.com/universal", { signal: signal ?? undefined });
+  });
+  const ai = createAI({ binding, id: gatewayId, ...(metadata ? { metadata } : {}) });
   // Same replica for every step of one subagent run, so Workers AI prefix
   // caching works (was the x-session-affinity header on `/compat`).
   const model = (modelId: string): LanguageModel =>
@@ -538,7 +559,7 @@ export function buildProviderForModel(
   const anthropic = modelId.startsWith("anthropic/");
   const gatewayId = anthropic || workersAIOnRunPath(modelId, env) ? bindingGatewayId(config, env) : undefined;
   if (gatewayId && anthropic) return buildAnthropicCreateAIProvider(gatewayId, env, sessionAffinity);
-  if (gatewayId) return buildWorkersAICreateAIProvider(gatewayId, env, sessionAffinity);
+  if (gatewayId) return buildWorkersAICreateAIProvider(gatewayId, config, env, sessionAffinity);
 
   const effectiveGateway = resolveGatewayForModel(modelId, config.activeGateway);
   const isOpencode = effectiveGateway === "opencode";
