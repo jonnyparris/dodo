@@ -171,6 +171,51 @@ describe("PiEngine", () => {
       await engine.close();
     });
   });
+
+  it("stops waiting for pi a grace period after an abort when the run never settles", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-abort-grace"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const faux = fauxProvider();
+      faux.setResponses([fauxAssistantMessage([fauxToolCall("stuck", {}, { id: "c1" })], { stopReason: "toolUse" })]);
+      let entered: () => void = () => {};
+      const enteredP = new Promise<void>((r) => { entered = r; });
+      let release: () => void = () => {};
+      const tools = {
+        stuck: tool({
+          description: "ignores the abort signal",
+          inputSchema: zodSchema(z.object({})),
+          execute: async () => {
+            entered();
+            await new Promise<void>((resolve) => { release = resolve; });
+            return "late";
+          },
+        }),
+      };
+      const logs: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+      const engine = new PiEngine({ ...host(state.storage, faux, []), log: (_l, message, fields) => logs.push({ message, fields }) });
+      const controller = new AbortController();
+      const running = engine.run({
+        promptId: "p1",
+        prepare: async () => ({ content: "go", entry: entry("go") }),
+        tools: await buildToolsExtension(tools),
+        signal: controller.signal,
+        abortGraceMs: 200,
+      });
+      try {
+        await enteredP;
+        const abortedAt = Date.now();
+        controller.abort();
+        const result = await running;
+        expect(result.status).toBe("unanswered");
+        expect(result.reason).toBe("abort_timeout");
+        expect(Date.now() - abortedAt).toBeLessThan(10_000);
+        expect(logs.map((l) => l.message)).toContain("pi: run did not settle after abort");
+      } finally {
+        release();
+        await engine.close();
+      }
+    });
+  });
 });
 
 describe("pi adapters", () => {
