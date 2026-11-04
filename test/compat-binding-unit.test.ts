@@ -4,7 +4,8 @@
  * "compat", so they need no AI_GATEWAY_KEY. These tests pin the routing,
  * the absence of key headers, the kill switch and the Google id.
  */
-import { generateText } from "ai";
+import { generateText, Output } from "ai";
+import { z } from "zod";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { compatBindingFetch, compatBindingGatewayId } from "../src/cloudflare-ai";
 import { gatewayHeaders, withCompatBinding, withRateLimitRetry } from "../src/pi/models";
@@ -155,6 +156,24 @@ describe("subagents on /compat", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].request.provider).toBe("compat");
     expect(acquired).toEqual([[`ai-gateway:${id}`, "subagent"]]);
+  });
+
+  it("send the JSON schema for @cf/ structured output, and plain json_object for other providers", async () => {
+    captureFetch();
+    const reply = { ...completion, choices: [{ ...completion.choices[0], message: { role: "assistant", content: '{"answer":"ok"}' } }] };
+    const { binding, calls } = fakeAIBinding(() => json(reply));
+    const schema = z.object({ answer: z.string() });
+    for (const id of ["@cf/zai-org/glm-5.3-flash", "openai/gpt-4.1-mini"]) {
+      const res = await generateText({ model: buildProviderForModel(id, config, envWith(binding), "sess-1").chatModel(id), prompt: "hi", output: Output.object({ schema }) });
+      expect(res.output).toEqual({ answer: "ok" });
+    }
+    // Without the schema GLM invents its own field names, fails validation and
+    // the retry runs out the coercion budget (measured on jp-gw 2026-10-28).
+    expect(calls[0].request.query.response_format).toMatchObject({
+      type: "json_schema",
+      json_schema: { name: "response", strict: true, schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] } },
+    });
+    expect(calls[1].request.query.response_format).toEqual({ type: "json_object" });
   });
 
   it("use HTTP with the key when COMPAT_VIA_BINDING=0 or the binding can't reach the gateway", async () => {

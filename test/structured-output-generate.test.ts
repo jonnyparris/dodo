@@ -95,4 +95,43 @@ describe("generateStructured", () => {
     const out = await generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q", maxRetries: 0 });
     expect(out).toMatchObject({ ok: false, attempts: 1, rawText: '{"answer":"4', tokenInput: 10, tokenOutput: 5 });
   });
+
+  // A slow model: resolves only when the request is aborted, and rejects the
+  // way runWithLocalSignal does (an AbortError "Request aborted", whatever the reason).
+  const hangUntilAborted = () => new MockLanguageModelV4({
+    doGenerate: ({ abortSignal }) => new Promise((_, reject) => {
+      const fail = () => reject(Object.assign(new Error("Request aborted"), { name: "AbortError" }));
+      if (abortSignal?.aborted) return fail();
+      abortSignal?.addEventListener("abort", fail, { once: true });
+    }),
+  });
+
+  it("reports its own deadline as a timeout and does not retry after it", async () => {
+    const model = hangUntilAborted();
+    const out = await generateStructured({ modelId: "@cf/zai-org/glm-5.3-flash", model, schema, prompt: "q", timeoutMs: 20 });
+    expect(out).toMatchObject({ ok: false, attempts: 1, lastError: "timed out after 0.02s" });
+    expect(model.doGenerateCalls).toHaveLength(1);
+  });
+
+  it("reports a caller abort as aborted and does not retry after it", async () => {
+    const model = hangUntilAborted();
+    const ac = new AbortController();
+    const pending = generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q", signal: ac.signal });
+    setTimeout(() => ac.abort(), 5);
+    expect(await pending).toMatchObject({ ok: false, attempts: 1, lastError: "aborted" });
+    expect(model.doGenerateCalls).toHaveLength(1);
+  });
+
+  it("keeps its own deadline when the caller also passes a signal", async () => {
+    const model = hangUntilAborted();
+    const caller = new AbortController().signal;
+    const out = await generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q", signal: caller, timeoutMs: 20 });
+    expect(out).toMatchObject({ ok: false, attempts: 1, lastError: "timed out after 0.02s" });
+  });
+
+  it("labels a caller's own timeout signal as timed out", async () => {
+    const model = hangUntilAborted();
+    const out = await generateStructured({ modelId: "openai/gpt-5.4", model, schema, prompt: "q", signal: AbortSignal.timeout(10), timeoutMs: 60_000 });
+    expect(out).toMatchObject({ ok: false, attempts: 1, lastError: "timed out" });
+  });
 });

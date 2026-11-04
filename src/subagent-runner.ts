@@ -512,6 +512,18 @@ export function subagentMaxRetries(modelId: string): number {
   return modelId.startsWith("@cf/") ? 5 : 2;
 }
 
+/**
+ * Wall-clock budget for the structured coercion pass (both attempts and any
+ * model-budget wait). Hosted models answer in a few seconds, so 30s stops a
+ * slow pass from holding up the subagent call. Workers AI models reason
+ * first: one pass took 10-25s on GLM-5.3 Flash, 64s on kimi-k2.6 and 81s on
+ * gemma-4 (jp-gw, 2026-10-28). 30s timed out every GLM retry; 120s fits two
+ * GLM passes, or one kimi/gemma pass.
+ */
+export function coercionTimeoutMs(modelId: string): number {
+  return modelId.startsWith("@cf/") ? 120_000 : 30_000;
+}
+
 function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
@@ -585,6 +597,13 @@ export function buildProviderForModel(
     baseURL,
     headers,
     includeUsage: true,
+    // Send the schema with structured output (`json_schema`, as createAI's
+    // run path does). Without it the package sends a bare `json_object`,
+    // the model never sees the schema, and GLM-5.3 Flash invented its own
+    // field names every time (jp-gw, 2026-10-28). Only `response_format`
+    // reads this flag, so tool turns are unchanged. Workers AI only: the
+    // other `/compat` providers haven't been checked with a strict schema.
+    supportsStructuredOutputs: modelId.startsWith("@cf/"),
     name: effectiveGateway,
     transformRequestBody: addAnthropicCacheMarkers,
     // Workers AI models: draw from the per-model budget shared with main
@@ -930,9 +949,7 @@ async function coerceStructured(input: {
     schema,
     prompt,
     signal: input.signal,
-    // Coercion pass is fast — give it a tighter budget so a slow
-    // structured pass can't hold up the whole subagent call.
-    timeoutMs: 30_000,
+    timeoutMs: coercionTimeoutMs(input.modelId),
   });
   if (out.ok) {
     return {
