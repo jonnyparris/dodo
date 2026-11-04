@@ -3,6 +3,7 @@
   "version": "0.4.0",
   "private": true,
   "type": "module",
+  "packageManager": "npm@11.12.1",
   "scripts": {
     "dev": "wrangler dev -c wrangler.dev.jsonc",
     "build": "COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown') && echo \"{\\\"commit\\\":\\\"$COMMIT\\\",\\\"builtAt\\\":\\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"}\" > public/version.json && node scripts/generate-typecheck-libs.mjs",
