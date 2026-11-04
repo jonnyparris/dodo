@@ -108,7 +108,7 @@ export interface GenerateStructuredOptions<T> {
   system?: string;
   /** Wall-clock cap. Defaults to 60s — structured calls should be fast. */
   timeoutMs?: number;
-  /** Abort signal — wins over `timeoutMs` when both are set. */
+  /** Abort signal (cancellation). `timeoutMs` still applies alongside it. */
   signal?: AbortSignal;
   /**
    * Maximum retries on schema-validation failure. The retry feeds the
@@ -169,8 +169,9 @@ export async function generateStructured<T>(
   const mode = structuredModeFor(options.modelId);
   const maxRetries = options.maxRetries ?? 1;
   const timeoutMs = options.timeoutMs ?? 60_000;
+  const deadline = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
   const signal =
-    options.signal ?? (timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined);
+    options.signal && deadline ? AbortSignal.any([options.signal, deadline]) : options.signal ?? deadline;
 
   let attempts = 0;
   let tokenInput = 0;
@@ -231,6 +232,16 @@ export async function generateStructured<T>(
         tokenOutput,
       };
     } catch (error) {
+      // Out of time (or cancelled): say which, and don't retry on a dead
+      // signal. The binding leg (runWithLocalSignal) relabels every abort as
+      // "Request aborted", so read the reason off the signal itself.
+      if (signal?.aborted) {
+        const ownDeadline = deadline?.aborted === true && signal.reason === deadline.reason;
+        const timedOut = ownDeadline || (signal.reason as { name?: unknown } | undefined)?.name === "TimeoutError";
+        lastError = !timedOut ? "aborted" : ownDeadline ? `timed out after ${timeoutMs / 1000}s` : "timed out";
+        rawText = extractRawText(error);
+        break;
+      }
       const message =
         error instanceof Error ? error.message : String(error);
       lastError = NoOutputGeneratedError.isInstance(error)
