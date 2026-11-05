@@ -5,7 +5,8 @@ import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@ear
 import { tool, zodSchema } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { entriesToMessages, PI_RESTART_LIMIT, PiEngine, type PiEngineHost, PiTaskParkedError } from "../src/pi/engine";
+import { entriesToMessages, PI_RESTART_LIMIT, PiEngine, type PiEngineHost, piUnansweredMessage } from "../src/pi/engine";
+import type { PiTurnProgress } from "../src/pi/live-bridge";
 import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "../src/pi/tools";
 import { agentModelRef, CREATE_AI_PROVIDER_ID, createAIGatewayId, dodoModel, gatewayHeaders, modelCost, setDodoProvider, WORKERS_AI_API, workersAIOnRunPath } from "../src/pi/models";
 import { fakeAIBinding } from "./helpers/fake-ai-binding";
@@ -133,14 +134,17 @@ describe("PiEngine", () => {
       const prepare = async () => { prepared++; return { content: "push it", entry: entry("push it") }; };
 
       const first = new PiEngine(host(state.storage, faux, []));
-      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) }).catch(() => {}); // pi 1.4: close() rejects the wait
+      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) }).catch(() => {}); // close() rejects the wait
       await enteredP;
       await first.close(); // eviction
       await running;
 
       const second = new PiEngine(host(state.storage, faux, []));
-      const result = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) });
+      const progress: PiTurnProgress[] = [];
+      const result = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools), onProgress: (p) => progress.push(p) });
       expect(prepared).toBe(1); // user turn not re-prepared / re-emitted
+      // The stall guard saw the recovered call open (long limit) at attach.
+      expect(progress[0]?.openTools.map((t) => t.name)).toEqual(["git_push"]);
       expect(result.recovered).toBe(true);
       expect(result.status).toBe("done");
       expect(result.text).toBe("after restart");
@@ -152,43 +156,74 @@ describe("PiEngine", () => {
 
   /**
    * Simulate the DO being reset mid-task `PI_RESTART_LIMIT` times. Writes
-   * pi-durable's internal `pi_tasks` table (schema v2, JSON `record` with
-   * `state.status` and `restarts`): revisit on a pi upgrade. A clean
-   * close() writes running tasks back as pending without counting, so put
-   * them back to running with one restart short of the limit; the next open
-   * counts the last one and parks them.
+   * pi-durable's internal `pi_tasks` table (JSON `record` with
+   * `state.status` and `restarts`): revisit on a pi upgrade. A clean close()
+   * writes running tasks back as pending without counting, so put them back
+   * to running one restart short of the limit; the next open counts the last
+   * one and ends them.
    */
-  function crashLoop(storage: DurableObjectStorage): number {
+  function crashLoop(storage: DurableObjectStorage, kind: string): number {
     const cursor = storage.sql.exec(
-      `UPDATE pi_tasks SET status = 'running', record = json_set(record, '$.state.status', 'running', '$.restarts', ${PI_RESTART_LIMIT - 1}) WHERE status = 'pending'`,
+      `UPDATE pi_tasks SET status = 'running', record = json_set(record, '$.state.status', 'running', '$.restarts', ${PI_RESTART_LIMIT - 1}) WHERE status IN ('pending', 'running', 'waiting') AND json_extract(record, '$.kind') = ?`,
+      kind,
     );
     return cursor.rowsWritten;
-  }
-
-  async function parkSetup(name: string) {
-    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName(name));
-    return stub;
   }
 
   function blockingTools() {
     let entered: () => void = () => {};
     const enteredP = new Promise<void>((r) => { entered = r; });
+    let calls = 0;
     const tools = {
       hang: tool({
         description: "hang",
         inputSchema: zodSchema(z.object({})),
         execute: async (_input, { abortSignal }) => {
+          calls++;
           entered();
           await new Promise<void>((resolve) => abortSignal?.addEventListener("abort", () => resolve()));
           return "done";
         },
       }),
     };
-    return { tools, enteredP };
+    return { tools, enteredP, calls: () => calls };
   }
 
-  it("fails a recovered turn pi parked (crash loop) instead of waiting, and the next prompt runs", async () => {
-    const stub = await parkSetup("pi-engine-parked-1");
+  it("a tool call cut off by the restart limit ends with an error result, and the turn still answers", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-restart-tool"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const faux = fauxProvider();
+      faux.setResponses([
+        fauxAssistantMessage([fauxToolCall("hang", {}, { id: "c1" })], { stopReason: "toolUse" }),
+        fauxAssistantMessage([fauxText("gave up on hang")]),
+      ]);
+      const { tools, enteredP, calls } = blockingTools();
+      const prepare = async () => ({ content: "loop", entry: entry("loop") });
+
+      const first = new PiEngine(host(state.storage, faux, []));
+      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) }).catch(() => {}); // close() rejects the wait
+      await enteredP;
+      await first.close();
+      await running;
+      expect(crashLoop(state.storage, "pi.tool")).toBeGreaterThan(0);
+
+      const logs: Array<{ level: string; message: string; fields?: Record<string, unknown> }> = [];
+      const events: Array<{ type: string; data: unknown }> = [];
+      const second = new PiEngine({ ...host(state.storage, faux, events), log: (level, message, fields) => logs.push({ level, message, fields }) });
+      const result = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) });
+      expect(result.recovered).toBe(true);
+      expect(result.status).toBe("done");
+      expect(result.text).toBe("gave up on hang");
+      expect(calls()).toBe(1); // not rerun
+      // The recovered call gets its tool_call before its (error) result.
+      const types = events.filter((e) => e.type === "tool_call" || e.type === "tool_result").map((e) => e.type);
+      expect(types).toEqual(["tool_call", "tool_result"]);
+      await second.close();
+    });
+  });
+
+  it("a generation task cut off by the restart limit settles the prompt unanswered (restart_limit), and the next prompt runs", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-restart-generation"));
     await runInDurableObject(stub, async (_i, state) => {
       const faux = fauxProvider();
       faux.setResponses([
@@ -199,54 +234,24 @@ describe("PiEngine", () => {
       const prepare = async () => ({ content: "loop", entry: entry("loop") });
 
       const first = new PiEngine(host(state.storage, faux, []));
-      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) }).catch(() => {}); // pi 1.4: close() rejects the wait
+      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) }).catch(() => {});
       await enteredP;
       await first.close();
       await running;
-      expect(crashLoop(state.storage)).toBeGreaterThan(0);
+      expect(crashLoop(state.storage, "pi.generation")).toBeGreaterThan(0);
 
       const logs: Array<{ level: string; message: string; fields?: Record<string, unknown> }> = [];
       const second = new PiEngine({ ...host(state.storage, faux, []), log: (level, message, fields) => logs.push({ level, message, fields }) });
-      const err = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) }).then(
-        () => undefined,
-        (e: unknown) => e,
-      );
-      expect(err).toBeInstanceOf(PiTaskParkedError);
-      expect((err as Error).message).toMatch(/restarted 5 times/);
-      // onReport's info was read, not just its message.
-      expect(logs.some((l) => l.message === "pi: task parked by the crash-loop guard" && l.fields?.type === "task_parked")).toBe(true);
-      expect(await second.parkedTasks()).toEqual([]);
+      const result = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) });
+      expect(result.status).toBe("unanswered");
+      expect(result.reason).toMatch(/^restart_limit/);
+      expect(piUnansweredMessage(result.reason ?? "")).toMatch(/^This turn was stopped: the session restarted/);
+      // onReport's tagged report was read, not just its error.
+      expect(logs.some((l) => l.message === "pi-durable report" && l.fields?.kind === "task_interrupted" && l.fields?.reason === "restart_limit")).toBe(true);
 
       const next = await second.run({ promptId: "p2", prepare: async () => ({ content: "again", entry: entry("again") }), tools: await buildToolsExtension(tools) });
       expect(next.status).toBe("done");
       expect(next.text).toBe("second prompt answered");
-      await second.close();
-    });
-  });
-
-  it("a new prompt clears work an earlier turn left parked, then runs", async () => {
-    const stub = await parkSetup("pi-engine-parked-2");
-    await runInDurableObject(stub, async (_i, state) => {
-      const faux = fauxProvider();
-      faux.setResponses([
-        fauxAssistantMessage([fauxToolCall("hang", {}, { id: "c1" })], { stopReason: "toolUse" }),
-        fauxAssistantMessage([fauxText("fresh answer")]),
-      ]);
-      const { tools, enteredP } = blockingTools();
-      const first = new PiEngine(host(state.storage, faux, []));
-      const running = first.run({ promptId: "old", prepare: async () => ({ content: "old", entry: entry("old") }), tools: await buildToolsExtension(tools) }).catch(() => {}); // pi 1.4: close() rejects the wait
-      await enteredP;
-      await first.close();
-      await running;
-      expect(crashLoop(state.storage)).toBeGreaterThan(0);
-
-      // Some other open (GET /messages, the engine view) counts the last restart and parks it.
-      const second = new PiEngine(host(state.storage, faux, []));
-      expect((await second.parkedTasks()).length).toBeGreaterThan(0);
-      const result = await second.run({ promptId: "new", prepare: async () => ({ content: "new", entry: entry("new") }), tools: await buildToolsExtension(tools) });
-      expect(result.status).toBe("done");
-      expect(result.text).toBe("fresh answer");
-      expect(await second.parkedTasks()).toEqual([]);
       await second.close();
     });
   });
@@ -283,6 +288,15 @@ describe("PiEngine", () => {
       expect(result.status).toBe("unanswered");
       await engine.close();
     });
+  });
+});
+
+describe("piUnansweredMessage", () => {
+  it("unwraps a model error, words restart_limit and interrupted plainly, and falls back to the reason", () => {
+    expect(piUnansweredMessage('model_error: "429 Too Many Requests"')).toBe("429 Too Many Requests");
+    expect(piUnansweredMessage('restart_limit: "generation cut off 5 times"')).toMatch(/gave up after too many restarts\. .*Send the prompt again/);
+    expect(piUnansweredMessage("interrupted")).toMatch(/during the model's answer, and the retries ran out\. Send the prompt again/);
+    expect(piUnansweredMessage("turn_limit: \"3 turns\"")).toBe('Turn ended without an answer (turn_limit: "3 turns")');
   });
 });
 

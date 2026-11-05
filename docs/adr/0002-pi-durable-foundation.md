@@ -149,21 +149,46 @@ existing workspace instead of cloning.
   change applies from the next prompt. The previous model stays registered
   too, for a background compaction that outlasts its prompt.
 
-## Pi 1.4 / agents 0.30 (2026-10)
+## Pi 1.5 / agents 0.33 (2026-11)
 
-- **No rollback.** pi-durable 1.4 migrates the `pi_` SQLite tables to schema
-  v2 on first open; 1.3 cannot open them. A deploy can't go back past this
-  version without losing every session's transcript.
-- **Crash-loop guard.** A task the DO is reset under 5 times without progress
-  (`settings.restartLimit`, `PI_RESTART_LIMIT`) is parked, and reported once,
-  at the open that counts it. `PiEngine.run()` checks `inspect()` for parked
-  tasks after open: a recovered prompt whose own run is parked is aborted and
-  fails with `PiTaskParkedError` (clear message, user resends); otherwise
-  (a new prompt, or only background work such as compaction parked) the
-  parked work is aborted and the prompt runs. Parked background tasks are
-  aborted by id, so healthy background work keeps running; every clear is
-  bounded at 30 s. Not `retryTask()`: the same step would most likely crash again.
-  `onReport` now logs the typed `info`.
+Dodo went from pi 1.3 / agents 0.28 straight to pi 1.5 / agents 0.33 (PR
+#153, first written for pi 1.4 / agents 0.30 and retargeted before it
+merged), so prod takes one storage migration instead of two.
+
+- **No rollback.** pi 1.4+ migrates the `pi_` SQLite tables to schema v2 on
+  first open, and pi 1.5 writes `pi.live` at version 3. Neither 1.3 nor 1.4
+  can read a session 1.5 opened. Roll forward to fix a bad deploy.
+- **The bridge renders state** (`src/pi/live-bridge.ts`). pi 1.5 removed
+  `watchEvents()`. `PiEngine.run()` attaches `Conversation.watch()` before it
+  submits (or resumes a recovered run), and `LiveBridge` turns each view into
+  Dodo's SSE events. Watch calls fold the commits made while the listener
+  runs, and the view's entries are a window, so the bridge renders state, it
+  doesn't replay events: new transcript entries (ordered, re-readable) drive
+  each step's text, `tool_call` (from the answer's `toolCall` blocks, args
+  as the model sent them), `tool_result`, steps and usage; `pi.live` drives
+  only the streaming partial, the turn stall guard's snapshot and logs. After
+  the settle, `finish()` reads entries no delivered view showed.
+- **Turn stall guard** takes a full snapshot per watch call
+  (`PiTurnProgress`: open tool calls, pending ones included, and compaction).
+- **Restart limit ends work** (no more parking, `retryTask()` is gone). A tool
+  call cut off 5 times in a row (`PI_RESTART_LIMIT`) ends with an error result
+  the model sees; a model request ends its run `unanswered` with
+  `restart_limit`, and a request in flight when the host died counts as a
+  failed attempt (`interrupted` once retries run out). Both become a plain
+  "send the prompt again" error (`piUnansweredMessage`). `onReport` gets one
+  tagged report (`kind`); `task_interrupted` is logged as an error.
+- **Deferred progress.** Streamed text and tool output reach watches at once
+  and storage in batches (`settings.progress.persistWithinMs`, 1 s). A crash
+  loses up to ~1 s of streamed text. `partialIntervalMs` (250 ms) now sets
+  the chat's update rate, not the write volume.
+- **agents 0.31 browser tool.** `browser_execute`'s code runs in its own
+  Dynamic Worker and calls a `browser` global (`browser.cdp(...)`,
+  `browser.attachToTarget(...)`); `notice` replaces `restarted`/`newTabs`.
+  The tool declares a structured output schema, which Dodo's wrapper passes
+  through. The system prompt and the `browser-cdp-perf` skill teach the new API.
+- **agents 0.31 MCP peers.** `@modelcontextprotocol/sdk` and
+  `@modelcontextprotocol/server` are optional peers now; Dodo lists both
+  (`agents/mcp`'s `createMcpHandler` imports the server package).
 - **createAI (agents ≥0.29).** No more universal endpoint. Main-session
   Anthropic models resolve by AI Gateway's catalog spelling
   (`anthropic/claude-sonnet-4.6`, `createAISpecifier()`) and run on

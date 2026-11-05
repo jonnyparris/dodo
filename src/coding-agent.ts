@@ -26,7 +26,7 @@ import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-clien
 import { isMcpHostRevoked, mcpHostRevokedMessage } from "./mcp-host-scope";
 import { contextWindowFor, DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH } from "./model-catalog";
 import { dispatchNotification } from "./notify";
-import { entriesToMessages, PiEngine, type PiUserContent } from "./pi/engine";
+import { entriesToMessages, PiEngine, type PiUserContent, piUnansweredMessage } from "./pi/engine";
 import { agentModelRef, setDodoProvider } from "./pi/models";
 import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { buildToolsExtension } from "./pi/tools";
@@ -98,7 +98,7 @@ import {
   type WatchdogConfig,
 } from "./watchdog";
 import { evaluateSession } from "./watchdog-policy";
-import { createTurnStallGuard, TurnStallError, turnStallLimitsFromEnv, type TurnStallEvent, type TurnStallGuard, type TurnStallLimits } from "./turn-stall-guard";
+import { createTurnStallGuard, TurnStallError, turnStallLimitsFromEnv, type TurnStallGuard, type TurnStallLimits } from "./turn-stall-guard";
 import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 
 type FiberPromptPayload = { promptId: string; content: string; images?: Array<{ data: string; mediaType: string; name?: string }>; authorEmail?: string; title: string };
@@ -840,15 +840,15 @@ export class CodingAgent extends CodingAgentBase {
           "**Three tools:**",
           "- `browser_markdown` — Fetch a page or document (HTML, PDF, Office, JSON) as markdown. Read-only. Plain fetch first, Browser Run only if the site blocks it or needs JavaScript. Long pages are windowed: call again with the `offset` the header line gives to read on. Pass `query` to also get a calibrated `hasAnswer` probability telling you whether the window answers your question.",
           "- `browser_triage` — Rank up to 8 candidate URLs by likely relevance BEFORE fetching anything. Calibrated probabilities, no page loads.",
-          "- `browser_execute` — Drive this session's persistent Chrome with JavaScript and a `cdp` global (its description has the full API). Tabs, cookies and logins carry over between calls; `restarted: true` means the browser was replaced and earlier tabs are gone.",
+          "- `browser_execute` — Drive this session's persistent Chrome with JavaScript and a `browser` global (`browser.cdp(...)`; its description has the full API). Tabs, cookies and logins carry over between calls; a `notice` in the result says when the browser was replaced and earlier tabs are gone.",
           "",
           "**Which tool when:**",
           "Read-only text (docs, articles, search results) → `browser_triage` (if choosing between URLs) → `browser_markdown`. Interactive pages, screenshots, DOM inspection, clicks, logins → `browser_execute`.",
           "",
           "**`browser_execute` notes:**",
-          '- `cdp.send({ method, params, sessionId: "active" })` targets the tab you are working in; it is remembered across calls.',
+          '- `browser.cdp({ method, params, sessionId: "active" })` targets the tab you are working in; it is remembered across calls.',
           "- To see a screenshot, return `{ type: \"browser_screenshot\", mediaType, data }` as the whole return value of its own call (not nested in another object, where the data is stripped). It is shown in the chat; you see it too if your model accepts images, otherwise check it with `image_check` on the attachment URL or read the page with `Runtime.evaluate`.",
-          "- One `cdp.send` result is capped at 1 MB: capture the viewport or use JPEG, not a full long page.",
+          "- One `browser.cdp` result is capped at 1 MB: capture the viewport or use JPEG, not a full long page.",
           "- If a login, CAPTCHA or MFA needs a human: leave the page on that step, call `request_user_input` (kind login/captcha), then end your turn with one line saying what to do. The person gets a Live View link (or uses **Settings → Browser Tools → Open live browser**) and replies when done. Then continue in the same tab.",
         ].join("\n")
       : undefined;
@@ -4761,7 +4761,6 @@ export class CodingAgent extends CodingAgentBase {
     if (!this.browser || !this.env.LOADER || !this.browserEnabled() || !isAdmin(ownerEmail ?? null, this.env)) return [];
     return [
       createBrowserExecuteTool({
-        ctx: this.ctx,
         browser: this.browser,
         loader: this.env.LOADER,
         onScreenshot: async (callId, image) => {
@@ -4815,7 +4814,7 @@ export class CodingAgent extends CodingAgentBase {
       tools,
       signal: options.signal,
       onPhase: stall ? (phase) => stall.touch(phase) : undefined,
-      onEvent: stall ? (event) => stall.event(event as TurnStallEvent) : undefined,
+      onProgress: stall ? (progress) => stall.progress(progress) : undefined,
       prepare: async () => {
         const { userMsgId, userMsg } = await this.prepareUserTurn(userContent, options);
         return {
@@ -4828,10 +4827,7 @@ export class CodingAgent extends CodingAgentBase {
     if (result.recovered) log("info", "pi: reattached to prompt after restart", { sessionId: this.sessionId(), promptId: options.promptId });
     if (result.status !== "done") {
       if (options.signal?.aborted) return { assistantMessageId: "", tokenInput: 0, tokenOutput: 0, text: "", steps: result.steps, toolCalls: result.toolCalls };
-      // pi already retried the provider; surface what the provider said.
-      const reason = result.reason ?? "unknown";
-      const modelError = /^model_error: "([\s\S]*)"$/.exec(reason)?.[1];
-      throw new Error(modelError ?? `Turn ended without an answer (${reason})`);
+      throw new Error(piUnansweredMessage(result.reason ?? "unknown"));
     }
     if (result.contextTokens > 0) this.writeMetadata("pi_context_tokens", String(result.contextTokens));
     await this.refreshPiCompactionCount();
