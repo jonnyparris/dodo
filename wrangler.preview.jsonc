@@ -60,10 +60,26 @@
       "new_sqlite_classes": ["ChatMonitorAgent"]
     }
   ],
-  // No r2_buckets on purpose: the preview worker must never be bound to the
-  // production buckets (dodo-workspaces / dodo-fork-snapshots). Every branch
-  // deployed here runs unreviewed code, so it gets no production storage.
+  // The preview worker must never be bound to the production buckets
+  // (dodo-workspaces / dodo-fork-snapshots). Every branch deployed here runs
+  // unreviewed code, so it gets no production storage.
   // See .github/workflows/dodo-preview.yml, which refuses such a deploy.
+  //
+  // FORK_SNAPSHOTS points at a preview-only bucket so fork / seed / bench
+  // flows work on preview. Crons are off here, so the 1-hour TTL sweep in
+  // UserControl never runs; the bucket has an R2 lifecycle rule that
+  // deletes objects after 1 day instead.
+  //
+  // WORKSPACE_BUCKET points at a preview-only bucket so attachments, task
+  // scratch files and skill assets work on preview. All keys are per
+  // session or per user, so nothing needs to be seeded from prod. The
+  // bucket has an R2 lifecycle rule that deletes objects after 7 days
+  // (long enough for a multi-day test run; an expired attachment just
+  // 404s, the same as having no bucket).
+  "r2_buckets": [
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-preview-workspaces" },
+    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-preview-fork-snapshots" }
+  ],
   "browser": {
     "binding": "BROWSER"
   },
@@ -100,11 +116,11 @@
     "required": ["ADMIN_EMAIL"]
   },
   "vars": {
-    "DEFAULT_MODEL": "anthropic/claude-sonnet-4",
+    "DEFAULT_MODEL": "anthropic/claude-sonnet-4-6",
     "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
     "DEFAULT_REPLICATE_IMAGE_MODEL": "google/nano-banana-2",
-    "DEFAULT_EXPLORE_MODEL": "anthropic/claude-haiku-4-5",
-    "DEFAULT_TASK_MODEL": "anthropic/claude-haiku-4-5",
+    "DEFAULT_EXPLORE_MODEL": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+    "DEFAULT_TASK_MODEL": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
     "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
     "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1/4b430e167a301330d13a9bb42f3986a2/jp-gw/compat",
     "WORKER_URL": "https://dodo-preview.jonnyparris.club",

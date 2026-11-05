@@ -22,11 +22,15 @@ vi.mock("@cloudflare/codemode", async (importOriginal) => {
 });
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/pi/models", async () => await import("./helpers/pi-models-mock"));
-vi.mock("../src/subagent-runner", async () => await import("./helpers/subagent-runner-mock"));
 vi.mock("../src/notify", () => ({
   dispatchNotification: vi.fn(),
 }));
 
+// The only mock of ../src/subagent-runner in this file. A second
+// vi.mock for the same path made the result depend on which factory
+// won, so CI sometimes ran the plain helper and the test saw a normal
+// "## Explore results" summary (run 39597020633).
+//
 // Override the subagent runner entry points to throw — covers the catch
 // block in ExploreAgent.query() which formats the EXPLORE_FALLBACK_HINT
 // into the summary. The facet calls `runSubagentForProfile`; the legacy

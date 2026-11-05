@@ -1,11 +1,16 @@
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { generateText, stepCountIs, type ModelMessage, type ToolSet } from "ai";
+import { createAI } from "agents/models/ai-sdk";
+import { generateText, stepCountIs, wrapLanguageModel, type LanguageModel, type LanguageModelMiddleware, type ModelMessage, type ToolSet } from "ai";
+import { adaptBindingForCreateAI, bindingGatewayId, compatBindingFetch, compatBindingGatewayId, gatewayMetadata, workersAIOnRunPath } from "./cloudflare-ai";
 import type { AgentProfile } from "./agent-profile";
 import {
   EXPLORE_PROFILE,
   TASK_PROFILE,
   resolveProfileModel,
 } from "./agent-profile";
+import { log } from "./logger";
+import { withModelBudget } from "./model-budget-fetch";
 import { lookupResultSchema } from "./result-schema-registry";
 import { generateStructured, type StructuredMode } from "./structured-output";
 import type { AppConfig, Env } from "./types";
@@ -336,7 +341,188 @@ export function addAnthropicCacheMarkers(body: Record<string, unknown>): Record<
   return out;
 }
 
+// ─── Anthropic prompt caching, native Messages API ───
+//
+// AI Gateway's unified `/compat/chat/completions` endpoint drops every
+// `cache_control` marker before the request reaches Anthropic (system,
+// tool and message markers alike; measured 2026-10-21: identical 17k-token
+// prefixes billed at full input price with no cache fields in usage).
+// The native Messages wire keeps them, so Anthropic subagent calls on AI
+// Gateway go through createAI (src/cloudflare-ai.ts) on `@ai-sdk/anthropic`,
+// and this middleware adds the breakpoints as AI SDK provider options.
+
+const ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4;
+type LanguageModelCallOptions = Parameters<NonNullable<LanguageModelMiddleware["transformParams"]>>[0]["params"];
+const CACHE_OPTION = { anthropic: { cacheControl: { type: "ephemeral" } } } as const;
+
+type ProviderOptionsLike = Record<string, Record<string, unknown> | undefined> | undefined;
+
+function hasAnthropicCache(options: ProviderOptionsLike): boolean {
+  const a = options?.anthropic;
+  return !!a && ("cacheControl" in a || "cache_control" in a);
+}
+
+function withCache<T extends { providerOptions?: ProviderOptionsLike }>(item: T): T {
+  return { ...item, providerOptions: { ...item.providerOptions, anthropic: { ...item.providerOptions?.anthropic, ...CACHE_OPTION.anthropic } } };
+}
+
+/**
+ * Add Anthropic cache breakpoints to an AI SDK call: the last system message,
+ * the last tool, and the last message. Marking the last message means each
+ * step of a tool loop reads the previous step's prefix from cache instead of
+ * re-paying for it. `@ai-sdk/anthropic` puts a message-level breakpoint on
+ * the message's last block. Existing breakpoints are kept and counted toward
+ * Anthropic's limit of 4 per request.
+ */
+export function addAnthropicCacheOptions(params: LanguageModelCallOptions): LanguageModelCallOptions {
+  const prompt = params.prompt as Array<{ role: string; providerOptions?: ProviderOptionsLike; content: unknown }>;
+  const tools = params.tools as Array<{ providerOptions?: ProviderOptionsLike }> | undefined;
+  let budget = ANTHROPIC_MAX_CACHE_BREAKPOINTS;
+  for (const m of prompt) {
+    if (hasAnthropicCache(m.providerOptions)) budget--;
+    if (Array.isArray(m.content)) budget -= (m.content as Array<{ providerOptions?: ProviderOptionsLike }>).filter((p) => hasAnthropicCache(p?.providerOptions)).length;
+  }
+  for (const t of tools ?? []) if (hasAnthropicCache(t.providerOptions)) budget--;
+
+  const out = [...prompt];
+  let lastSystem = -1;
+  for (let i = 0; i < out.length; i++) if (out[i].role === "system") lastSystem = i;
+  if (budget > 0 && lastSystem >= 0 && !hasAnthropicCache(out[lastSystem].providerOptions)) {
+    out[lastSystem] = withCache(out[lastSystem]);
+    budget--;
+  }
+  let outTools = tools;
+  if (budget > 0 && tools && tools.length > 0 && !tools.some((t) => hasAnthropicCache(t.providerOptions))) {
+    outTools = [...tools.slice(0, -1), withCache(tools[tools.length - 1])];
+    budget--;
+  }
+  const last = out.length - 1;
+  if (budget > 0 && last >= 0 && last !== lastSystem) {
+    const msg = out[last];
+    const parts = Array.isArray(msg.content) ? (msg.content as Array<{ type?: string; providerOptions?: ProviderOptionsLike }>) : undefined;
+    const partMarked = parts?.some((p) => hasAnthropicCache(p?.providerOptions)) ?? false;
+    if (!hasAnthropicCache(msg.providerOptions) && !partMarked) {
+      // A message-level breakpoint lands on the last part, and reasoning
+      // parts can't carry one; mark the last part that can instead. The
+      // trailing reasoning is then re-sent uncached, which is the best
+      // Anthropic allows.
+      let cacheable = -1;
+      for (let i = (parts?.length ?? 0) - 1; i >= 0; i--) {
+        if (parts![i]?.type !== "reasoning") {
+          cacheable = i;
+          break;
+        }
+      }
+      if (parts && cacheable >= 0 && cacheable !== parts.length - 1) {
+        const marked = [...parts];
+        marked[cacheable] = withCache(parts[cacheable]);
+        out[last] = { ...msg, content: marked };
+      } else if (!parts || cacheable >= 0) {
+        out[last] = withCache(msg);
+      }
+    }
+  }
+  return { ...params, prompt: out as LanguageModelCallOptions["prompt"], ...(outTools ? { tools: outTools as LanguageModelCallOptions["tools"] } : {}) };
+}
+
+export const anthropicCacheMiddleware: LanguageModelMiddleware = {
+  specificationVersion: "v4",
+  transformParams: async ({ params }) => addAnthropicCacheOptions(params),
+};
+
+/**
+ * Anthropic through createAI over the `AI` binding: `@ai-sdk/anthropic`
+ * builds the native request, createAI's `routed` sends it to AI Gateway's
+ * universal endpoint (`env.AI.gateway(id).run`). No AI_GATEWAY_KEY; the
+ * vendor's placeholder `x-api-key` is dropped by createAI (vendorKey
+ * "gateway"), so the gateway uses its own key / unified billing.
+ */
+function buildAnthropicCreateAIProvider(gatewayId: string, env: Env, sessionAffinity?: string) {
+  const metadata = gatewayMetadata(sessionAffinity, "subagent");
+  const ai = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId, ...(metadata ? { metadata } : {}) });
+  const anthropic = createAnthropic({ apiKey: "unused" });
+  // Dodo ids are `anthropic/claude-…`; Anthropic wants `claude-…`.
+  const model = (modelId: string): LanguageModel =>
+    wrapLanguageModel({ model: ai.routed(anthropic.languageModel(modelId.replace(/^anthropic\//, ""))), middleware: anthropicCacheMiddleware });
+  return Object.assign((modelId: string) => model(modelId), {
+    chatModel: model,
+    languageModel: (modelId: string, _cfg?: unknown) => model(modelId),
+  });
+}
+
+/**
+ * `@cf/` models through createAI's Workers AI run path over the `AI` binding
+ * (`env.AI.run` with the gateway option, plus createAI's per-model request
+ * quirks), the leg the main session uses with WORKERS_AI_VIA_BINDING.
+ * No AI_GATEWAY_KEY. createAI's AI SDK models are LanguageModelV4, which is
+ * why this needed AI SDK 7. `maxOutputTokens` (executeSubagent) becomes
+ * `max_tokens`. A rate limit comes back as a retryable 429 (a thrown
+ * AiError 3021/3040 is turned into one by adaptBindingForCreateAI), which
+ * the AI SDK's own retries (maxRetries) handle, as on `/compat`. Unlike the
+ * main session there is no rateLimitFetch wait on the binding: subagents
+ * never had one on `/compat` either.
+ *
+ * Each send takes a subagent slot from the shared per-model budget first
+ * (model-budget.ts), as the `/compat` leg below does: same key
+ * (`<activeGateway>:<model>`), so main turns and subagents on either leg
+ * share one book, and a 429 (thrown or returned) is reported back to it.
+ * createAI never calls fetch, so the budget sits on the binding's retry
+ * hook, like createAIFor in pi/models.ts. The AI SDK's retries call `run`
+ * again, so every resend asks for its own slot (Workers AI counts it too).
+ * Same wait as the `/compat` leg: up to 90s per send, then it goes anyway.
+ */
+function buildWorkersAICreateAIProvider(gatewayId: string, config: AppConfig, env: Env, sessionAffinity?: string) {
+  const metadata = gatewayMetadata(sessionAffinity, "subagent");
+  const binding = adaptBindingForCreateAI(env.AI, (run, signal, model) => {
+    const send: typeof fetch = () => run();
+    if (!model) return send("https://gateway.ai.cloudflare.com/universal");
+    // The URL is a label only: `send` ignores it and calls the binding.
+    return withModelBudget(send, {
+      env,
+      gateway: config.activeGateway,
+      modelId: model,
+      priority: "subagent",
+      onWait: (info) => log("info", "subagent: waiting for model capacity", { sessionId: sessionAffinity, ...info, waitMs: Math.round(info.waitMs) }),
+    })("https://gateway.ai.cloudflare.com/universal", { signal: signal ?? undefined });
+  });
+  const ai = createAI({ binding, id: gatewayId, ...(metadata ? { metadata } : {}) });
+  // Same replica for every step of one subagent run, so Workers AI prefix
+  // caching works (was the x-session-affinity header on `/compat`).
+  const model = (modelId: string): LanguageModel =>
+    ai.languageModel(modelId as `@cf/${string}`, sessionAffinity ? { sessionAffinity } : undefined);
+  return Object.assign((modelId: string) => model(modelId), {
+    chatModel: model,
+    languageModel: (modelId: string, _cfg?: unknown) => model(modelId),
+  });
+}
+
 // ─── Gateway / provider helpers ───
+
+/**
+ * Retry budget for one subagent model call.
+ *
+ * Workers AI enforces a per-account, per-model requests-per-minute cap.
+ * An explore fan-out on @cf/deepseek-ai/deepseek-v4.1-flash-1017 alone
+ * pushed ~40-80 requests into one minute and got 429 on ~25% of calls
+ * (jp-gw, 2026-10-21). The AI SDK default of 2 retries (2s + 4s backoff)
+ * can run out inside that window. 5 retries (2+4+8+16+32s) outlasts a
+ * full minute. Hosted third-party models keep the SDK default.
+ */
+export function subagentMaxRetries(modelId: string): number {
+  return modelId.startsWith("@cf/") ? 5 : 2;
+}
+
+/**
+ * Wall-clock budget for the structured coercion pass (both attempts and any
+ * model-budget wait). Hosted models answer in a few seconds, so 30s stops a
+ * slow pass from holding up the subagent call. Workers AI models reason
+ * first: one pass took 10-25s on GLM-5.3 Flash, 64s on kimi-k2.6 and 81s on
+ * gemma-4 (jp-gw, 2026-10-28). 30s timed out every GLM retry; 120s fits two
+ * GLM passes, or one kimi/gemma pass.
+ */
+export function coercionTimeoutMs(modelId: string): number {
+  return modelId.startsWith("@cf/") ? 120_000 : 30_000;
+}
 
 function trimBaseUrl(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
@@ -351,7 +537,13 @@ export function aigMetadataHeader(sessionId: string | undefined, role: "main" | 
   return sessionId ? { "cf-aig-metadata": JSON.stringify({ dodo_session: sessionId, dodo_role: role }) } : {};
 }
 
-export function resolveWireModelId(modelId: string, _activeGateway: "opencode" | "ai-gateway"): string {
+export function resolveWireModelId(modelId: string, activeGateway: "opencode" | "ai-gateway"): string {
+  // AI Gateway's `/compat` names Google AI Studio `google-ai-studio`:
+  // `google/gemini-2.5-flash` is "Model not found" there, with or without the
+  // key (checked 2026-10-22). OpenCode's gateway is left as it was.
+  if (activeGateway === "ai-gateway" && modelId.startsWith("google/")) {
+    return `google-ai-studio/${modelId.slice("google/".length)}`;
+  }
   // Workers AI models (@cf/…) must be wire-prefixed with `workers-ai/` on
   // BOTH gateways. The AI Gateway and the OpenCode gateway both proxy these
   // via Cloudflare's unified OpenAI-compatible endpoint, which expects the
@@ -376,17 +568,23 @@ export function buildProviderForModel(
   env: Env,
   sessionAffinity?: string,
 ) {
+  const anthropic = modelId.startsWith("anthropic/");
+  const gatewayId = anthropic || workersAIOnRunPath(modelId, env) ? bindingGatewayId(config, env) : undefined;
+  if (gatewayId && anthropic) return buildAnthropicCreateAIProvider(gatewayId, env, sessionAffinity);
+  if (gatewayId) return buildWorkersAICreateAIProvider(gatewayId, config, env, sessionAffinity);
+
   const effectiveGateway = resolveGatewayForModel(modelId, config.activeGateway);
   const isOpencode = effectiveGateway === "opencode";
   const baseURL = isOpencode
     ? `${trimBaseUrl(config.opencodeBaseURL)}`
     : `${trimBaseUrl(config.aiGatewayBaseURL)}`;
 
+  // `/compat` over the `AI` binding needs no AI_GATEWAY_KEY (compatBindingFetch).
+  const compatGatewayId = isOpencode ? undefined : compatBindingGatewayId(config, env);
   const headers: Record<string, string> = isOpencode
     ? { "cf-access-token": env.OPENCODE_GATEWAY_TOKEN ?? "" }
     : {
-        "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`,
-        "x-api-key": env.AI_GATEWAY_KEY ?? "",
+        ...(compatGatewayId ? {} : { "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_KEY ?? ""}`, "x-api-key": env.AI_GATEWAY_KEY ?? "" }),
         // Workers AI prefix caching is per-replica. Without a stable
         // affinity key, consecutive steps of one conversation land on
         // different replicas and re-pay full prefill every step.
@@ -399,8 +597,25 @@ export function buildProviderForModel(
     baseURL,
     headers,
     includeUsage: true,
+    // Send the schema with structured output (`json_schema`, as createAI's
+    // run path does). Without it the package sends a bare `json_object`,
+    // the model never sees the schema, and GLM-5.3 Flash invented its own
+    // field names every time (jp-gw, 2026-10-28). Only `response_format`
+    // reads this flag, so tool turns are unchanged. Workers AI only: the
+    // other `/compat` providers haven't been checked with a strict schema.
+    supportsStructuredOutputs: modelId.startsWith("@cf/"),
     name: effectiveGateway,
     transformRequestBody: addAnthropicCacheMarkers,
+    // Workers AI models: draw from the per-model budget shared with main
+    // turns, leaving the main-turn reserve alone (src/model-budget.ts).
+    // Under it, `/compat` goes over the binding when it can (compatBindingFetch).
+    fetch: withModelBudget(compatGatewayId ? compatBindingFetch(env.AI, compatGatewayId, baseURL) : (input, init) => fetch(input, init), {
+      env,
+      gateway: effectiveGateway,
+      modelId,
+      priority: "subagent",
+      onWait: (info) => log("info", "subagent: waiting for model capacity", { sessionId: sessionAffinity, ...info, waitMs: Math.round(info.waitMs) }),
+    }),
   });
 
   const translate = (m: string) => resolveWireModelId(m, effectiveGateway);
@@ -616,6 +831,7 @@ async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentRes
       tools: input.toolset,
       stopWhen: stepCountIs(input.profile.maxSteps),
       maxOutputTokens: 4000,
+      maxRetries: subagentMaxRetries(input.model),
       prepareStep: input.prepareStep ?? subagentPrepareStep(),
       abortSignal: input.signal ?? (input.timeoutMs ? AbortSignal.timeout(input.timeoutMs) : undefined),
     });
@@ -636,8 +852,8 @@ async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentRes
           entries.push({ role: "assistant", content: step.text });
         }
         for (const tc of step.toolCalls ?? []) {
-          const args = (tc as { args?: unknown }).args;
-          entries.push({ role: "tool", content: `${tc.toolName}: ${JSON.stringify(args)}` });
+          // AI SDK 5+ tool calls carry `input` (there is no `args`).
+          entries.push({ role: "tool", content: `${tc.toolName}: ${JSON.stringify(tc.input)}` });
         }
         return entries;
       }),
@@ -646,10 +862,10 @@ async function executeSubagent(input: SubagentExecuteInput): Promise<SubagentRes
     let structured: SubagentStructured | undefined;
     if (input.resultSchemaName && result.text.trim().length > 0) {
       // One coercion pass over the subagent's free-form final text.
-      // We deliberately don't pipe the schema into the multi-step loop
-      // (the AI SDK can't combine `tools` + `generateObject`), so the
-      // subagent does its tool-driven investigation first and a small
-      // structured pass distils the summary into the requested shape.
+      // We deliberately don't pipe the schema into the multi-step loop:
+      // the subagent does its tool-driven investigation in free form
+      // first, and a small structured pass (`generateStructured`)
+      // distils the summary into the requested shape.
       // The extra call is one round-trip; tokens used are accounted
       // for separately on `structured.tokenInput`/`tokenOutput`.
       structured = await coerceStructured({
@@ -733,9 +949,7 @@ async function coerceStructured(input: {
     schema,
     prompt,
     signal: input.signal,
-    // Coercion pass is fast — give it a tighter budget so a slow
-    // structured pass can't hold up the whole subagent call.
-    timeoutMs: 30_000,
+    timeoutMs: coercionTimeoutMs(input.modelId),
   });
   if (out.ok) {
     return {

@@ -7,7 +7,11 @@ export interface McpCatalogEntry {
   url: string;
   setupGuide?: string;
   auth_type?: "oauth" | "static_headers";
-  /** Hostnames implicitly allowed without requiring admin allowlist entry. */
+  /**
+   * Hostnames exempt from the allowlist when adding or editing an MCP config
+   * or starting OAuth (src/index.ts:isHostAllowed). NOT exempt for codemode
+   * sandbox egress (src/outbound.ts): MCP calls never run in the sandbox.
+   */
   knownHosts?: string[];
 }
 

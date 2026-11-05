@@ -110,6 +110,10 @@ export interface PiTurnInput {
   /** Current tool set as a pi extension; installed before the run starts. */
   tools: Extension;
   signal?: AbortSignal;
+  /** A setup step started (open, configure, prepare, submit). For the turn stall guard. */
+  onPhase?: (phase: string) => void;
+  /** Every pi agent event of the turn, before Dodo translates it. For the turn stall guard. */
+  onEvent?: (event: AgentEvent) => void;
 }
 
 export interface PiTurnResult {
@@ -233,12 +237,21 @@ export class PiEngine {
 
   /** Run (or reattach to) the turn for one Dodo prompt. */
   async run(input: PiTurnInput): Promise<PiTurnResult> {
+    // The turn can be aborted (user abort, turn stall guard) while a setup
+    // step below is still waiting. Stop before writing anything new.
+    const bail = () => {
+      if (input.signal?.aborted) throw input.signal.reason ?? new Error("aborted");
+    };
+    bail();
+    input.onPhase?.("pi_open");
     const harness = await this.open();
     this.registry.install(input.tools);
+    input.onPhase?.("pi_root");
     const root = await this.root();
     const model = this.host.modelRef();
     const agent = await root.agent(this.ctx);
     if (agent.model?.provider !== model.provider || agent.model?.modelId !== model.modelId) {
+      input.onPhase?.("pi_configure");
       await root.configure({ model }, this.ctx);
     }
 
@@ -254,7 +267,11 @@ export class PiEngine {
       recovered = submission !== undefined;
     }
     if (!submission) {
+      bail();
+      input.onPhase?.("prepare");
       const { content, entry } = await input.prepare();
+      bail();
+      input.onPhase?.("submit");
       submission = await root.submit(
         { type: "input", content, requestId: input.promptId, entry: { kind: DODO_USER_ENTRY, data: entry } },
         this.ctx,
@@ -266,17 +283,25 @@ export class PiEngine {
       );
     }
     harness.resume();
+    input.onPhase?.("running");
 
     const acc: BridgeState = { steps: 0, input: 0, output: 0, context: 0, toolCalls: [], streamed: "" };
     const stream = await watchEvents(harness, root.id, this.ctx);
+    // A recovered turn can attach with tool calls already running.
+    input.onEvent?.(stream.snapshot);
     stream.start(async (events) => {
-      for (const event of events) this.bridge(event, acc);
+      for (const event of events) {
+        input.onEvent?.(event);
+        this.bridge(event, acc);
+      }
     });
 
     const onAbort = () => {
       void root.abort(this.ctx).catch(() => {});
     };
     input.signal?.addEventListener("abort", onAbort, { once: true });
+    // Aborted between submit and here: the listener won't fire for a past abort.
+    if (input.signal?.aborted) onAbort();
     let settled: Awaited<ReturnType<Submission["wait"]>>;
     try {
       const waitCtx = input.signal ? withAbortSignal(input.signal, this.ctx) : this.ctx;

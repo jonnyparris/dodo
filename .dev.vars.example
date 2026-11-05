@@ -23,8 +23,14 @@ DODO_MCP_TOKEN=
 # Auth token for the OpenCode LLM gateway (only if using OpenCode gateway).
 OPENCODE_GATEWAY_TOKEN=
 
-# Auth key for the Cloudflare AI Gateway (only if using AI Gateway).
+# Auth key for the Cloudflare AI Gateway. Not needed when AI_GATEWAY_BASE_URL is a
+# gateway in this Worker's account (CLOUDFLARE_ACCOUNT_ID): every model then goes
+# through the `AI` binding. Only used over HTTP: another account's gateway, or
+# COMPAT_VIA_BINDING=0.
 AI_GATEWAY_KEY=
+
+# "0" sends AI Gateway /compat calls over HTTP with AI_GATEWAY_KEY instead of the AI binding.
+COMPAT_VIA_BINDING=
 
 # ─── Optional: Cloudflare Access ───
 # Set these to enable Cloudflare Access authentication.

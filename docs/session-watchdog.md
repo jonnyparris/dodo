@@ -154,9 +154,26 @@ curl https://dodo.example/session/$SESSION_ID/watchdog
 - **Granularity is bounded by the cron cadence.** Default `*/5 * * * *`
   means a 10-minute stall could be detected anywhere between 10:00 and
   15:00 minutes after the activity stamp.
-- **Activity = any metadata write.** A prompt that's busy with a slow
-  tool call but writing nothing to its own metadata may look stuck
-  even though it isn't. The current activity-stamp is conservative.
+- **Activity = turn progress.** The activity stamp (`updated_at`) moves
+  when a prompt is sent and, during a turn, on every setup step and pi
+  event (at most every 30s). A slow tool call sends no events, so a tool
+  that runs longer than `stallSeconds` looks stuck. (Before the turn stall
+  guard, the stamp only moved when a prompt was sent, so the watchdog
+  fired `stallSeconds` after the prompt started, stuck or not.)
+
+## Built-in turn stall guard
+
+Every prompt turn also runs a stall guard with no setup needed
+(`src/turn-stall-guard.ts`). A turn that makes no progress for 15 minutes
+(30 minutes while a tool call or compaction is open) fails with
+`Turn stalled: no progress for …s (last step: …)`, and the session takes
+new prompts. It covers the steps before the first model request as well
+(config read, MCP connect, context warm-up, tool build, pi prepare and
+submit). A model stream that goes quiet fails and retries sooner, after
+5 minutes (`src/pi/stream-idle-timeout.ts`). Tune with the Worker vars
+`TURN_STALL_SECONDS` and `TURN_STALL_TOOL_SECONDS`; `TURN_STALL_SECONDS=0`
+turns it off. The watchdog stays useful for a shorter threshold, `notify`
+without aborting, or `nudge`.
 - **No retries.** If `abort` or the nudge prompt itself fails, the
   watchdog logs the failure but doesn't try again on the same tick.
   The next tick re-evaluates from scratch.

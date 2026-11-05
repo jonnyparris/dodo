@@ -200,7 +200,7 @@ npx wrangler secret put ADMIN_EMAIL             # required
 npx wrangler secret put SECRETS_MASTER_KEY      # recommended: openssl rand -hex 32
 npx wrangler secret put COOKIE_SECRET           # recommended: openssl rand -hex 32
 npx wrangler secret put DODO_MCP_TOKEN          # recommended: openssl rand -base64url 32
-npx wrangler secret put AI_GATEWAY_KEY          # or OPENCODE_GATEWAY_TOKEN
+npx wrangler secret put AI_GATEWAY_KEY          # or OPENCODE_GATEWAY_TOKEN; not needed when the gateway is in this Worker's account (see below)
 
 npm run deploy:safe   # deploy, then run the post-deploy smoke probe
 ```
@@ -283,6 +283,12 @@ Every session gets a git repo on [Cloudflare Artifacts](https://developers.cloud
 
 ---
 
+## Use it from pi
+
+[`clients/pi`](clients/pi/README.md) is a [pi](https://github.com/earendil-works/pi) extension that attaches your terminal to a Dodo session. Type in pi, and Dodo runs the prompt and streams back replies and tool calls. Close the laptop and the session keeps going; `/dodo` on any machine attaches to it again. `/dodo model` switches the model for that one session.
+
+---
+
 ## Connect via MCP
 
 | Endpoint | Tools | For |
@@ -328,12 +334,12 @@ Dodo doesn't bundle a model. Set the model and gateway in the UI (Settings) or w
 
 | Gateway | Setup |
 |---|---|
-| **AI Gateway** | Secret `AI_GATEWAY_KEY`, var `AI_GATEWAY_BASE_URL`. Workers AI models (`@cf/…`) go through the same gateway. |
+| **AI Gateway** | Var `AI_GATEWAY_BASE_URL`. When the URL is a gateway in the Worker's own account (`CLOUDFLARE_ACCOUNT_ID`), every model goes through the `AI` binding and needs no key: Anthropic through createAI, everything else to `/compat` through the binding's universal endpoint (`COMPAT_VIA_BINDING=0` sends `/compat` over HTTP with `AI_GATEWAY_KEY` instead). Otherwise secret `AI_GATEWAY_KEY` is the auth. Var `WORKERS_AI_VIA_BINDING=1` (opt-in, being A/B tested; needs the own-account gateway above) moves `@cf/…` models from `/compat` to createAI's Workers AI run path. |
 | **OpenCode** | Secret `OPENCODE_GATEWAY_TOKEN`. Models fill in automatically. |
 
-Model ids look like `anthropic/claude-sonnet-4` or `@cf/zai-org/glm-5.3-flash`. The picker only offers models the active gateway can route.
+Model ids look like `anthropic/claude-sonnet-4-6` or `@cf/zai-org/glm-5.3-flash`. The picker only offers models the active gateway can route.
 
-**Verified on pi-durable:** GLM 5.3 Flash (the default, with vision), Kimi K2.6 and Gemma on Workers AI. **Known issue:** tool calls on the text-only Workers AI models `gpt-oss-120b` and `qwen2.5-coder-32b` fail with a 400 (they reject array user content).
+**Verified on pi-durable:** GLM 5.3 Flash (the default, with vision), Kimi K2.6 and Gemma on Workers AI. **Known issue:** tool calls on the text-only Workers AI models `gpt-oss-120b` and `qwen2.5-coder-32b` fail with a 400 on `/compat` (they reject array user content and `null` assistant content). With `WORKERS_AI_VIA_BINDING=1`, createAI's request quirks fix this: gpt-oss-120b and Qwen3 30B completed tool turns on preview (2026-10-22).
 
 </details>
 
@@ -346,7 +352,7 @@ Model ids look like `anthropic/claude-sonnet-4` or `@cf/zai-org/glm-5.3-flash`. 
 | `SECRETS_MASTER_KEY` | Recommended | Encrypts per-user secrets at rest |
 | `COOKIE_SECRET` | Recommended | Signs share-link cookies |
 | `DODO_MCP_TOKEN` | Recommended | Bearer token for `/mcp` |
-| `AI_GATEWAY_KEY` | If using AI Gateway | Gateway auth |
+| `AI_GATEWAY_KEY` | If using an AI Gateway the `AI` binding can't reach (another account), or with `COMPAT_VIA_BINDING=0` | Gateway auth over HTTP |
 | `OPENCODE_GATEWAY_TOKEN` | If using OpenCode | Gateway auth |
 | `REPLICATE_API_TOKEN` | For images | `/generate` and image edits |
 | `CF_ACCESS_AUD` / `CF_ACCESS_TEAM_DOMAIN` | If using Access | Multi-user auth |

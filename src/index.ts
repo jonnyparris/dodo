@@ -13,6 +13,7 @@ import { log } from "./logger";
 import { resolveMcpCallbackHost } from "./mcp-callback";
 import { createDodoMcpServer } from "./mcp";
 import { MCP_CATALOG } from "./mcp-catalog";
+import { lookupMcpHostScope, type McpHostScope } from "./mcp-host-scope";
 import { createDodoCodeModeMcpServer } from "./mcp-codemode";
 import { AllowlistOutbound } from "./outbound";
 import { errorLimiter, maybeCleanupRateLimiters, messageLimiter, promptLimiter, shareLimiter } from "./rate-limit";
@@ -89,14 +90,29 @@ async function proxyToSharedIndex(env: Env, path: string, init?: RequestInit): P
   return stub.fetch(`https://shared-index${path}`, init);
 }
 
-/** Catalog knownHosts are implicitly allowed (avoids requiring admin to manually allowlist them). */
+/**
+ * Catalog knownHosts are implicitly allowed at config time only (add/edit an
+ * MCP config, start OAuth). Not exempt for codemode sandbox egress; see
+ * src/outbound.ts.
+ */
 const catalogHostnames = new Set(MCP_CATALOG.flatMap((entry) => entry.knownHosts ?? []).map((h) => h.toLowerCase()));
 
 async function isHostAllowed(env: Env, hostname: string): Promise<boolean> {
-  if (catalogHostnames.has(hostname)) return true;
-  const checkRes = await proxyToSharedIndex(env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
-  const checkBody = (await checkRes.json()) as { allowed: boolean };
-  return checkBody.allowed;
+  let checkBody: McpHostScope;
+  try {
+    checkBody = await lookupMcpHostScope(env, hostname);
+  } catch (err) {
+    // SharedIndex unavailable: give catalog hosts the answer they always had
+    // before scopes (allowed without a lookup). This skips an admin's
+    // mcp: off during the outage, which is the price of not 500ing OAuth.
+    log("warn", "allowlist check failed", { hostname, error: err instanceof Error ? err.message : String(err) });
+    if (catalogHostnames.has(hostname)) return true;
+    throw err;
+  }
+  if (checkBody.allowed) return true;
+  // An admin's explicit mcp: off beats the catalog's implicit allow.
+  if (checkBody.listed) return false;
+  return catalogHostnames.has(hostname);
 }
 
 function rateLimitedResponse(result: { remaining: number; retryAfter?: number }, route: string, email: string): Response {
@@ -117,6 +133,20 @@ async function readConfig(env: Env, email: string): Promise<AppConfig> {
   const stub = getUserControlStub(env, email);
   const response = await stub.fetch("https://user-control/config");
   return (await response.json()) as AppConfig;
+}
+
+/**
+ * x-dodo-* gateway headers derived from the session owner's config, forwarded
+ * to the agent DO so the owner's model/gateway choices win over anything the
+ * calling user (or a guest) might set.
+ */
+function agentGatewayHeaders(config: AppConfig): Record<string, string> {
+  return {
+    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+    "x-dodo-gateway": config.activeGateway,
+    "x-dodo-model": config.model,
+    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+  };
 }
 
 /**
@@ -609,6 +639,8 @@ app.delete("/api/admin/users/:email/browser", adminGuard as never, async (c) =>
 );
 
 app.get("/api/admin/stats", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/stats"));
+// Workers AI per-model request budgets (src/model-budget.ts): learned cap, use in the last minute, waits, 429s.
+app.get("/api/admin/model-budget", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/model-budget"));
 
 app.get("/api/admin/users/detailed", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users/detailed"));
 
@@ -820,10 +852,7 @@ app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
       "x-dodo-session-id": sessionId,
       "x-owner-email": owner,
       "x-author-email": owner,
-      "x-dodo-ai-base-url": ownerConfigRes.aiGatewayBaseURL,
-      "x-dodo-gateway": ownerConfigRes.activeGateway,
-      "x-dodo-model": ownerConfigRes.model,
-      "x-dodo-opencode-base-url": ownerConfigRes.opencodeBaseURL,
+      ...agentGatewayHeaders(ownerConfigRes),
     },
     method: "POST",
   });
@@ -1333,10 +1362,7 @@ app.post("/api/tasks/batch-dispatch", async (c) => {
         body: JSON.stringify({ content: lines.join("\n") }),
       });
       await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
-        "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-        "x-dodo-gateway": config.activeGateway,
-        "x-dodo-model": config.model,
-        "x-dodo-opencode-base-url": config.opencodeBaseURL,
+        ...agentGatewayHeaders(config),
         "x-author-email": email,
         "x-owner-email": email,
       });
@@ -1447,10 +1473,7 @@ app.post("/api/tasks/:id/dispatch", async (c) => {
     body: JSON.stringify({ content: lines.join("\n") }),
   });
   await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
-    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-    "x-dodo-gateway": config.activeGateway,
-    "x-dodo-model": config.model,
-    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    ...agentGatewayHeaders(config),
     "x-author-email": email,
     "x-owner-email": email,
   });
@@ -2036,10 +2059,14 @@ app.post("/api/scheduled-sessions", async (c) => {
     return c.json({ error: "Invalid JSON body" }, 400);
   }
 
-  // Fork-source permission check at CREATE time — matches the posture of
-  // /session/:id/cron (source is owned or shared at schedule time). If the
-  // source is later unshared/deleted, the fire will fail and the schedule
-  // will eventually stall.
+  // Fork-source checks at CREATE time. The schedule lives in the caller's
+  // UserControl DO and forkScheduledSession only looks the source up in
+  // that same DO, so the caller must OWN the source: write access on a
+  // shared session would create a schedule that fails every fire with
+  // source_session_missing. If the source is later deleted, the fire will
+  // fail and the schedule will eventually stall. (The DO re-checks
+  // ownership, which also covers platform admins: resolveSessionPermission
+  // reports them as owner of any session.)
   if (parsed.source === "fork") {
     const sourceSessionId = typeof parsed.sourceSessionId === "string" ? parsed.sourceSessionId : "";
     if (!sourceSessionId) {
@@ -2051,6 +2078,11 @@ app.post("/api/scheduled-sessions", async (c) => {
     }
     if ((PERMISSION_LEVELS[perm.permission] ?? -1) < (PERMISSION_LEVELS.write ?? 999)) {
       return c.json({ error: "Insufficient permission on source session" }, 403);
+    }
+    if (perm.ownerEmail !== email) {
+      return c.json({
+        error: "Scheduled forks can only use a session you own as the source. Fork the shared session first, then schedule from your copy.",
+      }, 400);
     }
   }
 
@@ -2542,10 +2574,7 @@ app.post("/session/:id/message", async (c) => {
   const ownerEmail = c.get("sessionOwnerEmail") || email;
   const config = await readConfig(c.env, ownerEmail);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/message", {
-    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-    "x-dodo-gateway": config.activeGateway,
-    "x-dodo-model": config.model,
-    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    ...agentGatewayHeaders(config),
     "x-author-email": email,
     "x-owner-email": ownerEmail,
   });
@@ -2561,11 +2590,8 @@ app.post("/session/:id/prompt", async (c) => {
   const ownerEmail = c.get("sessionOwnerEmail") || email;
   const config = await readConfig(c.env, ownerEmail);
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompt", {
-    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
-    "x-dodo-gateway": config.activeGateway,
-    "x-dodo-model": config.model,
+    ...agentGatewayHeaders(config),
     "x-dodo-image-model": config.replicateImageModel ?? "",
-    "x-dodo-opencode-base-url": config.opencodeBaseURL,
     "x-author-email": email,
     "x-owner-email": ownerEmail,
   });
@@ -2641,6 +2667,18 @@ app.post("/session/:id/abort", async (c) => {
   const denied = requirePermission(c, "write");
   if (denied) return denied;
   return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/abort");
+});
+
+// Set or clear the per-session model override without sending a prompt.
+// Owner only (the DO checks x-author-email against the session owner).
+app.put("/session/:id/model-override", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/model-override", {
+    "x-author-email": email,
+    "x-owner-email": c.get("sessionOwnerEmail") || email,
+  });
 });
 
 app.get("/session/:id/browser", async (c) => {

@@ -1,0 +1,41 @@
+{
+  "base": "https://dodo.jonnyparris.club",
+  "gateway": "jp-gw",
+  "checkout": {
+    "url": "https://github.com/jonnyparris/dodo",
+    "branches": ["bench/base", "bench/bugfix-base"]
+  },
+  "arms": {
+    "ref-ds1017": {
+      "model": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+      "exploreModel": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+      "taskModel": "@cf/deepseek-ai/deepseek-v4.1-flash-1017"
+    }
+  },
+  "tasks": [
+    {
+      "id": "explore",
+      "clone": { "url": "https://github.com/jonnyparris/dodo", "dir": "/dodo", "branch": "bench/base" },
+      "prompt": "The Dodo repo (a coding agent on Cloudflare Workers) is cloned at /dodo. Question: how is the LLM model for a prompt chosen, end to end? Trace it from the user's saved config, through the HTTP prompt route and the MCP path, into the CodingAgent Durable Object, and on to the explore and task subagents. Give file:line for each hop. Don't edit any files."
+    },
+    {
+      "id": "bugfix",
+      "clone": { "url": "https://github.com/jonnyparris/dodo", "dir": "/dodo", "branch": "bench/bugfix-base" },
+      "prompt": "Bug report: on sessions running the pi engine with prompt caching, the per-message token count in the UI says something like '145 in' for a turn where the model actually received ~29k prompt tokens. Usage stats and the session summary are under-reported the same way. The repo is at /dodo. Find the root cause, fix it, and add a regression test to the existing test file for that module. Commit with a conventional commit message.",
+      "collect": ["/dodo/src/pi/engine.ts", "/dodo/test/pi-engine.test.ts"],
+      "verify": "BENCH_FIXED_REF=origin/bench/base BENCH_BUGGY_REF=origin/bench/bugfix-base bench/verify/bugfix-token-cache.sh"
+    },
+    {
+      "id": "refactor",
+      "clone": { "url": "https://github.com/jonnyparris/dodo", "dir": "/dodo", "branch": "bench/base" },
+      "prompt": "In /dodo/src/index.ts, the POST /session/:id/message and POST /session/:id/prompt routes (and any other routes in that file doing the same thing) each build the same block of x-dodo-* gateway headers from the session owner's config. Extract that into one helper and use it everywhere the pattern repeats in that file. Keep behaviour identical (note /prompt also sends x-dodo-image-model). Commit when done.",
+      "collect": ["/dodo/src/index.ts"],
+      "verify": "bench/verify/refactor-gateway-headers.sh"
+    },
+    {
+      "id": "browser",
+      "prompt": "Open news.ycombinator.com in the browser, take a screenshot, and tell me which story has the most points.",
+      "timeoutMinutes": 10
+    }
+  ]
+}

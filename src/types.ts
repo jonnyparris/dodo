@@ -9,6 +9,8 @@ export interface Env {
   AI_GATEWAY_BASE_URL: string;
   AI_GATEWAY_DEFAULT_MODEL?: string;
   AI_GATEWAY_KEY?: string;
+  /** "0" sends AI Gateway `/compat` calls over HTTP with AI_GATEWAY_KEY instead of the `AI` binding (src/cloudflare-ai.ts compatBindingFetch). */
+  COMPAT_VIA_BINDING?: string;
   ALLOW_UNAUTHENTICATED_DEV?: string;
   ASSETS?: Fetcher;
   ARTIFACTS: Artifacts;
@@ -25,6 +27,14 @@ export interface Env {
   DEFAULT_EXPLORE_MODEL?: string;
   /** Default model for the `task` subagent. Same fallback semantics. */
   DEFAULT_TASK_MODEL?: string;
+  /** JSON `{ "<model id>" | "@cf/*": rpm }` overriding the Workers AI per-model
+   *  request budgets in src/model-budget.ts. 0 turns a budget off. */
+  MODEL_RPM_LIMITS?: string;
+  /** Turn stall guard (src/turn-stall-guard.ts): seconds without progress before a
+   *  turn fails. Default 900; 0 turns the guard off. */
+  TURN_STALL_SECONDS?: string;
+  /** Same, while a tool call or compaction is open. Default 1800. */
+  TURN_STALL_TOOL_SECONDS?: string;
   DEPLOY_MCP_CATALOG_CONFIG?: string;
   DODO_MCP_TOKEN?: string;
   DODO_COMMIT?: string;
@@ -71,6 +81,8 @@ export interface Env {
   CLOUDFLARE_API_TOKEN?: string;
   /** Cloudflare account id used to scope Workers API calls. Wrangler var. */
   CLOUDFLARE_ACCOUNT_ID?: string;
+  /** "1"/"true": `@cf/` models (main session and explore/task subagents) go through createAI's Workers AI run path (env.AI.run) instead of AI Gateway /compat. A/B flag, off by default. */
+  WORKERS_AI_VIA_BINDING?: string;
   /** Worker script name used when querying observability for this worker. Wrangler var. */
   DODO_WORKER_NAME?: string;
 
@@ -187,7 +199,10 @@ export interface SessionState {
   contextWindow: number;
   createdAt: string;
   messageCount: number;
+  /** Main model: the running prompt's while one runs, else the next prompt's. */
   model: string;
+  /** The next prompt's main model. Differs from `model` only while a prompt runs and the override changed. */
+  nextModel?: string;
   ownerEmail?: string;
   sessionId: string;
   status: "idle" | "running" | "deleted";
@@ -350,8 +365,23 @@ export interface WorkspaceEntry {
 }
 
 export interface AllowlistEntry {
+  /**
+   * When false (the default), AllowlistOutbound strips credential headers
+   * (Authorization, Cookie, X-Api-Key, ...) from sandbox fetches to this
+   * host. See src/outbound.ts.
+   */
+  allowCredentials: boolean;
   createdAt: string;
   hostname: string;
+  /** MCP server configs (and OAuth) may point at this host. */
+  mcp: boolean;
+  /**
+   * Sandbox egress is limited to these HTTP methods, e.g. ["GET", "HEAD"]
+   * for a read-only host. null means any method. Ignored for MCP.
+   */
+  methods: string[] | null;
+  /** Codemode sandbox fetch() may reach this host. */
+  sandbox: boolean;
 }
 
 /**

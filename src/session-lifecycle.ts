@@ -55,7 +55,8 @@ export type PromptSource =
   | "cron"
   | "queue"
   | "goal-autocontinue"
-  | "image-gen";
+  | "image-gen"
+  | "message";
 
 /**
  * Per-source policy. Adding a new source = one row.
@@ -133,6 +134,19 @@ export const SOURCE_POLICIES: Record<PromptSource, SourcePolicy> = {
     emitState: false,
     notifyOnError: false,
     notifyOnComplete: false,
+    synchronous: true,
+  },
+  // Sync POST /message: the caller waits for the answer in the HTTP reply,
+  // so a busy session rejects (409) instead of queueing. Runs inline like
+  // image-gen, but holds the active prompt id, so async prompts queue
+  // behind it and abort / the watchdog can reach it.
+  message: {
+    onBusy: "reject",
+    maxRetries: 0,
+    syncIndex: true,
+    emitState: true,
+    notifyOnError: true,
+    notifyOnComplete: true,
     synchronous: true,
   },
 };

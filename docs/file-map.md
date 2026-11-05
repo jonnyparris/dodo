@@ -16,7 +16,8 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `src/agent-base.ts` — `DodoAgentBase extends Agent` (agents SDK): SDK fibers (`startFiber` / `onFiberRecovered`), `_think_config` table, `migrateLegacyFiberTable` for pre-0.28 sessions
 - `src/session-lifecycle.ts` — prompt lifecycle (start, queue, abort, busy handling) driven by fibers
 - `src/pi/engine.ts` — PiEngine: the agent loop on `@earendil-works/pi-durable` (Harness on DO SQLite, `pi_` tables), SSE event bridge, transcript view. See `docs/adr/0002-pi-durable-foundation.md`
-- `src/pi/models.ts` — Dodo gateways as a pi-ai `openai-completions` provider
+- `src/pi/models.ts` — Dodo gateways as a pi-ai `openai-completions` provider; Anthropic on AI Gateway (and `@cf/` with `WORKERS_AI_VIA_BINDING`, run path) as a createAI provider (`cloudflare`)
+- `src/cloudflare-ai.ts` — when the `AI` binding can stand in for the configured AI Gateway URL (`bindingGatewayId`), gateway log metadata, 429 wait on binding calls (main session only; subagents rely on the AI SDK's own 429 retries). Used by the createAI leg in `src/pi/models.ts` and `src/subagent-runner.ts`
 - `src/pi/tools.ts` — adapts AI SDK `tool()` objects to durable pi tools; `REPLAY_SAFE_TOOLS`
 - `src/pi/loop-guard.ts` — repeated-tool-call detection as a pi hook
 - `src/think-history.ts` / `src/transcript.ts` — read-only reader for pre-pi (Think-era) history, migrated lazily on the next prompt
@@ -31,9 +32,10 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `src/tools/kitebuild.ts` — `ci_run`: verify a pushed branch in Kitebuild (enabled by `KITEBUILD_*` config)
 - `src/explore-agent.ts` / `src/task-agent.ts` / `src/subagent-runner.ts` — `explore` and `task` subagents (in-process or facet DOs)
 - `src/typecheck.ts` — in-isolate `tsc --noEmit` tool
-- `src/session-model-override.ts` — per-session `model` / `exploreModel` / `taskModel` override (prompt body → metadata → session + facet config)
+- `src/session-model-override.ts` — per-session `model` / `exploreModel` / `taskModel` override (prompt body or `PUT /session/:id/model-override` → metadata → session + facet config)
 - `src/session-goal.ts` — goal helpers + types. See `docs/session-goals.md`
 - `src/watchdog.ts` — stall detection for long prompts. See `docs/session-watchdog.md`
+- `src/turn-stall-guard.ts` — built-in: fails a turn with no progress for 15 min (30 min while a tool runs), setup steps included. `TURN_STALL_SECONDS` / `TURN_STALL_TOOL_SECONDS`. See `docs/session-watchdog.md`
 - `src/chat-monitor-agent.ts` — polls a Google Chat space and forwards messages into a session
 - `src/presence.ts` — WebSocket presence tracking
 - `src/autopilot.ts` — self-diagnose loop: `buildDiagnoseGoal`, `buildSupervisorGoal`, owner resolution
@@ -45,6 +47,7 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `src/shared-index.ts` — global singleton DO (user allowlist, host allowlist, models cache, session shares/permissions)
 - `src/crypto.ts` — hybrid envelope encryption (PBKDF2 + HKDF + AES-GCM) for per-user secrets
 - `src/rate-limit.ts` — per-user rate limiting
+- `src/model-budget.ts` / `src/model-budget-fetch.ts` — shared per-model Workers AI request budget (book lives in the SharedIndex DO). Main turns and explore/task subagents take a slot before each model request; subagents leave a 25% reserve for main turns and back off after a 429. Override caps with `MODEL_RPM_LIMITS`; inspect with `GET /api/admin/model-budget`
 
 ## Skills
 
@@ -78,3 +81,4 @@ Source layout. `src/index.ts` is the entry point; everything else hangs off the 
 - `public/index.html` — three-panel web UI (mobile-responsive)
 - `public/docs.html` — architecture documentation page
 - `public/howto.html` — task-oriented how-to guides
+- `clients/pi/` — pi extension: attach a terminal pi to a Dodo session over SSE + the HTTP API (`/dodo`)

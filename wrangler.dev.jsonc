@@ -17,7 +17,8 @@
     "bindings": [
       { "name": "CODING_AGENT", "class_name": "CodingAgent" },
       { "name": "USER_CONTROL", "class_name": "UserControl" },
-      { "name": "SHARED_INDEX", "class_name": "SharedIndex" }
+      { "name": "SHARED_INDEX", "class_name": "SharedIndex" },
+      { "name": "CHAT_MONITOR", "class_name": "ChatMonitorAgent" }
     ]
   },
   "worker_loaders": [{ "binding": "LOADER" }],
@@ -38,6 +39,10 @@
     {
       "tag": "v4",
       "new_sqlite_classes": ["ExploreAgent", "TaskAgent"]
+    },
+    {
+      "tag": "v7",
+      "new_sqlite_classes": ["ChatMonitorAgent"]
     }
   ],
   "r2_buckets": [
@@ -50,15 +55,30 @@
   "triggers": {
     "crons": ["0 */6 * * *"]
   },
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "default"
+    }
+  ],
   "assets": {
-    "directory": "./public"
+    "directory": "./public",
+    // Required so `c.env.ASSETS.fetch(...)` works inside route handlers.
+    // Without the binding declaration, `env.ASSETS` is undefined and any
+    // page route that relies on the binding (e.g. /admin/seeds,
+    // /admin/autopilot, /admin/chat-monitors) falls through to its
+    // "Admin page not available" fallback.
+    "binding": "ASSETS"
+  },
+  "ai": {
+    "binding": "AI"
   },
   "vars": {
     // Set these to your Cloudflare Access application's audience tag and team domain.
     "CF_ACCESS_AUD": "your-cf-access-audience-tag",
     "CF_ACCESS_TEAM_DOMAIN": "https://your-team.cloudflareaccess.com",
     // Set this to any model your LLM gateway supports
-    "DEFAULT_MODEL": "anthropic/claude-sonnet-4",
+    "DEFAULT_MODEL": "anthropic/claude-sonnet-4-6",
     // Default model used when a new session is created with activeGateway=ai-gateway.
     "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
     "DEFAULT_REPLICATE_IMAGE_MODEL": "google/nano-banana-2",

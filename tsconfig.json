@@ -13,6 +13,7 @@
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true
   },
+  // bench/ (Node scripts) has its own bench/tsconfig.json; `npm run typecheck` runs both.
   "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
   // Vendored busyworker upstream — kept out of tsc to avoid churning every
   // refresh against Dodo's stricter compiler settings. esbuild/wrangler

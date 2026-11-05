@@ -71,7 +71,7 @@ describe("stripUnsupportedFileParts", () => {
     const messages: ModelMessage[] = [
       { role: "user", content: [textPart, imagePart] },
     ];
-    const { stripped } = stripUnsupportedFileParts(messages, "deepseek/deepseek-chat");
+    const { stripped } = stripUnsupportedFileParts(messages, "deepseek/deepseek-v4-pro");
     expect(stripped).toBe(1);
   });
 

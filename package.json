@@ -3,6 +3,7 @@
   "version": "0.4.0",
   "private": true,
   "type": "module",
+  "packageManager": "npm@11.12.1",
   "scripts": {
     "dev": "wrangler dev -c wrangler.dev.jsonc",
     "build": "COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown') && echo \"{\\\"commit\\\":\\\"$COMMIT\\\",\\\"builtAt\\\":\\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"}\" > public/version.json && node scripts/generate-typecheck-libs.mjs",
@@ -14,11 +15,13 @@
     "test:typecheck-smoke": "node --experimental-strip-types --experimental-detect-module --no-warnings=ExperimentalWarning scripts/smoke-typecheck.mjs",
     "lint": "biome lint .",
     "lint:fix": "biome lint --write .",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p bench",
     "types": "wrangler types"
   },
   "dependencies": {
-    "@ai-sdk/openai-compatible": "^2.0.37",
+    "@ai-sdk/anthropic": "^4.0.87",
+    "@ai-sdk/openai-compatible": "^3.0.77",
+    "@ai-sdk/provider": "^4.0.33",
     "@cloudflare/codemode": "^0.5.4",
     "@cloudflare/computer": "^0.5.1",
     "@cloudflare/puppeteer": "^1.4.0",
@@ -29,7 +32,7 @@
     "@hono/capnweb": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "agents": "^0.28.1",
-    "ai": "^6.0.142",
+    "ai": "^7.0.150",
     "capnweb": "^0.6.1",
     "cron-schedule": "^6.0.0",
     "hono": "^4.12.9",

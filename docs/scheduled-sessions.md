@@ -69,10 +69,27 @@ Create a scheduled new-session job.
 | `intervalSeconds`  | ≥ 300 (5 minutes)                   |
 | `cron` gap         | next-3-match gap ≥ 300s             |
 
-**Fork source permission:** if `source: "fork"`, the caller must have
-write access on the source session at create time. Fork sources are
-resolved via `resolveSessionPermission` — session owner, platform admin,
-SharedIndex grant, or a valid share cookie.
+**Fork source ownership:** if `source: "fork"`, the caller must own the
+source session, and it must not be deleted. The schedule lives in the
+caller's UserControl DO and each fire looks the source up there.
+Responses: 403 with no access or read-only access; 400 with write access
+but not owner (platform admins get no exception); 400 if the source is
+soft-deleted. To schedule work on a shared session, fork it first and
+schedule from your copy.
+
+**Fork sources survive the idle sweep.** The sweep soft-deletes sessions
+idle for 10+ minutes with no prompts and no transcript messages (a fork
+carries its source's messages but no prompt rows, so it counts as used). It skips any session named as a
+schedule's `sourceSessionId`, and any session that has ever been forked
+from (`sessions.fork_source = 1`, set by every fork path: HTTP, MCP
+`fork_session`, seed forks and scheduled forks). The flag lives in the
+source owner's DO, so a user with write access who forks a shared session
+sets it on the owner's copy. It is set before the snapshot, so a failed
+fork attempt also sets it. The flag never clears and is not shown in the
+UI; delete the session by hand when it is no longer needed. Sessions
+forked before this flag existed are not backfilled: fork them once to
+protect them. A fork (scheduled or not) from a soft-deleted source fails
+with `source_session_missing` / 404.
 
 **Cap:** 50 scheduled sessions per user. Returns 400 with a clear message
 when exceeded.

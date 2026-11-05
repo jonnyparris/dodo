@@ -23,7 +23,8 @@ import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
 import { createModelOverrideStore, type ModelOverrideStore, modelOverridePatch, modelOverrideValueSchema, withModelOverride } from "./session-model-override";
 import { log } from "./logger";
 import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
-import { DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, FALLBACK_MODELS, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
+import { isMcpHostRevoked, mcpHostRevokedMessage } from "./mcp-host-scope";
+import { contextWindowFor, DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH } from "./model-catalog";
 import { dispatchNotification } from "./notify";
 import { entriesToMessages, PiEngine, type PiUserContent } from "./pi/engine";
 import { agentModelRef, setDodoProvider } from "./pi/models";
@@ -45,6 +46,10 @@ const STEP_UP_PARKS_KEY = "oauth_step_up_parks";
 // shared with the rest of startup): stay well under it.
 export const STEP_UP_RECOVERY_WAIT_MS = 10_000;
 const COMPLETION_WEBHOOK_KEY = "completion_webhook";
+/** Set when PUT /model-override lands mid-run: rebuild the session config when the run ends. */
+const CONFIG_REFRESH_PENDING = "config_refresh_pending";
+/** The owner's default model as of the last config rebuild (the next prompt uses it unless the session has an override). */
+const OWNER_MODEL_KEY = "owner_default_model";
 /** While a person is needed, poke the browser this often (Browser Run idle keep_alive is 180 s). */
 const BROWSER_WARM_INTERVAL_SECONDS = 120;
 /** ~20 minutes of keeping the browser alive for a handoff. */
@@ -100,21 +105,11 @@ import {
   type WatchdogConfig,
 } from "./watchdog";
 import { evaluateSession } from "./watchdog-policy";
+import { createTurnStallGuard, TurnStallError, turnStallLimitsFromEnv, type TurnStallEvent, type TurnStallGuard, type TurnStallLimits } from "./turn-stall-guard";
 import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 
 type FiberPromptPayload = { promptId: string; content: string; images?: Array<{ data: string; mediaType: string; name?: string }>; authorEmail?: string; title: string };
 
-/**
- * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
- *
- * Derived from the shared model catalog in model-catalog.ts so the two lists
- * cannot drift. If a model is missing from the catalog but used at runtime,
- * DEFAULT_CONTEXT_WINDOW applies. See issue #34.
- */
-const CONTEXT_WINDOW_TOKENS: Record<string, number> = Object.fromEntries(
-  [...FALLBACK_MODELS, ...WORKERS_AI_MODELS].map((m) => [m.id, m.contextWindow]),
-);
-const DEFAULT_CONTEXT_WINDOW = 128_000;
 /** Budget factor — use 80% of context window for messages, leave 20% for response. */
 const CONTEXT_BUDGET_FACTOR = 0.8;
 
@@ -374,6 +369,12 @@ const sendMessageSchema = z.object({
   exploreModel: modelOverrideValueSchema.optional(),
   taskModel: modelOverrideValueSchema.optional(),
 }).strict();
+/** PUT /model-override body. */
+const modelOverrideBodySchema = z.object({
+  model: modelOverrideValueSchema.optional(),
+  exploreModel: modelOverrideValueSchema.optional(),
+  taskModel: modelOverrideValueSchema.optional(),
+}).strict();
 /** /generate schema — text-to-image via Replicate. */
 const generateImageSchema = z.object({
   content: z.string().trim().min(1).max(REPLICATE_MAX_PROMPT_LENGTH),
@@ -453,7 +454,7 @@ const SYSTEM_PROMPT = [
   "",
   "## Code execution",
   "",
-  "The **codemode** tool runs JavaScript in a sandboxed Worker with workspace filesystem and git access. Use it for build scripts, tests, one-off computations, and `fetch()` to allowlisted hosts (auth headers are NOT injected — include tokens yourself, or prefer the `git_*` tools which handle auth in the parent worker). 30-second timeout, restricted network.",
+  "The **codemode** tool runs JavaScript in a sandboxed Worker with workspace filesystem and git access. Use it for build scripts, tests, one-off computations, and `fetch()` to allowlisted hosts. Dodo injects no tokens, and it strips credential headers (Authorization, cookies, API keys) unless an admin has allowed auth for that host; the response header `x-dodo-stripped-headers` says what was removed. Some hosts allow only GET and HEAD; other methods get a 405. Responses with `x-dodo-blocked` are Dodo policy blocks, not upstream errors: do not retry them another way. Never put tokens in URLs or request bodies to get around this. For git, use the `git_*` tools, which handle auth in the parent worker. 30-second timeout, restricted network.",
   "",
   "## Git",
   "",
@@ -822,10 +823,13 @@ export class CodingAgent extends CodingAgentBase {
       setAbortController: (c) => {
         this._fiberAbortController = c;
       },
-      readAppConfig: () => this.readAppConfig(),
+      readAppConfig: () => this.readAppConfig({ promptStart: true }),
       log: (level, message, fields) => log(level, message, fields ?? {}),
       onPromptStart: () => this.clearNeedsInput(),
-      onPromptFinished: (promptId, cause) => this.ringCompletionWebhook(promptId, cause.kind),
+      onPromptFinished: (promptId, cause) => {
+        this.ringCompletionWebhook(promptId, cause.kind);
+        this.afterRunIdle();
+      },
     });
   }
 
@@ -1368,7 +1372,10 @@ export class CodingAgent extends CodingAgentBase {
     // has items, the DO likely evicted between lifecycle.finish() clearing
     // active_prompt_id and the queue dequeue running. Use lifecycle.start
     // with source="queue" to drain a single item with the right policy.
-    if (!this.control.readActivePromptId()) {
+    if (this.control.readActivePromptId()) {
+      // finish() drains the queue itself.
+      void this.failInterruptedInlinePrompt();
+    } else {
       void this.drainOneQueuedPrompt();
     }
 
@@ -1392,6 +1399,26 @@ export class CodingAgent extends CodingAgentBase {
       });
       return Promise.race([recovery, cap]).finally(() => clearTimeout(timer));
     }
+  }
+
+  /**
+   * A fresh instance found an active prompt with no fiber: an inline run
+   * (sync /message, image generation) that died with the old instance, or a
+   * prompt evicted before its fiber spawned. Nothing will ever finish it, so
+   * fail it; otherwise the session stays "running" and every prompt queues
+   * behind it. Fiber-backed prompts are left to onFiberRecovered.
+   */
+  private async failInterruptedInlinePrompt(): Promise<void> {
+    const promptId = this.control.readActivePromptId();
+    if (!promptId || this.readPromptFiberId(promptId) || this.hasFiberForPrompt(promptId)) return;
+    log("warn", "failing an inline prompt interrupted by a restart", { sessionId: this.sessionId(), promptId });
+    try {
+      await this.finishPrompt(promptId, { error: "Interrupted: the session restarted while this prompt was running", status: "failed" });
+    } catch (error) {
+      log("warn", "could not fail the interrupted inline prompt", { sessionId: this.sessionId(), promptId, error: String(error) });
+    }
+    this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
   }
 
   private async drainOneQueuedPrompt(): Promise<void> {
@@ -1428,6 +1455,11 @@ export class CodingAgent extends CodingAgentBase {
       }
 
       if (request.method === "GET" && url.pathname === "/") {
+        // No prompt yet: load the owner's config so the details show the
+        // owner's model, not the Worker default. Only when the session has
+        // no config: a later change to the owner's config shows from the
+        // next prompt.
+        if (!this.getConfig()) await this.refreshConfigFromOwner();
         return Response.json(this.readSessionDetails());
       }
 
@@ -1508,8 +1540,17 @@ export class CodingAgent extends CodingAgentBase {
       if (request.method === "GET" && url.pathname === "/prompts/count") {
         // Lightweight count endpoint used by the UserControl idle-session
         // sweep. Full /prompts would serialise the whole list.
+        // `messages` counts transcript messages too: a fork imports the
+        // source's messages but not its prompt rows, so prompts alone
+        // reads 0 and the sweep would delete a forked conversation.
+        // message_metadata gets a row for every message appendTranscript
+        // writes (fork import, /generate). Think-era history is counted
+        // from its own table, which stays in place after migration to pi.
+        // Overcounting only keeps a session; undercounting deletes one.
         const row = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM prompts"))[0] as SqlRow | null);
-        return Response.json({ count: Number(row?.n ?? 0) });
+        const msgRow = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM message_metadata"))[0] as SqlRow | null);
+        const thinkMessages = this.sessions.sessionIds().reduce((n, id) => n + this.sessions.getMessageCount(id), 0);
+        return Response.json({ count: Number(row?.n ?? 0), messages: Math.max(Number(msgRow?.n ?? 0), thinkMessages) });
       }
 
       if (request.method === "GET" && url.pathname === "/prompt-queue") {
@@ -1865,6 +1906,10 @@ export class CodingAgent extends CodingAgentBase {
 
       if (request.method === "POST" && url.pathname === "/abort") {
         return await this.handleAbort();
+      }
+
+      if (request.method === "PUT" && url.pathname === "/model-override") {
+        return await this.handleModelOverride(request);
       }
 
       return new Response("Not Found", { status: 404 });
@@ -3232,36 +3277,58 @@ export class CodingAgent extends CodingAgentBase {
     }
 
     // handleMessage is synchronous — callers (MCP, external integrations) expect the
-    // assistant response in the HTTP reply. Queuing would lose the response. Keep 409.
-    // This is the only path that doesn't go through SessionLifecycle (sync semantics
-    // mean we don't spawn a fiber); status/title management is done by hand using the
-    // typed control plane.
-    if (this.control.readActivePromptId()) {
-      return Response.json({ error: "A prompt is already running" }, { status: 409 });
-    }
-
-    const existingTitle = this.control.readTitle();
-    const title = existingTitle ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
-    if (!existingTitle) this.control.setTitle(title);
-    this.control.setStatus("running");
-    await this.syncSessionIndex({ status: "running", title });
-
-    const notifyOwner = this.control.readOwnerEmail() ?? undefined;
-
+    // assistant response in the HTTP reply. Queuing would lose the response, so a
+    // busy session gets 409 (the "message" policy rejects). The run goes through
+    // SessionLifecycle like image generation: it holds the active prompt id, so an
+    // async /prompt queues behind it instead of starting on top, and abort / the
+    // watchdog can stop it. No fiber: the run is inline, and onStart fails it if
+    // the DO restarts mid-run (failInterruptedInlinePrompt).
+    //
+    // Before status goes "running": ensureThinkConfig leaves a running
+    // session's config alone.
     this.ensureThinkConfig(request);
-    await this.readAppConfig();
+    const started = await this.sessionLifecycle.start({ source: "message", content: input.content, authorEmail });
+    if (started.kind === "rejected") {
+      return Response.json({ error: started.reason === "busy" ? "A prompt is already running" : started.message }, { status: started.reason === "busy" ? 409 : 400 });
+    }
+    if (started.kind !== "started") {
+      return Response.json({ error: "Unable to start the message" }, { status: 500 });
+    }
+    const promptId = started.promptId;
+    const aborted = () => Response.json({ error: "Prompt aborted", aborted: true, promptId, sessionId }, { status: 409 });
+    // start() awaits the session index sync after setting the active prompt.
+    // An abort in that window finished the prompt before our controller
+    // existed: don't run it.
+    if (this.control.readActivePromptId() !== promptId) {
+      // start()'s "running" index sync may have landed after the abort's "idle" one.
+      // Unless a queued prompt has started since: then the index is right.
+      if (!this.control.readActivePromptId()) await this.syncSessionIndex({ status: "idle" }).catch(() => {});
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      return aborted();
+    }
+    this.markPromptRunning(promptId);
+
+    // handleAbort() (and the watchdog) abort this controller via lifecycle.abortActive.
+    const controller = new AbortController();
+    this._fiberAbortController = controller;
+    const signal = controller.signal;
+
     try {
+      // Inside the try, so a UserControl failure here still sets the session idle.
+      await this.readAppConfig({ promptStart: true });
+      if (signal.aborted) return aborted();
       await this.migrateThinkSessionToPi();
-      const result = await this.runPiChat(input.content, { promptId: `sync_${crypto.randomUUID()}`, authorEmail: authorEmail ?? undefined, images: input.images });
+      if (signal.aborted) return aborted();
+      const result = await this.runPiChat(input.content, { promptId, authorEmail: authorEmail ?? undefined, images: input.images, signal });
+      if (signal.aborted) return aborted();
 
       // Guard: treat empty LLM response as a failure (same as runFiberPrompt)
       if (!result.text && !result.assistantMessageId) {
         const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
-        this.control.setStatus("idle");
-        await this.syncSessionIndex({ status: "idle", title });
         this.emitEvent({ data: { message }, type: "error_message" });
-        this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-        dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: notifyOwner });
+        // lifecycle.finish sets the session idle and sends the prompt-error notification.
+        await this.finishPrompt(promptId, { error: message, status: "failed" });
         return Response.json({ error: message, sessionId }, { status: 502 });
       }
 
@@ -3271,21 +3338,48 @@ export class CodingAgent extends CodingAgentBase {
         { messageId: result.assistantMessageId, model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: result.tokenInput, tokenOutput: result.tokenOutput, authorEmail: null, createdAt: nowEpoch() },
       );
 
-      this.control.setStatus("idle");
-      await this.syncSessionIndex({ status: "idle", title });
+      // The answer goes out before finish, which may start a queued prompt.
       this.emitEvent({ data: assistantRecord, type: "message" });
-      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-      dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: notifyOwner });
+      try {
+        await this.finishPrompt(promptId, { resultMessageId: result.assistantMessageId, status: "completed", text: result.text });
+      } catch (error) {
+        // The answer is stored and sent, so the caller still gets it. If finish
+        // threw before it released the session, release it here.
+        log("error", "sync message: finish after a completed run failed", { sessionId, promptId, error: String(error) });
+        // Best effort only: nothing here may fall through to the outer catch,
+        // which would mark the delivered answer failed.
+        try {
+          if (this.control.readActivePromptId() === promptId) {
+            try {
+              this.updatePrompt(promptId, { status: "completed", resultMessageId: result.assistantMessageId });
+            } catch (e) {
+              log("error", "sync message: could not mark the prompt completed", { sessionId, promptId, error: String(e) });
+            }
+            this.control.endPrompt();
+            await this.syncSessionIndex({ status: "idle" }).catch(() => {});
+            this.ringCompletionWebhook(promptId, "completed");
+          }
+          this.afterRunIdle(); // flag-guarded: a no-op unless a config refresh is pending
+          // finish may have thrown before (or while) draining the queue.
+          if (!this.control.readActivePromptId()) void this.drainOneQueuedPrompt().catch(() => {});
+        } catch (e) {
+          log("error", "sync message: could not release the session after a failed finish", { sessionId, promptId, error: String(e) });
+        }
+      }
 
-      return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, sessionId, steps: result.steps, toolCalls: result.toolCalls });
+      return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, promptId, sessionId, steps: result.steps, toolCalls: result.toolCalls });
     } catch (error) {
-      this.control.setStatus("idle");
-      await this.syncSessionIndex({ status: "idle", title });
+      // abortActive already finished the prompt as aborted.
+      if (signal.aborted) return aborted();
       const message = error instanceof Error ? error.message : "Unknown LLM failure";
       this.emitEvent({ data: { message }, type: "error_message" });
-      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
-      dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: notifyOwner });
+      await this.finishPrompt(promptId, { error: message, status: "failed" });
       return Response.json({ error: message, sessionId }, { status: 502 });
+    } finally {
+      // A queued prompt may already have started its own fiber (and controller).
+      if (this._fiberAbortController === controller) this._fiberAbortController = null;
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
     }
   }
 
@@ -3425,6 +3519,7 @@ export class CodingAgent extends CodingAgentBase {
       return Response.json({ error: "Unable to start image generation" }, { status: 500 });
     }
     const promptId = startResult.promptId;
+    this.markPromptRunning(promptId);
 
     try {
       // 1. Persist user prompt message
@@ -3693,12 +3788,15 @@ export class CodingAgent extends CodingAgentBase {
       return;
     }
 
-    // Refresh the session config from the latest account config before each prompt run.
-    await this.readAppConfig();
+    this.markPromptRunning(promptId);
 
     // Chat completed before an eviction: just finalize.
     const snapshot = resume ?? (fiber?.snapshot as PromptFiberSnapshot | null | undefined);
     if (snapshot?.chatCompleted) {
+      // Refresh the session config from the latest account config. Not a
+      // prompt start: spawnPrompt already applied the override, and a run
+      // recovered after eviction (or retried) keeps the models it started on.
+      await this.readAppConfig();
       await this.finalizePromptFromFiber(promptId, title, snapshot);
       return;
     }
@@ -3709,9 +3807,24 @@ export class CodingAgent extends CodingAgentBase {
     const signal = this._fiberAbortController.signal;
     const controller = this._fiberAbortController;
     fiber?.signal.addEventListener("abort", () => controller.abort(), { once: true });
+    // A turn that stops making progress (before the first model request,
+    // or anywhere else) fails instead of holding the session. See
+    // src/turn-stall-guard.ts.
+    const stall = this.startTurnStallGuard(promptId, controller);
     try {
-      await this.migrateThinkSessionToPi();
-      const result = await this.runPiChat(content, { promptId, authorEmail, signal, images });
+      const result = await stall.run((async () => {
+        // Refresh the session config from the latest account config. Not a
+        // prompt start: spawnPrompt already applied the override, and a run
+        // recovered after eviction (or retried) keeps the models it started on.
+        stall.touch("read_config");
+        await this.readAppConfig();
+        if (signal.aborted) throw signal.reason;
+        stall.touch("migrate_think");
+        await this.migrateThinkSessionToPi();
+        if (signal.aborted) throw signal.reason;
+        return this.runPiChat(content, { promptId, authorEmail, signal, images, stall });
+      })());
+      stall.stop();
 
       // Guard: treat empty LLM response as a failure — UNLESS the prompt
       // was aborted, in which case the empty result is expected and
@@ -3760,6 +3873,16 @@ export class CodingAgent extends CodingAgentBase {
         tokenOutput: result.tokenOutput,
       });
     } catch (error) {
+      // A stall aborts the controller too, but nobody marked the prompt:
+      // fail it, unless a user abort got there first.
+      const stalled = error instanceof TurnStallError ? error : stall.fired;
+      if (stalled) {
+        const statusRow = Array.from(this.ctx.storage.sql.exec<{ status: string }>("SELECT status FROM prompts WHERE id = ?", promptId))[0];
+        if (statusRow && statusRow.status !== "queued" && statusRow.status !== "running") return;
+        this.emitEvent({ data: { message: stalled.message }, type: "error_message" });
+        await this.finishPrompt(promptId, { error: stalled.message, status: "failed" });
+        return;
+      }
       // Don't report abort-caused errors as failures — the abort handler already
       // marked the prompt as aborted.
       if (signal.aborted) return;
@@ -3768,11 +3891,50 @@ export class CodingAgent extends CodingAgentBase {
       // lifecycle.finish dispatches the prompt-error notification per policy
       await this.finishPrompt(promptId, { error: message, status: "failed" });
     } finally {
-      this._fiberAbortController = null;
+      stall.stop();
+      // A queued prompt may already have started its own fiber (and controller).
+      if (this._fiberAbortController === controller) this._fiberAbortController = null;
       await this.syncSessionIndex({ status: "idle", title });
       this.emitEvent({ data: this.listPrompts(), type: "prompt" });
       this.emitEvent({ data: this.readSessionDetails(), type: "state" });
     }
+  }
+
+  /** Test hook: overrides the env-derived turn stall limits. */
+  turnStallLimitsOverride: TurnStallLimits | null = null;
+  private _lastActivityTouch = 0;
+
+  /**
+   * Start the turn stall guard for one prompt. On a stall it logs and
+   * aborts the turn's controller (which aborts the pi run); runFiberPrompt
+   * fails the prompt. Progress also keeps the session's `updated_at`
+   * fresh (at most every 30s), so the opt-in session watchdog measures
+   * time since the last progress, not time since the prompt was sent.
+   */
+  private startTurnStallGuard(promptId: string, controller: AbortController): TurnStallGuard {
+    const limits = this.turnStallLimitsOverride ?? turnStallLimitsFromEnv(this.env);
+    return createTurnStallGuard({
+      limits,
+      signal: controller.signal,
+      onProgress: () => {
+        const now = Date.now();
+        if (now - this._lastActivityTouch < 30_000) return;
+        this._lastActivityTouch = now;
+        this.control.touchUpdated();
+      },
+      onStall: (err) => {
+        log("error", "turn stalled, failing the prompt", {
+          sessionId: this.sessionId(),
+          promptId,
+          phase: err.info.phase,
+          idleSeconds: Math.round(err.info.idleMs / 1000),
+          limitSeconds: Math.round(err.info.limitMs / 1000),
+          openTools: err.info.openTools,
+          events: err.info.events,
+        });
+        controller.abort(err);
+      },
+    });
   }
 
   /**
@@ -3893,6 +4055,24 @@ export class CodingAgent extends CodingAgentBase {
     return state;
   }
 
+  /** A live SDK fiber was started for this prompt (its fiber_id may not be on the prompt row yet). */
+  private hasFiberForPrompt(promptId: string): boolean {
+    const sql = this.ctx.storage.sql;
+    try {
+      if (!sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cf_agents_fibers'").toArray().length) return false;
+      // Only fibers the SDK will still recover; a terminal one will never finish the prompt.
+      return sql.exec(
+        "SELECT 1 FROM cf_agents_fibers WHERE status IN ('pending', 'running', 'interrupted') AND (CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.promptId') END) = ? LIMIT 1",
+        promptId,
+      ).toArray().length > 0;
+    } catch (error) {
+      // Can't tell: leave the prompt alone rather than fail a live one (if the
+      // table stays unreadable, the session stays busy until someone aborts).
+      log("warn", "could not read the fiber table", { sessionId: this.sessionId(), promptId, error: String(error) });
+      return true;
+    }
+  }
+
   /** Read the fiber_id from a prompt row. */
   private readPromptFiberId(promptId: string): string | null {
     const row = (Array.from(this.ctx.storage.sql.exec("SELECT fiber_id FROM prompts WHERE id = ?", promptId))[0] as SqlRow | null);
@@ -3956,6 +4136,10 @@ export class CodingAgent extends CodingAgentBase {
     const existing = this.getConfig();
 
     if (existing) {
+      // A request that arrives mid-run (a prompt queued behind the running
+      // one) must not move the running prompt's model; the next prompt's
+      // readAppConfig applies the change.
+      if (this.control.readStatus() === "running") return;
       // Check if model/gateway/image-model changed — if so, reconfigure
       const imageModelChanged = incomingImageModel !== undefined && incomingImageModel !== existing.replicateImageModel;
       if (existing.model === incomingModel && existing.activeGateway === incomingGateway && !imageModelChanged) {
@@ -4361,11 +4545,14 @@ export class CodingAgent extends CodingAgentBase {
       storage: this.ctx.storage,
       configureModels: (models) => {
         const config = this.piGatewayConfig();
-        setDodoProvider(models, [config.model], config, this.env);
+        setDodoProvider(models, [config.model], config, this.env, {
+          // The UI shows "waiting for model capacity" instead of a silent stall.
+          onBudgetWait: (info) => this.emitEvent({ type: "model_wait", data: { model: config.model, waitMs: Math.round(info.waitMs), used: info.used, limit: info.limit } }),
+        });
       },
       modelRef: () => {
         const config = this.piGatewayConfig();
-        return agentModelRef(config.model, config);
+        return agentModelRef(config.model, config, this.env);
       },
       onLoopVerdict: (verdict) => log("warn", "pi: loop guard", { sessionId: this.sessionId(), ...verdict }),
       systemPrompt: () => this.getSystemPrompt(),
@@ -4626,20 +4813,34 @@ export class CodingAgent extends CodingAgentBase {
    */
   private async runPiChat(
     userContent: string,
-    options: { promptId: string; authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }> },
+    options: { promptId: string; authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string; name?: string }>; stall?: TurnStallGuard },
   ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string; steps: number; toolCalls: string[] }> {
+    const stall = options.stall;
+    // After a stall (or user abort) the turn's caller has moved on; a setup
+    // step that finishes late must not go on to touch per-turn state.
+    const bail = () => {
+      if (options.signal?.aborted) throw options.signal.reason ?? new Error("aborted");
+    };
+    stall?.touch("connect_mcp");
     await this.connectMcpServers();
+    bail();
+    stall?.touch("warm_context");
     await this.warmTurnContext();
-    this._toolAttachments.clear();
-    this._toolCallNames.clear();
+    bail();
+    stall?.touch("build_tools");
     const tools = await buildToolsExtension(this.getTools(), {
       onCall: (name) => this._toolCallNames.add(name),
       extra: this.piNativeTools(),
     });
+    bail();
+    this._toolAttachments.clear();
+    this._toolCallNames.clear();
     const result = await this.piEngine().run({
       promptId: options.promptId,
       tools,
       signal: options.signal,
+      onPhase: stall ? (phase) => stall.touch(phase) : undefined,
+      onEvent: stall ? (event) => stall.event(event as TurnStallEvent) : undefined,
       prepare: async () => {
         const { userMsgId, userMsg } = await this.prepareUserTurn(userContent, options);
         return {
@@ -5076,10 +5277,23 @@ export class CodingAgent extends CodingAgentBase {
     const totalTokenInput = Number(metaTotals?.total_in ?? 0);
     const totalTokenOutput = Number(metaTotals?.total_out ?? 0);
 
-    // Context window info
+    // Context window info. The session config holds the models the current
+    // (or last) prompt runs on. A session override set while a prompt runs
+    // only applies from the next prompt, so it shows once the session is
+    // idle; PUT /model-override refreshes the config when idle, or when the
+    // run ends if a prompt was running (so clearing an override mid-run
+    // shows the owner's model once the session is idle).
     const config = this.getConfig();
-    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
-    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const modelOverride = this.modelOverride.read();
+    const pending = status === "running" ? {} : modelOverride;
+    const modelId = pending.model ?? config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const exploreModel = pending.exploreModel ?? config?.exploreModel;
+    const taskModel = pending.taskModel ?? config?.taskModel;
+    // The next prompt's main model. Same as modelId when idle; while a prompt
+    // runs it can differ (override set or cleared mid-run). Clients show it
+    // as "next" so they don't have to guess the owner's default.
+    const nextModel = status === "running" ? modelOverride.model ?? this.readMetadata(OWNER_MODEL_KEY) ?? modelId : modelId;
+    const contextWindow = contextWindowFor(modelId);
     const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
     // Use latest assistant turn's input tokens as the best proxy for current context size
     const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
@@ -5099,7 +5313,6 @@ export class CodingAgent extends CodingAgentBase {
     const compactionCount = onPi
       ? parseInt(this.readMetadata("pi_compactions") ?? "0", 10) || 0
       : thinkSid ? this.sessions.compactionCount(thinkSid) : 0;
-    const modelOverride = this.modelOverride.read();
 
     return {
       activePromptId,
@@ -5117,8 +5330,9 @@ export class CodingAgent extends CodingAgentBase {
       totalTokenInput,
       totalTokenOutput,
       updatedAt,
-      ...(config?.exploreModel ? { exploreModel: config.exploreModel } : {}),
-      ...(config?.taskModel ? { taskModel: config.taskModel } : {}),
+      ...(nextModel ? { nextModel } : {}),
+      ...(exploreModel ? { exploreModel } : {}),
+      ...(taskModel ? { taskModel } : {}),
       ...(Object.keys(modelOverride).length > 0 ? { modelOverride } : {}),
     };
   }
@@ -5152,6 +5366,21 @@ export class CodingAgent extends CodingAgentBase {
       createdAt,
       createdAt,
     );
+  }
+
+  /**
+   * The turn body has started: queued -> running. Without this a started
+   * row stays "queued" for the whole turn, so a turn that hangs mid-run
+   * looks exactly like one that never started. Only for the session's
+   * active prompt: a stale fiber (not reachable in the normal start path)
+   * must not mark a second row "running" that finish() would never clear.
+   */
+  private markPromptRunning(promptId: string): void {
+    if (this.control.readActivePromptId() !== promptId) return;
+    const row = Array.from(this.ctx.storage.sql.exec<{ status: string }>("SELECT status FROM prompts WHERE id = ?", promptId))[0];
+    if (row?.status !== "queued") return;
+    this.updatePrompt(promptId, { status: "running" });
+    this.emitEvent({ data: this.listPrompts(), type: "prompt" });
   }
 
   private updatePrompt(
@@ -5559,11 +5788,16 @@ export class CodingAgent extends CodingAgentBase {
       const tools = this.mcp.listTools() as unknown;
       const servers = this.getMcpServers().servers as Record<string, { name?: string; server_url?: string } | undefined>;
       if (!Array.isArray(tools)) return [];
+      // Hide tools from servers whose host an admin turned mcp off for.
+      // The SDK keeps the connection (and its OAuth tokens) so turning mcp
+      // back on restores the tools without a new OAuth dance.
+      const revokedServerIds = await this.revokedOAuthServerIds(servers);
       const result: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; serverId: string; displayName?: string }> = [];
       for (const raw of tools) {
         if (!raw || typeof raw !== "object") continue;
         const t = raw as { name?: unknown; serverId?: unknown; description?: unknown; inputSchema?: unknown };
         if (typeof t.name !== "string" || typeof t.serverId !== "string") continue;
+        if (revokedServerIds.has(t.serverId)) continue;
         const server = servers[t.serverId];
         result.push({
           name: t.name,
@@ -5580,6 +5814,15 @@ export class CodingAgent extends CodingAgentBase {
     }
   }
 
+  /** OAuth hub server ids whose host has mcp turned off in the allowlist. */
+  private async revokedOAuthServerIds(
+    servers: Record<string, { server_url?: string } | undefined>,
+  ): Promise<Set<string>> {
+    const entries = Object.entries(servers).filter(([, s]) => typeof s?.server_url === "string");
+    const flags = await Promise.all(entries.map(([, s]) => isMcpHostRevoked(this.env, s!.server_url!)));
+    return new Set(entries.filter((_, i) => flags[i]).map(([id]) => id));
+  }
+
   /**
    * RPC: invoke an OAuth-connected MCP tool.
    *
@@ -5587,6 +5830,11 @@ export class CodingAgent extends CodingAgentBase {
    * credentials (which live only in the per-user hub DO) are applied.
    */
   async callOAuthTool(serverId: string, toolName: string, args: unknown): Promise<unknown> {
+    // A revoked MCP host gets no calls, step-up or not.
+    const revocationRow = (this.getMcpServers().servers as Record<string, { server_url?: string } | undefined>)[serverId];
+    if (revocationRow?.server_url && (await isMcpHostRevoked(this.env, revocationRow.server_url))) {
+      throw new Error(mcpHostRevokedMessage(revocationRow.server_url));
+    }
     type StepUpProvider = {
       authUrl?: string;
       clientId?: string;
@@ -5836,12 +6084,40 @@ export class CodingAgent extends CodingAgentBase {
       // federated through the per-user hub DO and never connected from
       // session DOs directly. `refresh_token` is connected here with a
       // bearer header sourced from UserControl, which owns the refresh.
-      const enabled = configs.filter((c) => {
+      const candidates = configs.filter((c) => {
         if (!c.enabled || c.type !== "http" || !c.url) return false;
         if (c.auth_type === "oauth") return false;
         if (c.id === "browser-rendering" && !browserEnabled) return false;
         return true;
       });
+
+      // An admin's explicit `mcp: off` on a host revokes configs that point
+      // at it, not just new adds/edits (src/mcp-host-scope.ts). Checked on
+      // every call (cached 30s per isolate; a failed lookup reuses the last
+      // answer, see src/mcp-host-scope.ts) and kept out of the fingerprint
+      // below, so a revocation rebuilds the gatekeepers instead of waiting
+      // for the 5-minute TTL.
+      const revokedFlags = await Promise.all(candidates.map((c) => isMcpHostRevoked(this.env, c.url!)));
+      const revoked = candidates.filter((_, i) => revokedFlags[i]);
+      const enabled = candidates.filter((_, i) => !revokedFlags[i]);
+      const recordRevoked = () => {
+        for (const c of revoked) {
+          this.mcpStatus.set(c.id, {
+            name: c.name,
+            url: c.url,
+            ok: false,
+            error: mcpHostRevokedMessage(c.url!),
+            lastCheckedAt: Date.now(),
+          });
+        }
+      };
+      if (revoked.length > 0) {
+        log("info", "mcp configs skipped: host has mcp off", {
+          sessionId,
+          mcpIds: revoked.map((c) => c.id),
+        });
+      }
+
       if (enabled.length === 0) {
         // Edge: previously connected, now everything is disabled. Drop the
         // old gatekeepers — leaving stale `mcpGatekeepers` would surface
@@ -5851,10 +6127,15 @@ export class CodingAgent extends CodingAgentBase {
             try { gk.disconnect(); } catch { /* best effort */ }
           }
           this.mcpGatekeepers = [];
-          this.mcpStatus.clear();
         }
+        this.mcpStatus.clear();
+        recordRevoked();
         this.mcpConnectedAt = 0;
         this.mcpEnabledConfigsFingerprint = "";
+        // OAuth tools live on the hub and don't depend on HTTP configs: a
+        // user with only OAuth servers (or every HTTP config revoked) still
+        // gets them.
+        await this.loadOAuthToolsFromHub(ownerEmail);
         return;
       }
 
@@ -5882,6 +6163,12 @@ export class CodingAgent extends CodingAgentBase {
           CodingAgent.MCP_REFRESH_TTL_MS,
         )
       ) {
+        // Drop status rows for configs that were removed or disabled since
+        // the last rebuild (e.g. a revoked config the user then deleted).
+        const candidateIds = new Set(candidates.map((c) => c.id));
+        for (const id of this.mcpStatus.keys()) {
+          if (!candidateIds.has(id)) this.mcpStatus.delete(id);
+        }
         await this.loadOAuthToolsFromHub(ownerEmail);
         return;
       }
@@ -5893,6 +6180,7 @@ export class CodingAgent extends CodingAgentBase {
       }
       this.mcpGatekeepers = [];
       this.mcpStatus.clear();
+      recordRevoked();
 
       // Helper: ask UserControl for a current access token. UserControl
       // refreshes if expired (serialised by per-user DO single-threading).
@@ -6061,42 +6349,60 @@ export class CodingAgent extends CodingAgentBase {
     }
   }
 
-  private async readAppConfig(): Promise<AppConfig> {
+  /**
+   * Rebuild the session config from the owner's live config plus the session
+   * model override. `promptStart` is for the calls that begin a run. Any
+   * other call while a prompt runs (facet spawn, git commit/pull, eviction
+   * recovery) keeps the running prompt's models and gateway in the session
+   * config, so the details and the answer's model attribution stay on what
+   * the prompt runs on. A mid-run override applies from the next prompt, and
+   * to the details once the run ends (CONFIG_REFRESH_PENDING). Facets spawned
+   * mid-run still get it: facetParentConfig layers the override on top.
+   */
+  private async readAppConfig(opts: { promptStart?: boolean } = {}): Promise<AppConfig> {
     const ownerEmail = this.readMetadata("owner_email");
     if (!ownerEmail) {
       throw new Error("Session has no owner_email. Run migration (POST /api/admin/migrate) to fix legacy sessions.");
     }
     const stub = getUserControlStub(this.env, ownerEmail);
     const response = await stub.fetch("https://user-control/config");
+    if (!response.ok) throw new Error(`UserControl /config returned ${response.status}`);
     const appConfig = (await response.json()) as AppConfig;
 
     const existing = this.getConfig();
     const override = this.modelOverride.read();
+    const keepRunning = !opts.promptStart && existing !== null && this.control.readStatus() === "running";
     const dodoConfig: DodoConfig = {
       sessionId: this.sessionId(),
       ownerEmail,
       createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
       browserEnabled: this.browserEnabled(),
-      activeGateway: existing?.activeGateway ?? appConfig.activeGateway,
+      // Model and gateway both from the owner's live config, so they stay a
+      // routable pair. Not existing.model: that can be an override the owner
+      // has since cleared. Every route sends the owner's config as x-dodo-*
+      // headers anyway, so for a prompt that came through a route they agree.
+      activeGateway: keepRunning ? existing.activeGateway : appConfig.activeGateway ?? existing?.activeGateway,
       gitAuthorEmail: appConfig.gitAuthorEmail,
       gitAuthorName: appConfig.gitAuthorName,
-      model: override.model ?? existing?.model ?? appConfig.model,
-      opencodeBaseURL: existing?.opencodeBaseURL ?? appConfig.opencodeBaseURL,
-      aiGatewayBaseURL: existing?.aiGatewayBaseURL ?? appConfig.aiGatewayBaseURL,
+      model: keepRunning ? existing.model : override.model ?? appConfig.model,
+      opencodeBaseURL: appConfig.opencodeBaseURL ?? existing?.opencodeBaseURL,
+      aiGatewayBaseURL: appConfig.aiGatewayBaseURL ?? existing?.aiGatewayBaseURL,
+      replicateImageModel: appConfig.replicateImageModel ?? existing?.replicateImageModel,
       // Always pull the latest prefix from UserControl so config changes
       // take effect on the next prompt without requiring a session restart.
       systemPromptPrefix: appConfig.systemPromptPrefix,
       // Same for subagent models — changes at the user level propagate to
       // the next prompt without needing a session recreate. A session
       // override wins.
-      exploreModel: override.exploreModel ?? appConfig.exploreModel,
-      taskModel: override.taskModel ?? appConfig.taskModel,
+      exploreModel: keepRunning ? existing.exploreModel : override.exploreModel ?? appConfig.exploreModel,
+      taskModel: keepRunning ? existing.taskModel : override.taskModel ?? appConfig.taskModel,
       // Dispatch-mode flags propagate via DodoConfig so getTools() sees
       // the latest value on the next prompt without a session restart.
       exploreMode: appConfig.exploreMode ?? "inprocess",
       taskMode: appConfig.taskMode ?? "inprocess",
     };
     this.configure(dodoConfig);
+    if (appConfig.model) this.writeMetadata(OWNER_MODEL_KEY, appConfig.model);
 
     return appConfig;
   }
@@ -6116,6 +6422,65 @@ export class CodingAgent extends CodingAgentBase {
     }
     this.modelOverride.apply(patch);
     return null;
+  }
+
+  /**
+   * PUT /model-override: set or clear the session model override without
+   * sending a prompt (pi client `/dodo model`). Same rules as the prompt body
+   * fields: owner only, "" clears. Takes effect from the next prompt; a
+   * running prompt keeps its models (facet-mode subagents it starts later
+   * re-read the override).
+   */
+  private async handleModelOverride(request: Request): Promise<Response> {
+    const parsed = modelOverrideBodySchema.safeParse(await request.json().catch(() => null));
+    if (!parsed.success) return Response.json({ error: parsed.error.issues[0]?.message ?? "Invalid body" }, { status: 400 });
+    this.ensureMetadata(this.requireSessionId(request), request.headers.get("x-owner-email"));
+    const denied = this.applyModelOverride(parsed.data, request.headers.get("x-author-email"));
+    if (denied) return denied;
+    // Idle: rebuild the session config now, so the details, /debug/compaction
+    // and a goal auto-continue turn all see the new models. A running prompt
+    // keeps its models; the next prompt's readAppConfig applies the override,
+    // and the config is rebuilt when the run ends (refreshConfigAfterRun), so
+    // a cleared override doesn't keep showing while the session sits idle.
+    if (this.control.read().status !== "running") await this.refreshConfigFromOwner();
+    else this.writeMetadata(CONFIG_REFRESH_PENDING, "1");
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    return Response.json({ modelOverride: this.modelOverride.read() });
+  }
+
+  /**
+   * The override changed while a prompt ran: rebuild the config once the
+   * session is idle and push fresh details. If the next prompt already
+   * started, its own readAppConfig did the job.
+   */
+  private async refreshConfigAfterRun(): Promise<void> {
+    // Another run started first (a queued prompt, image generation): keep the
+    // flag, so that run's end applies it. Image generation never calls
+    // readAppConfig, so it doesn't apply the override itself.
+    if (this.control.read().status === "running") return;
+    // Keep the flag if the refresh fails (the next run end retries), or if a
+    // run started during it (the refresh then kept that run's models).
+    if ((await this.refreshConfigFromOwner()) && this.control.read().status !== "running") this.metadataKv.delete(CONFIG_REFRESH_PENDING);
+    if (this.control.read().status === "running") return;
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+  }
+
+  /** The session just went idle (async finish or the sync /message path): apply a config refresh queued by a mid-run PUT /model-override. */
+  private afterRunIdle(): void {
+    if (!this.readMetadata(CONFIG_REFRESH_PENDING)) return;
+    this.ctx.waitUntil(this.refreshConfigAfterRun().catch((error) => log("warn", "config refresh after run failed", { sessionId: this.sessionId(), error: String(error) })));
+  }
+
+  /** readAppConfig for display paths: a UserControl failure must not fail the request. False only when the refresh failed. */
+  private async refreshConfigFromOwner(): Promise<boolean> {
+    if (!this.readMetadata("owner_email")) return true; // no owner yet: nothing to refresh
+    try {
+      await this.readAppConfig();
+      return true;
+    } catch (error) {
+      log("warn", "could not refresh session config from owner", { sessionId: this.sessionId(), error: String(error) });
+      return false;
+    }
   }
 
   /**

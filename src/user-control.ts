@@ -49,7 +49,7 @@ const MAX_DELAY_SECONDS = 90 * 86400;
 const MAX_SCHEDULES_PER_USER = 50;
 
 // ─── Idle-session cleanup constants ───
-/** Sessions with no prompts that have been idle longer than this get soft-deleted. */
+/** Sessions with no prompts or messages that have been idle longer than this get soft-deleted. */
 const IDLE_SESSION_TTL_SECONDS = 600; // 10 minutes
 /** How often the DO alarm re-runs the idle sweep. */
 const IDLE_SWEEP_INTERVAL_SECONDS = 300; // 5 minutes
@@ -484,6 +484,13 @@ export class UserControl extends DurableObject<Env> {
         const row = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM sessions WHERE id = ?", sessionId))[0] as SqlRow | null);
         if (!row) return Response.json({ error: "Session not found" }, { status: 404 });
         return Response.json({ found: true });
+      }
+
+      if (request.method === "POST" && url.pathname.match(/^\/sessions\/[^/]+\/fork-source$/)) {
+        const sessionId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const marked = this.markForkSource(sessionId);
+        if (!marked) return Response.json({ error: `Session '${sessionId}' not found` }, { status: 404 });
+        return Response.json({ marked: true, sessionId });
       }
 
       if (request.method === "DELETE" && url.pathname.match(/^\/sessions\/[^/]+$/) && !url.pathname.includes("/mcp-overrides") && !url.pathname.includes("/soft-delete") && !url.pathname.includes("/restore")) {
@@ -1403,6 +1410,25 @@ export class UserControl extends DurableObject<Env> {
       this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'");
     } catch { /* column already exists */ }
 
+    // fork_source = 1 once anything has forked from this session. Fork
+    // bases (bench harness, hand-built templates) usually have zero
+    // prompts, so without this flag the idle sweep deletes them and the
+    // next fork fails with "Source session not found".
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN fork_source INTEGER NOT NULL DEFAULT 0");
+    } catch { /* column already exists */ }
+
+    // has_prompts = 1 once the session is known to hold a prompt or a
+    // transcript (a fork imports messages but no prompt rows). Set when
+    // the CodingAgent reports status 'running' (user / queue prompts; cron,
+    // watchdog and other syncIndex:false sources don't report it) and, for
+    // everything else including rows that predate the column, by the idle
+    // sweep after it counts prompts and messages. The sweep filters on it in SQL, so prompted sessions stop
+    // taking batch slots and newer empty sessions get reached.
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN has_prompts INTEGER NOT NULL DEFAULT 0");
+    } catch { /* column already exists */ }
+
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS memory_entries (
         id TEXT PRIMARY KEY,
@@ -1795,9 +1821,8 @@ export class UserControl extends DurableObject<Env> {
       opencodeBaseURL: get("opencodeBaseURL") ?? this.env.OPENCODE_BASE_URL,
       systemPromptPrefix: get("systemPromptPrefix"),
       // Fall back to the env defaults, then undefined (heuristic path).
-      // DEFAULT_EXPLORE_MODEL ships as Kimi K2.6 in wrangler.jsonc —
-      // investigate/search work is the subagent's primary use case, and
-      // Kimi is the best-value fit per the 2026-04-24 model comparison.
+      // DEFAULT_EXPLORE_MODEL / DEFAULT_TASK_MODEL ship as DeepSeek V4.1
+      // Flash 1017 in wrangler.jsonc. See the comment there for the bench.
       exploreModel: get("exploreModel") ?? this.env.DEFAULT_EXPLORE_MODEL,
       taskModel: get("taskModel") ?? this.env.DEFAULT_TASK_MODEL,
       // Replicate image model — env default, then the hardcoded nano-banana-2.
@@ -1880,7 +1905,17 @@ export class UserControl extends DurableObject<Env> {
     const nextTitle = patch.title === undefined ? current.title : patch.title;
     const nextStatus = patch.status ?? current.status;
     const now = nowEpoch();
-    this.ctx.storage.sql.exec("UPDATE sessions SET title = ?, status = ?, updated_at = ? WHERE id = ?", nextTitle, nextStatus, now, id);
+    // 'running' means a prompt was dispatched; from then on the session
+    // is never an idle-sweep candidate.
+    const prompted = nextStatus === "running" ? 1 : 0;
+    this.ctx.storage.sql.exec(
+      "UPDATE sessions SET title = ?, status = ?, updated_at = ?, has_prompts = MAX(has_prompts, ?) WHERE id = ?",
+      nextTitle,
+      nextStatus,
+      now,
+      prompted,
+      id,
+    );
     return this.getSession(id);
   }
 
@@ -2957,6 +2992,8 @@ export class UserControl extends DurableObject<Env> {
         err: err instanceof Error ? err.message : String(err),
       });
     }
+    // Arm the periodic wake if the sync failed, so the reconcile retries.
+    await this.rearmAlarm();
     return { token, created_at: now };
   }
 
@@ -3566,6 +3603,22 @@ export class UserControl extends DurableObject<Env> {
     const sessionTitle = sourceInput.title ?? null;
     const sourceSessionId = sourceInput.source === "fork" ? sourceInput.sourceSessionId : null;
 
+    // forkScheduledSession only finds sources in THIS DO, so a source the
+    // user doesn't own (shared, or any session for a platform admin) would
+    // fail every fire with source_session_missing. Reject it up front.
+    if (sourceSessionId !== null) {
+      const sourceRow = Array.from(this.ctx.storage.sql.exec(
+        "SELECT status FROM sessions WHERE id = ?",
+        sourceSessionId,
+      ))[0] as SqlRow | undefined;
+      if (!sourceRow) {
+        throw new Error("Scheduled forks can only use a session you own as the source. Fork the shared session first, then schedule from your copy.");
+      }
+      if (String(sourceRow.status) === "deleted") {
+        throw new Error("Source session is deleted");
+      }
+    }
+
     this.ctx.storage.sql.exec(
       `INSERT INTO scheduled_sessions (
         id, description, prompt, schedule_type,
@@ -3676,10 +3729,21 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Set the DO alarm to fire at the earliest pending work:
    *   - next scheduled-session fire (min next_run_epoch)
-   *   - next idle-session sweep (if any idle sessions exist)
+   *   - next periodic wake (idle-session sweep + MCP token reconcile),
+   *     only while there is an idle session the sweep could delete or an
+   *     MCP token still waiting to sync to SharedIndex
    * Clears the alarm when neither bucket has pending work.
+   *
+   * `fromAlarm` is set by alarm() itself: the alarm that is running now
+   * is spent, so the periodic leg restarts from now. Every other caller
+   * keeps an earlier armed alarm, so frequent calls (one per session
+   * create) can't keep pushing the sweep back.
    */
-  private async rearmAlarm(): Promise<void> {
+  private async rearmAlarm(opts: { fromAlarm?: boolean } = {}): Promise<void> {
+    // Read the armed alarm before the SQL reads so nothing awaits between
+    // computing the candidates and setAlarm (registerSession calls this
+    // fire-and-forget, so two calls can overlap).
+    const armed = opts.fromAlarm ? null : await this.ctx.storage.getAlarm();
     const candidates: number[] = [];
 
     const nextSched = (Array.from(this.ctx.storage.sql.exec(
@@ -3689,13 +3753,22 @@ export class UserControl extends DurableObject<Env> {
       candidates.push(Number(nextSched.t) * 1000);
     }
 
-    // Only keep the idle sweep armed while there are idle sessions to
-    // watch. Empty userbases shouldn't pay for periodic wake-ups.
-    const idle = (Array.from(this.ctx.storage.sql.exec(
-      "SELECT 1 AS has FROM sessions WHERE status = 'idle' LIMIT 1",
+    // Only wake periodically when there is work for the sweep or the
+    // token reconcile. Empty userbases shouldn't pay for wake-ups. The
+    // session filter matches sweepIdleSessions minus the age cutoff:
+    // prompted, seed and fork-source sessions are never deleted.
+    const sweepable = (Array.from(this.ctx.storage.sql.exec(
+      `SELECT 1 AS has FROM sessions
+        WHERE status = 'idle' AND has_prompts = 0 AND kind != 'seed' AND fork_source = 0
+          AND id NOT IN (SELECT source_session_id FROM scheduled_sessions WHERE source_session_id IS NOT NULL)
+        LIMIT 1`,
     ))[0] as SqlRow | null);
-    if (idle?.has != null) {
-      candidates.push(Date.now() + IDLE_SWEEP_INTERVAL_SECONDS * 1000);
+    const unsyncedToken = (Array.from(this.ctx.storage.sql.exec(
+      "SELECT 1 AS has FROM user_mcp_tokens WHERE synced_to_index = 0 LIMIT 1",
+    ))[0] as SqlRow | null);
+    if (sweepable?.has != null || unsyncedToken?.has != null) {
+      const nextWake = Date.now() + IDLE_SWEEP_INTERVAL_SECONDS * 1000;
+      candidates.push(armed !== null ? Math.min(armed, nextWake) : nextWake);
     }
 
     if (candidates.length === 0) {
@@ -3716,8 +3789,8 @@ export class UserControl extends DurableObject<Env> {
   /**
    * Alarm handler. Serves two buckets of work:
    *   1. Scheduled-session fires (overdue rows in scheduled_sessions).
-   *   2. Idle-session sweep — soft-deletes sessions with no prompts that
-   *      have been idle for more than IDLE_SESSION_TTL_SECONDS.
+   *   2. Idle-session sweep — soft-deletes sessions with no prompts or
+   *      transcript messages that have been idle for more than IDLE_SESSION_TTL_SECONDS.
    *
    * The DO input gate serialises alarm() with fetch handlers, so a
    * concurrent DELETE can't interleave between rows. The per-iteration
@@ -3765,13 +3838,26 @@ export class UserControl extends DurableObject<Env> {
     // index side; bounded LIMIT keeps wake-ups cheap.
     await this.reconcileUnsyncedMcpTokens();
 
-    await this.rearmAlarm();
+    await this.rearmAlarm({ fromAlarm: true });
+  }
+
+  /**
+   * Flag a live session as a fork source so the idle sweep keeps it.
+   * One-way: nothing clears the flag. The user can still delete the
+   * session by hand. Returns false if no live session has that id.
+   */
+  private markForkSource(sessionId: string): boolean {
+    const cursor = this.ctx.storage.sql.exec(
+      "UPDATE sessions SET fork_source = 1 WHERE id = ? AND status != 'deleted'",
+      sessionId,
+    );
+    return cursor.rowsWritten > 0;
   }
 
   /**
    * Soft-delete sessions that have been idle for at least
-   * IDLE_SESSION_TTL_SECONDS *and* never received a prompt. The "no
-   * prompts" check requires a per-session cross-DO call to the
+   * IDLE_SESSION_TTL_SECONDS *and* hold no prompts and no transcript
+   * messages (a fork has messages but no prompt rows). The "empty" check requires a per-session cross-DO call to the
    * CodingAgent, so we bound the batch size to keep wake-ups cheap.
    *
    * The sweep intentionally skips sessions already in the `deleted`
@@ -3783,50 +3869,70 @@ export class UserControl extends DurableObject<Env> {
     // Seed sessions (admin-owned warm clones) are exempt from idle
     // cleanup — they intentionally have no prompts and exist precisely
     // so they outlive a normal idle window. Cleaning them up would
-    // defeat the cache.
+    // defeat the cache. Fork sources are exempt for the same reason:
+    // anything forked from (fork_source = 1) or named as the source of a
+    // fork schedule is a template, and deleting it breaks later forks.
     const candidates = Array.from(this.ctx.storage.sql.exec(
-      "SELECT id FROM sessions WHERE status = 'idle' AND kind != 'seed' AND updated_at < ? ORDER BY updated_at ASC LIMIT ?",
+      `SELECT id FROM sessions
+        WHERE status = 'idle' AND has_prompts = 0 AND kind != 'seed' AND fork_source = 0 AND updated_at < ?
+          AND id NOT IN (SELECT source_session_id FROM scheduled_sessions WHERE source_session_id IS NOT NULL)
+        ORDER BY updated_at ASC LIMIT ?`,
       cutoff,
       IDLE_SWEEP_BATCH_SIZE,
     ));
 
     for (const row of candidates) {
       const sessionId = String(row.id);
-      let promptCount: number;
+      let contentCount: number;
       try {
-        promptCount = await this.countSessionPrompts(sessionId);
+        contentCount = await this.countSessionContent(sessionId);
       } catch (err) {
         // If the CodingAgent DO is unreachable, leave the session alone —
         // better to retry next sweep than to delete blindly.
-        log("warn", "idle-sweep: failed to count prompts", {
+        log("warn", "idle-sweep: failed to count session content", {
           sessionId,
           err: err instanceof Error ? err.message : String(err),
         });
         continue;
       }
 
-      if (promptCount > 0) continue;
+      if (contentCount > 0) {
+        // Remember it, so this session never takes a batch slot again.
+        // Without this, 25+ old prompted sessions sit at the head of the
+        // ORDER BY updated_at queue and newer empty ones are never reached.
+        this.ctx.storage.sql.exec("UPDATE sessions SET has_prompts = 1 WHERE id = ?", sessionId);
+        continue;
+      }
 
       // Reuse the same soft-delete primitive as the manual DELETE path
       // so the 5-min recovery window behaves identically.
+      // Re-check the exemptions in the UPDATE itself: countSessionContent
+      // awaits a cross-DO call, and the session may have been forked,
+      // prompted or touched in the meantime.
       const deleteExpiry = nowEpoch() + 300;
-      this.ctx.storage.sql.exec(
-        "UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?",
+      const deleted = this.ctx.storage.sql.exec(
+        `UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ?
+          WHERE id = ? AND status = 'idle' AND has_prompts = 0 AND fork_source = 0 AND updated_at < ?
+            AND id NOT IN (SELECT source_session_id FROM scheduled_sessions WHERE source_session_id IS NOT NULL)`,
         deleteExpiry,
         nowEpoch(),
         sessionId,
+        cutoff,
       );
+      if (deleted.rowsWritten === 0) continue;
       this.emitUserEvent({ type: "sessions_changed", reason: "deleted", sessionId });
       log("info", "idle-sweep: soft-deleted empty idle session", { sessionId });
     }
   }
 
   /**
-   * Ask a session's CodingAgent DO how many prompts it holds. Uses the
-   * lightweight /prompts/count endpoint — a GET of /prompts would
-   * serialise the whole list, which can be 100s of rows.
+   * Ask a session's CodingAgent DO how many prompts plus transcript
+   * messages it holds. Uses the lightweight /prompts/count endpoint — a
+   * GET of /prompts would serialise the whole list, which can be 100s of
+   * rows. Messages count because a fork imports the source's transcript
+   * but not its prompt rows.
    */
-  private async countSessionPrompts(sessionId: string): Promise<number> {
+  private async countSessionContent(sessionId: string): Promise<number> {
     const agent = await getAgentByName(this.env.CODING_AGENT as never, sessionId);
     const res = await agent.fetch(
       new Request("https://coding-agent/prompts/count", { method: "GET" }),
@@ -3834,8 +3940,8 @@ export class UserControl extends DurableObject<Env> {
     if (!res.ok) {
       throw new Error(`prompt count fetch failed: ${res.status}`);
     }
-    const body = (await res.json()) as { count?: number };
-    return Number(body.count ?? 0);
+    const body = (await res.json()) as { count?: number; messages?: number };
+    return Number(body.count ?? 0) + Number(body.messages ?? 0);
   }
 
   /**
@@ -3980,11 +4086,19 @@ export class UserControl extends DurableObject<Env> {
     title: string | null,
   ): Promise<string> {
     // Verify the source session exists in THIS DO. Scheduled sessions can
-    // only fork from sessions owned by the same user — the create-time
-    // permission check already ensured the caller had write on the source.
+    // only fork from sessions owned by the same user — createScheduledSession
+    // enforces that at create time, so a miss here means the source row was
+    // purged after the schedule was made (a soft-deleted source is caught by
+    // markForkSource below).
     const sourceRow = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM sessions WHERE id = ?", sourceSessionId))[0] as SqlRow | null);
     if (!sourceRow) {
       throw new SourceSessionMissingError(sourceSessionId);
+    }
+    // Keep the source once the schedule row is gone (one-shot schedules
+    // delete their row on success). Direct SQL: a stub fetch to this DO
+    // from inside it would deadlock.
+    if (!this.markForkSource(sourceSessionId)) {
+      throw new SourceSessionMissingError(sourceSessionId); // soft-deleted
     }
 
     // Snapshot the source agent. Buffer to ArrayBuffer so we can both
