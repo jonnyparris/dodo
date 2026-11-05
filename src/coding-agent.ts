@@ -2889,6 +2889,12 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   private async requestUserInput(input: { kind: InputKind; reason: string; oauthServerId?: string }): Promise<NeedsInput> {
+    // needs_input clears when a prompt starts, so a card already here is
+    // from this turn. Models often follow a step-up card with their own
+    // request_user_input: keep the Approve access card as it is instead
+    // of replacing it with one that has no button.
+    const current = this.readNeedsInput();
+    if (current?.oauthServerId && !input.oauthServerId) return current;
     let liveView = false;
     if (this.browser) {
       try {

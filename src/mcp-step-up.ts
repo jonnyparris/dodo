@@ -260,7 +260,7 @@ export function stepUpToolResult(s: OAuthStepUp, cardShown: boolean): { error: s
     error: `${who} refused this call until the person approves more access (OAuth re-authorization).`,
     requiredScope: s.scope,
     next: cardShown
-      ? "The person has been shown an Approve access button (session marked 'needs input'). End your turn now with one short line asking them to approve and reply done. When they reply, retry this exact call once. If it fails the same way again, stop and say so."
+      ? "The person has been shown an Approve access button (session marked 'needs input'). Don't call request_user_input: the card is already up. End your turn now with one short line asking them to approve and reply done. When they reply, retry this exact call once. If it fails the same way again, stop and say so."
       : `Dodo could not show the person the Approve access button. Tell them ${who} needs them to approve more access before this call can work, then stop. Do not retry this call in this turn.`,
   };
 }

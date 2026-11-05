@@ -135,6 +135,7 @@ describe("helpers", () => {
     const shown = stepUpToolResult(s, true);
     expect(shown.next).toMatch(/End your turn/);
     expect(shown.next).toMatch(/retry this exact call once/);
+    expect(shown.next).toMatch(/Don't call request_user_input/);
     expect(stepUpToolResult(s, false).next).toMatch(/could not show the person/);
     // The transcript is visible to read-only share viewers: never the link.
     for (const r of [shown, stepUpToolResult(s, false)]) expect(JSON.stringify(r)).not.toContain("https://");
