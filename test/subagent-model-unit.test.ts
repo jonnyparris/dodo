@@ -14,20 +14,20 @@ const MAIN_OPENAI = "openai/gpt-5.4";
 describe("resolveSubagentModel — precedence", () => {
   it("per-call override wins over session default and heuristic", () => {
     const result = resolveSubagentModel(
-      { model: "@cf/moonshotai/kimi-k2.6" },
+      { model: "@cf/google/gemma-4-26b-a4b-it" },
       "anthropic/claude-haiku-4-5", // session default
       MAIN_ANTHROPIC,
     );
-    expect(result).toBe("@cf/moonshotai/kimi-k2.6");
+    expect(result).toBe("@cf/google/gemma-4-26b-a4b-it");
   });
 
   it("session default wins when no per-call override", () => {
     const result = resolveSubagentModel(
       {},
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/google/gemma-4-26b-a4b-it",
       MAIN_ANTHROPIC,
     );
-    expect(result).toBe("@cf/moonshotai/kimi-k2.6");
+    expect(result).toBe("@cf/google/gemma-4-26b-a4b-it");
   });
 
   it("falls back to heuristic when neither per-call nor session default set", () => {
@@ -51,19 +51,19 @@ describe("resolveSubagentModel — edge cases", () => {
   it("empty string per-call model is treated as 'not set' (session default wins)", () => {
     const result = resolveSubagentModel(
       { model: "" },
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/google/gemma-4-26b-a4b-it",
       MAIN_ANTHROPIC,
     );
-    expect(result).toBe("@cf/moonshotai/kimi-k2.6");
+    expect(result).toBe("@cf/google/gemma-4-26b-a4b-it");
   });
 
   it("whitespace-only per-call model is treated as 'not set'", () => {
     const result = resolveSubagentModel(
       { model: "   " },
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/google/gemma-4-26b-a4b-it",
       MAIN_ANTHROPIC,
     );
-    expect(result).toBe("@cf/moonshotai/kimi-k2.6");
+    expect(result).toBe("@cf/google/gemma-4-26b-a4b-it");
   });
 
   it("empty string session default is treated as 'not set' (falls back to heuristic)", () => {
@@ -74,19 +74,38 @@ describe("resolveSubagentModel — edge cases", () => {
   it("non-string per-call model is ignored", () => {
     const result = resolveSubagentModel(
       { model: 42 as unknown as string },
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/google/gemma-4-26b-a4b-it",
       MAIN_ANTHROPIC,
     );
-    expect(result).toBe("@cf/moonshotai/kimi-k2.6");
+    expect(result).toBe("@cf/google/gemma-4-26b-a4b-it");
   });
 
   it("trims whitespace from per-call override", () => {
     const result = resolveSubagentModel(
-      { model: "  @cf/moonshotai/kimi-k2.6  " },
+      { model: "  @cf/google/gemma-4-26b-a4b-it  " },
       undefined,
       MAIN_ANTHROPIC,
     );
-    expect(result).toBe("@cf/moonshotai/kimi-k2.6");
+    expect(result).toBe("@cf/google/gemma-4-26b-a4b-it");
+  });
+});
+
+describe("resolveSubagentModel — removed Workers AI models", () => {
+  it("remaps a per-call or session-default id removed on 2026-11-15 to its replacement", () => {
+    expect(resolveSubagentModel({ model: "@cf/moonshotai/kimi-k2.6" }, undefined, MAIN_ANTHROPIC)).toBe(
+      "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+    );
+    expect(resolveSubagentModel({}, " @cf/zai-org/glm-5.3-flash ", MAIN_ANTHROPIC)).toBe(
+      "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+    );
+    expect(resolveSubagentModel({}, "@cf/qwen/qwen3-30b-a3b-fp8", MAIN_ANTHROPIC)).toBe(
+      "@cf/google/gemma-4-26b-a4b-it",
+    );
+    // No per-call or session default: the family fallback returns the main
+    // model for @cf/ ids, and that is remapped too.
+    expect(resolveSubagentModel({}, undefined, "@cf/moonshotai/kimi-k2.6")).toBe(
+      "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+    );
   });
 });
 
@@ -99,17 +118,17 @@ describe("resolveSubagentModel — cross-gateway scenarios", () => {
   it("allows @cf/* subagent model even when main model is on opencode gateway", () => {
     const result = resolveSubagentModel(
       {},
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/google/gemma-4-26b-a4b-it",
       MAIN_ANTHROPIC, // opencode gateway model
     );
-    expect(result).toBe("@cf/moonshotai/kimi-k2.6");
+    expect(result).toBe("@cf/google/gemma-4-26b-a4b-it");
   });
 
   it("allows anthropic/ subagent model even when main model is on ai-gateway", () => {
     const result = resolveSubagentModel(
       {},
       "anthropic/claude-haiku-4-5",
-      "@cf/moonshotai/kimi-k2.6", // ai-gateway model
+      "@cf/google/gemma-4-26b-a4b-it", // ai-gateway model
     );
     expect(result).toBe("anthropic/claude-haiku-4-5");
   });

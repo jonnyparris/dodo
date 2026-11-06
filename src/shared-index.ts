@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { resolveAdminEmail } from "./auth";
 import { DEFAULT_REPLICATE_IMAGE_MODEL, FALLBACK_MODELS, WORKERS_AI_MODELS } from "./model-catalog";
+import { isDeprecatedWorkersAiModel } from "./model-deprecations";
 import { type BudgetDecision, type BudgetPriority, ModelBudgetBook } from "./model-budget";
 import { hashShareToken } from "./share";
 import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
@@ -80,6 +81,24 @@ function isRoutableByOpencodeGateway(id: string): boolean {
 interface WorkersAiCatalogModel {
   name?: string;
   properties?: Array<{ property_id?: string; value?: unknown }>;
+}
+
+/**
+ * The model picker list: the gateway's base catalogue, then Workers AI models
+ * it doesn't already have (deduped). Workers AI models removed on 2026-11-15
+ * are dropped from both: the live catalogue and its cache list them until the
+ * date passes.
+ */
+export function pickerModels<M extends { id: string }>(base: M[], workersAi: M[]): M[] {
+  const kept = base.filter((m) => !isDeprecatedWorkersAiModel(m.id));
+  const seen = new Set(kept.map((m) => m.id));
+  const extras: M[] = [];
+  for (const m of workersAi) {
+    if (seen.has(m.id) || isDeprecatedWorkersAiModel(m.id)) continue;
+    seen.add(m.id);
+    extras.push(m);
+  }
+  return [...kept, ...extras];
 }
 
 /**
@@ -361,19 +380,11 @@ export class SharedIndex extends DurableObject<Env> {
         const filteredBase = gateway === "opencode"
           ? models.filter((m) => isRoutableByOpencodeGateway(m.id))
           : models;
-        const ids = new Set(filteredBase.map((m) => m.id));
         // Append the live Workers AI catalogue (falls back to the hardcoded
         // WORKERS_AI_MODELS when the API is unavailable). Union the hardcoded
         // list in too so curated favourites survive any catalogue naming drift.
         const liveWorkersAi = await this.getWorkersAiModels();
-        const seen = new Set<string>();
-        const extras: Array<{ id: string; name: string; costInput: number | null; costOutput: number | null; contextWindow: number | null }> = [];
-        for (const m of [...liveWorkersAi, ...WORKERS_AI_MODELS]) {
-          if (ids.has(m.id) || seen.has(m.id)) continue;
-          seen.add(m.id);
-          extras.push(m);
-        }
-        return Response.json({ models: [...filteredBase, ...extras] });
+        return Response.json({ models: pickerModels(filteredBase, [...liveWorkersAi, ...WORKERS_AI_MODELS]) });
       }
 
       // Replicate image-model catalogue for the "Image model" picker.

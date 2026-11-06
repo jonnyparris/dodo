@@ -214,7 +214,7 @@ describe("pi adapters", () => {
     expect(dodoModel("google/gemini-2.5-pro", config, {} as never).cost.tiers?.[0]?.inputTokensAbove).toBe(200_000);
     expect(modelCost("deepseek/deepseek-flash")).toMatchObject({ input: 0.3, output: 1.2, cacheRead: 0.006 });
     // Not in pi-ai's catalog: Dodo's prices, no cache price.
-    expect(modelCost("@cf/zai-org/glm-5.3-flash")).toEqual({ input: 0.15, output: 0.5, cacheRead: 0, cacheWrite: 0 });
+    expect(modelCost("@cf/deepseek-ai/deepseek-v4.1-flash-1017")).toEqual({ input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0 });
     // Callers get a copy, not pi-ai's shared catalog object.
     modelCost("openai/gpt-5.4").input = 999;
     expect(modelCost("openai/gpt-5.4").input).toBe(2.5);
