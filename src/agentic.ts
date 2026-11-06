@@ -28,6 +28,7 @@ import { createExecuteTool } from "./tools/execute-tool";
 import { createWorkspaceTools } from "./tools/workspace-tools";
 import { createImageCheckTool, type ResolveImage } from "./tools/image-check";
 import { buildSessionTools, type SessionToolHost } from "./tools/session-tools";
+import { isOAuthStepUpMarker, OAUTH_STEP_UP_KEY, stepUpReason, stepUpToolResult } from "./mcp-step-up";
 import { sanitizeToolJsonSchema } from "./tool-schema";
 import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";
@@ -1806,7 +1807,7 @@ export function buildToolsForThink(
   // list is pre-fetched; execute() routes back to the hub via the provided
   // executor so OAuth credentials never leave that DO.
   if (options?.oauthTools?.length && options.oauthToolExec) {
-    const oauthTools = buildOAuthMcpTools(options.oauthTools, options.oauthToolExec, existingNames);
+    const oauthTools = buildOAuthMcpTools(options.oauthTools, options.oauthToolExec, existingNames, options.sessionTools);
     Object.assign(tools, oauthTools);
   }
 
@@ -1891,10 +1892,11 @@ function slugifyToolNamespace(name: string): string {
  * avoid collisions across servers. Capped at 64 chars to satisfy AI SDK
  * naming constraints. Collisions after truncation are logged.
  */
-function buildOAuthMcpTools(
+export function buildOAuthMcpTools(
   oauthTools: OAuthToolInfo[],
   executor: (serverId: string, name: string, args: unknown) => Promise<unknown>,
   existingNames: Set<string>,
+  sessionTools?: Pick<SessionToolHost, "requestUserInput">,
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
@@ -1928,7 +1930,22 @@ function buildOAuthMcpTools(
       inputSchema: jsonSchema(sanitizeToolJsonSchema(info.inputSchema)),
       execute: async (args: unknown) => {
         try {
-          return await executor(info.serverId, info.name, args);
+          const result = await executor(info.serverId, info.name, args);
+          if (!isOAuthStepUpMarker(result)) return result;
+          // The server needs the person to approve more access. Raise the
+          // needs-input card (server id only, never the link: see
+          // stepUpToolResult), then tell the model to stop and retry once.
+          const stepUp = result[OAUTH_STEP_UP_KEY];
+          let cardShown = false;
+          if (sessionTools) {
+            try {
+              await sessionTools.requestUserInput({ kind: "login", reason: stepUpReason(stepUp), oauthServerId: stepUp.serverId });
+              cardShown = true;
+            } catch (err) {
+              log("warn", "oauth-mcp step-up card failed", { serverId: info.serverId, err: err instanceof Error ? err.message : String(err) });
+            }
+          }
+          return stepUpToolResult(stepUp, cardShown);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return { error: `OAuth MCP tool call failed: ${msg}` };

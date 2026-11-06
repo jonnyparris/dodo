@@ -294,6 +294,8 @@ describe("OAuth hub", () => {
             { name: "b", serverId: "s_off", inputSchema: {} },
           ],
           callTool,
+          // callOAuthTool reads the connection for OAuth step-up (src/mcp-step-up.ts).
+          mcpConnections: {},
         },
       });
 

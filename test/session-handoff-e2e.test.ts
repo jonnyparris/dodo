@@ -121,6 +121,31 @@ describe("request_user_input", () => {
     const after = await json<{ needsInput: unknown }>(await call(`/session/${id}/prompts`));
     expect(after.needsInput).toBeNull();
   });
+
+  it("keeps the step-up card's Approve access server when the model asks again in the same turn", async () => {
+    const id = await newSession();
+    await send(`/session/${id}/message`, { content: "hello" });
+    const stub = await stubFor(id);
+    await inDO(stub, async (instance) => {
+      const host = instance.sessionToolHost();
+      // The OAuth tool wrapper raises the card (src/agentic.ts buildOAuthMcpTools)...
+      await host.requestUserInput({ kind: "login", reason: "Approve more access", oauthServerId: "srv" });
+      // ...then the model calls request_user_input itself.
+      await exec(buildSessionTools(host), "request_user_input")({ kind: "confirm", reason: "Click Approve access, then reply done" });
+    });
+    const { needsInput } = await json<{ needsInput: { kind: string; reason: string; oauthServerId?: string } | null }>(await call(`/session/${id}/prompts`));
+    expect(needsInput).toMatchObject({ kind: "login", reason: "Approve more access", oauthServerId: "srv" });
+
+    // The next prompt clears it, so the following turn's cards stand alone.
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "done" }));
+    await waitForPrompt(id, promptId);
+    await inDO(stub, async (instance) =>
+      exec(buildSessionTools(instance.sessionToolHost()), "request_user_input")({ kind: "captcha", reason: "Solve the CAPTCHA" }),
+    );
+    const later = await json<{ needsInput: { kind: string; oauthServerId?: string } | null }>(await call(`/session/${id}/prompts`));
+    expect(later.needsInput).toMatchObject({ kind: "captcha" });
+    expect(later.needsInput?.oauthServerId).toBeUndefined();
+  });
 });
 
 describe("completion webhook", () => {
