@@ -1896,7 +1896,7 @@ export function buildOAuthMcpTools(
   oauthTools: OAuthToolInfo[],
   executor: (serverId: string, name: string, args: unknown) => Promise<unknown>,
   existingNames: Set<string>,
-  sessionTools?: Pick<SessionToolHost, "requestUserInput">,
+  sessionTools?: Pick<SessionToolHost, "requestUserInput" | "resolveOAuthStepUp">,
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
@@ -1931,7 +1931,16 @@ export function buildOAuthMcpTools(
       execute: async (args: unknown) => {
         try {
           const result = await executor(info.serverId, info.name, args);
-          if (!isOAuthStepUpMarker(result)) return result;
+          if (!isOAuthStepUpMarker(result)) {
+            // Any success: the host drops this server's step-up from the
+            // card if the hub no longer has one waiting (no-op otherwise).
+            try {
+              await sessionTools?.resolveOAuthStepUp?.(info.serverId);
+            } catch (err) {
+              log("warn", "oauth-mcp step-up card clear failed", { serverId: info.serverId, err: err instanceof Error ? err.message : String(err) });
+            }
+            return result;
+          }
           // The server needs the person to approve more access. Raise the
           // needs-input card (server id only, never the link: see
           // stepUpToolResult), then tell the model to stop and retry once.

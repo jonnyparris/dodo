@@ -15,6 +15,7 @@ import {
   stepUpToolResult,
   stripStepUpMarker,
 } from "../src/mcp-step-up";
+import { addOAuthStepUp, oauthEntriesOf, removeOAuthStepUp, type NeedsInput } from "../src/tools/session-tools";
 
 const AUTH_URL = "https://mcp.example.com/authorize?client_id=c1&state=n2.srv&scope=user%3Aread+account%3Aread+workers_scripts%3Awrite";
 
@@ -172,6 +173,24 @@ describe("buildOAuthMcpTools step-up handling", () => {
     expect(await run(tools["cloudflare-api__execute"], {})).toBe(result);
     expect(requestUserInput).not.toHaveBeenCalled();
   });
+
+  it("a successful call asks the host to clear its server's step-up; a step-up does not", async () => {
+    const resolveOAuthStepUp = vi.fn(async () => {});
+    const requestUserInput = vi.fn(async (i: { kind: string; reason: string }) => ({ ...i, liveView: false, at: "now" } as never));
+    const ok = buildOAuthMcpTools(info, async () => ({ content: [] }), new Set(), { requestUserInput, resolveOAuthStepUp });
+    await run(ok["cloudflare-api__execute"], {});
+    expect(resolveOAuthStepUp).toHaveBeenCalledWith("srv");
+    resolveOAuthStepUp.mockClear();
+    const up = buildOAuthMcpTools(info, async () => ({ [OAUTH_STEP_UP_KEY]: { serverId: "srv", authUrl: AUTH_URL } }), new Set(), { requestUserInput, resolveOAuthStepUp });
+    await run(up["cloudflare-api__execute"], {});
+    expect(resolveOAuthStepUp).not.toHaveBeenCalled();
+  });
+
+  it("a throwing card clear still returns the result", async () => {
+    const result = { content: [{ type: "text", text: "ok" }] };
+    const tools = buildOAuthMcpTools(info, async () => result, new Set(), { requestUserInput: vi.fn(), resolveOAuthStepUp: async () => { throw new Error("boom"); } });
+    expect(await run(tools["cloudflare-api__execute"], {})).toBe(result);
+  });
 });
 
 describe("stripStepUpMarker", () => {
@@ -186,5 +205,53 @@ describe("stripStepUpMarker", () => {
     expect(stripStepUpMarker(ok)).toBe(ok);
     expect(stripStepUpMarker(null)).toBeNull();
     expect(stripStepUpMarker("x")).toBe("x");
+  });
+});
+
+describe("step-up card helpers (session-tools)", () => {
+  const AT = "2026-11-06T00:00:00.000Z";
+  const a = { kind: "login" as const, reason: "A needs you.", serverId: "a" };
+  const b = { kind: "login" as const, reason: "B needs you.", serverId: "b" };
+
+  it("first step-up makes a fresh card; the same server again changes nothing", () => {
+    const first = addOAuthStepUp(null, a, AT);
+    expect(first).toMatchObject({ changed: true, fresh: true });
+    expect(first.card).toEqual({ kind: "login", reason: "A needs you.", liveView: false, at: AT, oauthServerId: "a", oauth: [{ serverId: "a", reason: "A needs you." }] });
+    expect(addOAuthStepUp(first.card, a, "later")).toEqual({ card: first.card, changed: false, fresh: false });
+  });
+
+  it("a second server joins the card instead of replacing it", () => {
+    const first = addOAuthStepUp(null, a, AT).card;
+    const r = addOAuthStepUp(first, b, "later");
+    expect(r).toMatchObject({ changed: true, fresh: false });
+    expect(r.card.oauthServerId).toBe("a");
+    expect(r.card.oauth!.map((e) => e.serverId)).toEqual(["a", "b"]);
+    expect(r.card.reason).toBe("A needs you. B needs you.");
+    expect(r.card.at).toBe(AT);
+    expect(first.oauth).toHaveLength(1); // input not mutated
+  });
+
+  it("a step-up replaces a non-OAuth card, counts as fresh, and keeps its Live View", () => {
+    const login: NeedsInput = { kind: "captcha", reason: "Solve it", liveView: true, at: AT };
+    const r = addOAuthStepUp(login, a, "later");
+    expect(r).toMatchObject({ changed: true, fresh: true });
+    expect(r.card).toMatchObject({ kind: "login", liveView: true, oauthServerId: "a", reason: "A needs you." });
+  });
+
+  it("removing a server; the last one clears the card", () => {
+    const card = addOAuthStepUp(addOAuthStepUp(null, a, AT).card, b, AT).card;
+    expect(removeOAuthStepUp(card, "zzz")).toBe(card);
+    const left = removeOAuthStepUp(card, "a")!;
+    expect(left.oauthServerId).toBe("b");
+    expect(left.reason).toBe("B needs you.");
+    expect(removeOAuthStepUp(left, "b")).toBeNull();
+  });
+
+  it("cards saved with only oauthServerId still work", () => {
+    const legacy: NeedsInput = { kind: "login", reason: "Old card", liveView: false, at: AT, oauthServerId: "a" };
+    expect(oauthEntriesOf(legacy)).toEqual([{ serverId: "a", reason: "Old card" }]);
+    expect(addOAuthStepUp(legacy, a, "later").changed).toBe(false);
+    expect(removeOAuthStepUp(legacy, "a")).toBeNull();
+    expect(oauthEntriesOf({ kind: "login", reason: "x", liveView: false, at: AT })).toEqual([]);
   });
 });

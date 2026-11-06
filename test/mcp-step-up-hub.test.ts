@@ -292,6 +292,103 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     expect(parks).toEqual([]);
   });
 
+  const parksOf = (hub: Hub) => runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) =>
+    state.storage.sql.exec("SELECT value FROM metadata WHERE key = 'oauth_step_up_parks'").toArray());
+  const ageParks = (hub: Hub, id: string, authUrl: string) => runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) => {
+    state.storage.sql.exec("UPDATE metadata SET value = ? WHERE key = 'oauth_step_up_parks'", JSON.stringify({ [id]: { at: Date.now() - STEP_UP_PARK_TTL_MS - 1000, authUrl } }));
+  });
+  const inDO = runInDurableObject as unknown as <T>(stub: unknown, fn: (instance: any) => Promise<T>) => Promise<T>;
+  const expire = (hub: Hub, payload: { serverId: string; authUrl: string }) => inDO<void>(hub, async (i) => i.expireStepUpPark(payload));
+
+  it("a park that outlives its link expires without a restart: no stale link is served", async () => {
+    const { hub, id } = await connected();
+    const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    expect(stepUp).toBeTruthy();
+    // Parking schedules the expiry.
+    const scheduled = await inDO<unknown[]>(hub, async (i) =>
+      (i.getSchedules() as Array<{ callback: string; payload: unknown }>).filter((x) => x.callback === "expireStepUpPark").map((x) => x.payload));
+    expect(scheduled).toContainEqual({ serverId: id, authUrl: stepUp.authUrl });
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(true);
+
+    // Too early: nothing changes.
+    await expire(hub, { serverId: id, authUrl: stepUp.authUrl });
+    expect((await hub.getMcpServers()).servers[id].auth_url).toBe(stepUp.authUrl);
+
+    await ageParks(hub, id, stepUp.authUrl);
+    await expire(hub, { serverId: id, authUrl: stepUp.authUrl });
+    const s = (await hub.getMcpServers()).servers[id];
+    expect(s.auth_url ?? null).toBeNull();
+    expect(s.state).toBe("ready");
+    expect(await parksOf(hub)).toEqual([]);
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(false);
+    // Still works on the old grant, and a new step-up raises a fresh link.
+    expect(((await hub.callOAuthTool(id, "forge", {})) as { content?: unknown }).content).toEqual([{ type: "text", text: "hi" }]);
+    const again = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    expect(again?.authUrl).toBeTruthy();
+    expect(again.authUrl).not.toBe(stepUp.authUrl);
+  });
+
+  it("expiry leaves an approved park alone", async () => {
+    const { fake, hub, id, callbackUrl } = await connected();
+    const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    fake.codes.set("code-write", `${BASE} ${WRITE}`);
+    expect((await callback(hub, callbackUrl, stepUp.authUrl, "code-write")).status).toBe(302);
+    await waitForState(hub, id, "ready");
+    // Approved: nothing waits any more, though the park row is still there.
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(false);
+    await ageParks(hub, id, stepUp.authUrl);
+    await expire(hub, { serverId: id, authUrl: stepUp.authUrl });
+    expect((await hub.getMcpServers()).servers[id].state).toBe("ready");
+    expect(await parksOf(hub)).toEqual([]);
+    const retry = (await hub.callOAuthTool(id, "execute", { code: "write" })) as { content?: Array<{ text?: string }> };
+    expect(retry.content?.[0]?.text).toBe("wrote it");
+  });
+
+  const expiries = (hub: Hub) => inDO<unknown[]>(hub, async (i) =>
+    (i.getSchedules() as Array<{ callback: string; payload: unknown }>).filter((x) => x.callback === "expireStepUpPark").map((x) => x.payload));
+
+  it("one expiry per park: a re-park replaces it and a restart doesn't add copies", async () => {
+    const { hub, getHub, id } = await connected();
+    const first = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    // The model's retry before approving: a fresh link replaces the park.
+    const second = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    expect(second.authUrl).not.toBe(first.authUrl);
+    expect(await expiries(hub)).toEqual([{ serverId: id, authUrl: second.authUrl }]);
+    // The first link's expiry, had it fired anyway, leaves the new park alone.
+    await expire(hub, { serverId: id, authUrl: first.authUrl });
+    expect((await hub.getMcpServers()).servers[id].auth_url).toBe(second.authUrl);
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(true);
+    await evictDurableObject(hub as unknown as DurableObjectStub);
+    const woke = await getHub();
+    await waitForTools(woke, id);
+    expect((await woke.getMcpServers()).servers[id].state).toBe("authenticating");
+    expect(await expiries(woke)).toEqual([{ serverId: id, authUrl: second.authUrl }]);
+  });
+
+  it("expiry after a restart puts the server back to the state it was parked from", async () => {
+    const { hub, getHub, id } = await connected();
+    const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    await evictDurableObject(hub as unknown as DurableObjectStub);
+    const woke = await getHub();
+    await waitForTools(woke, id);
+    expect((await woke.getMcpServers()).servers[id].state).toBe("authenticating");
+    await ageParks(woke, id, stepUp.authUrl);
+    await expire(woke, { serverId: id, authUrl: stepUp.authUrl });
+    expect((await woke.getMcpServers()).servers[id]).toMatchObject({ state: "ready", auth_url: null });
+  });
+
+  it("expiry with no recorded park state reconnects the server", async () => {
+    const { hub, id } = await connected();
+    const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    // What a restored connection looks like when nothing re-parked it here.
+    await inDO<void>(hub, async (i) => { i.stepUpParkedFrom.clear(); });
+    await ageParks(hub, id, stepUp.authUrl);
+    await expire(hub, { serverId: id, authUrl: stepUp.authUrl });
+    expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
+    await waitForState(hub, id, "ready");
+    expect(((await hub.callOAuthTool(id, "forge", {})) as { content?: unknown }).content).toEqual([{ type: "text", text: "hi" }]);
+  });
+
   it("two parallel 403s both get the marker and the saved link completes", async () => {
     const { fake, hub, id, callbackUrl } = await connected();
     const [a, b] = await Promise.all([
