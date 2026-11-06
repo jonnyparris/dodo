@@ -35,7 +35,6 @@ describe("createBrowserExecuteTool", () => {
     });
     const shots: unknown[] = [];
     const tool = createBrowserExecuteTool({
-      ctx: {} as DurableObjectState,
       browser: {} as never,
       loader: {} as WorkerLoader,
       onScreenshot: async (callId, image) => void shots.push({ callId, ...image }),
@@ -49,10 +48,18 @@ describe("createBrowserExecuteTool", () => {
     expect(shots).toEqual([{ callId: "call-1", mediaType: "image/jpeg", data: "AAAA" }]);
   });
 
+  it("passes structuredOutput through (the SDK tool declares a schema for it)", async () => {
+    const structured = { status: "completed", executionId: "e2", result: { title: "x" } };
+    fakeRun.mockResolvedValueOnce({ output: [{ type: "text", text: "{}" }], structuredOutput: structured, details: { executionId: "e2", status: "completed" } });
+    const tool = createBrowserExecuteTool({ browser: {} as never, loader: {} as WorkerLoader });
+    const r = await tool.execute({ code: "x" } as never, api, {} as never);
+    expect(r.structuredOutput).toEqual(structured);
+  });
+
   it("passes isError through and survives a failing screenshot upload", async () => {
     fakeRun.mockResolvedValueOnce({ output: [{ type: "image", data: "BB", mimeType: "image/png" }], isError: true });
     const tool = createBrowserExecuteTool({
-      ctx: {} as DurableObjectState, browser: {} as never, loader: {} as WorkerLoader,
+      browser: {} as never, loader: {} as WorkerLoader,
       onScreenshot: async () => { throw new Error("R2 down"); },
     });
     const r = await tool.execute({ code: "x" } as never, api, {} as never);

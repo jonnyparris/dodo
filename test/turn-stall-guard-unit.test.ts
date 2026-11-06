@@ -19,6 +19,8 @@ const never = <T>() => new Promise<T>(() => {});
 const stallOf = (guard: TurnStallGuard): Promise<TurnStallError> =>
   guard.run(never<never>()).catch((e: unknown) => e as TurnStallError);
 
+const live = (label: string, openTools: Array<{ callId: string; name: string }> = []) => ({ label, openTools, compacting: false });
+
 describe("turn stall guard", () => {
   it("fails a step that never settles and names it", async () => {
     let stalled: TurnStallError | null = null;
@@ -37,7 +39,7 @@ describe("turn stall guard", () => {
     const work = (async () => {
       for (let i = 0; i < 8; i++) {
         await sleep(25);
-        guard.event({ type: "message_update" });
+        guard.progress(live("generation"));
       }
       return "done";
     })();
@@ -48,10 +50,10 @@ describe("turn stall guard", () => {
 
   it("gives an open tool call the long limit, then the idle limit again after it ends", async () => {
     const guard = createTurnStallGuard({ limits: { idleMs: 50, longMs: 400 } });
-    guard.event({ type: "tool_execution_start", toolCallId: "c1", toolName: "ci_run" });
+    guard.progress(live("tool:ci_run", [{ callId: "c1", name: "ci_run" }]));
     await sleep(150); // past idle, inside long
     expect(guard.fired).toBeNull();
-    guard.event({ type: "tool_execution_end", toolCallId: "c1", toolName: "ci_run" });
+    guard.progress(live("generation"));
     const err = await stallOf(guard);
     expect(err).toBeInstanceOf(TurnStallError);
     expect(err.info.limitMs).toBe(50);
@@ -60,7 +62,7 @@ describe("turn stall guard", () => {
 
   it("fails a tool call that runs past the long limit and names the tool", async () => {
     const guard = createTurnStallGuard({ limits: { idleMs: 30, longMs: 120 } });
-    guard.event({ type: "tool_execution_start", toolCallId: "c1", toolName: "mcp__x__slow" });
+    guard.progress(live("tool:mcp__x__slow", [{ callId: "c1", name: "mcp__x__slow" }]));
     const started = Date.now();
     const err = await stallOf(guard);
     expect(Date.now() - started).toBeGreaterThanOrEqual(100);
@@ -68,20 +70,20 @@ describe("turn stall guard", () => {
     expect(err.message).toContain("waiting on tool mcp__x__slow");
   });
 
-  it("takes open tool calls from a snapshot (a recovered turn attaching mid-tool)", async () => {
+  it("each snapshot replaces the open tool calls (a recovered turn attaching mid-tool)", async () => {
     const guard = createTurnStallGuard({ limits: { idleMs: 40, longMs: 400 } });
-    guard.event({ type: "snapshot", tools: [{ callId: "c1", name: "ci_run", status: "running" }, { callId: "c0", name: "read", status: "done" }], compactions: [] });
+    guard.progress(live("attach", [{ callId: "c1", name: "ci_run" }]));
     await sleep(120);
     expect(guard.fired).toBeNull();
-    // An overflow snapshot with nothing running replaces the set.
-    guard.event({ type: "snapshot", tools: [], compactions: [] });
+    // A snapshot with nothing open replaces the set.
+    guard.progress(live("generation"));
     const err = await stallOf(guard);
     expect(err.info.limitMs).toBe(40);
   });
 
   it("treats an open compaction like a tool call", async () => {
     const guard = createTurnStallGuard({ limits: { idleMs: 40, longMs: 400 } });
-    guard.event({ type: "compaction_start" });
+    guard.progress({ label: "compaction", openTools: [], compacting: true });
     await sleep(120);
     expect(guard.fired).toBeNull();
     guard.stop();
@@ -115,11 +117,11 @@ describe("turn stall guard", () => {
     expect(await off.run(Promise.resolve(1))).toBe(1);
   });
 
-  it("calls onProgress on every touch and event", () => {
+  it("calls onProgress on every touch and live snapshot", () => {
     let n = 0;
     const guard = createTurnStallGuard({ limits: { idleMs: 1000, longMs: 1000 }, onProgress: () => n++ });
     guard.touch("a");
-    guard.event({ type: "message_start" });
+    guard.progress(live("generation"));
     guard.stop();
     expect(n).toBe(2);
   });

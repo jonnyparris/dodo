@@ -244,8 +244,8 @@ pi-durable writes each model response and each tool call to the session's SQLite
 
 ### Session browser
 
-- **One Chrome per session**, from the Agents SDK `Browser` on Browser Run. It closes after 3 minutes idle and starts again on the next call. `restarted: true` tells the model it lost its tabs.
-- **`cdp.send({ method, params, sessionId: "active" })`** works on the tab the agent last used, across calls.
+- **One Chrome per session**, from the Agents SDK `Browser` on Browser Run. It closes after 3 minutes idle and starts again on the next call. A `notice` in the result tells the model it lost its tabs.
+- **`browser.cdp({ method, params, sessionId: "active" })`** works on the tab the agent last used, across calls. The model's code runs in its own Dynamic Worker.
 - **Screenshots.** When a call returns `{ type: "browser_screenshot", mediaType, data }`, the image goes to R2 and shows in the chat. Vision models see it. Text-only models can ask `image_check` about it.
 - **Live View.** Settings → Browser Tools has **Open live browser** (watch or drive it yourself) and **Close browser**. The API is `GET` / `DELETE /session/:id/browser/live`.
 - Admins get the built-in browser. Other users can connect their own Browser Run credentials (billed to them) once an admin enables it.

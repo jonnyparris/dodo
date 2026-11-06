@@ -20,9 +20,8 @@
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage, ImageContent, TextContent, UserMessage } from "@earendil-works/pi-ai";
-import { createModels, type MutableModels } from "@earendil-works/pi-ai/models";
+import type { Models } from "@earendil-works/pi-ai/models";
 import {
-  type AgentEvent,
   AssistantEntry,
   createRegistry,
   defineExtension,
@@ -30,12 +29,14 @@ import {
   type Extension,
   Harness,
   type HarnessSettings,
+  type Report,
   section,
   type Submission,
-  watchEvents,
+  type SubmissionDraft,
 } from "@earendil-works/pi-durable";
 import { DurableObjectSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { LiveBridge, messageText, type PiTurnProgress } from "./live-bridge";
 import { buildLoopGuardExtension, type LoopVerdict } from "./loop-guard";
 import { DODO_PROVIDER_ID } from "./models";
 
@@ -87,11 +88,12 @@ export interface PiEngineHost {
   /** The DO's storage (`ctx.storage`). */
   storage: DurableObjectStorage;
   /**
-   * Refresh model access on the shared Models collection (e.g. after a
-   * model/gateway change). Called before every run. pi-durable > 1.3.0
-   * accepts a function for `models`; until then we mutate one collection.
+   * Current model access (catalog, credentials, request transforms). pi calls
+   * this at each use (every generation, compaction, hook and tool), so a
+   * model/gateway change applies at the next request without reopening the
+   * Harness. Cheap to call: the host should cache by config.
    */
-  configureModels(models: MutableModels): void;
+  models(): Models;
   /** Current model ref for the conversation. */
   modelRef(): { provider: string; modelId: string };
   /** Current system prompt. Rendered before each model request. */
@@ -112,8 +114,8 @@ export interface PiTurnInput {
   signal?: AbortSignal;
   /** A setup step started (open, configure, prepare, submit). For the turn stall guard. */
   onPhase?: (phase: string) => void;
-  /** Every pi agent event of the turn, before Dodo translates it. For the turn stall guard. */
-  onEvent?: (event: AgentEvent) => void;
+  /** Each change of the conversation's live state while the turn runs (a full snapshot). For the turn stall guard. */
+  onProgress?: (progress: PiTurnProgress) => void;
 }
 
 export interface PiTurnResult {
@@ -130,33 +132,58 @@ export interface PiTurnResult {
   reason?: string;
 }
 
+/** pi-durable's default `settings.restartLimit`. Dodo keeps it. */
+export const PI_RESTART_LIMIT = 5;
+
 const SETTINGS: HarnessSettings = {
   retry: { maxRetries: 3 },
   compaction: { enabled: true },
-  // DO SQLite is local; 250 ms keeps write volume modest while streaming.
-  progress: { partialIntervalMs: 250, outputIntervalMs: 250 },
+  // How often the streamed answer and running tool output are committed.
+  // Since pi 1.5 these commits are deferred: watches (the chat stream) see
+  // each one at once, and storage gets them in batches, with the run's next
+  // step or within persistWithinMs. So the interval sets the chat's update
+  // rate, not the write volume. A crash loses up to persistWithinMs of
+  // streamed text (pi's default, set here so it is visible).
+  progress: { partialIntervalMs: 250, outputIntervalMs: 250, persistWithinMs: 1000 },
   toolExecution: "parallel",
+  // A task the DO is reset under this many times in a row ends: a tool call
+  // with an error result the model sees, a model request by ending the run
+  // without an answer (`restart_limit`; piUnansweredMessage).
+  restartLimit: PI_RESTART_LIMIT,
 };
 
-function textOf(message: AssistantMessage | UserMessage | undefined): string {
-  if (!message) return "";
-  const content = message.content;
-  if (typeof content === "string") return content;
-  return content
-    .filter((c): c is TextContent => c.type === "text")
-    .map((c) => c.text)
-    .join("");
+/**
+ * Entries the turn's conversation watch holds: starts with the newest 24,
+ * trims back to 24 past 64. A recovered tool round with up to 23 results
+ * still has its answer in the first view, so its calls keep their arguments
+ * in the chat (a bigger round's calls show with `{}`). Smaller than pi's
+ * default (50/100), since entries can hold large tool output.
+ */
+const WATCH_WINDOW = { min: 24, max: 64 } as const;
+
+/**
+ * The user-facing error for a turn pi settled without an answer (not
+ * aborted). `reason` is PiTurnResult.reason: the run failure reason, then
+ * `: <detail JSON>` when there is one.
+ */
+export function piUnansweredMessage(reason: string): string {
+  // pi already retried the provider; surface what the provider said.
+  const modelError = /^model_error: "([\s\S]*)"$/.exec(reason)?.[1];
+  if (modelError !== undefined) return modelError;
+  if (/^restart_limit\b/.test(reason)) {
+    return (
+      "This turn was stopped: the session restarted while running it and gave up after too many restarts. " +
+      "A step is probably crashing or overloading the worker. Send the prompt again to retry, or break the work into smaller steps."
+    );
+  }
+  if (/^interrupted\b/.test(reason)) {
+    return "This turn was stopped: the session restarted during the model's answer, and the retries ran out. Send the prompt again to retry.";
+  }
+  return `Turn ended without an answer (${reason})`;
 }
 
-interface BridgeState {
-  steps: number;
-  input: number;
-  output: number;
-  /** Context size of the last assistant step. */
-  context: number;
-  toolCalls: string[];
-  /** Text of the current assistant message already sent as text_delta. */
-  streamed: string;
+function textOf(message: AssistantMessage | UserMessage | undefined): string {
+  return messageText(message);
 }
 
 export class PiEngine {
@@ -165,7 +192,6 @@ export class PiEngine {
   private database: DurableObjectSqliteDatabase | undefined;
   private readonly registry = createRegistry();
   private readonly ctx: Context = BACKGROUND_CONTEXT;
-  private readonly models: MutableModels = createModels();
 
   constructor(private readonly host: PiEngineHost) {
     this.registry.install(
@@ -189,7 +215,6 @@ export class PiEngine {
 
   /** Open (once) and return the Harness. */
   async open(): Promise<Harness> {
-    this.host.configureModels(this.models);
     if (this.harness) return this.harness;
     if (!this.opening) {
       this.opening = (async () => {
@@ -198,11 +223,10 @@ export class PiEngine {
         const harness = await Harness.open(
           storage,
           {
-            models: this.models,
+            models: () => this.host.models(),
             registry: this.registry,
             settings: SETTINGS,
-            onReport: (error) =>
-              this.host.log("warn", "pi-durable report", { error: error instanceof Error ? error.message : String(error) }),
+            onReport: (report) => this.report(report),
           },
           this.ctx,
         );
@@ -211,7 +235,7 @@ export class PiEngine {
             this.harness = undefined;
             this.opening = undefined;
           }
-          if (end.reason === "failed") {
+          if (end.kind === "failed") {
             this.host.log("error", "pi-durable harness failed", { error: String(end.error) });
           }
         });
@@ -223,6 +247,21 @@ export class PiEngine {
       });
     }
     return this.opening;
+  }
+
+  private report(report: Report): void {
+    const error = report.error;
+    const fields: Record<string, unknown> = { kind: report.kind, error: error instanceof Error ? error.message : String(error) };
+    if ("task" in report && report.task) {
+      fields.taskId = String(report.task.id);
+      fields.taskKind = report.task.kind;
+    }
+    if ("extension" in report && report.extension) fields.extension = report.extension;
+    if ("reason" in report) fields.reason = report.reason;
+    if ("restarts" in report) fields.restarts = report.restarts;
+    if (report.kind === "host_error") fields.callback = report.callback;
+    const level = report.kind === "storage_failed" || report.kind === "task_faulted" || report.kind === "task_interrupted" ? "error" : "warn";
+    this.host.log(level, "pi-durable report", fields);
   }
 
   private async root() {
@@ -266,53 +305,69 @@ export class PiEngine {
       submission = await harness.submission(existing.submission_id as never, this.ctx);
       recovered = submission !== undefined;
     }
-    if (!submission) {
-      bail();
-      input.onPhase?.("prepare");
-      const { content, entry } = await input.prepare();
-      bail();
-      input.onPhase?.("submit");
-      submission = await root.submit(
-        { type: "input", content, requestId: input.promptId, entry: { kind: DODO_USER_ENTRY, data: entry } },
-        this.ctx,
-      );
-      await db.run(
-        `INSERT OR REPLACE INTO ${PI_TABLE_PREFIX}dodo_prompts (prompt_id, submission_id) VALUES (?, ?)`,
-        input.promptId,
-        submission.id,
-      );
-    }
-    harness.resume();
-    input.onPhase?.("running");
 
-    const acc: BridgeState = { steps: 0, input: 0, output: 0, context: 0, toolCalls: [], streamed: "" };
-    const stream = await watchEvents(harness, root.id, this.ctx);
-    // A recovered turn can attach with tool calls already running.
-    input.onEvent?.(stream.snapshot);
-    stream.start(async (events) => {
-      for (const event of events) {
-        input.onEvent?.(event);
-        this.bridge(event, acc);
-      }
+    // Attach before submitting (and before resuming a recovered run), so
+    // every entry of this turn arrives after the baseline.
+    const bridge = new LiveBridge({
+      emit: (event) => this.host.emit(event),
+      log: (level, message, fields) => this.host.log(level, message, fields),
+      onProgress: input.onProgress,
+      loadEntries: (min, max) => this.entriesBetween(root, min, max),
+    });
+    // attach() reads the newest answer's tool calls from the first view;
+    // render() pages entries a later trim skipped.
+    const watch = await root.watch(this.ctx, WATCH_WINDOW);
+    let listening: Promise<void> = Promise.resolve();
+    bridge.attach(watch.value);
+    watch.start(async (call) => {
+      if (call.kind !== "value") return;
+      listening = bridge.apply(call.value);
+      await listening;
     });
 
     const onAbort = () => {
       void root.abort(this.ctx).catch(() => {});
     };
-    input.signal?.addEventListener("abort", onAbort, { once: true });
-    // Aborted between submit and here: the listener won't fire for a past abort.
-    if (input.signal?.aborted) onAbort();
     let settled: Awaited<ReturnType<Submission["wait"]>>;
     try {
+      if (!submission) {
+        bail();
+        input.onPhase?.("prepare");
+        const { content, entry } = await input.prepare();
+        bail();
+        input.onPhase?.("submit");
+        submission = await root.submit(
+          { type: "input", content, requestId: input.promptId, entry: { kind: DODO_USER_ENTRY, data: entry } },
+          this.ctx,
+        );
+        await db.run(
+          `INSERT OR REPLACE INTO ${PI_TABLE_PREFIX}dodo_prompts (prompt_id, submission_id) VALUES (?, ?)`,
+          input.promptId,
+          submission.id,
+        );
+      }
+      const turn = submission;
+      harness.resume();
+      input.onPhase?.("running");
+
+      input.signal?.addEventListener("abort", onAbort, { once: true });
+      // Aborted between submit and here: the listener won't fire for a past abort.
+      if (input.signal?.aborted) onAbort();
       const waitCtx = input.signal ? withAbortSignal(input.signal, this.ctx) : this.ctx;
-      settled = await submission.wait(waitCtx).catch(async (err) => {
-        if (input.signal?.aborted) return submission.wait(this.ctx);
+      settled = await turn.wait(waitCtx).catch(async (err) => {
+        if (input.signal?.aborted) return turn.wait(this.ctx);
         throw err;
       });
     } finally {
       input.signal?.removeEventListener("abort", onAbort);
-      await stream.stop().catch(() => {});
+      await watch.stop().catch(() => {});
+      // stop() leaves a listener call that is already running.
+      await listening;
     }
+    // The listener can lag behind the settle, and stop() drops folded views:
+    // read what it didn't show.
+    await bridge.finish();
+    const acc = bridge.totals;
 
     if (settled.status !== "done" || settled.type !== "input") {
       const reason = settled.status === "unanswered" ? settled.reason : settled.status;
@@ -346,74 +401,22 @@ export class PiEngine {
     };
   }
 
-  /** Translate pi agent events into Dodo's SSE protocol. */
-  private bridge(event: AgentEvent, acc: BridgeState): void {
-    const emitText = (text: string) => {
-      // Partials are committed on an interval: text can arrive as deltas,
-      // whole in a block, or only with the final message. Emit each
-      // message's text exactly once, as the not-yet-streamed suffix.
-      if (text.length > acc.streamed.length && text.startsWith(acc.streamed)) {
-        this.host.emit({ type: "text_delta", data: { delta: text.slice(acc.streamed.length) } });
-        acc.streamed = text;
-      }
-    };
-    switch (event.type) {
-      case "message_start":
-        acc.streamed = "";
-        if (event.message.role === "assistant") emitText(textOf(event.message));
-        return;
-      case "message_update":
-        for (const change of event.changes) {
-          if (change.type === "text_delta") emitText(acc.streamed + change.delta);
-          else if (change.type === "message") emitText(textOf(change.message));
-        }
-        return;
-      case "message_end": {
-        if (event.entry.kind !== "pi.assistant") return;
-        acc.steps++;
-        const m = event.entry.model?.[0] as AssistantMessage | undefined;
-        if (m?.stopReason !== "aborted" && m?.stopReason !== "error") emitText(textOf(m));
-        acc.streamed = "";
-        // Total prompt tokens incl. cache reads/writes — what the AI SDK's
-        // inputTokens reported on Think, and what users compare against bills.
-        acc.input += (m?.usage?.input ?? 0) + (m?.usage?.cacheRead ?? 0) + (m?.usage?.cacheWrite ?? 0);
-        acc.output += m?.usage?.output ?? 0;
-        if (m?.usage) acc.context = (m.usage.input ?? 0) + (m.usage.cacheRead ?? 0) + (m.usage.cacheWrite ?? 0);
-        return;
-      }
-      case "tool_execution_start":
-        if (event.parentToolCallId) return;
-        acc.toolCalls.push(event.toolName);
-        this.host.emit({
-          type: "tool_call",
-          data: { toolCallId: event.toolCallId, toolName: event.toolName, input: event.args },
-        });
-        return;
-      case "tool_execution_end": {
-        if (event.parentToolCallId) return;
-        const result = event.entry?.model?.[0] as { content?: Array<TextContent | ImageContent> } | undefined;
-        const output = (result?.content ?? [])
-          .filter((c): c is TextContent => c.type === "text")
-          .map((c) => c.text)
-          .join("");
-        this.host.emit({ type: "tool_result", data: { toolCallId: event.toolCallId, output } });
-        return;
-      }
-      case "auto_retry_start":
-        this.host.log("warn", "pi: provider retry", { attempt: event.attempt, error: event.errorMessage });
-        return;
-      case "compaction_start":
-        this.host.log("info", "pi: compaction start", { reason: event.reason, blocking: event.blocking });
-        return;
-      case "compaction_end":
-        this.host.log(event.error ? "warn" : "info", "pi: compaction end", { reason: event.reason, error: event.error });
-        return;
-      case "task_failed":
-        this.host.log("error", "pi: task failed", { kind: event.kind, message: event.message });
-        return;
-      default:
-        return;
+  /** Transcript entries with `min <= id <= max`, oldest first. */
+  private async entriesBetween(root: Awaited<ReturnType<PiEngine["root"]>>, min: number, max?: number): Promise<EntryRecord[]> {
+    const out: EntryRecord[] = [];
+    let cursor: unknown;
+    for (;;) {
+      const page = await root.entries(
+        { order: "ascending", minEntryId: min as never, ...(max !== undefined ? { maxEntryId: max as never } : {}) },
+        500,
+        cursor as never,
+        this.ctx,
+      );
+      out.push(...page.items);
+      if (!page.next) break;
+      cursor = page.next;
     }
+    return out;
   }
 
   /**
@@ -425,7 +428,7 @@ export class PiEngine {
     if (messages.length === 0) return;
     const harness = await this.open();
     const root = await this.root();
-    const write = async (entry: Parameters<typeof root.submit>[0]) => {
+    const write = async (entry: SubmissionDraft) => {
       const sub = await root.submit(entry, this.ctx);
       harness.resume();
       await sub.wait(this.ctx);

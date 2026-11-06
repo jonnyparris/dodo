@@ -10,7 +10,7 @@ import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-s
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
-import { createProvider } from "@earendil-works/pi-ai/models";
+import { createModels, createProvider } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
 import { PiEngine, type PiEngineHost } from "../src/pi/engine";
 import { buildToolsExtension } from "../src/pi/tools";
@@ -223,7 +223,8 @@ describe("withStreamIdleTimeout + pi-durable retry", () => {
       const { timeouts, onTimeout } = collect();
       const host: PiEngineHost = {
         storage: state.storage,
-        configureModels: (models) =>
+        models: () => {
+          const models = createModels();
           models.setProvider(
             createProvider({
               id: "stall",
@@ -231,7 +232,9 @@ describe("withStreamIdleTimeout + pi-durable retry", () => {
               models: [{ id: "stall-1", name: "stall-1", api: "stall", provider: "stall", baseUrl: "http://x", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 1000 }],
               api: withStreamIdleTimeout(streams, { idleMs: 100, onTimeout }),
             }),
-          ),
+          );
+          return models;
+        },
         modelRef: () => ({ provider: "stall", modelId: "stall-1" }),
         systemPrompt: () => "You are Dodo.",
         emit: () => {},

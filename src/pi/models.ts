@@ -104,17 +104,28 @@ export function modelCost(modelId: string): ModelCost {
   };
 }
 
-// `anthropic/<id>` ids pi-ai's Cloudflare AI Gateway catalog lists. createAI
-// resolves only these by id: the request body must carry Anthropic's own
-// spelling, which it reads from the catalog entry.
-let gatewayAnthropicIds: Set<string> | undefined;
-function inGatewayCatalog(modelId: string): boolean {
-  gatewayAnthropicIds ??= new Set(
+// `anthropic/<id>` ids pi-ai's Cloudflare AI Gateway catalog lists, mapped
+// to the specifier createAI resolves them by. Dodo spells Claude ids as
+// Anthropic does (`anthropic/claude-sonnet-4-6`); since agents 0.29 createAI
+// takes AI Gateway's catalog spelling (`anthropic/claude-sonnet-4.6`) and runs
+// it on `env.AI.run`. The request body still carries Anthropic's own spelling,
+// which createAI reads from the catalog entry.
+let gatewayAnthropicIds: Map<string, string> | undefined;
+function anthropicCatalog(): Map<string, string> {
+  gatewayAnthropicIds ??= new Map(
     Object.values(CLOUDFLARE_AI_GATEWAY_MODELS as Record<string, { id: string; baseUrl: string }>)
       .filter((e) => e.baseUrl.replace(/\/$/, "").endsWith("/anthropic"))
-      .map((e) => `anthropic/${e.id}`),
+      // Same rule as agents' gatewayCatalogId(): a dot between version numbers.
+      .map((e) => [`anthropic/${e.id}`, `anthropic/${e.id.replace(/(\d)-(\d)(?!\d)/g, "$1.$2")}`]),
   );
-  return gatewayAnthropicIds.has(modelId);
+  return gatewayAnthropicIds;
+}
+function inGatewayCatalog(modelId: string): boolean {
+  return anthropicCatalog().has(modelId);
+}
+/** The specifier createAI resolves a catalogued Dodo Anthropic id by (AI Gateway's spelling). */
+export function createAISpecifier(modelId: string): string {
+  return anthropicCatalog().get(modelId) ?? modelId;
 }
 
 /**
@@ -169,11 +180,14 @@ export function dodoModel(modelId: string, config: GatewayConfig, env: Env): Mod
   if (gatewayId && modelId.startsWith("@cf/")) return workersAIModel(modelId, gatewayId, env);
   if (gatewayId) {
     // createAI's catalog model (api anthropic-messages, gateway-shaped
-    // baseUrl, provider `cloudflare`, id = the Dodo id) with Dodo's limits and
-    // prices. Spreading keeps createAI's routing tags.
-    const base = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId })(modelId) as Model<"anthropic-messages">;
+    // baseUrl, provider `cloudflare`) with Dodo's limits and prices. Spreading
+    // keeps createAI's routing tags (catalog id for `env.AI.run`, Anthropic's
+    // id for the body), so `id` can stay the Dodo id that persisted turn refs
+    // (`cloudflare/anthropic/claude-…-4-6`) and the stream lookup use.
+    const base = createAI({ binding: adaptBindingForCreateAI(env.AI), id: gatewayId })(createAISpecifier(modelId)) as Model<"anthropic-messages">;
     return {
       ...base,
+      id: modelId,
       name: modelId,
       reasoning: false,
       input: modelSupportsVision(modelId) ? ["text", "image"] : ["text"],
