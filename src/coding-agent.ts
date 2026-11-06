@@ -45,6 +45,12 @@ const STEP_UP_PARKS_KEY = "oauth_step_up_parks";
 // onStart runs inside the lifecycle's blockConcurrencyWhile (30s limit,
 // shared with the rest of startup): stay well under it.
 export const STEP_UP_RECOVERY_WAIT_MS = 10_000;
+/**
+ * Longest listOAuthTools waits for the hub's in-flight MCP connects (after a
+ * wake or an OAuth callback). A connect that outlasts it isn't waited on
+ * again, so a hung server costs one turn this much, not every turn.
+ */
+export const OAUTH_TOOLS_WAIT_MS = 8_000;
 const COMPLETION_WEBHOOK_KEY = "completion_webhook";
 /** Set when PUT /model-override lands mid-run: rebuild the session config when the run ends. */
 const CONFIG_REFRESH_PENDING = "config_refresh_pending";
@@ -1334,6 +1340,12 @@ export class CodingAgent extends CodingAgentBase {
    * writable only so tests can shorten it (test/mcp-step-up-hub.test.ts).
    */
   static stepUpRecoveryWaitMs = STEP_UP_RECOVERY_WAIT_MS;
+
+  /**
+   * Cap on how long listOAuthTools waits for in-flight MCP connections.
+   * Static and writable only so tests can shorten it.
+   */
+  static oauthToolsWaitMs = OAUTH_TOOLS_WAIT_MS;
 
   /** Hub DO OAuth provider: pins the step-up issuer on code exchange (src/mcp-oauth-provider.ts). */
   override createMcpOAuthProvider(callbackUrl: string): DodoOAuthClientProvider {
@@ -5850,6 +5862,10 @@ export class CodingAgent extends CodingAgentBase {
    */
   async listOAuthTools(): Promise<Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; serverId: string; displayName?: string }>> {
     try {
+      // A woken hub restores its servers in the background: for a few
+      // seconds they sit in connecting/discovering with no tools, and a
+      // turn that read the list then ran with no OAuth MCP tools at all.
+      await this.waitForOAuthConnects();
       const tools = this.mcp.listTools() as unknown;
       const servers = this.getMcpServers().servers as Record<string, { name?: string; server_url?: string } | undefined>;
       if (!Array.isArray(tools)) return [];
@@ -5877,6 +5893,48 @@ export class CodingAgent extends CodingAgentBase {
       log("warn", "listOAuthTools failed", { err: err instanceof Error ? err.message : String(err) });
       return [];
     }
+  }
+
+  /** Connects that already outlasted the listOAuthTools cap: not waited on again. */
+  private stalledOAuthConnects = new WeakSet<Promise<unknown>>();
+  private warnedOAuthConnectsFallback = false;
+
+  /**
+   * Wait (capped) for the hub's in-flight MCP connects. No-op when none.
+   * Reads the SDK's per-server connect promises so a hung connect is waited
+   * on once, while a new connect for the same server (new promise) still is.
+   */
+  private async waitForOAuthConnects(): Promise<void> {
+    const capMs = CodingAgent.oauthToolsWaitMs;
+    if (capMs <= 0) return;
+    const pending = (this.mcp as unknown as { _pendingConnections?: unknown })._pendingConnections;
+    if (!(pending instanceof Map)) {
+      // SDK internals moved: fall back to the public wait, which re-pays the
+      // cap on every call while a connect hangs.
+      if (!this.warnedOAuthConnectsFallback) {
+        this.warnedOAuthConnectsFallback = true;
+        log("warn", "listOAuthTools: agents SDK has no _pendingConnections; using waitForConnections", { capMs });
+      }
+      await this.mcp.waitForConnections({ timeout: capMs });
+      return;
+    }
+    const connects = pending as Map<string, Promise<unknown>>;
+    const fresh = [...connects.entries()].filter(([, p]) => !this.stalledOAuthConnects.has(p));
+    if (fresh.length === 0) return;
+    const timedOut = Symbol("timeout");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      Promise.allSettled(fresh.map(([, p]) => p)),
+      new Promise<typeof timedOut>((r) => { timer = setTimeout(() => r(timedOut), capMs); }),
+    ]).finally(() => clearTimeout(timer));
+    if (outcome !== timedOut) return;
+    // Settled connects leave the map; what's still there with the same
+    // promise outlasted the cap. Later turns skip it (they still get its
+    // tools once it lands); a slow-but-healthy connect costs those turns
+    // the wait, which beats re-paying the cap on every turn while one hangs.
+    const stalled = fresh.filter(([id, p]) => connects.get(id) === p);
+    for (const [, p] of stalled) this.stalledOAuthConnects.add(p);
+    log("warn", "listOAuthTools: mcp connects still pending after cap", { capMs, serverIds: stalled.map(([id]) => id) });
   }
 
   /** OAuth hub server ids whose host has mcp turned off in the allowlist. */

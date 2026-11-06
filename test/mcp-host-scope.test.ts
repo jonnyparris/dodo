@@ -296,6 +296,9 @@ describe("OAuth hub", () => {
           callTool,
           // callOAuthTool reads the connection for OAuth step-up (src/mcp-step-up.ts).
           mcpConnections: {},
+          // listOAuthTools waits for in-flight connects first; none here.
+          _pendingConnections: new Map(),
+          waitForConnections: async () => undefined,
         },
       });
 

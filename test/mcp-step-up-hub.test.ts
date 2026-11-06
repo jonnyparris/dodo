@@ -59,7 +59,7 @@ function fakeServer() {
   /** Origin of each token request, same order as tokenRequests. */
   const tokenOrigins: string[] = [];
   /** Knobs for restart tests: list failures, and a /mcp that never answers. */
-  const knobs = { failToolsList: false, hang: null as Promise<void> | null };
+  const knobs = { failToolsList: false, hang: null as Promise<void> | null, delay: null as Promise<void> | null, held: null as (() => void) | null };
   /** Origin of each dynamic client registration. */
   const registerOrigins: string[] = [];
   const json = (o: unknown, headers: Record<string, string> = {}) =>
@@ -106,6 +106,11 @@ function fakeServer() {
       if (knobs.hang) {
         await knobs.hang;
         return new Response("gone", { status: 503 });
+      }
+      // A slow server: answers normally once released.
+      if (knobs.delay) {
+        knobs.held?.();
+        await knobs.delay;
       }
       const scope = tokens.get((req.headers.get("authorization") ?? "").replace(/^Bearer /, ""));
       if (!scope) return challenge(401, BASE);
@@ -575,6 +580,72 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
       await runInDurableObject(hub as unknown as DurableObjectStub, async (instance: object) => {
         (instance.constructor as unknown as CapClass).stepUpRecoveryWaitMs = before;
       }).catch(() => undefined);
+      release();
+      fake.knobs.hang = null;
+    }
+  });
+
+  type ToolsWaitClass = { oauthToolsWaitMs: number };
+  const setToolsWait = (hub: Hub, ms: number) => runInDurableObject(hub as unknown as DurableObjectStub, async (instance: object) => {
+    const cls = instance.constructor as unknown as ToolsWaitClass;
+    const before = cls.oauthToolsWaitMs;
+    cls.oauthToolsWaitMs = ms;
+    return before;
+  });
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("a session turn right after a hub wake gets the tools of a server still discovering", async () => {
+    const { fake, hub, getHub, id } = await connected();
+    // Hold the reconnect after the restart until listOAuthTools has been
+    // called. Before the fix that call returned [] at once and the turn ran
+    // with no OAuth MCP tools.
+    let release!: () => void;
+    fake.knobs.delay = new Promise<void>((r) => { release = r; });
+    const held = new Promise<void>((r) => { fake.knobs.held = r; });
+    try {
+      await evictDurableObject(hub as unknown as DurableObjectStub);
+      const woke = await getHub();
+      await held;
+      // One call, no polling: that's what a session turn does.
+      let settled = false;
+      const call = woke.listOAuthTools().finally(() => { settled = true; });
+      await sleep(200);
+      expect(settled).toBe(false);
+      release();
+      const tools = await call;
+      expect(tools.filter((t) => t.serverId === id).map((t) => t.name).sort()).toEqual(["execute", "forge"]);
+    } finally {
+      release();
+      fake.knobs.delay = null;
+      fake.knobs.held = null;
+    }
+  });
+
+  it("a hung server delays listOAuthTools once, up to the cap, not every turn", async () => {
+    const { fake, hub, getHub, id } = await connected();
+    let release!: () => void;
+    fake.knobs.hang = new Promise<void>((r) => { release = r; });
+    let woke: Hub = hub;
+    let before: number | undefined;
+    try {
+      await evictDurableObject(hub as unknown as DurableObjectStub);
+      woke = await getHub();
+      // Shortened so the test is quick; the code path is the same.
+      before = await setToolsWait(woke, 300);
+      expect(before).toBe(8_000);
+      const started = Date.now();
+      const tools = await woke.listOAuthTools();
+      const waited = Date.now() - started;
+      expect(waited).toBeGreaterThanOrEqual(250);
+      expect(waited).toBeLessThan(5_000);
+      // Still connecting: no tools for it yet, but the turn isn't blocked.
+      expect(tools.filter((t) => t.serverId === id)).toEqual([]);
+      // The next turn doesn't wait on the same stuck connect again.
+      const again = Date.now();
+      await woke.listOAuthTools();
+      expect(Date.now() - again).toBeLessThan(250);
+    } finally {
+      if (before !== undefined) await setToolsWait(woke, before).catch(() => undefined);
       release();
       fake.knobs.hang = null;
     }
