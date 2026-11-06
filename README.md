@@ -37,7 +37,7 @@
 
 ## Try these prompts
 
-Paste any of these into a new session. Every one was run on a live Dodo with the default Workers AI model (`@cf/zai-org/glm-5.3-flash`) before it went in this list.
+Paste any of these into a new session. Every one was run on a live Dodo with the Workers AI model that was the default at the time (`@cf/zai-org/glm-5.3-flash`) before it went in this list. Workers AI removes GLM-5.3 Flash on 2026-11-15; the default is now `@cf/deepseek-ai/deepseek-v4.1-flash-1017`.
 
 ### A browser that remembers
 
@@ -337,9 +337,9 @@ Dodo doesn't bundle a model. Set the model and gateway in the UI (Settings) or w
 | **AI Gateway** | Var `AI_GATEWAY_BASE_URL`. When the URL is a gateway in the Worker's own account (`CLOUDFLARE_ACCOUNT_ID`), every model goes through the `AI` binding and needs no key: Anthropic through createAI, everything else to `/compat` through the binding's universal endpoint (`COMPAT_VIA_BINDING=0` sends `/compat` over HTTP with `AI_GATEWAY_KEY` instead). Otherwise secret `AI_GATEWAY_KEY` is the auth. Var `WORKERS_AI_VIA_BINDING=1` (opt-in, being A/B tested; needs the own-account gateway above) moves `@cf/…` models from `/compat` to createAI's Workers AI run path. |
 | **OpenCode** | Secret `OPENCODE_GATEWAY_TOKEN`. Models fill in automatically. |
 
-Model ids look like `anthropic/claude-sonnet-4-6` or `@cf/zai-org/glm-5.3-flash`. The picker only offers models the active gateway can route.
+Model ids look like `anthropic/claude-sonnet-4-6` or `@cf/deepseek-ai/deepseek-v4.1-flash-1017`. The picker only offers models the active gateway can route. Workers AI models removed on 2026-11-15 (GLM-5.3 Flash, GLM-5.2, Kimi K2.6/K2.7, DeepSeek V4 0731/0813 and 18 others) are hidden from the picker, and a saved config or session override that names one runs on its replacement instead (`src/model-deprecations.ts`).
 
-**Verified on pi-durable:** GLM 5.3 Flash (the default, with vision), Kimi K2.6 and Gemma on Workers AI. **Known issue:** tool calls on the text-only Workers AI models `gpt-oss-120b` and `qwen2.5-coder-32b` fail with a 400 on `/compat` (they reject array user content and `null` assistant content). With `WORKERS_AI_VIA_BINDING=1`, createAI's request quirks fix this: gpt-oss-120b and Qwen3 30B completed tool turns on preview (2026-10-22).
+**Verified on pi-durable:** DeepSeek V4.1 Flash 1017 (the default, with vision) and Gemma 4 on Workers AI. GLM 5.3 Flash and Kimi K2.6 also worked, before their removal. **Known issue:** tool calls on the text-only Workers AI models `gpt-oss-120b` and `qwen2.5-coder-32b` fail with a 400 on `/compat` (they reject array user content and `null` assistant content). With `WORKERS_AI_VIA_BINDING=1`, createAI's request quirks fix this: gpt-oss-120b and Qwen3 30B completed tool turns on preview (2026-10-22).
 
 </details>
 

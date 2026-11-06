@@ -123,6 +123,40 @@ describe("UserControl DO", () => {
     });
   });
 
+  it("config: model ids Workers AI removed on 2026-11-15 read back as their replacements", async () => {
+    try {
+      const res = await fetchJson("/api/config", {
+        body: JSON.stringify({
+          activeGateway: "ai-gateway",
+          model: "@cf/zai-org/glm-5.3-flash",
+          exploreModel: "@cf/moonshotai/kimi-k2.6",
+          taskModel: "@cf/meta/llama-3.2-1b-instruct",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "PUT",
+      });
+      expect(res.status).toBe(200);
+      const read = (await (await fetchJson("/api/config")).json()) as { model: string; exploreModel: string; taskModel: string };
+      expect(read.model).toBe("@cf/deepseek-ai/deepseek-v4.1-flash-1017");
+      expect(read.exploreModel).toBe("@cf/deepseek-ai/deepseek-v4.1-flash-1017");
+      expect(read.taskModel).toBe("@cf/google/gemma-4-26b-a4b-it");
+
+      // A live model is left as it is.
+      const live = (await (await fetchJson("/api/config", {
+        body: JSON.stringify({ model: "@cf/google/gemma-4-26b-a4b-it" }),
+        headers: { "content-type": "application/json" },
+        method: "PUT",
+      })).json()) as { model: string };
+      expect(live.model).toBe("@cf/google/gemma-4-26b-a4b-it");
+    } finally {
+      await fetchJson("/api/config", {
+        body: JSON.stringify({ activeGateway: "opencode", model: "claude-test", exploreModel: "", taskModel: "" }),
+        headers: { "content-type": "application/json" },
+        method: "PUT",
+      });
+    }
+  });
+
   it("config: passing both activeGateway and model respects the explicit model", async () => {
     const res = await fetchJson("/api/config", {
       body: JSON.stringify({ activeGateway: "ai-gateway", model: "openai/gpt-5.4" }),

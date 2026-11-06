@@ -10,10 +10,12 @@
  *
  * Set via `model` / `exploreModel` / `taskModel` on POST /session/:id/prompt
  * (and MCP `send_prompt`). A value is kept for later prompts in the session.
- * An empty string removes it. Stored as plain `metadata` rows.
+ * An empty string removes it. Stored as plain `metadata` rows. Removed
+ * Workers AI ids are remapped on read (src/model-deprecations.ts).
  */
 
 import { z } from "zod";
+import { remapDeprecatedModel } from "./model-deprecations";
 import type { MetadataKv } from "./session-control-plane";
 
 export const MODEL_OVERRIDE_FIELDS = ["model", "exploreModel", "taskModel"] as const;
@@ -48,7 +50,8 @@ export function createModelOverrideStore(kv: MetadataKv): ModelOverrideStore {
       const out: SessionModelOverride = {};
       for (const field of MODEL_OVERRIDE_FIELDS) {
         const value = kv.read(KEYS[field]);
-        if (value) out[field] = value;
+        // Remapped off Workers AI models removed on 2026-11-15.
+        if (value) out[field] = remapDeprecatedModel(value);
       }
       return out;
     },

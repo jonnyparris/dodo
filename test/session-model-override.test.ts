@@ -383,6 +383,44 @@ describe("session-model-override helpers", () => {
     expect(store.read()).toEqual({ exploreModel: "@cf/c/d", taskModel: "anthropic/claude-haiku-4-5" });
   });
 
+  it("store reads a removed Workers AI id as its replacement, leaving storage alone", () => {
+    const rows = new Map<string, string>([
+      ["session_model_override", "@cf/zai-org/glm-5.3-flash"],
+      ["session_explore_model_override", "@cf/meta/llama-3.2-3b-instruct"],
+      ["session_task_model_override", "anthropic/claude-haiku-4-5"],
+    ]);
+    const store = createModelOverrideStore({
+      read: (k) => rows.get(k) ?? null,
+      write: (k, v) => void rows.set(k, v),
+      delete: (k) => void rows.delete(k),
+    });
+    expect(store.read()).toEqual({
+      model: "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+      exploreModel: "@cf/google/gemma-4-26b-a4b-it",
+      taskModel: "anthropic/claude-haiku-4-5",
+    });
+    expect(rows.get("session_model_override")).toBe("@cf/zai-org/glm-5.3-flash");
+  });
+
+  it("a persisted session config naming a removed Workers AI model loads as its replacement; the row is unchanged", async () => {
+    const stub = await getAgentByName(typedEnv.CODING_AGENT as never, `deprecated-config-${crypto.randomUUID()}`);
+    const out = await inDO<{ cfg: { model: string; exploreModel?: string; taskModel?: string }; row: string }>(stub, async (agent) => {
+      const sql = agent.ctx.storage.sql;
+      sql.exec("CREATE TABLE IF NOT EXISTS _think_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      sql.exec(
+        "INSERT OR REPLACE INTO _think_config (key, value) VALUES ('config', ?)",
+        JSON.stringify({ model: "@cf/zai-org/glm-5.3-flash", exploreModel: "@cf/qwen/qwen3-30b-a3b-fp8", taskModel: "anthropic/claude-haiku-4-5" }),
+      );
+      const cfg = agent.getConfig();
+      const row = String((Array.from(sql.exec("SELECT value FROM _think_config WHERE key = 'config'"))[0] as { value: string }).value);
+      return { cfg, row };
+    });
+    expect(out.cfg.model).toBe("@cf/deepseek-ai/deepseek-v4.1-flash-1017");
+    expect(out.cfg.exploreModel).toBe("@cf/google/gemma-4-26b-a4b-it");
+    expect(out.cfg.taskModel).toBe("anthropic/claude-haiku-4-5");
+    expect(JSON.parse(out.row).model).toBe("@cf/zai-org/glm-5.3-flash");
+  });
+
   it("modelOverridePatch only picks the fields that were sent", () => {
     expect(modelOverridePatch({ model: undefined, taskModel: "" })).toEqual({ taskModel: "" });
   });
