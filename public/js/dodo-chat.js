@@ -799,20 +799,28 @@ function renderNeedsInput(state){
   $("needs-input-text").textContent=`Dodo needs you: ${state.reason||"see the last message"}`;
   $("needs-input-live").hidden=!state.liveView;
   const auth=$("needs-input-auth");
-  if(auth){const sid=state.oauthServerId||"";auth.hidden=!sid;auth.onclick=sid?()=>openOAuthApproval(sid):null}
+  if(auth){
+    const ids=Array.isArray(state.oauth)?state.oauth.map(e=>e.serverId):state.oauthServerId?[state.oauthServerId]:[];
+    auth.hidden=!ids.length;auth.textContent=ids.length>1?`Approve access (${ids.length})`:"Approve access";
+    auth.onclick=ids.length?()=>openOAuthApproval(ids):null;
+  }
   bar.hidden=false;
 }
-// The needs-input card only carries the hub server id (share viewers can
-// read it). The link comes from GET /api/mcp/oauth-servers, which reads the
+// The needs-input card only carries hub server ids, never links (share
+// viewers can read it). The link comes from GET /api/mcp/oauth-servers, which reads the
 // *caller's* hub, so only the session owner gets one. Open the tab first,
 // synchronously, so the popup blocker allows it, then point it at the link.
-async function openOAuthApproval(serverId){
+// Several servers on one card: open the first that still has a link; the
+// person clicks again for the next.
+async function openOAuthApproval(serverIds){
   const w=window.open("","_blank");
   try{
     const {servers}=await api("/api/mcp/oauth-servers");
-    const s=(servers||[]).find(x=>x.id===serverId);
-    const u=s&&/^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1|\[::1\])[:/])/i.test(s.authUrl||"")?s.authUrl:"";
-    if(!u){w?.close();toast(!s?"Only the session owner can approve this access.":s.state==="ready"?"Nothing to approve: this server is already connected. Reply done.":`This server is ${s.state}. Check it in Settings → Integrations.`,"warning");return}
+    const okUrl=x=>/^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1|\[::1\])[:/])/i.test(x.authUrl||"");
+    const mine=serverIds.map(id=>(servers||[]).find(x=>x.id===id)).filter(Boolean);
+    const s=mine.find(okUrl)||mine.find(x=>x.state!=="ready")||mine[0];
+    const u=s&&okUrl(s)?s.authUrl:"";
+    if(!u){w?.close();toast(!s?"Only the session owner can approve this access.":s.state==="ready"?"No approval link is waiting: already approved, or the link expired. Reply done to retry.":`This server is ${s.state}. Check it in Settings → Integrations.`,"warning");return}
     if(!w){toast("Popup blocked. Allow popups for this site and try again.","error");return}
     w.opener=null;w.location.href=u;
   }catch(e){w?.close();toast(`Could not load the approval link: ${e.message}`,"error")}

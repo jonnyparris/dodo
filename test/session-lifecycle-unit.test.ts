@@ -6,6 +6,7 @@ import {
   type FiberDriver,
   type FiberPromptPayload,
   type PromptRepo,
+  isPersonPrompt,
   type SessionLifecycle,
   SOURCE_POLICIES,
 } from "../src/session-lifecycle";
@@ -67,6 +68,7 @@ function fakePromptRepo(emit: (e: { type: string; data: unknown }) => void) {
 function makeLifecycle(overrides: {
   initialKv?: Record<string, string>;
   uuidSeq?: string[];
+  onPromptStart?: (promptId: string, source: string, author: string | null) => void;
 } = {}) {
   const kv = createInMemoryMetadataKv(overrides.initialKv ?? {});
   const control = createSessionControlPlane(kv);
@@ -97,6 +99,7 @@ function makeLifecycle(overrides: {
       abortController = c;
     },
     readAppConfig: async () => undefined,
+    onPromptStart: overrides.onPromptStart,
     uuid: uuidSeq
       ? () => uuidSeq.shift() ?? `uuid-fallback-${Math.random()}`
       : () => `uuid-${Math.random().toString(36).slice(2, 8)}`,
@@ -180,6 +183,31 @@ describe("SessionLifecycle.start", () => {
     expect(r.kind).toBe("queued");
     expect(h.promptQueue).toHaveLength(1);
     expect(h.spawned).toHaveLength(0);
+  });
+
+  it("onPromptStart gets source and author; a queued one-off cron keeps its cron label", async () => {
+    const starts: Array<[string, string, string | null]> = [];
+    const h = makeLifecycle({ uuidSeq: ["p-1", "p-2", "p-3"], onPromptStart: (id, source, author) => starts.push([id, source, author]) });
+    await h.lifecycle.start({ source: "user", content: "first", authorEmail: "u@x" });
+    await h.lifecycle.start({ source: "cron", content: "one-off", onBusy: "queue" });
+    await h.lifecycle.start({ source: "user", content: "second", authorEmail: "u@x" });
+    expect(h.promptQueue.map((q) => q.authorEmail)).toEqual(["cron", "u@x"]);
+    await h.lifecycle.finish("p-1", { kind: "completed" });
+    await h.lifecycle.finish("p-2", { kind: "completed" });
+    expect(starts).toEqual([["p-1", "user", "u@x"], ["p-2", "queue", "cron"], ["p-3", "queue", "u@x"]]);
+    expect(starts.map(([, src, a]) => isPersonPrompt(src as never, a))).toEqual([true, false, true]);
+  });
+
+  it("isPersonPrompt: cron, watchdog and goal auto-continue are not a person, also when queued", () => {
+    expect(isPersonPrompt("user", "me@example.com")).toBe(true);
+    expect(isPersonPrompt("user", null)).toBe(true);
+    expect(isPersonPrompt("message", null)).toBe(true);
+    expect(isPersonPrompt("image-gen", null)).toBe(true);
+    expect(isPersonPrompt("queue", "me@example.com")).toBe(true);
+    expect(isPersonPrompt("cron", null)).toBe(false);
+    expect(isPersonPrompt("watchdog", "watchdog")).toBe(false);
+    expect(isPersonPrompt("goal-autocontinue", "goal-autocontinue")).toBe(false);
+    expect(isPersonPrompt("queue", "cron")).toBe(false);
   });
 
   it("cron: skips silently when busy", async () => {

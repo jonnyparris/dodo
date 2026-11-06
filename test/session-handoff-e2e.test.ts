@@ -10,9 +10,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/types";
 import { buildSessionTools, checkScheduleSpec, toScheduleSpec } from "../src/tools/session-tools";
 import { checkCallbackUrl, postCompletionWebhook } from "../src/completion-webhook";
+import { dispatchNotification } from "../src/notify";
 
 vi.mock("../src/agentic", async () => await import("./helpers/agentic-mock"));
 vi.mock("../src/pi/models", async () => await import("./helpers/pi-models-mock"));
+vi.mock("../src/notify", async (importOriginal) => ({ ...(await importOriginal<typeof import("../src/notify")>()), dispatchNotification: vi.fn() }));
 
 import worker from "../src/index";
 
@@ -51,7 +53,10 @@ type Exec = (args: unknown) => Promise<any>;
 const exec = (tools: Record<string, unknown>, name: string): Exec =>
   (args) => (tools[name] as { execute: (a: unknown, o: unknown) => Promise<unknown> }).execute(args, { toolCallId: "t", messages: [] }) as Promise<any>;
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.mocked(dispatchNotification).mockClear();
+});
 
 describe("schedule_prompt / list_schedules / cancel_schedule", () => {
   it("creates a real cron job the UI lists, and cancels it", async () => {
@@ -128,10 +133,15 @@ describe("request_user_input", () => {
     const stub = await stubFor(id);
     await inDO(stub, async (instance) => {
       const host = instance.sessionToolHost();
-      // The OAuth tool wrapper raises the card (src/agentic.ts buildOAuthMcpTools)...
-      await host.requestUserInput({ kind: "login", reason: "Approve more access", oauthServerId: "srv" });
-      // ...then the model calls request_user_input itself.
-      await exec(buildSessionTools(host), "request_user_input")({ kind: "confirm", reason: "Click Approve access, then reply done" });
+      instance.oauthStepUpPendingViaHub = async () => true; // the hub still waits on "srv"
+      try {
+        // The OAuth tool wrapper raises the card (src/agentic.ts buildOAuthMcpTools)...
+        await host.requestUserInput({ kind: "login", reason: "Approve more access", oauthServerId: "srv" });
+        // ...then the model calls request_user_input itself.
+        await exec(buildSessionTools(host), "request_user_input")({ kind: "confirm", reason: "Click Approve access, then reply done" });
+      } finally {
+        delete instance.oauthStepUpPendingViaHub;
+      }
     });
     const { needsInput } = await json<{ needsInput: { kind: string; reason: string; oauthServerId?: string } | null }>(await call(`/session/${id}/prompts`));
     expect(needsInput).toMatchObject({ kind: "login", reason: "Approve more access", oauthServerId: "srv" });
@@ -145,6 +155,105 @@ describe("request_user_input", () => {
     const later = await json<{ needsInput: { kind: string; oauthServerId?: string } | null }>(await call(`/session/${id}/prompts`));
     expect(later.needsInput).toMatchObject({ kind: "captcha" });
     expect(later.needsInput?.oauthServerId).toBeUndefined();
+  });
+
+  type Card = { kind: string; reason: string; oauthServerId?: string; oauth?: Array<{ serverId: string; tools: string[] }> } | null;
+  const card = async (id: string) => (await json<{ needsInput: Card }>(await call(`/session/${id}/prompts`))).needsInput;
+  const needsInputNotes = () => vi.mocked(dispatchNotification).mock.calls.filter(([, , n]) => (n as { kind: string }).kind === "needs-input");
+
+  it("request_user_input after a step-up card says the card was kept, with its reason", async () => {
+    const id = await newSession();
+    await send(`/session/${id}/message`, { content: "hello" });
+    const r = await inDO(await stubFor(id), async (instance) => {
+      const host = instance.sessionToolHost();
+      await host.requestUserInput({ kind: "login", reason: "Approve more access", oauthServerId: "srv" });
+      instance.oauthStepUpPendingViaHub = async () => true; // the hub still waits on "srv"
+      try {
+        return await exec(buildSessionTools(host), "request_user_input")({ kind: "question", reason: "Which account?" });
+      } finally {
+        delete instance.oauthStepUpPendingViaHub;
+      }
+    });
+    expect(r).toMatchObject({ ok: true, kept: true, reason: "Approve more access" });
+    expect(r.next).toMatch(/Approve access card is already up/);
+    expect(r.next).not.toMatch(/end your turn now with your question/i);
+  });
+
+  it("a step-up card the hub no longer waits on doesn't swallow a new question", async () => {
+    const id = await newSession();
+    await send(`/session/${id}/message`, { content: "hello" });
+    const r = await inDO(await stubFor(id), async (instance) => {
+      const host = instance.sessionToolHost();
+      await host.requestUserInput({ kind: "login", reason: "Approve more access", oauthServerId: "srv" });
+      vi.mocked(dispatchNotification).mockClear();
+      // The owner's hub has no link waiting for "srv" (approved or expired).
+      return exec(buildSessionTools(host), "request_user_input")({ kind: "question", reason: "Which account?" });
+    });
+    expect(r).toMatchObject({ ok: true, liveView: false });
+    expect(r.kept).toBeUndefined();
+    expect(await card(id)).toMatchObject({ kind: "question", reason: "Which account?" });
+    expect((await card(id))?.oauthServerId).toBeUndefined();
+    expect(needsInputNotes()).toHaveLength(1);
+  });
+
+  it("parallel and retried step-ups raise one card and one notification; a second server joins it", async () => {
+    const id = await newSession();
+    await send(`/session/${id}/message`, { content: "hello" });
+    vi.mocked(dispatchNotification).mockClear();
+    await inDO(await stubFor(id), async (instance) => {
+      const host = instance.sessionToolHost();
+      const a = { kind: "login", reason: "A needs you.", oauthServerId: "a" } as const;
+      await Promise.all([host.requestUserInput(a), host.requestUserInput(a), host.requestUserInput(a)]);
+      await host.requestUserInput(a); // the model's retry
+      await host.requestUserInput({ kind: "login", reason: "B needs you.", oauthServerId: "b" });
+    });
+    expect(needsInputNotes()).toHaveLength(1);
+    const c = await card(id);
+    expect(c?.oauthServerId).toBe("a");
+    expect(c?.oauth).toEqual([{ serverId: "a", reason: "A needs you." }, { serverId: "b", reason: "B needs you." }]);
+  });
+
+  it("a server leaves the card once the hub has no link waiting for it; the last one clears it", async () => {
+    const id = await newSession();
+    await send(`/session/${id}/message`, { content: "hello" });
+    const stub = await stubFor(id);
+    await inDO(stub, async (instance) => {
+      const host = instance.sessionToolHost();
+      await host.requestUserInput({ kind: "login", reason: "A needs you.", oauthServerId: "a" });
+      await host.requestUserInput({ kind: "login", reason: "B needs you.", oauthServerId: "b" });
+      // A read-only call on the old grant works while "a" still waits.
+      instance.oauthStepUpPendingViaHub = async () => true;
+      try {
+        await host.resolveOAuthStepUp("a");
+      } finally {
+        delete instance.oauthStepUpPendingViaHub; // back to the prototype's real hub call
+      }
+    });
+    expect((await card(id))?.oauth?.map((e) => e.serverId)).toEqual(["a", "b"]);
+    // The real hub (the owner's) has neither server parked: nothing waits.
+    await inDO(stub, async (instance) => instance.sessionToolHost().resolveOAuthStepUp("a"));
+    expect(await card(id)).toMatchObject({ oauthServerId: "b", reason: "B needs you." });
+    await inDO(stub, async (instance) => instance.sessionToolHost().resolveOAuthStepUp("b"));
+    expect(await card(id)).toBeNull();
+  });
+
+  it("a cron prompt keeps the card; the person's reply clears it", async () => {
+    const id = await newSession();
+    await send(`/session/${id}/message`, { content: "hello" });
+    const stub = await stubFor(id);
+    await inDO(stub, async (instance) => {
+      await instance.sessionToolHost().requestUserInput({ kind: "login", reason: "Approve more access", oauthServerId: "srv" });
+      await instance.runCronPrompt({ description: "digest", prompt: "Daily digest" });
+    });
+    const { prompts } = await json<{ prompts: Array<{ id: string; content?: string }> }>(await call(`/session/${id}/prompts`));
+    const cron = prompts.find((p) => p.content === "Daily digest");
+    expect(cron).toBeTruthy();
+    await waitForPrompt(id, cron!.id);
+    expect(await card(id)).toMatchObject({ oauthServerId: "srv" });
+
+    const { promptId } = await json<{ promptId: string }>(await send(`/session/${id}/prompt`, { content: "done" }));
+    await waitForPrompt(id, promptId);
+    expect(await card(id)).toBeNull();
   });
 });
 

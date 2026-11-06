@@ -48,13 +48,78 @@ export interface NeedsInput {
    * browser looks the link up via GET /api/mcp/oauth-servers.
    */
   oauthServerId?: string;
+  /**
+   * Every OAuth server on the card, in the order their step-ups came in
+   * (`oauthServerId` is the first one). An entry goes once the hub says
+   * that server has no step-up waiting (`resolveOAuthStepUp`). Cards saved
+   * before this field: see `oauthEntriesOf`.
+   */
+  oauth?: OAuthCardEntry[];
+}
+
+export interface OAuthCardEntry {
+  serverId: string;
+  reason: string;
 }
 
 export interface SessionToolHost {
   createSchedule(input: { description: string; prompt: string } & ScheduleSpec): Promise<ScheduleRecord>;
   listSchedules(): ScheduleRecord[];
   cancelSchedule(id: string): Promise<boolean>;
+  /** With `oauthServerId`: an OAuth step-up (src/agentic.ts buildOAuthMcpTools). */
   requestUserInput(input: { kind: InputKind; reason: string; oauthServerId?: string }): Promise<NeedsInput>;
+  /**
+   * A call to `serverId` succeeded. If the card has that server and the hub
+   * has no step-up waiting for it any more (approved, or the link expired),
+   * take it off the card. A success alone proves nothing: calls that don't
+   * need the new scope keep working on the old grant.
+   */
+  resolveOAuthStepUp?(serverId: string): Promise<void>;
+}
+
+/** OAuth entries of a card, including cards saved with only `oauthServerId`. */
+export function oauthEntriesOf(card: NeedsInput | null | undefined): OAuthCardEntry[] {
+  if (!card) return [];
+  if (Array.isArray(card.oauth)) return card.oauth;
+  return card.oauthServerId ? [{ serverId: card.oauthServerId, reason: card.reason }] : [];
+}
+
+/**
+ * Add one step-up to the card (pure). Returns `changed: false` for a server
+ * already on it, so parallel or retried calls don't raise the card or send
+ * the notification again. `fresh` = there was no OAuth card before: only
+ * then does the caller notify. A non-OAuth card is replaced, keeping its
+ * `liveView` (the browser is still open).
+ */
+export function addOAuthStepUp(
+  current: NeedsInput | null,
+  input: { kind: InputKind; reason: string; serverId: string },
+  at: string,
+): { card: NeedsInput; changed: boolean; fresh: boolean } {
+  const entries = oauthEntriesOf(current);
+  if (entries.some((e) => e.serverId === input.serverId)) return { card: current!, changed: false, fresh: false };
+  const fresh = entries.length === 0;
+  const next = [...entries, { serverId: input.serverId, reason: input.reason }];
+  const base = fresh || !current
+    ? { kind: input.kind, liveView: current?.liveView ?? false, at }
+    : { kind: current.kind, liveView: current.liveView, at: current.at };
+  return { card: cardWith(base, next), changed: true, fresh };
+}
+
+/**
+ * Take a server off the card (pure). `null` = nothing left: clear the card.
+ * Server not on it → the same object.
+ */
+export function removeOAuthStepUp(current: NeedsInput, serverId: string): NeedsInput | null {
+  const entries = oauthEntriesOf(current);
+  if (!entries.some((e) => e.serverId === serverId)) return current;
+  const left = entries.filter((e) => e.serverId !== serverId);
+  if (left.length === 0) return null;
+  return cardWith({ kind: current.kind, liveView: current.liveView, at: current.at }, left);
+}
+
+function cardWith(base: Pick<NeedsInput, "kind" | "liveView" | "at">, entries: OAuthCardEntry[]): NeedsInput {
+  return { ...base, reason: entries.map((e) => e.reason).join(" "), oauthServerId: entries[0]!.serverId, oauth: entries };
 }
 
 const CRON_RE = /^\s*(\S+\s+){4}\S+\s*$/;
@@ -161,6 +226,18 @@ export function buildSessionTools(host: SessionToolHost) {
       })),
       execute: async ({ kind, reason }) => {
         const state = await host.requestUserInput({ kind, reason });
+        // This tool never passes a server id, so OAuth entries mean an
+        // Approve access card was already up and was kept (it has the button).
+        if (oauthEntriesOf(state).length > 0) {
+          return {
+            ok: true,
+            kept: true,
+            reason: state.reason,
+            next: "An Approve access card is already up for this session and was kept (your request did not replace it): " +
+              `"${state.reason}". End your turn now with one short line asking them to approve and reply done; ` +
+              "if you also have a question, ask it in that same line.",
+          };
+        }
         return {
           ok: true,
           liveView: state.liveView,

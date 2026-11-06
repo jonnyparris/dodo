@@ -33,9 +33,9 @@ import type { Browser } from "agents/browser";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { BROWSER_TOOL_NAME, createBrowserExecuteTool, createSessionBrowser } from "./browser/session-browser";
 import { checkCallbackUrl, postCompletionWebhook } from "./completion-webhook";
-import type { InputKind, NeedsInput, SessionToolHost } from "./tools/session-tools";
+import { addOAuthStepUp, oauthEntriesOf, removeOAuthStepUp, type InputKind, type NeedsInput, type SessionToolHost } from "./tools/session-tools";
 import { DodoOAuthClientProvider } from "./mcp-oauth-provider";
-import { detectOAuthStepUp, OAUTH_STEP_UP_KEY, issuersMatch, parseStepUpParks, planStepUpRecovery, safeOrigin, stripStepUpMarker, type StepUpParks } from "./mcp-step-up";
+import { detectOAuthStepUp, OAUTH_STEP_UP_KEY, issuersMatch, parseStepUpParks, planStepUpRecovery, safeOrigin, STEP_UP_PARK_TTL_MS, stripStepUpMarker, type StepUpParks } from "./mcp-step-up";
 
 /** Metadata keys for the human handoff and completion doorbell. */
 const NEEDS_INPUT_KEY = "needs_input";
@@ -73,6 +73,7 @@ import {
 } from "./session-goal";
 import {
   createSessionLifecycle,
+  isPersonPrompt,
   type SessionLifecycle,
 } from "./session-lifecycle";
 import {
@@ -825,7 +826,12 @@ export class CodingAgent extends CodingAgentBase {
       },
       readAppConfig: () => this.readAppConfig({ promptStart: true }),
       log: (level, message, fields) => log(level, message, fields ?? {}),
-      onPromptStart: () => this.clearNeedsInput(),
+      // Only a person's prompt answers the card. Cron, the watchdog and goal
+      // auto-continue run without them (a queued one-off cron keeps its
+      // "cron" author label), so the card stays up for those.
+      onPromptStart: (_promptId, source, author) => {
+        if (isPersonPrompt(source, author)) this.clearNeedsInput();
+      },
       onPromptFinished: (promptId, cause) => {
         this.ringCompletionWebhook(promptId, cause.kind);
         this.afterRunIdle();
@@ -2869,6 +2875,7 @@ export class CodingAgent extends CodingAgentBase {
       listSchedules: () => this.listCronJobs().map(toRecord),
       cancelSchedule: (id) => this.deleteCronJob(id),
       requestUserInput: (input) => this.requestUserInput(input),
+      resolveOAuthStepUp: (serverId) => this.resolveOAuthStepUp(serverId),
     };
   }
 
@@ -2889,12 +2896,28 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   private async requestUserInput(input: { kind: InputKind; reason: string; oauthServerId?: string }): Promise<NeedsInput> {
-    // needs_input clears when a prompt starts, so a card already here is
-    // from this turn. Models often follow a step-up card with their own
-    // request_user_input: keep the Approve access card as it is instead
-    // of replacing it with one that has no button.
     const current = this.readNeedsInput();
-    if (current?.oauthServerId && !input.oauthServerId) return current;
+    if (input.oauthServerId) {
+      // No await between read and write: parallel step-ups in one turn
+      // can't overwrite each other. One notification per card, not per call.
+      const { card, changed, fresh } = addOAuthStepUp(current, { kind: input.kind, reason: input.reason, serverId: input.oauthServerId }, new Date().toISOString());
+      if (!changed) return card;
+      this.writeMetadata(NEEDS_INPUT_KEY, JSON.stringify(card));
+      this.emitEvent({ type: "needs_input", data: card });
+      if (fresh) this.notifyNeedsInput(card.reason);
+      return card;
+    }
+    // Models often follow a step-up card with their own request_user_input
+    // (and the card can outlive automatic prompts): keep the Approve access
+    // card instead of replacing it with one that has no button. The tool
+    // result tells the model it was kept. Servers the hub no longer waits on
+    // (approved, link expired) go first, so a dead card can't swallow a
+    // new question.
+    if (oauthEntriesOf(current).length > 0) {
+      for (const { serverId } of oauthEntriesOf(current)) await this.resolveOAuthStepUp(serverId);
+      const left = this.readNeedsInput();
+      if (oauthEntriesOf(left).length > 0) return left!;
+    }
     let liveView = false;
     if (this.browser) {
       try {
@@ -2902,22 +2925,58 @@ export class CodingAgent extends CodingAgentBase {
       } catch (err) {
         log("warn", "request_user_input: live view check failed", { sessionId: this.sessionId(), error: err instanceof Error ? err.message : String(err) });
       }
+      // A step-up may have raised its card during that await.
+      const now = this.readNeedsInput();
+      if (oauthEntriesOf(now).length > 0) return now!;
     }
-    const state: NeedsInput = { kind: input.kind, reason: input.reason, liveView, at: new Date().toISOString(), ...(input.oauthServerId ? { oauthServerId: input.oauthServerId } : {}) };
+    const state: NeedsInput = { kind: input.kind, reason: input.reason, liveView, at: new Date().toISOString() };
     this.writeMetadata(NEEDS_INPUT_KEY, JSON.stringify(state));
     this.emitEvent({ type: "needs_input", data: state });
-    dispatchNotification(this.env, this.ctx, {
-      kind: "needs-input",
-      title: `Dodo needs you: ${this.control.read().title ?? this.sessionId()}`,
-      body: input.reason.slice(0, 200),
-      tags: "raising_hand,robot",
-      priority: "high",
-      ownerEmail: this.readMetadata("owner_email") ?? undefined,
-    });
+    this.notifyNeedsInput(input.reason);
     // Keep the browser (and the page the person must act on) alive past
     // Browser Run's idle keep_alive while we wait for them.
     if (liveView) await this.schedule(BROWSER_WARM_INTERVAL_SECONDS, "keepBrowserWarm", { left: BROWSER_WARM_TICKS });
     return state;
+  }
+
+  private notifyNeedsInput(reason: string): void {
+    dispatchNotification(this.env, this.ctx, {
+      kind: "needs-input",
+      title: `Dodo needs you: ${this.control.read().title ?? this.sessionId()}`,
+      body: reason.slice(0, 200),
+      tags: "raising_hand,robot",
+      priority: "high",
+      ownerEmail: this.readMetadata("owner_email") ?? undefined,
+    });
+  }
+
+  /**
+   * A call to an OAuth server on the card worked. If the hub has no step-up
+   * waiting for that server any more (the person approved, maybe before the
+   * model ended its turn, or the link expired), take it off the card so the
+   * button doesn't dead-end in "already connected". Only asks the hub when
+   * the card has that server.
+   */
+  private async resolveOAuthStepUp(serverId: string): Promise<void> {
+    if (!oauthEntriesOf(this.readNeedsInput()).some((e) => e.serverId === serverId)) return;
+    let pending = true;
+    try {
+      pending = await this.oauthStepUpPendingViaHub(serverId);
+    } catch (err) {
+      log("warn", "oauth step-up pending check failed; keeping the card", { serverId, error: err instanceof Error ? err.message : String(err) });
+    }
+    if (pending) return;
+    // Re-read: the card may have changed during the hub call.
+    const current = this.readNeedsInput();
+    if (!current) return;
+    const next = removeOAuthStepUp(current, serverId);
+    if (next === current) return;
+    if (!next) {
+      this.clearNeedsInput();
+      return;
+    }
+    this.writeMetadata(NEEDS_INPUT_KEY, JSON.stringify(next));
+    this.emitEvent({ type: "needs_input", data: next });
   }
 
   /** Schedule callback: one CDP command so Browser Run doesn't reclaim the browser while a person is needed. */
@@ -5914,12 +5973,94 @@ export class CodingAgent extends CodingAgentBase {
       }
       // Put the connection where the SDK's callback route expects it, so the
       // code is exchanged (and new scopes saved) instead of dropped as stale.
+      // A parallel call may have parked it already: keep the first state.
+      if (conn.connectionState !== "authenticating") this.stepUpParkedFrom.set(serverId, conn.connectionState);
       conn.connectionState = "authenticating";
       (this.mcp as unknown as { persistAuthContinuation(id: string, c: unknown): unknown }).persistAuthContinuation(serverId, conn);
-      this.writeStepUpParks({ ...this.readStepUpParks(), [serverId]: { at: Date.now(), authUrl: stepUp.authUrl } });
+      const parkedAt = Date.now();
+      this.writeStepUpParks({ ...this.readStepUpParks(), [serverId]: { at: parkedAt, authUrl: stepUp.authUrl } });
+      await this.scheduleStepUpExpiry(serverId, stepUp.authUrl, parkedAt);
       log("info", "oauth mcp needs re-authorization", { serverId, scope: stepUp.scope ?? null });
       return { [OAUTH_STEP_UP_KEY]: stepUp };
     }
+  }
+
+  /**
+   * State each server had when this instance parked it on a live
+   * connection (`ready`, or `connected` when discovery failed). Expiry puts
+   * it back; a connection restored after a restart has to reconnect instead.
+   */
+  private stepUpParkedFrom = new Map<string, string>();
+
+  /**
+   * Expire the park when its link dies, even if the hub never restarts.
+   * One expiry per server: a re-park with a new link cancels the old one,
+   * and `idempotent` stops restarts from adding copies of the same one.
+   */
+  private async scheduleStepUpExpiry(serverId: string, authUrl: string, parkedAt: number): Promise<void> {
+    const delaySeconds = Math.max(1, Math.ceil((parkedAt + STEP_UP_PARK_TTL_MS - Date.now()) / 1000) + 1);
+    try {
+      await this.schedule(delaySeconds, "expireStepUpPark", { serverId, authUrl }, { idempotent: true });
+    } catch (err) {
+      // Restart recovery still clears it on the next wake.
+      log("warn", "oauth mcp step-up expiry not scheduled", { serverId, error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    // Superseded links' expiries would be no-ops anyway (expireStepUpPark
+    // checks the link); cancelling them just keeps the schedule table short.
+    try {
+      const existing = (await this.listSchedules()) as Array<{ id: string; callback: string; payload: unknown }>;
+      for (const s of existing) {
+        const p = s.payload as { serverId?: string; authUrl?: string } | null;
+        if (s.callback === "expireStepUpPark" && p?.serverId === serverId && p.authUrl !== authUrl) await this.cancelSchedule(s.id);
+      }
+    } catch (err) {
+      log("warn", "oauth mcp old step-up expiry not cancelled", { serverId, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * Schedule callback: a step-up park outlived its link (STEP_UP_PARK_TTL_MS).
+   * Clear the saved auth_url so GET /api/mcp/oauth-servers stops serving a
+   * link that can't complete, and put the server back on the old grant.
+   * A no-op once the park was approved, replaced or already recovered.
+   */
+  async expireStepUpPark(payload: { serverId: string; authUrl: string }): Promise<void> {
+    const { serverId, authUrl } = payload;
+    const parks = this.readStepUpParks();
+    const park = parks[serverId];
+    if (!park || park.authUrl !== authUrl) return;
+    if (Date.now() - park.at < STEP_UP_PARK_TTL_MS) {
+      await this.scheduleStepUpExpiry(serverId, authUrl, park.at);
+      return;
+    }
+    type Mgr = {
+      mcpConnections: Record<string, { connectionState: string } | undefined>;
+      clearServerAuthUrl(id: string): void;
+      establishConnection(id: string): Promise<void>;
+      getServersFromStorage(): Array<{ id: string; auth_url?: string | null }>;
+    };
+    const mgr = this.mcp as unknown as Mgr;
+    const { [serverId]: _expired, ...rest } = parks;
+    this.writeStepUpParks(rest);
+    const parkedFrom = this.stepUpParkedFrom.get(serverId);
+    this.stepUpParkedFrom.delete(serverId);
+    // Approved, removed, or the SDK saved its own link since: not ours.
+    if (mgr.getServersFromStorage().find((r) => r.id === serverId)?.auth_url !== authUrl) return;
+    mgr.clearServerAuthUrl(serverId);
+    const conn = mgr.mcpConnections[serverId];
+    if (conn?.connectionState === "authenticating") {
+      if (parkedFrom) {
+        // Parked on a live connection; the transport never dropped.
+        conn.connectionState = parkedFrom;
+      } else {
+        const reconnect = mgr.establishConnection(serverId).catch((err) => {
+          log("warn", "oauth mcp step-up expiry reconnect failed", { serverId, error: err instanceof Error ? err.message : String(err) });
+        });
+        this.ctx.waitUntil(reconnect);
+      }
+    }
+    log("info", "oauth mcp step-up park expired", { serverId, state: conn?.connectionState ?? null });
   }
 
   private readStepUpParks(): StepUpParks {
@@ -5977,7 +6118,11 @@ export class CodingAgent extends CodingAgentBase {
         // `connected` (discovery failed) also counts as authorized for the
         // callback, so park that too.
         const reachable = live?.connectionState === "ready" || live?.connectionState === "connected";
-        if (action === "keep" && reachable && authUrlOf()[serverId] === parkedUrl) live.connectionState = "authenticating";
+        if (action === "keep" && reachable && authUrlOf()[serverId] === parkedUrl) {
+          this.stepUpParkedFrom.set(serverId, live.connectionState);
+          live.connectionState = "authenticating";
+          void this.scheduleStepUpExpiry(serverId, parkedUrl, parks[serverId]!.at);
+        }
         log("info", "oauth mcp step-up park recovered", { serverId, action, state: live?.connectionState ?? null });
       }).catch((err) => {
         log("warn", "oauth mcp step-up park recovery failed", { serverId, action, error: err instanceof Error ? err.message : String(err) });
@@ -6017,6 +6162,26 @@ export class CodingAgent extends CodingAgentBase {
       log("warn", "loadOAuthToolsFromHub failed", { err: err instanceof Error ? err.message : String(err) });
       this.cachedOAuthTools = [];
     }
+  }
+
+  /** Hub RPC: does this server still wait for the person to approve a step-up? */
+  oauthStepUpPending(serverId: string): boolean {
+    // A park whose link was approved stays in metadata until it expires;
+    // the saved auth_url is what's still waiting.
+    const row = (this.mcp as unknown as { getServersFromStorage(): Array<{ id: string; auth_url?: string | null }> })
+      .getServersFromStorage().find((r) => r.id === serverId);
+    return !!row?.auth_url;
+  }
+
+  private async oauthStepUpPendingViaHub(serverId: string): Promise<boolean> {
+    const ownerEmail = (this.readMetadata("owner_email") ?? "").trim().toLowerCase();
+    if (!ownerEmail) return true; // can't ask: keep the card
+    if ((this.name ?? "") === ownerEmail) return this.oauthStepUpPending(serverId);
+    const hubStub = await getAgentByName<Env, CodingAgent>(
+      this.env.CODING_AGENT as unknown as AgentNamespace<CodingAgent>,
+      ownerEmail,
+    );
+    return hubStub.oauthStepUpPending(serverId);
   }
 
   /**
