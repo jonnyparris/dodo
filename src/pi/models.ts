@@ -298,6 +298,80 @@ export function withWorkersAIMaxTokens(api: ProviderStreams): ProviderStreams {
   };
 }
 
+/** True for a Workers AI model's `/compat` entry (wire id `workers-ai/@cf/...`). */
+function isWorkersAICompatModel(model: Model<Api>): boolean {
+  return model.name.startsWith("@cf/") || model.id.startsWith("workers-ai/@cf/");
+}
+
+/** The placeholder the attachment guard uses for a part the model cannot take. */
+const DROPPED_ATTACHMENT_NOTE = "[attachment removed from context — this model cannot process file attachments]";
+
+/**
+ * Make a `/compat` body acceptable to Workers AI, which validates `content`
+ * as a string per message and rejects two shapes pi-ai sends:
+ *
+ * - `content: null` on a tool-only assistant turn. pi-ai writes
+ *   `compat.requiresAssistantAfterToolResult ? "" : null`, and Workers AI
+ *   answers `400 Bad input ... required properties at '/messages/2' are
+ *   'role,content'`.
+ * - `content: [...]` on a turn with more than one block. A text-only model
+ *   answers the same 400.
+ *
+ * On `jp-gw` these were every `@cf/openai/gpt-oss-120b` 400 in the gateway's
+ * request log between 2026-10-22 and 2026-10-25 (20 of the 28 Workers AI 400s
+ * it kept there), each on a turn past the first, while the first turn of the
+ * same session, model and gateway succeeded. Vision `@cf/` models keep arrays
+ * (glm-5.3-flash parses them: its own 400 was an image-count limit), so
+ * `acceptsImages` decides whether an array collapses to its text.
+ */
+export function stringMessageContent(payload: unknown, acceptsImages: boolean): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+  const body = payload as { messages?: unknown };
+  if (!Array.isArray(body.messages)) return payload;
+  let changed = false;
+  const messages = body.messages.map((message) => {
+    if (!message || typeof message !== "object") return message;
+    const { role, content } = message as { role?: unknown; content?: unknown };
+    if (role === "assistant" && content === null) {
+      changed = true;
+      return { ...(message as Record<string, unknown>), content: "" };
+    }
+    if (!acceptsImages && Array.isArray(content)) {
+      const text = content
+        .map((part) => {
+          const p = part as { type?: unknown; text?: unknown };
+          return p?.type === "text" && typeof p.text === "string" ? p.text : "";
+        })
+        .filter((t) => t.length > 0)
+        .join("\n\n");
+      changed = true;
+      return { ...(message as Record<string, unknown>), content: text.length > 0 ? text : DROPPED_ATTACHMENT_NOTE };
+    }
+    return message;
+  });
+  return changed ? { ...body, messages } : payload;
+}
+
+/**
+ * Apply stringMessageContent to `/compat` requests for `@cf/` models. A
+ * caller-supplied onPayload is chained, not replaced.
+ */
+export function withWorkersAIStringContent(api: ProviderStreams): ProviderStreams {
+  type PayloadHook = (payload: unknown, model: Model<Api>) => unknown | undefined | Promise<unknown | undefined>;
+  const normalize = <O extends { onPayload?: PayloadHook } | undefined>(model: Model<Api>, options: O): O =>
+    isWorkersAICompatModel(model)
+      ? ({
+          ...options,
+          onPayload: async (payload: unknown, m: Model<Api>) => stringMessageContent((await options?.onPayload?.(payload, m)) ?? payload, m.input.includes("image")),
+        } as O)
+      : options;
+  return {
+    ...api,
+    stream: (model, context, options) => api.stream(model, context, normalize(model, options)),
+    streamSimple: (model, context, options) => api.streamSimple(model, context, normalize(model, options)),
+  };
+}
+
 /**
  * Give every model request a fetch that waits out 429s (see
  * rate-limit-fetch.ts). A caller-supplied fetch is kept as the base.
@@ -433,7 +507,9 @@ export function setDodoProvider(
   // is the base: at request time the 429 wait and the budget wrap the
   // binding call (each resend takes a slot, then goes over the binding).
   const compatStreams = withStreamIdleTimeout(
-    withCompatBinding(withModelBudgetStreams(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), budget), config, env),
+    withWorkersAIStringContent(
+      withCompatBinding(withModelBudgetStreams(withRateLimitRetry(openAICompletionsApi(), rateLimitOptions), budget), config, env),
+    ),
     idleOptions,
   );
   // Drained `cloudflare/@cf/…` refs: send the /compat model (wire id
