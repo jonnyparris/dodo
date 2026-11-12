@@ -160,6 +160,12 @@ curl https://dodo.example/session/$SESSION_ID/watchdog
   that runs longer than `stallSeconds` looks stuck. (Before the turn stall
   guard, the stamp only moved when a prompt was sent, so the watchdog
   fired `stallSeconds` after the prompt started, stuck or not.)
+- **No retries.** If `abort` or the nudge prompt itself fails, the
+  watchdog logs the failure but doesn't try again on the same tick.
+  The next tick re-evaluates from scratch.
+- **No cross-session coordination.** Each session's watchdog is
+  independent. If you want "alert me if *any* session stalls",
+  configure a watchdog per session, or write a separate poller.
 
 ## Built-in turn stall guard
 
@@ -174,9 +180,12 @@ submit). A model stream that goes quiet fails and retries sooner, after
 `TURN_STALL_SECONDS` and `TURN_STALL_TOOL_SECONDS`; `TURN_STALL_SECONDS=0`
 turns it off. The watchdog stays useful for a shorter threshold, `notify`
 without aborting, or `nudge`.
-- **No retries.** If `abort` or the nudge prompt itself fails, the
-  watchdog logs the failure but doesn't try again on the same tick.
-  The next tick re-evaluates from scratch.
-- **No cross-session coordination.** Each session's watchdog is
-  independent. If you want "alert me if *any* session stalls",
-  configure a watchdog per session, or write a separate poller.
+
+After an abort (user, guard, or watchdog), `PiEngine.run` waits at most
+30 seconds for pi to settle the run (`PI_ABORT_GRACE_MS`, a constant in
+`src/pi/engine.ts`, not a Worker var), then stops waiting, detaches its
+event stream and logs `pi: run did not settle after abort`. Known gap: a
+model request or tool that ignores the abort signal keeps pi's run alive.
+A prompt sent meanwhile queues in pi behind it. After the stuck run ends,
+pi sometimes runs the queued prompt and sometimes leaves it queued until
+the stall guard fails it (15 minutes by default).

@@ -3979,6 +3979,8 @@ export class CodingAgent extends CodingAgentBase {
 
   /** Test hook: overrides the env-derived turn stall limits. */
   turnStallLimitsOverride: TurnStallLimits | null = null;
+  /** Test hook: overrides PI_ABORT_GRACE_MS (how long a turn waits for pi to settle after an abort). */
+  piAbortGraceMsOverride: number | null = null;
   private _lastActivityTouch = 0;
 
   /**
@@ -4916,6 +4918,7 @@ export class CodingAgent extends CodingAgentBase {
       promptId: options.promptId,
       tools,
       signal: options.signal,
+      abortGraceMs: this.piAbortGraceMsOverride ?? undefined,
       onPhase: stall ? (phase) => stall.touch(phase) : undefined,
       onEvent: stall ? (event) => stall.event(event as TurnStallEvent) : undefined,
       prepare: async () => {
