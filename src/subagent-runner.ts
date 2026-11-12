@@ -433,7 +433,7 @@ export const anthropicCacheMiddleware: LanguageModelMiddleware = {
 /**
  * Anthropic through createAI over the `AI` binding: `@ai-sdk/anthropic`
  * builds the native request, createAI's `routed` sends it to AI Gateway's
- * universal endpoint (`env.AI.gateway(id).run`). No AI_GATEWAY_KEY; the
+ * provider-native path over the binding (`env.AI.fetch`, agents 0.29+). No AI_GATEWAY_KEY; the
  * vendor's placeholder `x-api-key` is dropped by createAI (vendorKey
  * "gateway"), so the gateway uses its own key / unified billing.
  */
