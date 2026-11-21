@@ -1135,7 +1135,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
       "No output is included: fetch it with get_messages. Kept for later prompts in the session; pass an empty string to remove it.",
     ),
     model: z.string().max(200).optional().describe(
-      "Run this session on this model instead of the user's configured model (e.g. '@cf/zai-org/glm-5.3-flash'). " +
+      "Run this session on this model instead of the user's configured model (e.g. '@cf/deepseek-ai/deepseek-v4.1-flash-1017'). " +
       "Kept for later prompts in the session; pass an empty string to go back to the user's model. Does not change the user's config.",
     ),
     exploreModel: z.string().max(200).optional().describe("Same as model, for this session's explore subagents."),
@@ -1196,7 +1196,7 @@ export function createDodoMcpServer(env: Env, userEmail: string, depth = 0): Mcp
     return jsonFetch(env, "agent", "/messages", { sessionId, depth });
   });
 
-  server.tool("get_prompts", "Get prompt history for a session. `needsInput` is set when the agent stopped for a person (login, CAPTCHA, decision): { kind, reason, liveView, at }.", {
+  server.tool("get_prompts", "Get prompt history for a session. `needsInput` is set when the agent stopped for a person (login, CAPTCHA, decision, OAuth re-approval): { kind, reason, liveView, at, oauthServerId?, oauth? }. oauthServerId = an OAuth MCP server waiting for the owner to approve more access (oauth = all of them, [{ serverId, reason, tools }]); the owner opens the link from the Dodo UI (or GET /api/mcp/oauth-servers → authUrl), then replies.", {
     sessionId: z.string().describe("Session ID"),
   }, async ({ sessionId }) => {
     const access = await ensureSessionAccess(env, userEmail, sessionId, "readonly");

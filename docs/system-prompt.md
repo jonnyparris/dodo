@@ -73,7 +73,7 @@ These tools are available to the agent at runtime (built in `src/agentic.ts`):
 
 **Session** (`src/tools/session-tools.ts`, top-level turns only):
 - `schedule_prompt` / `list_schedules` / `cancel_schedule` — run a prompt later in this session (once, at a time, cron, interval)
-- `request_user_input` — stop for a person (login, CAPTCHA, decision): sets `needsInput`, keeps the browser alive, then the turn ends
+- `request_user_input` — stop for a person (login, CAPTCHA, decision): sets `needsInput`, keeps the browser alive, then the turn ends (if an OAuth **Approve access** card is already up, it is kept and the result says `kept: true` with the card's reason)
 
 **Git tools** (built in `buildGitTools()`):
 - **Top-level (hot path):** `git_status`, `git_add`, `git_commit`, `git_diff`

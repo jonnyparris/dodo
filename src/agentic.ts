@@ -28,6 +28,7 @@ import { createExecuteTool } from "./tools/execute-tool";
 import { createWorkspaceTools } from "./tools/workspace-tools";
 import { createImageCheckTool, type ResolveImage } from "./tools/image-check";
 import { buildSessionTools, type SessionToolHost } from "./tools/session-tools";
+import { isOAuthStepUpMarker, OAUTH_STEP_UP_KEY, stepUpReason, stepUpToolResult } from "./mcp-step-up";
 import { sanitizeToolJsonSchema } from "./tool-schema";
 import { createShellTool } from "./tools/shell";
 import { runTypecheck } from "./typecheck";
@@ -941,7 +942,7 @@ function buildExploreTool(
           "Optional directory to scope the search to (e.g. 'src/' or 'lib/utils'). Applied to every query.",
         ),
         model: z.string().optional().describe(
-          "Optional model override for this call (e.g. '@cf/moonshotai/kimi-k2.6', 'anthropic/claude-haiku-4-5'). Leave unset to use the session default.",
+          "Optional model override for this call (e.g. '@cf/google/gemma-4-26b-a4b-it', 'anthropic/claude-haiku-4-5'). Leave unset to use the session default.",
         ),
       })),
       execute: async (args: Record<string, unknown>) => {
@@ -1227,7 +1228,7 @@ function buildTaskTool(
         "Optional directory to scope the task to (e.g. 'src/'). Hint only — the subagent can still read outside this path.",
       ),
       model: z.string().optional().describe(
-        "Optional model override for this call (e.g. 'anthropic/claude-haiku-4-5', '@cf/moonshotai/kimi-k2.6'). Leave unset to use the session default (configured via PUT /config taskModel, defaults to DeepSeek V4.1 Flash 1017).",
+        "Optional model override for this call (e.g. 'anthropic/claude-haiku-4-5', '@cf/google/gemma-4-26b-a4b-it'). Leave unset to use the session default (configured via PUT /config taskModel, defaults to DeepSeek V4.1 Flash 1017).",
       ),
       resultSchemaName: z.enum(["task-summary", "verify-run-summary", "dispatch-decision"]).optional().describe(
         "Optional structured-result schema. When set, the subagent's free-form output is coerced into the named schema and returned in a ```json block alongside the narrative. 'task-summary' is the most common choice for delegated work; 'verify-run-summary' for typecheck/test-style runs; 'dispatch-decision' for supervisor-style fan-out planning.",
@@ -1806,7 +1807,7 @@ export function buildToolsForThink(
   // list is pre-fetched; execute() routes back to the hub via the provided
   // executor so OAuth credentials never leave that DO.
   if (options?.oauthTools?.length && options.oauthToolExec) {
-    const oauthTools = buildOAuthMcpTools(options.oauthTools, options.oauthToolExec, existingNames);
+    const oauthTools = buildOAuthMcpTools(options.oauthTools, options.oauthToolExec, existingNames, options.sessionTools);
     Object.assign(tools, oauthTools);
   }
 
@@ -1891,10 +1892,11 @@ function slugifyToolNamespace(name: string): string {
  * avoid collisions across servers. Capped at 64 chars to satisfy AI SDK
  * naming constraints. Collisions after truncation are logged.
  */
-function buildOAuthMcpTools(
+export function buildOAuthMcpTools(
   oauthTools: OAuthToolInfo[],
   executor: (serverId: string, name: string, args: unknown) => Promise<unknown>,
   existingNames: Set<string>,
+  sessionTools?: Pick<SessionToolHost, "requestUserInput" | "resolveOAuthStepUp">,
 ): Record<string, AnyTool> {
   const tools: Record<string, AnyTool> = {};
 
@@ -1928,7 +1930,31 @@ function buildOAuthMcpTools(
       inputSchema: jsonSchema(sanitizeToolJsonSchema(info.inputSchema)),
       execute: async (args: unknown) => {
         try {
-          return await executor(info.serverId, info.name, args);
+          const result = await executor(info.serverId, info.name, args);
+          if (!isOAuthStepUpMarker(result)) {
+            // Any success: the host drops this server's step-up from the
+            // card if the hub no longer has one waiting (no-op otherwise).
+            try {
+              await sessionTools?.resolveOAuthStepUp?.(info.serverId);
+            } catch (err) {
+              log("warn", "oauth-mcp step-up card clear failed", { serverId: info.serverId, err: err instanceof Error ? err.message : String(err) });
+            }
+            return result;
+          }
+          // The server needs the person to approve more access. Raise the
+          // needs-input card (server id only, never the link: see
+          // stepUpToolResult), then tell the model to stop and retry once.
+          const stepUp = result[OAUTH_STEP_UP_KEY];
+          let cardShown = false;
+          if (sessionTools) {
+            try {
+              await sessionTools.requestUserInput({ kind: "login", reason: stepUpReason(stepUp), oauthServerId: stepUp.serverId });
+              cardShown = true;
+            } catch (err) {
+              log("warn", "oauth-mcp step-up card failed", { serverId: info.serverId, err: err instanceof Error ? err.message : String(err) });
+            }
+          }
+          return stepUpToolResult(stepUp, cardShown);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return { error: `OAuth MCP tool call failed: ${msg}` };

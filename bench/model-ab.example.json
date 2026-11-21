@@ -2,9 +2,8 @@
   "base": "https://dodo.jonnyparris.club",
   "gateway": "jp-gw",
   "arms": {
-    "kimi": { "model": "@cf/moonshotai/kimi-k2.6" },
     "ds1017": { "model": "@cf/deepseek-ai/deepseek-v4.1-flash-1017" },
-    "glm": { "model": "@cf/zai-org/glm-5.3-flash", "exploreModel": "@cf/zai-org/glm-5.3-flash", "taskModel": "@cf/zai-org/glm-5.3-flash" }
+    "gemma4": { "model": "@cf/google/gemma-4-26b-a4b-it", "exploreModel": "@cf/google/gemma-4-26b-a4b-it", "taskModel": "@cf/google/gemma-4-26b-a4b-it" }
   },
   "tasks": [
     {

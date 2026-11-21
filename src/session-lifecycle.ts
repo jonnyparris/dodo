@@ -250,6 +250,25 @@ function deriveTitle(content: string, intent: StartIntent, current: SessionContr
   return content.length > 72 ? content.slice(0, 72) + "…" : content;
 }
 
+/** Author labels of prompts no person sent (see SOURCE_POLICIES.authorEmailLabel). */
+const AUTOMATIC_AUTHOR_LABELS = new Set(
+  (Object.entries(SOURCE_POLICIES) as Array<[PromptSource, SourcePolicy]>)
+    .map(([, p]) => p.authorEmailLabel)
+    .filter((l): l is string => !!l),
+);
+
+/**
+ * Did a person (or a client acting for one, e.g. MCP send_prompt) send this
+ * prompt? False for cron, the watchdog and goal auto-continue, also when one
+ * of them was queued and restarts as "queue" (the queue row keeps its
+ * author label).
+ */
+export function isPersonPrompt(source: PromptSource, author: string | null): boolean {
+  // Automatic sources are the ones with an author label in SOURCE_POLICIES.
+  if (SOURCE_POLICIES[source]?.authorEmailLabel) return false;
+  return !(author && AUTOMATIC_AUTHOR_LABELS.has(author));
+}
+
 function resolveAuthor(intent: StartIntent, policy: SourcePolicy): string | undefined {
   if (intent.authorEmail) return intent.authorEmail;
   return policy.authorEmailLabel;
@@ -280,8 +299,13 @@ export interface SessionLifecycleDeps {
    * spawn, matching pre-refactor `readAppConfig()` calls.
    */
   readAppConfig: () => Promise<unknown>;
-  /** A prompt became active (after beginPrompt). Clears per-turn state such as "needs input". */
-  onPromptStart?: (promptId: string) => void;
+  /**
+   * A prompt became active (after beginPrompt). The DO clears "needs input"
+   * here, for person prompts only. `author` = the resolved author (email or
+   * the source's label): a queued prompt restarts as source "queue" but
+   * keeps it, see `isPersonPrompt`.
+   */
+  onPromptStart?: (promptId: string, source: PromptSource, author: string | null) => void;
   /** A prompt reached a terminal state (row written, session idle). Rings completion webhooks. */
   onPromptFinished?: (promptId: string, cause: FinishCause) => void;
 }
@@ -311,7 +335,7 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps): SessionLifec
     title: string,
   ): Promise<{ fiberId: string | null }> {
     deps.control.beginPrompt(promptId, title);
-    deps.onPromptStart?.(promptId);
+    deps.onPromptStart?.(promptId, intent.source, resolveAuthor(intent, policy) ?? null);
     deps.prompts.insert({
       promptId,
       content: intent.content,

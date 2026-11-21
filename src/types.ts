@@ -151,9 +151,9 @@ export interface AppConfig {
    * Default model used by the `explore` subagent when the model doesn't
    * pass an explicit `model` arg. Leave unset to use the built-in
    * getExploreModel() heuristic (cheap model by provider family), which
-   * falls back to Kimi K2.6 for unfamiliar providers. Mixing providers is
-   * supported — e.g. main model anthropic/claude-opus-4-7, explore model
-   * @cf/moonshotai/kimi-k2.6. The subagent follows the session's
+   * falls back to the main model for unfamiliar providers. Mixing providers
+   * is supported — e.g. main model anthropic/claude-opus-4-7, explore model
+   * @cf/deepseek-ai/deepseek-v4.1-flash-1017. The subagent follows the session's
    * activeGateway; both gateways route Workers AI (`@cf/...`) models.
    */
   exploreModel?: string;

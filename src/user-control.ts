@@ -19,6 +19,7 @@ import {
 import { log } from "./logger";
 import { HttpMcpClient, type McpClientConfig } from "./mcp-client";
 import { DEFAULT_REPLICATE_IMAGE_MODEL } from "./model-catalog";
+import { DEFAULT_WORKERS_AI_MODEL, remapDeprecatedModel } from "./model-deprecations";
 import { sendRunNotification } from "./notify";
 import { advanceStep, getInitialState, type OnboardingState } from "./onboarding";
 import { RateLimiter } from "./rate-limit";
@@ -1817,14 +1818,17 @@ export class UserControl extends DurableObject<Env> {
       aiGatewayBaseURL: get("aiGatewayBaseURL") ?? this.env.AI_GATEWAY_BASE_URL,
       gitAuthorEmail: get("gitAuthorEmail") ?? this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
       gitAuthorName: get("gitAuthorName") ?? this.env.GIT_AUTHOR_NAME ?? "Dodo",
-      model: get("model") ?? this.env.DEFAULT_MODEL,
+      // Model ids are remapped off Workers AI models removed on 2026-11-15
+      // (src/model-deprecations.ts). Storage keeps the old value until the
+      // next config save.
+      model: remapDeprecatedModel(get("model") ?? this.env.DEFAULT_MODEL),
       opencodeBaseURL: get("opencodeBaseURL") ?? this.env.OPENCODE_BASE_URL,
       systemPromptPrefix: get("systemPromptPrefix"),
       // Fall back to the env defaults, then undefined (heuristic path).
       // DEFAULT_EXPLORE_MODEL / DEFAULT_TASK_MODEL ship as DeepSeek V4.1
       // Flash 1017 in wrangler.jsonc. See the comment there for the bench.
-      exploreModel: get("exploreModel") ?? this.env.DEFAULT_EXPLORE_MODEL,
-      taskModel: get("taskModel") ?? this.env.DEFAULT_TASK_MODEL,
+      exploreModel: remapDeprecatedModel(get("exploreModel") ?? this.env.DEFAULT_EXPLORE_MODEL),
+      taskModel: remapDeprecatedModel(get("taskModel") ?? this.env.DEFAULT_TASK_MODEL),
       // Replicate image model — env default, then the hardcoded nano-banana-2.
       replicateImageModel: get("replicateImageModel") ?? this.env.DEFAULT_REPLICATE_IMAGE_MODEL ?? DEFAULT_REPLICATE_IMAGE_MODEL,
       // Schema (UpdateConfigRequest) enforces the enum on write, but we
@@ -1854,7 +1858,7 @@ export class UserControl extends DurableObject<Env> {
     const modelExplicit = Object.prototype.hasOwnProperty.call(input, "model");
     if (gatewayChanged && !modelExplicit) {
       if (input.activeGateway === "ai-gateway" && !nextConfig.model.startsWith("@cf/")) {
-        nextConfig.model = this.env.AI_GATEWAY_DEFAULT_MODEL ?? "@cf/moonshotai/kimi-k2.6";
+        nextConfig.model = remapDeprecatedModel(this.env.AI_GATEWAY_DEFAULT_MODEL ?? DEFAULT_WORKERS_AI_MODEL);
       }
     }
 

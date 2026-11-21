@@ -12,6 +12,7 @@
  * Dodo's agent loop is pi (src/pi/). ADR 0002, phase 2.
  */
 import { Agent } from "agents";
+import { remapConfigModels } from "./model-deprecations";
 import { ThinkHistory } from "./think-history";
 import type { Env } from "./types";
 
@@ -99,7 +100,8 @@ export class DodoAgentBase<Config> extends Agent<Env> {
     this.ensureConfigTable();
     const row = Array.from(this.ctx.storage.sql.exec<{ value: string }>("SELECT value FROM _think_config WHERE key = 'config'"))[0];
     if (!row) return null;
-    this.#config = JSON.parse(String(row.value)) as Config;
+    // A stored row can name a Workers AI model removed on 2026-11-15.
+    this.#config = remapConfigModels(JSON.parse(String(row.value)) as Config);
     return this.#config;
   }
 }

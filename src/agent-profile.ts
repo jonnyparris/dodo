@@ -18,6 +18,8 @@
  * which we don't do today.
  */
 
+import { remapDeprecatedModel } from "./model-deprecations";
+
 /**
  * Stable model-family routing for subagents.
  *
@@ -193,10 +195,12 @@ export function resolveProfileModel(
 ): string {
   const rawArgModel = args.model;
   if (typeof rawArgModel === "string" && rawArgModel.trim().length > 0) {
-    return rawArgModel.trim();
+    // The orchestrating model may still name a Workers AI id removed on
+    // 2026-11-15 (old tool descriptions, its own training data).
+    return remapDeprecatedModel(rawArgModel.trim());
   }
   if (typeof sessionDefault === "string" && sessionDefault.trim().length > 0) {
-    return sessionDefault.trim();
+    return remapDeprecatedModel(sessionDefault.trim());
   }
-  return profile.resolveDefaultModel(mainModel);
+  return remapDeprecatedModel(profile.resolveDefaultModel(mainModel));
 }
