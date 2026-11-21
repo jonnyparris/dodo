@@ -1,16 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import { buildOAuthMcpTools } from "../src/agentic";
 import {
-  detectOAuthStepUp,
   isOAuthStepUpMarker,
   issuersMatch,
   isTrustedAuthUrl,
-  isUnauthorizedError,
   OAUTH_STEP_UP_KEY,
+  parkExpired,
   parseStepUpParks,
-  planStepUpRecovery,
   STEP_UP_PARK_TTL_MS,
   scopeFromAuthUrl,
+  stepUpFromAuthError,
   stepUpReason,
   stepUpToolResult,
   stripStepUpMarker,
@@ -19,49 +18,21 @@ import { addOAuthStepUp, oauthEntriesOf, removeOAuthStepUp, type NeedsInput } fr
 
 const AUTH_URL = "https://mcp.example.com/authorize?client_id=c1&state=n2.srv&scope=user%3Aread+account%3Aread+workers_scripts%3Awrite";
 
-class UnauthorizedError extends Error {
-  constructor() {
-    super("Unauthorized");
-    this.name = "UnauthorizedError";
-  }
-}
-
-describe("isUnauthorizedError", () => {
-  it("matches UnauthorizedError, 401 status and wrapped causes", () => {
-    expect(isUnauthorizedError(new UnauthorizedError())).toBe(true);
-    expect(isUnauthorizedError(Object.assign(new Error("x"), { status: 401 }))).toBe(true);
-    expect(isUnauthorizedError(new Error("wrapped", { cause: new UnauthorizedError() }))).toBe(true);
-  });
-  it("ignores other failures", () => {
-    expect(isUnauthorizedError(new Error("Server returned 500"))).toBe(false);
-    expect(isUnauthorizedError(Object.assign(new Error("Forbidden"), { status: 403 }))).toBe(false);
-    expect(isUnauthorizedError(null)).toBe(false);
-  });
-});
-
-describe("detectOAuthStepUp", () => {
+describe("stepUpFromAuthError", () => {
   const iss = "https://mcp.example.com";
-  const base = { serverId: "srv", serverName: "Cloudflare API", authUrlBefore: undefined, grantIssuer: iss, linkIssuer: iss };
-  it("returns the new authorize URL and its scopes", () => {
-    const s = detectOAuthStepUp({ ...base, error: new UnauthorizedError(), authUrlAfter: AUTH_URL });
-    expect(s).toEqual({ serverId: "srv", serverName: "Cloudflare API", authUrl: AUTH_URL, scope: "user:read account:read workers_scripts:write" });
-  });
-  it("ignores a URL left over from the original connect", () => {
-    expect(detectOAuthStepUp({ ...base, authUrlBefore: AUTH_URL, error: new UnauthorizedError(), authUrlAfter: AUTH_URL })).toBeNull();
-  });
-  it("ignores non-auth errors even with a fresh URL", () => {
-    expect(detectOAuthStepUp({ ...base, error: new Error("timeout"), authUrlAfter: AUTH_URL })).toBeNull();
+  const base = { serverId: "srv", serverName: "Cloudflare API", grantIssuer: iss, linkIssuer: iss };
+  it("returns the SDK's link and its scopes", () => {
+    expect(stepUpFromAuthError({ ...base, authUrl: AUTH_URL })).toEqual({ serverId: "srv", serverName: "Cloudflare API", authUrl: AUTH_URL, scope: "user:read account:read workers_scripts:write" });
   });
   it("rejects non-http URLs", () => {
-    expect(detectOAuthStepUp({ ...base, error: new UnauthorizedError(), authUrlAfter: "javascript:alert(1)" })).toBeNull();
+    expect(stepUpFromAuthError({ ...base, authUrl: "javascript:alert(1)" })).toBeNull();
   });
   it("rejects a link from a different authorization server than the grant's", () => {
-    const err = new UnauthorizedError();
     const grantIssuer = "https://mcp.example.com";
-    expect(detectOAuthStepUp({ ...base, error: err, authUrlAfter: AUTH_URL, grantIssuer, linkIssuer: "https://mcp.example.com/" })).not.toBeNull();
-    expect(detectOAuthStepUp({ ...base, error: err, authUrlAfter: AUTH_URL, grantIssuer, linkIssuer: "https://evil.example" })).toBeNull();
-    expect(detectOAuthStepUp({ ...base, error: err, authUrlAfter: AUTH_URL, grantIssuer, linkIssuer: undefined })).toBeNull();
-    expect(detectOAuthStepUp({ ...base, error: err, authUrlAfter: AUTH_URL, grantIssuer: undefined })).toBeNull();
+    expect(stepUpFromAuthError({ ...base, authUrl: AUTH_URL, grantIssuer, linkIssuer: "https://mcp.example.com/" })).not.toBeNull();
+    expect(stepUpFromAuthError({ ...base, authUrl: AUTH_URL, grantIssuer, linkIssuer: "https://evil.example" })).toBeNull();
+    expect(stepUpFromAuthError({ ...base, authUrl: AUTH_URL, grantIssuer, linkIssuer: undefined })).toBeNull();
+    expect(stepUpFromAuthError({ ...base, authUrl: AUTH_URL, grantIssuer: undefined })).toBeNull();
   });
 });
 
@@ -95,26 +66,13 @@ describe("isTrustedAuthUrl", () => {
   });
 });
 
-describe("step-up park recovery plan", () => {
-  const now = 1_000_000_000;
-  it("keeps fresh parks, unparks stale ones, drops ones that aren't ours any more", () => {
-    const parks = {
-      fresh: { at: now - 60_000, authUrl: "https://a/x" },
-      stale: { at: now - STEP_UP_PARK_TTL_MS, authUrl: "https://a/y" },
-      done: { at: now - 1000, authUrl: "https://a/z" },
-      sdk: { at: now - 1000, authUrl: "https://a/old" },
-    };
-    const plan = planStepUpRecovery(parks, { fresh: "https://a/x", stale: "https://a/y", done: null, sdk: "https://a/sdk-own-reauth" }, now);
-    expect(plan).toEqual([
-      { serverId: "fresh", action: "keep" },
-      { serverId: "stale", action: "unpark" },
-      { serverId: "done", action: "drop" },
-      { serverId: "sdk", action: "drop" },
-    ]);
-  });
+describe("step-up parks", () => {
   it("parses only well-formed entries", () => {
     expect(parseStepUpParks('{"a":{"at":1,"authUrl":"https://x"},"b":1,"c":{"at":"x","authUrl":"y"},"d":null}')).toEqual({ a: { at: 1, authUrl: "https://x" } });
+    expect(parseStepUpParks('{"a":{"at":1,"authUrl":"https://x","unscheduled":true},"b":{"at":2,"authUrl":"https://y","unscheduled":"yes"}}')).toEqual({ a: { at: 1, authUrl: "https://x", unscheduled: true }, b: { at: 2, authUrl: "https://y" } });
     expect(parseStepUpParks("[1]")).toEqual({});
+    expect(parkExpired({ at: 1000 }, 1000 + STEP_UP_PARK_TTL_MS - 1)).toBe(false);
+    expect(parkExpired({ at: 1000 }, 1000 + STEP_UP_PARK_TTL_MS)).toBe(true);
     expect(parseStepUpParks("{bad")).toEqual({});
     expect(parseStepUpParks(null)).toEqual({});
   });

@@ -26,25 +26,33 @@ import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-clien
 import { isMcpHostRevoked, mcpHostRevokedMessage } from "./mcp-host-scope";
 import { contextWindowFor, DEFAULT_REPLICATE_IMAGE_MODEL, extractGeneratePrompt, modelSupportsVision, REPLICATE_MAX_EDIT_IMAGES, REPLICATE_MAX_PROMPT_LENGTH } from "./model-catalog";
 import { dispatchNotification } from "./notify";
-import { entriesToMessages, PiEngine, type PiUserContent } from "./pi/engine";
+import { entriesToMessages, PiEngine, type PiUserContent, piUnansweredMessage } from "./pi/engine";
 import { agentModelRef, setDodoProvider } from "./pi/models";
+import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { buildToolsExtension } from "./pi/tools";
 import type { Browser } from "agents/browser";
+import { MCPAuthorizationRequiredError } from "agents/mcp/client";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { BROWSER_TOOL_NAME, createBrowserExecuteTool, createSessionBrowser } from "./browser/session-browser";
 import { checkCallbackUrl, postCompletionWebhook } from "./completion-webhook";
 import { addOAuthStepUp, oauthEntriesOf, removeOAuthStepUp, type InputKind, type NeedsInput, type SessionToolHost } from "./tools/session-tools";
 import { DodoOAuthClientProvider } from "./mcp-oauth-provider";
-import { detectOAuthStepUp, OAUTH_STEP_UP_KEY, issuersMatch, parseStepUpParks, planStepUpRecovery, safeOrigin, STEP_UP_PARK_TTL_MS, stripStepUpMarker, type StepUpParks } from "./mcp-step-up";
+import { OAUTH_STEP_UP_KEY, issuersMatch, parkExpired, parseStepUpParks, safeOrigin, STEP_UP_PARK_TTL_MS, stepUpFromAuthError, stripStepUpMarker, type StepUpPark, type StepUpParks } from "./mcp-step-up";
+
+/**
+ * The SDK's mid-session re-authorization error (agents 0.34). The tag check
+ * also matches a copy from a second bundled instance of the SDK.
+ */
+function isAuthorizationRequired(e: unknown): e is MCPAuthorizationRequiredError {
+  if (e instanceof MCPAuthorizationRequiredError) return true;
+  const t = e as { _tag?: unknown; authUrl?: unknown } | null;
+  return !!t && typeof t === "object" && t._tag === "MCPAuthorizationRequiredError" && typeof t.authUrl === "string";
+}
 
 /** Metadata keys for the human handoff and completion doorbell. */
 const NEEDS_INPUT_KEY = "needs_input";
 /** Hub DO: when each OAuth MCP server was parked for a step-up (src/mcp-step-up.ts). */
 const STEP_UP_PARKS_KEY = "oauth_step_up_parks";
-/** Longest a hub wake waits for step-up park recovery (connect + discover). */
-// onStart runs inside the lifecycle's blockConcurrencyWhile (30s limit,
-// shared with the rest of startup): stay well under it.
-export const STEP_UP_RECOVERY_WAIT_MS = 10_000;
 /**
  * Longest listOAuthTools waits for the hub's in-flight MCP connects (after a
  * wake or an OAuth callback). A connect that outlasts it isn't waited on
@@ -112,7 +120,7 @@ import {
   type WatchdogConfig,
 } from "./watchdog";
 import { evaluateSession } from "./watchdog-policy";
-import { createTurnStallGuard, TurnStallError, turnStallLimitsFromEnv, type TurnStallEvent, type TurnStallGuard, type TurnStallLimits } from "./turn-stall-guard";
+import { createTurnStallGuard, TurnStallError, turnStallLimitsFromEnv, type TurnStallGuard, type TurnStallLimits } from "./turn-stall-guard";
 import { createWatchdogState, type WatchdogState } from "./watchdog-state";
 
 type FiberPromptPayload = { promptId: string; content: string; images?: Array<{ data: string; mediaType: string; name?: string }>; authorEmail?: string; title: string };
@@ -629,6 +637,8 @@ export class CodingAgent extends CodingAgentBase {
    *  brains nudge themselves if they didn't call chat_reply). */
   private _toolCallNames: Set<string> = new Set();
   private _piEngine: PiEngine | null = null;
+  /** Model access for the pi engine, built for one gateway config. */
+  private _piModels: { key: string; model: string; ids: string[]; models: Models } | undefined;
   /** Last known pi transcript length, for the sync messageCount() read. */
   private _piMessageCount = 0;
   private readonly presence = new PresenceTracker();
@@ -857,15 +867,15 @@ export class CodingAgent extends CodingAgentBase {
           "**Three tools:**",
           "- `browser_markdown` — Fetch a page or document (HTML, PDF, Office, JSON) as markdown. Read-only. Plain fetch first, Browser Run only if the site blocks it or needs JavaScript. Long pages are windowed: call again with the `offset` the header line gives to read on. Pass `query` to also get a calibrated `hasAnswer` probability telling you whether the window answers your question.",
           "- `browser_triage` — Rank up to 8 candidate URLs by likely relevance BEFORE fetching anything. Calibrated probabilities, no page loads.",
-          "- `browser_execute` — Drive this session's persistent Chrome with JavaScript and a `cdp` global (its description has the full API). Tabs, cookies and logins carry over between calls; `restarted: true` means the browser was replaced and earlier tabs are gone.",
+          "- `browser_execute` — Drive this session's persistent Chrome with JavaScript and a `browser` global (`browser.cdp(...)`; its description has the full API). Tabs, cookies and logins carry over between calls; a `notice` in the result says when the browser was replaced and earlier tabs are gone.",
           "",
           "**Which tool when:**",
           "Read-only text (docs, articles, search results) → `browser_triage` (if choosing between URLs) → `browser_markdown`. Interactive pages, screenshots, DOM inspection, clicks, logins → `browser_execute`.",
           "",
           "**`browser_execute` notes:**",
-          '- `cdp.send({ method, params, sessionId: "active" })` targets the tab you are working in; it is remembered across calls.',
+          '- `browser.cdp({ method, params, sessionId: "active" })` targets the tab you are working in; it is remembered across calls.',
           "- To see a screenshot, return `{ type: \"browser_screenshot\", mediaType, data }` as the whole return value of its own call (not nested in another object, where the data is stripped). It is shown in the chat; you see it too if your model accepts images, otherwise check it with `image_check` on the attachment URL or read the page with `Runtime.evaluate`.",
-          "- One `cdp.send` result is capped at 1 MB: capture the viewport or use JPEG, not a full long page.",
+          "- One `browser.cdp` result is capped at 1 MB: capture the viewport or use JPEG, not a full long page.",
           "- If a login, CAPTCHA or MFA needs a human: leave the page on that step, call `request_user_input` (kind login/captcha), then end your turn with one line saying what to do. The person gets a Live View link (or uses **Settings → Browser Tools → Open live browser**) and replies when done. Then continue in the same tab.",
         ].join("\n")
       : undefined;
@@ -1336,12 +1346,6 @@ export class CodingAgent extends CodingAgentBase {
   }
 
   /**
-   * Cap on how long onStart waits for step-up park recovery. Static and
-   * writable only so tests can shorten it (test/mcp-step-up-hub.test.ts).
-   */
-  static stepUpRecoveryWaitMs = STEP_UP_RECOVERY_WAIT_MS;
-
-  /**
    * Cap on how long listOAuthTools waits for in-flight MCP connections.
    * Static and writable only so tests can shorten it.
    */
@@ -1397,26 +1401,8 @@ export class CodingAgent extends CodingAgentBase {
       void this.drainOneQueuedPrompt();
     }
 
-    // Hub DO only in practice: bring back servers a step-up parked before
-    // this restart (see planStepUpRecovery). No-op without parks. Awaited
-    // (capped) so a wake caused by the OAuth callback itself handles the
-    // callback only after the server is parked again: mid-reconnect the
-    // SDK would drop the code as stale.
-    // Past the cap, a callback that lands mid-reconnect is dropped as stale:
-    // the next call 403s again and raises a fresh card. Better than a hung
-    // MCP server blocking every session's OAuth tools.
-    const recovery = this.recoverStepUpParks();
-    if (recovery) {
-      const capMs = CodingAgent.stepUpRecoveryWaitMs;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const cap = new Promise<void>((r) => {
-        timer = setTimeout(() => {
-          log("warn", "oauth mcp step-up park recovery still running after cap", { capMs });
-          r();
-        }, capMs);
-      });
-      return Promise.race([recovery, cap]).finally(() => clearTimeout(timer));
-    }
+    // Hub DO: a step-up park whose expiry could not be scheduled.
+    this.rescheduleUnscheduledParks();
   }
 
   /**
@@ -4620,12 +4606,24 @@ export class CodingAgent extends CodingAgentBase {
   private piEngine(): PiEngine {
     this._piEngine ??= new PiEngine({
       storage: this.ctx.storage,
-      configureModels: (models) => {
+      // pi calls this at every model use; rebuild only when the config
+      // changes. Model and gateway don't change while a prompt runs
+      // (readAppConfig keepRunning, ensureThinkConfig), so the running turn's
+      // model stays registered; the next prompt picks up a new one. The
+      // previous model stays registered too: a background compaction started
+      // on it can outlast its prompt and asks for it again.
+      models: () => {
         const config = this.piGatewayConfig();
-        setDodoProvider(models, [config.model], config, this.env, {
+        const cached = this._piModels;
+        const ids = !cached ? [config.model] : cached.model === config.model ? cached.ids : [config.model, cached.model];
+        const key = JSON.stringify([config, ids]);
+        if (this._piModels?.key === key) return this._piModels.models;
+        const models = setDodoProvider(createModels(), ids, config, this.env, {
           // The UI shows "waiting for model capacity" instead of a silent stall.
           onBudgetWait: (info) => this.emitEvent({ type: "model_wait", data: { model: config.model, waitMs: Math.round(info.waitMs), used: info.used, limit: info.limit } }),
         });
+        this._piModels = { key, model: config.model, ids, models };
+        return models;
       },
       modelRef: () => {
         const config = this.piGatewayConfig();
@@ -4863,7 +4861,6 @@ export class CodingAgent extends CodingAgentBase {
     if (!this.browser || !this.env.LOADER || !this.browserEnabled() || !isAdmin(ownerEmail ?? null, this.env)) return [];
     return [
       createBrowserExecuteTool({
-        ctx: this.ctx,
         browser: this.browser,
         loader: this.env.LOADER,
         onScreenshot: async (callId, image) => {
@@ -4917,7 +4914,7 @@ export class CodingAgent extends CodingAgentBase {
       tools,
       signal: options.signal,
       onPhase: stall ? (phase) => stall.touch(phase) : undefined,
-      onEvent: stall ? (event) => stall.event(event as TurnStallEvent) : undefined,
+      onProgress: stall ? (progress) => stall.progress(progress) : undefined,
       prepare: async () => {
         const { userMsgId, userMsg } = await this.prepareUserTurn(userContent, options);
         return {
@@ -4930,10 +4927,7 @@ export class CodingAgent extends CodingAgentBase {
     if (result.recovered) log("info", "pi: reattached to prompt after restart", { sessionId: this.sessionId(), promptId: options.promptId });
     if (result.status !== "done") {
       if (options.signal?.aborted) return { assistantMessageId: "", tokenInput: 0, tokenOutput: 0, text: "", steps: result.steps, toolCalls: result.toolCalls };
-      // pi already retried the provider; surface what the provider said.
-      const reason = result.reason ?? "unknown";
-      const modelError = /^model_error: "([\s\S]*)"$/.exec(reason)?.[1];
-      throw new Error(modelError ?? `Turn ended without an answer (${reason})`);
+      throw new Error(piUnansweredMessage(result.reason ?? "unknown"));
     }
     if (result.contextTokens > 0) this.writeMetadata("pi_context_tokens", String(result.contextTokens));
     await this.refreshPiCompactionCount();
@@ -5895,46 +5889,37 @@ export class CodingAgent extends CodingAgentBase {
     }
   }
 
-  /** Connects that already outlasted the listOAuthTools cap: not waited on again. */
-  private stalledOAuthConnects = new WeakSet<Promise<unknown>>();
-  private warnedOAuthConnectsFallback = false;
+  /** Servers whose connect already outlasted the listOAuthTools cap: not waited on again. */
+  private stalledOAuthServers = new Set<string>();
 
   /**
    * Wait (capped) for the hub's in-flight MCP connects. No-op when none.
-   * Reads the SDK's per-server connect promises so a hung connect is waited
-   * on once, while a new connect for the same server (new promise) still is.
+   * Reads public connection state: a server still `connecting` or
+   * `discovering` has no tools yet. A server that outlasts the cap is
+   * waited on once, until it leaves those states.
    */
   private async waitForOAuthConnects(): Promise<void> {
     const capMs = CodingAgent.oauthToolsWaitMs;
     if (capMs <= 0) return;
-    const pending = (this.mcp as unknown as { _pendingConnections?: unknown })._pendingConnections;
-    if (!(pending instanceof Map)) {
-      // SDK internals moved: fall back to the public wait, which re-pays the
-      // cap on every call while a connect hangs.
-      if (!this.warnedOAuthConnectsFallback) {
-        this.warnedOAuthConnectsFallback = true;
-        log("warn", "listOAuthTools: agents SDK has no _pendingConnections; using waitForConnections", { capMs });
-      }
-      await this.mcp.waitForConnections({ timeout: capMs });
-      return;
-    }
-    const connects = pending as Map<string, Promise<unknown>>;
-    const fresh = [...connects.entries()].filter(([, p]) => !this.stalledOAuthConnects.has(p));
+    const conns = this.mcp.mcpConnections as Record<string, { connectionState?: string } | undefined>;
+    const busy = (id: string) => {
+      const s = conns[id]?.connectionState;
+      return s === "connecting" || s === "discovering";
+    };
+    for (const id of this.stalledOAuthServers) if (!busy(id)) this.stalledOAuthServers.delete(id);
+    const fresh = Object.keys(conns).filter((id) => busy(id) && !this.stalledOAuthServers.has(id));
     if (fresh.length === 0) return;
-    const timedOut = Symbol("timeout");
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const outcome = await Promise.race([
-      Promise.allSettled(fresh.map(([, p]) => p)),
-      new Promise<typeof timedOut>((r) => { timer = setTimeout(() => r(timedOut), capMs); }),
-    ]).finally(() => clearTimeout(timer));
-    if (outcome !== timedOut) return;
-    // Settled connects leave the map; what's still there with the same
-    // promise outlasted the cap. Later turns skip it (they still get its
-    // tools once it lands); a slow-but-healthy connect costs those turns
-    // the wait, which beats re-paying the cap on every turn while one hangs.
-    const stalled = fresh.filter(([id, p]) => connects.get(id) === p);
-    for (const [, p] of stalled) this.stalledOAuthConnects.add(p);
-    log("warn", "listOAuthTools: mcp connects still pending after cap", { capMs, serverIds: stalled.map(([id]) => id) });
+    const deadline = Date.now() + capMs;
+    while (fresh.some(busy) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, Math.min(50, Math.max(1, deadline - Date.now()))));
+    }
+    const stalled = fresh.filter(busy);
+    if (stalled.length === 0) return;
+    // Later turns skip these (they still get the tools once they land); a
+    // slow-but-healthy connect costs those turns the wait, which beats
+    // re-paying the cap on every turn while one hangs.
+    for (const id of stalled) this.stalledOAuthServers.add(id);
+    log("warn", "listOAuthTools: mcp connects still pending after cap", { capMs, serverIds: stalled });
   }
 
   /** OAuth hub server ids whose host has mcp turned off in the allowlist. */
@@ -5953,23 +5938,19 @@ export class CodingAgent extends CodingAgentBase {
    * credentials (which live only in the per-user hub DO) are applied.
    */
   async callOAuthTool(serverId: string, toolName: string, args: unknown): Promise<unknown> {
+    const row = this.mcp.listServers().find((r) => r.id === serverId);
     // A revoked MCP host gets no calls, step-up or not.
-    const revocationRow = (this.getMcpServers().servers as Record<string, { server_url?: string } | undefined>)[serverId];
-    if (revocationRow?.server_url && (await isMcpHostRevoked(this.env, revocationRow.server_url))) {
-      throw new Error(mcpHostRevokedMessage(revocationRow.server_url));
+    if (row?.server_url && (await isMcpHostRevoked(this.env, row.server_url))) {
+      throw new Error(mcpHostRevokedMessage(row.server_url));
     }
     type StepUpProvider = {
-      authUrl?: string;
       clientId?: string;
       invalidateCredentials?: (scope: "discovery") => Promise<void>;
-      tokens?: () => Promise<{ issuer?: string } | undefined>;
-      clientInformation?: () => Promise<{ issuer?: string } | undefined>;
+      tokens?: () => Promise<unknown>;
       discoveryState?: () => Promise<{ authorizationServerUrl?: string; authorizationServerMetadata?: { issuer?: string } } | undefined>;
     };
-    type StepUpConn = { connectionState: string; options: { transport: { authProvider?: StepUpProvider } } };
-    const conn = (this.mcp.mcpConnections as Record<string, StepUpConn | undefined>)[serverId];
-    const provider = conn?.options.transport.authProvider;
-    const authUrlBefore = provider?.authUrl;
+    type StepUpConn = { options: { transport: { authProvider?: StepUpProvider } } };
+    const provider = (this.mcp.mcpConnections as Record<string, StepUpConn | undefined>)[serverId]?.options.transport.authProvider;
     const safe = async <T>(f: (() => Promise<T>) | undefined): Promise<T | undefined> => {
       try {
         return await f?.call(provider);
@@ -5977,12 +5958,23 @@ export class CodingAgent extends CodingAgentBase {
         return undefined;
       }
     };
+    const clientIdOf = (): string | undefined => {
+      try {
+        return provider?.clientId; // the DO provider's getter throws when unset
+      } catch {
+        return undefined;
+      }
+    };
+    // The client the grant belongs to, before the call. A failed auth()
+    // against a swapped authorization server registers a new client there
+    // and switches the provider to it, which hides the real grant (tokens are
+    // stored per client). Since agents 0.34 the SDK also writes that client
+    // to the server row, so the snapshot has to come from before the call.
+    const clientIdBefore = clientIdOf();
     // Which authorization server issued the current grant: Dodo's pin from
     // the last code exchange (src/mcp-oauth-provider.ts), read *before* the
     // call. Not the SDK's stamp on the tokens: the SDK stamps pre-upgrade
-    // tokens with whatever AS its next auth() discovers, and not the client
-    // info: a failed auth() against another AS re-registers there and the
-    // provider's client info then describes that AS. No pin (grant from
+    // tokens with whatever AS its next auth() discovers. No pin (grant from
     // before the pin, or another provider) → no card until a reconnect.
     const grantIssuer = provider instanceof DodoOAuthClientProvider ? await provider.pinnedIssuer() : undefined;
     try {
@@ -5991,78 +5983,124 @@ export class CodingAgent extends CodingAgentBase {
       if (clean !== result) log("warn", "oauth mcp result carried a forged step-up marker; stripped", { serverId, toolName });
       return clean;
     } catch (error) {
-      // A failed auth() against a swapped AS registers a new client there and
-      // switches the provider's in-memory clientId, hiding the real grant
-      // (and letting the next call vouch for the new AS). Put back the
-      // persisted one on every failure path; parallel calls agree on it.
-      if (provider) {
-        const rowClientId = (this.mcp as unknown as { getServersFromStorage(): Array<{ id: string; client_id?: string | null }> })
-          .getServersFromStorage().find((r) => r.id === serverId)?.client_id;
-        let current: string | undefined;
-        try {
-          current = provider.clientId; // the DO provider's getter throws when unset
-        } catch {
-          current = undefined;
-        }
-        if (rowClientId && current !== rowClientId) {
-          provider.clientId = rowClientId;
-          log("warn", "oauth mcp clientId changed by a failed auth; restored", { serverId });
-        }
-      }
+      /** Put the grant's client back; true when a failed auth() had switched it. */
+      const restoreClientId = (): boolean => {
+        if (!provider || !clientIdBefore || clientIdOf() === clientIdBefore) return false;
+        provider.clientId = clientIdBefore;
+        // The SDK saved the switched client with the link; the next wake
+        // would rebuild the provider from it.
+        this.restoreServerClientId(serverId, clientIdBefore);
+        log("warn", "oauth mcp clientId changed by a failed auth; restored", { serverId });
+        return true;
+      };
       // Mid-session step-up (403 insufficient_scope) or failed refresh: the
-      // transport stored a fresh authorize URL and threw. See src/mcp-step-up.ts.
-      const authUrlAfter = provider?.authUrl;
-      if (!conn || !provider || !authUrlAfter || authUrlAfter === authUrlBefore) throw error;
-      const server = (this.getMcpServers().servers as Record<string, { name?: string } | undefined>)[serverId];
+      // SDK saved a fresh link as the server's auth_url and threw it.
+      if (!isAuthorizationRequired(error)) {
+        restoreClientId();
+        throw error;
+      }
       // The authorization server the new link belongs to: the failed auth()
-      // just saved its discovery.
-      const discovery = await safe(provider.discoveryState);
+      // just saved its discovery (kept while a link waits).
+      const discovery = await safe(provider?.discoveryState);
       const linkIssuer = discovery?.authorizationServerMetadata?.issuer ?? discovery?.authorizationServerUrl;
-      const stepUp = detectOAuthStepUp({ serverId, serverName: server?.name, error, authUrlBefore, authUrlAfter, grantIssuer, linkIssuer });
+      const stepUp = stepUpFromAuthError({ serverId, serverName: row?.name, authUrl: error.authUrl, grantIssuer, linkIssuer });
       if (!stepUp) {
-        log("warn", "oauth mcp re-authorization link refused", { serverId, grantIssuer: grantIssuer ?? null, linkIssuer: linkIssuer ?? null, authOrigin: safeOrigin(authUrlAfter) });
+        log("warn", "oauth mcp re-authorization link refused", { serverId, grantIssuer: grantIssuer ?? null, linkIssuer: linkIssuer ?? null, authOrigin: safeOrigin(error.authUrl) });
+        restoreClientId();
         // A swapped AS left its discovery behind; drop it so the next auth()
         // re-discovers. Only on a real mismatch: a pending legitimate link
         // needs its discovery state on the callback leg.
         if (grantIssuer && linkIssuer && !issuersMatch(grantIssuer, linkIssuer)) {
-          await safe(provider.invalidateCredentials ? () => provider.invalidateCredentials!("discovery") : undefined);
+          await safe(provider?.invalidateCredentials ? () => provider.invalidateCredentials!("discovery") : undefined);
+        }
+        // The SDK now waits on the refused link. Dodo never serves it (see
+        // vettedStepUpLink), and nothing would ever expire it: after a wake
+        // the server would stay `authenticating` with no tools. With a grant
+        // left, reconnect on it, which forgets the link. That also restarts
+        // a session the SDK kept working on its grant. Skip it if the SDK has
+        // moved on to another link.
+        const stillSaved = () => this.mcp.listServers().find((r) => r.id === serverId)?.auth_url === error.authUrl;
+        if (stillSaved() && (await safe(provider?.tokens))) {
+          const inflight = this.dodoReconnects.get(serverId);
+          if (!inflight) {
+            await this.reconnectOnce(serverId, "refused link", CodingAgent.oauthToolsWaitMs);
+          } else {
+            // That reconnect forgot the saved link before the SDK saved this
+            // one: reconnect again once it settles, in the background.
+            this.ctx.waitUntil(inflight.then(() => (stillSaved() ? this.reconnectOnce(serverId, "refused link", 0) : undefined)));
+          }
         }
         throw error;
       }
-      // Put the connection where the SDK's callback route expects it, so the
-      // code is exchanged (and new scopes saved) instead of dropped as stale.
-      // A parallel call may have parked it already: keep the first state.
-      if (conn.connectionState !== "authenticating") this.stepUpParkedFrom.set(serverId, conn.connectionState);
-      conn.connectionState = "authenticating";
-      (this.mcp as unknown as { persistAuthContinuation(id: string, c: unknown): unknown }).persistAuthContinuation(serverId, conn);
-      const parkedAt = Date.now();
-      this.writeStepUpParks({ ...this.readStepUpParks(), [serverId]: { at: parkedAt, authUrl: stepUp.authUrl } });
-      await this.scheduleStepUpExpiry(serverId, stepUp.authUrl, parkedAt);
+      // Same link again (a waiting server answers every call with it): keep
+      // the park's clock, or each retry would push the expiry out.
+      // A park whose expiry could not be scheduled tries again.
+      const parks = this.readStepUpParks();
+      const park = parks[serverId];
+      if (park?.authUrl !== stepUp.authUrl || park.unscheduled) {
+        const parkedAt = park?.authUrl === stepUp.authUrl ? park.at : Date.now();
+        // Written first: the link is served only while its park exists.
+        this.writeStepUpParks({ ...parks, [serverId]: { at: parkedAt, authUrl: stepUp.authUrl } });
+        if (!(await this.scheduleStepUpExpiry(serverId, stepUp.authUrl, parkedAt, true))) this.flagUnscheduled(serverId, { at: parkedAt, authUrl: stepUp.authUrl });
+      }
       log("info", "oauth mcp needs re-authorization", { serverId, scope: stepUp.scope ?? null });
       return { [OAUTH_STEP_UP_KEY]: stepUp };
     }
   }
 
-  /**
-   * State each server had when this instance parked it on a live
-   * connection (`ready`, or `connected` when discovery failed). Expiry puts
-   * it back; a connection restored after a restart has to reconnect instead.
-   */
-  private stepUpParkedFrom = new Map<string, string>();
+  /** In-flight Dodo reconnects, by server: parallel callers share one. */
+  private dodoReconnects = new Map<string, Promise<void>>();
 
   /**
-   * Expire the park when its link dies, even if the hub never restarts.
-   * One expiry per server: a re-park with a new link cancels the old one,
-   * and `idempotent` stops restarts from adding copies of the same one.
+   * Reconnect a server on its grant (after a refused link or an expired
+   * park), so the SDK forgets the saved link. Shared by parallel callers and
+   * run in the background; the caller waits at most `waitMs`.
    */
-  private async scheduleStepUpExpiry(serverId: string, authUrl: string, parkedAt: number): Promise<void> {
+  private async reconnectOnce(serverId: string, why: string, waitMs: number): Promise<void> {
+    let p = this.dodoReconnects.get(serverId);
+    if (!p) {
+      p = this.reconnectMcpServer(serverId)
+        .then(
+          (r) => log("info", "oauth mcp reconnected", { serverId, why, state: r.state }),
+          (err: unknown) => log("warn", "oauth mcp reconnect failed", { serverId, why, error: err instanceof Error ? err.message : String(err) }),
+        )
+        .finally(() => this.dodoReconnects.delete(serverId));
+      this.dodoReconnects.set(serverId, p);
+      this.ctx.waitUntil(p);
+    }
+    if (waitMs <= 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([p, new Promise<void>((r) => { timer = setTimeout(r, waitMs); })]).finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * Write the grant's client id back to the SDK's server row. agents 0.34
+   * saves the provider's client with every link, also one a swapped
+   * authorization server registered, and has no public setter for it. Best
+   * effort: without it, the next wake hides the grant and asks to sign in.
+   */
+  private restoreServerClientId(serverId: string, clientId: string): void {
+    try {
+      this.ctx.storage.sql.exec("UPDATE cf_agents_mcp_servers SET client_id = ? WHERE id = ?", clientId, serverId);
+    } catch (err) {
+      log("warn", "oauth mcp row clientId not restored", { serverId, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * Expire the park when its link dies. Schedules are durable, so this also
+   * covers a hub restart. One expiry per server: a re-park with a new link
+   * cancels the old one. `idempotent` only at park time: a reschedule from
+   * inside the expiry callback would match its own still-running row and
+   * create nothing.
+   */
+  private async scheduleStepUpExpiry(serverId: string, authUrl: string, parkedAt: number, idempotent: boolean): Promise<boolean> {
     const delaySeconds = Math.max(1, Math.ceil((parkedAt + STEP_UP_PARK_TTL_MS - Date.now()) / 1000) + 1);
     try {
-      await this.schedule(delaySeconds, "expireStepUpPark", { serverId, authUrl }, { idempotent: true });
+      await this.schedule(delaySeconds, "expireStepUpPark", { serverId, authUrl }, { idempotent });
     } catch (err) {
-      // Restart recovery still clears it on the next wake.
       log("warn", "oauth mcp step-up expiry not scheduled", { serverId, error: err instanceof Error ? err.message : String(err) });
-      return;
+      return false;
     }
     // Superseded links' expiries would be no-ops anyway (expireStepUpPark
     // checks the link); cancelling them just keeps the schedule table short.
@@ -6075,50 +6113,69 @@ export class CodingAgent extends CodingAgentBase {
     } catch (err) {
       log("warn", "oauth mcp old step-up expiry not cancelled", { serverId, error: err instanceof Error ? err.message : String(err) });
     }
+    return true;
   }
 
   /**
    * Schedule callback: a step-up park outlived its link (STEP_UP_PARK_TTL_MS).
-   * Clear the saved auth_url so GET /api/mcp/oauth-servers stops serving a
-   * link that can't complete, and put the server back on the old grant.
-   * A no-op once the park was approved, replaced or already recovered.
+   * The SDK keeps a waiting server on its link until someone reconnects it,
+   * even once the link can't complete. Reconnect it: the SDK first forgets
+   * the saved auth_url, then connects on the grant (or asks for a fresh
+   * sign-in if none is left). Runs in the background so a hung server
+   * doesn't hold the hub's other schedules.
+   * A no-op once the park was approved, declined or replaced.
    */
   async expireStepUpPark(payload: { serverId: string; authUrl: string }): Promise<void> {
     const { serverId, authUrl } = payload;
     const parks = this.readStepUpParks();
     const park = parks[serverId];
     if (!park || park.authUrl !== authUrl) return;
-    if (Date.now() - park.at < STEP_UP_PARK_TTL_MS) {
-      await this.scheduleStepUpExpiry(serverId, authUrl, park.at);
+    if (!parkExpired(park)) {
+      if (!(await this.scheduleStepUpExpiry(serverId, authUrl, park.at, false))) this.flagUnscheduled(serverId, park);
       return;
     }
-    type Mgr = {
-      mcpConnections: Record<string, { connectionState: string } | undefined>;
-      clearServerAuthUrl(id: string): void;
-      establishConnection(id: string): Promise<void>;
-      getServersFromStorage(): Array<{ id: string; auth_url?: string | null }>;
-    };
-    const mgr = this.mcp as unknown as Mgr;
     const { [serverId]: _expired, ...rest } = parks;
     this.writeStepUpParks(rest);
-    const parkedFrom = this.stepUpParkedFrom.get(serverId);
-    this.stepUpParkedFrom.delete(serverId);
-    // Approved, removed, or the SDK saved its own link since: not ours.
-    if (mgr.getServersFromStorage().find((r) => r.id === serverId)?.auth_url !== authUrl) return;
-    mgr.clearServerAuthUrl(serverId);
-    const conn = mgr.mcpConnections[serverId];
-    if (conn?.connectionState === "authenticating") {
-      if (parkedFrom) {
-        // Parked on a live connection; the transport never dropped.
-        conn.connectionState = parkedFrom;
-      } else {
-        const reconnect = mgr.establishConnection(serverId).catch((err) => {
-          log("warn", "oauth mcp step-up expiry reconnect failed", { serverId, error: err instanceof Error ? err.message : String(err) });
-        });
-        this.ctx.waitUntil(reconnect);
-      }
+    // Approved, declined, removed, or the SDK saved another link since: not ours.
+    if (this.mcp.listServers().find((r) => r.id === serverId)?.auth_url !== authUrl) return;
+    await this.reconnectOnce(serverId, "step-up park expired", 0);
+  }
+
+  /**
+   * Mark a park whose expiry could not be scheduled, so the next call with
+   * its link or the next wake tries again. Only if the park is still that one:
+   * a call may have parked a new link during the failed schedule.
+   */
+  private flagUnscheduled(serverId: string, park: StepUpPark): void {
+    const parks = this.readStepUpParks();
+    const now = parks[serverId];
+    if (now?.authUrl !== park.authUrl || now.at !== park.at) return;
+    this.writeStepUpParks({ ...parks, [serverId]: { at: park.at, authUrl: park.authUrl, unscheduled: true } });
+  }
+
+  /**
+   * Wake: schedule the expiry of parks whose schedule failed. Parks exist
+   * only on the per-user hub; elsewhere this is one metadata read.
+   */
+  private rescheduleUnscheduledParks(): void {
+    let parks: StepUpParks;
+    try {
+      parks = this.readStepUpParks();
+    } catch (err) {
+      log("warn", "oauth mcp step-up parks unreadable on wake", { error: err instanceof Error ? err.message : String(err) });
+      return;
     }
-    log("info", "oauth mcp step-up park expired", { serverId, state: conn?.connectionState ?? null });
+    for (const [serverId, park] of Object.entries(parks)) {
+      if (!park.unscheduled) continue;
+      void this.scheduleStepUpExpiry(serverId, park.authUrl, park.at, true)
+        .then((ok) => {
+          if (!ok) return;
+          const now = this.readStepUpParks();
+          const cur = now[serverId];
+          if (cur?.authUrl === park.authUrl && cur.at === park.at) this.writeStepUpParks({ ...now, [serverId]: { at: park.at, authUrl: park.authUrl } });
+        })
+        .catch((err: unknown) => log("warn", "oauth mcp step-up park not rescheduled on wake", { serverId, error: err instanceof Error ? err.message : String(err) }));
+    }
   }
 
   private readStepUpParks(): StepUpParks {
@@ -6131,65 +6188,6 @@ export class CodingAgent extends CodingAgentBase {
       return;
     }
     this.writeMetadata(STEP_UP_PARKS_KEY, JSON.stringify(parks));
-  }
-
-  /**
-   * After a hub restart, reconnect servers a step-up parked, using the old
-   * grant, so ignoring the Approve access card doesn't remove their tools
-   * from every session. Runs from onStart, after the SDK's restore.
-   */
-  private recoverStepUpParks(): Promise<void> | undefined {
-    const parks = this.readStepUpParks();
-    if (Object.keys(parks).length === 0) return undefined;
-    type Conn = { connectionState: string };
-    type Mgr = {
-      mcpConnections: Record<string, Conn | undefined>;
-      clearServerAuthUrl(id: string): void;
-      establishConnection(id: string): Promise<void>;
-      getServersFromStorage(): Array<{ id: string; auth_url?: string | null }>;
-    };
-    const mgr = this.mcp as unknown as Mgr;
-    const authUrlOf = (): Record<string, string | null | undefined> => {
-      const out: Record<string, string | null | undefined> = {};
-      for (const row of mgr.getServersFromStorage()) out[row.id] = row.auth_url;
-      return out;
-    };
-    const next: StepUpParks = { ...parks };
-    const work: Promise<void>[] = [];
-    for (const { serverId, action } of planStepUpRecovery(parks, authUrlOf(), Date.now())) {
-      const conn = mgr.mcpConnections[serverId];
-      if (action === "drop" || !conn || conn.connectionState !== "authenticating") {
-        delete next[serverId];
-        continue;
-      }
-      if (action === "unpark") {
-        mgr.clearServerAuthUrl(serverId);
-        delete next[serverId];
-      }
-      const parkedUrl = parks[serverId]!.authUrl;
-      const reconnect = mgr.establishConnection(serverId).then(() => {
-        // Still waiting for the person: park again (tools stay loaded), so
-        // the callback exchanges the code instead of dropping it as stale.
-        // Only if the parked link is still the saved one: if the reconnect
-        // found the old grant dead, the SDK saved its own link instead.
-        const live = mgr.mcpConnections[serverId];
-        // `connected` (discovery failed) also counts as authorized for the
-        // callback, so park that too.
-        const reachable = live?.connectionState === "ready" || live?.connectionState === "connected";
-        if (action === "keep" && reachable && authUrlOf()[serverId] === parkedUrl) {
-          this.stepUpParkedFrom.set(serverId, live.connectionState);
-          live.connectionState = "authenticating";
-          void this.scheduleStepUpExpiry(serverId, parkedUrl, parks[serverId]!.at);
-        }
-        log("info", "oauth mcp step-up park recovered", { serverId, action, state: live?.connectionState ?? null });
-      }).catch((err) => {
-        log("warn", "oauth mcp step-up park recovery failed", { serverId, action, error: err instanceof Error ? err.message : String(err) });
-      });
-      this.ctx.waitUntil(reconnect);
-      work.push(reconnect);
-    }
-    this.writeStepUpParks(next);
-    return work.length ? Promise.all(work).then(() => undefined) : undefined;
   }
 
   /**
@@ -6224,11 +6222,33 @@ export class CodingAgent extends CodingAgentBase {
 
   /** Hub RPC: does this server still wait for the person to approve a step-up? */
   oauthStepUpPending(serverId: string): boolean {
-    // A park whose link was approved stays in metadata until it expires;
-    // the saved auth_url is what's still waiting.
-    const row = (this.mcp as unknown as { getServersFromStorage(): Array<{ id: string; auth_url?: string | null }> })
-      .getServersFromStorage().find((r) => r.id === serverId);
-    return !!row?.auth_url;
+    return this.vettedStepUpLink(serverId) !== null;
+  }
+
+  /**
+   * The approval link a server waits on, if Dodo vetted it (a park for that
+   * exact link). Since agents 0.34 the SDK saves every re-authorization link
+   * as auth_url before Dodo sees it, also one the issuer pin refused, so the
+   * saved link alone is not enough. A park whose link was approved or
+   * declined stays in metadata until it expires; the saved auth_url is what
+   * still waits. A park past the link lifetime is never served, also when
+   * its expiry could not be scheduled.
+   */
+  vettedStepUpLink(serverId: string): string | null {
+    const saved = this.mcp.listServers().find((r) => r.id === serverId)?.auth_url;
+    const park = this.readStepUpParks()[serverId];
+    return saved && park?.authUrl === saved && !parkExpired(park) ? saved : null;
+  }
+
+  /** Hub RPC: `vettedStepUpLink` for every server that has one. */
+  vettedStepUpLinks(): Record<string, string> {
+    const parks = this.readStepUpParks();
+    const out: Record<string, string> = {};
+    for (const r of this.mcp.listServers()) {
+      const park = parks[r.id];
+      if (r.auth_url && park?.authUrl === r.auth_url && !parkExpired(park)) out[r.id] = r.auth_url;
+    }
+    return out;
   }
 
   private async oauthStepUpPendingViaHub(serverId: string): Promise<boolean> {

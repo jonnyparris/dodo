@@ -5,7 +5,9 @@
  * - One browser per session DO, recorded in its storage via the agents
  *   Lifecycle. Tabs, cookies and logins carry over between calls until it
  *   sits idle past keep_alive; the next call then gets a fresh browser and
- *   the result says `restarted: true`.
+ *   the result's `notice` says it was replaced.
+ * - The model's code runs in its own Dynamic Worker (agents >= 0.31) and
+ *   drives the browser through a `browser` global (`browser.cdp(...)`).
  * - Each pi conversation (session, fork, subagent) gets its own active tab
  *   (`sessionId: "active"`); cookies are shared.
  * - Not rerun after an eviction (the code may have clicked or submitted
@@ -31,7 +33,6 @@ export function createSessionBrowser(binding: Fetcher): Browser {
 type Content = TextContent | ImageContent;
 
 export interface DodoBrowserToolOptions {
-  ctx: DurableObjectState;
   browser: Browser;
   loader: WorkerLoader;
   /** Called with each screenshot the run returned (to store and show it). */
@@ -39,7 +40,7 @@ export interface DodoBrowserToolOptions {
 }
 
 export function createBrowserExecuteTool(options: DodoBrowserToolOptions): ToolRegistration {
-  const tool = browserTool({ ctx: options.ctx, browser: options.browser, loader: options.loader, name: BROWSER_TOOL_NAME });
+  const tool = browserTool({ browser: options.browser, loader: options.loader, name: BROWSER_TOOL_NAME });
   return {
     ...(tool as unknown as ToolRegistration),
     async execute(args, api, context) {
@@ -49,6 +50,7 @@ export function createBrowserExecuteTool(options: DodoBrowserToolOptions): ToolR
         output?: Content[];
         content?: Content[];
         details?: unknown;
+        structuredOutput?: unknown;
         isError?: boolean;
       };
       const output = raw.output ?? raw.content ?? [];
@@ -61,6 +63,8 @@ export function createBrowserExecuteTool(options: DodoBrowserToolOptions): ToolR
       return {
         output,
         ...(raw.details !== undefined ? { details: raw.details as never } : {}),
+        // The SDK tool declares a structuredOutputSchema (code mode reads the run as an object).
+        ...(raw.structuredOutput !== undefined ? { structuredOutput: raw.structuredOutput as never } : {}),
         ...(raw.isError ? { isError: true } : {}),
       };
     },

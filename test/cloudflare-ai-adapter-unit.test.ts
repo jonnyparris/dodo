@@ -28,6 +28,19 @@ describe("adaptBindingForCreateAI", () => {
     expect(runCalls[0].options).toEqual({ returnRawResponse: true });
   });
 
+  it("fetch (createAI's provider-native path and stream resume) strips the signal and still honours it", async () => {
+    const { binding, calls } = fakeAIBinding(() => new Response("ok"));
+    const adapted = adaptBindingForCreateAI(binding) as unknown as { fetch: (input: string, init?: RequestInit) => Promise<Response> };
+    const url = "https://workers-binding.ai/ai-gateway/gateways/gw/anthropic/v1/messages";
+    const res = await adapted.fetch(url, { method: "POST", body: "{}", signal: new AbortController().signal });
+    expect(await res.text()).toBe("ok");
+    expect(calls).toHaveLength(1);
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(adapted.fetch(url, { method: "POST", body: "{}", signal: aborted.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(calls).toHaveLength(1);
+  });
+
   it("run turns a thrown AiError 3021 into a 429 Response", async () => {
     const { binding } = fakeAIBinding(() => new Response("{}"), () => {
       throw new Error("AiError: 3021: per min rate reached");

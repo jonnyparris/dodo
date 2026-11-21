@@ -140,5 +140,85 @@ existing workspace instead of cloning.
   test on `~/dev/pi` branch `fix/ai-no-placeholder-bearer`. pi's contribution
   gate requires an issue in the reporter's own words and a maintainer `lgtm`
   before a PR — not filed by an agent.
-- `HarnessOptions.models` as a function is unreleased (>1.3.0); Dodo mutates
-  one `Models` until it ships.
+- `HarnessOptions.models` as a function shipped in pi-durable 1.4.0. Dodo
+  passes one (`PiEngineHost.models()`); CodingAgent rebuilds its `Models` only
+  when the gateway config changes, and pi reads it at every model request, so
+  URL/credential changes apply without reopening. Model and gateway stay
+  fixed while a prompt runs (`readAppConfig` keepRunning,
+  `ensureThinkConfig`), so the running turn's model ref stays registered; a
+  change applies from the next prompt. The previous model stays registered
+  too, for a background compaction that outlasts its prompt.
+
+## Pi 1.5 / agents 0.33 (2026-11)
+
+Dodo went from pi 1.3 / agents 0.28 straight to pi 1.5 / agents 0.33 (PR
+#153, first written for pi 1.4 / agents 0.30 and retargeted before it
+merged), so prod takes one storage migration instead of two.
+
+- **No rollback.** pi 1.4+ migrates the `pi_` SQLite tables to schema v2 on
+  first open, and pi 1.5 writes `pi.live` at version 3. Neither 1.3 nor 1.4
+  can read a session 1.5 opened. Roll forward to fix a bad deploy.
+- **The bridge renders state** (`src/pi/live-bridge.ts`). pi 1.5 removed
+  `watchEvents()`. `PiEngine.run()` attaches `Conversation.watch()` before it
+  submits (or resumes a recovered run), and `LiveBridge` turns each view into
+  Dodo's SSE events. Watch calls fold the commits made while the listener
+  runs, and the view's entries are a window, so the bridge renders state, it
+  doesn't replay events: new transcript entries (ordered, re-readable) drive
+  each step's text, `tool_call` (from the answer's `toolCall` blocks, args
+  as the model sent them), `tool_result`, steps and usage; `pi.live` drives
+  only the streaming partial, the turn stall guard's snapshot and logs. After
+  the settle, `finish()` reads entries no delivered view showed.
+- **Turn stall guard** takes a full snapshot per watch call
+  (`PiTurnProgress`: open tool calls, pending ones included, and compaction).
+- **Restart limit ends work** (no more parking, `retryTask()` is gone). A tool
+  call cut off 5 times in a row (`PI_RESTART_LIMIT`) ends with an error result
+  the model sees; a model request ends its run `unanswered` with
+  `restart_limit`, and a request in flight when the host died counts as a
+  failed attempt (`interrupted` once retries run out). Both become a plain
+  "send the prompt again" error (`piUnansweredMessage`). `onReport` gets one
+  tagged report (`kind`); `task_interrupted` is logged as an error.
+- **Deferred progress.** Streamed text and tool output reach watches at once
+  and storage in batches (`settings.progress.persistWithinMs`, 1 s). A crash
+  loses up to ~1 s of streamed text. `partialIntervalMs` (250 ms) now sets
+  the chat's update rate, not the write volume.
+- **agents 0.31 browser tool.** `browser_execute`'s code runs in its own
+  Dynamic Worker and calls a `browser` global (`browser.cdp(...)`,
+  `browser.attachToTarget(...)`); `notice` replaces `restarted`/`newTabs`.
+  The tool declares a structured output schema, which Dodo's wrapper passes
+  through. The system prompt and the `browser-cdp-perf` skill teach the new API.
+- **agents 0.31 MCP peers.** `@modelcontextprotocol/sdk` and
+  `@modelcontextprotocol/server` are optional peers now; Dodo lists both
+  (`agents/mcp`'s `createMcpHandler` imports the server package).
+- **createAI (agents ≥0.29).** No more universal endpoint. Main-session
+  Anthropic models resolve by AI Gateway's catalog spelling
+  (`anthropic/claude-sonnet-4.6`, `createAISpecifier()`) and run on
+  `env.AI.run`; Dodo keeps its own id (`anthropic/claude-sonnet-4-6`) on the
+  model so persisted `cloudflare/…` refs still resolve. Subagents' `routed`
+  Anthropic models go to the provider-native path over `env.AI.fetch`, which
+  `adaptBindingForCreateAI` now wraps (AbortSignal kept local).
+
+## Pi 1.6 / agents 0.34 (2026-11)
+
+agents 0.34 peer-pins pi `~1.6.0`, so the two move together again.
+
+- **No rollback, again.** pi 1.6 writes `pi.tool` v4 and `pi.generation` v3.
+  pi 1.5 can't run the tool calls or model requests of a session 1.6
+  opened. Roll forward.
+- **Code changes were small.** `Context` moved to
+  `@earendil-works/chord/context`. None of pi 1.6's other breaking changes
+  (`HookTask`, tools that park, optional `until`, extension namespaces)
+  touch Dodo's code.
+- **MCP step-up is the SDK's now** (`MCPAuthorizationRequiredError`,
+  cloudflare/agents#2658). `CodingAgent.callOAuthTool` catches it and
+  returns the card marker. Dodo keeps the issuer pin, the forged-marker
+  strip and a 10-minute link expiry (its own `expireStepUpPark` schedule,
+  which calls `reconnectMcpServer`). The SDK saves links the pin refuses
+  too, so the hub serves a link only if it parked it
+  (`vettedStepUpLink`), and puts the grant's client id back in the
+  server row after a swapped authorization server changed it. Dodo dropped
+  its re-park after a hub restart: the SDK restores a waiting server as
+  `authenticating` without tools until the person approves, declines or
+  Dodo's expiry reconnects it. See `src/mcp-step-up.ts`.
+- **listOAuthTools' connect wait** polls public connection state
+  (`connecting` / `discovering`) instead of the SDK's private
+  `_pendingConnections`, which is gone.

@@ -5,7 +5,8 @@ import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@ear
 import { tool, zodSchema } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { entriesToMessages, PiEngine, type PiEngineHost } from "../src/pi/engine";
+import { entriesToMessages, PI_RESTART_LIMIT, PiEngine, type PiEngineHost, piUnansweredMessage } from "../src/pi/engine";
+import type { PiTurnProgress } from "../src/pi/live-bridge";
 import { buildToolsExtension, modelOutputToContent, REPLAY_SAFE_TOOLS } from "../src/pi/tools";
 import { agentModelRef, CREATE_AI_PROVIDER_ID, createAIGatewayId, dodoModel, gatewayHeaders, modelCost, setDodoProvider, WORKERS_AI_API, workersAIOnRunPath } from "../src/pi/models";
 import { fakeAIBinding } from "./helpers/fake-ai-binding";
@@ -13,10 +14,22 @@ import { calculateCost, createModels } from "@earendil-works/pi-ai/models";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 
+const modelsFor = new WeakMap<object, ReturnType<typeof createModels>>();
+/** One Models per faux provider, like the CodingAgent host's config cache. */
+function fauxModels(faux: ReturnType<typeof fauxProvider>) {
+  let models = modelsFor.get(faux);
+  if (!models) {
+    models = createModels();
+    models.setProvider(faux.provider);
+    modelsFor.set(faux, models);
+  }
+  return models;
+}
+
 function host(storage: DurableObjectStorage, faux: ReturnType<typeof fauxProvider>, events: Array<{ type: string; data: unknown }>): PiEngineHost {
   return {
     storage,
-    configureModels: (models) => models.setProvider(faux.provider),
+    models: () => fauxModels(faux),
     modelRef: () => ({ provider: "faux", modelId: "faux-1" }),
     systemPrompt: () => "You are Dodo.",
     emit: (e) => events.push(e),
@@ -121,19 +134,124 @@ describe("PiEngine", () => {
       const prepare = async () => { prepared++; return { content: "push it", entry: entry("push it") }; };
 
       const first = new PiEngine(host(state.storage, faux, []));
-      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) });
+      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) }).catch(() => {}); // close() rejects the wait
       await enteredP;
       await first.close(); // eviction
-      await running.catch(() => {});
+      await running;
 
       const second = new PiEngine(host(state.storage, faux, []));
-      const result = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) });
+      const progress: PiTurnProgress[] = [];
+      const result = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools), onProgress: (p) => progress.push(p) });
       expect(prepared).toBe(1); // user turn not re-prepared / re-emitted
+      // The stall guard saw the recovered call open (long limit) at attach.
+      expect(progress[0]?.openTools.map((t) => t.name)).toEqual(["git_push"]);
       expect(result.recovered).toBe(true);
       expect(result.status).toBe("done");
       expect(result.text).toBe("after restart");
       // git_push is replay-unsafe: it is NOT rerun; the model got an `interrupted` result.
       expect(pushes).toBe(1);
+      await second.close();
+    });
+  });
+
+  /**
+   * Simulate the DO being reset mid-task `PI_RESTART_LIMIT` times. Writes
+   * pi-durable's internal `pi_tasks` table (JSON `record` with
+   * `state.status` and `restarts`): revisit on a pi upgrade. A clean close()
+   * writes running tasks back as pending without counting, so put them back
+   * to running one restart short of the limit; the next open counts the last
+   * one and ends them.
+   */
+  function crashLoop(storage: DurableObjectStorage, kind: string): number {
+    const cursor = storage.sql.exec(
+      `UPDATE pi_tasks SET status = 'running', record = json_set(record, '$.state.status', 'running', '$.restarts', ${PI_RESTART_LIMIT - 1}) WHERE status IN ('pending', 'running', 'waiting') AND json_extract(record, '$.kind') = ?`,
+      kind,
+    );
+    return cursor.rowsWritten;
+  }
+
+  function blockingTools() {
+    let entered: () => void = () => {};
+    const enteredP = new Promise<void>((r) => { entered = r; });
+    let calls = 0;
+    const tools = {
+      hang: tool({
+        description: "hang",
+        inputSchema: zodSchema(z.object({})),
+        execute: async (_input, { abortSignal }) => {
+          calls++;
+          entered();
+          await new Promise<void>((resolve) => abortSignal?.addEventListener("abort", () => resolve()));
+          return "done";
+        },
+      }),
+    };
+    return { tools, enteredP, calls: () => calls };
+  }
+
+  it("a tool call cut off by the restart limit ends with an error result, and the turn still answers", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-restart-tool"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const faux = fauxProvider();
+      faux.setResponses([
+        fauxAssistantMessage([fauxToolCall("hang", {}, { id: "c1" })], { stopReason: "toolUse" }),
+        fauxAssistantMessage([fauxText("gave up on hang")]),
+      ]);
+      const { tools, enteredP, calls } = blockingTools();
+      const prepare = async () => ({ content: "loop", entry: entry("loop") });
+
+      const first = new PiEngine(host(state.storage, faux, []));
+      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) }).catch(() => {}); // close() rejects the wait
+      await enteredP;
+      await first.close();
+      await running;
+      expect(crashLoop(state.storage, "pi.tool")).toBeGreaterThan(0);
+
+      const logs: Array<{ level: string; message: string; fields?: Record<string, unknown> }> = [];
+      const events: Array<{ type: string; data: unknown }> = [];
+      const second = new PiEngine({ ...host(state.storage, faux, events), log: (level, message, fields) => logs.push({ level, message, fields }) });
+      const result = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) });
+      expect(result.recovered).toBe(true);
+      expect(result.status).toBe("done");
+      expect(result.text).toBe("gave up on hang");
+      expect(calls()).toBe(1); // not rerun
+      // The recovered call gets its tool_call before its (error) result.
+      const types = events.filter((e) => e.type === "tool_call" || e.type === "tool_result").map((e) => e.type);
+      expect(types).toEqual(["tool_call", "tool_result"]);
+      await second.close();
+    });
+  });
+
+  it("a generation task cut off by the restart limit settles the prompt unanswered (restart_limit), and the next prompt runs", async () => {
+    const stub = (env as unknown as Env).CODING_AGENT.get((env as unknown as Env).CODING_AGENT.idFromName("pi-engine-restart-generation"));
+    await runInDurableObject(stub, async (_i, state) => {
+      const faux = fauxProvider();
+      faux.setResponses([
+        fauxAssistantMessage([fauxToolCall("hang", {}, { id: "c1" })], { stopReason: "toolUse" }),
+        fauxAssistantMessage([fauxText("second prompt answered")]),
+      ]);
+      const { tools, enteredP } = blockingTools();
+      const prepare = async () => ({ content: "loop", entry: entry("loop") });
+
+      const first = new PiEngine(host(state.storage, faux, []));
+      const running = first.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) }).catch(() => {});
+      await enteredP;
+      await first.close();
+      await running;
+      expect(crashLoop(state.storage, "pi.generation")).toBeGreaterThan(0);
+
+      const logs: Array<{ level: string; message: string; fields?: Record<string, unknown> }> = [];
+      const second = new PiEngine({ ...host(state.storage, faux, []), log: (level, message, fields) => logs.push({ level, message, fields }) });
+      const result = await second.run({ promptId: "p1", prepare, tools: await buildToolsExtension(tools) });
+      expect(result.status).toBe("unanswered");
+      expect(result.reason).toMatch(/^restart_limit/);
+      expect(piUnansweredMessage(result.reason ?? "")).toMatch(/^This turn was stopped: the session restarted/);
+      // onReport's tagged report was read, not just its error.
+      expect(logs.some((l) => l.message === "pi-durable report" && l.fields?.kind === "task_interrupted" && l.fields?.reason === "restart_limit")).toBe(true);
+
+      const next = await second.run({ promptId: "p2", prepare: async () => ({ content: "again", entry: entry("again") }), tools: await buildToolsExtension(tools) });
+      expect(next.status).toBe("done");
+      expect(next.text).toBe("second prompt answered");
       await second.close();
     });
   });
@@ -170,6 +288,15 @@ describe("PiEngine", () => {
       expect(result.status).toBe("unanswered");
       await engine.close();
     });
+  });
+});
+
+describe("piUnansweredMessage", () => {
+  it("unwraps a model error, words restart_limit and interrupted plainly, and falls back to the reason", () => {
+    expect(piUnansweredMessage('model_error: "429 Too Many Requests"')).toBe("429 Too Many Requests");
+    expect(piUnansweredMessage('restart_limit: "generation cut off 5 times"')).toMatch(/gave up after too many restarts\. .*Send the prompt again/);
+    expect(piUnansweredMessage("interrupted")).toMatch(/during the model's answer, and the retries ran out\. Send the prompt again/);
+    expect(piUnansweredMessage("turn_limit: \"3 turns\"")).toBe('Turn ended without an answer (turn_limit: "3 turns")');
   });
 });
 
@@ -301,7 +428,7 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
       fetched.push(String(input));
       return new Response("unexpected", { status: 500 });
     });
-    const { binding, calls } = fakeAIBinding(() => reply());
+    const { binding, catalogCalls: calls } = fakeAIBinding(() => reply());
     const env = { AI: binding, AI_GATEWAY_KEY: "gw-key", CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
     const models = createModels();
     setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
@@ -317,13 +444,14 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     expect(fetched).toEqual([]);
     expect(calls).toHaveLength(1);
     const c = calls[0]!;
-    expect(c.gatewayId).toBe("gw");
-    expect(c.request.provider).toBe("anthropic");
-    expect(c.request.endpoint).toBe("v1/messages");
+    // agents 0.29+: a catalog model runs on env.AI.run under AI Gateway's
+    // catalog id, with the Anthropic-native body (model field dropped).
+    expect(c.model).toBe("anthropic/claude-sonnet-4.6");
+    expect((c.options.gateway as { id?: string }).id).toBe("gw");
     expect(JSON.stringify(c)).not.toContain("gw-key");
     expect((c.options.gateway as { metadata?: unknown }).metadata).toEqual({ dodo_session: "sess-9", dodo_role: "main" });
-    const body = c.request.query;
-    expect(body.model).toBe("claude-sonnet-4-6");
+    const body = c.inputs;
+    expect(body.model).toBeUndefined();
     expect((body.system as Array<Record<string, unknown>>).at(-1)?.cache_control).toMatchObject({ type: "ephemeral" });
     expect((body.tools as Array<Record<string, unknown>>).at(-1)?.cache_control).toMatchObject({ type: "ephemeral" });
     // Usage: pi-ai splits uncached input from cache reads/writes and prices them.
@@ -337,7 +465,7 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
   });
 
   it("still resolves a pre-createAI dodo-gateway/anthropic ref (persisted turn) and sends it through the binding", async () => {
-    const { binding, calls } = fakeAIBinding(() => reply());
+    const { binding, catalogCalls: calls } = fakeAIBinding(() => reply());
     const env = { AI: binding, AI_GATEWAY_KEY: "gw-key", CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
     const models = createModels();
     setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
@@ -346,7 +474,7 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
     const res = await models.complete(legacy!, { messages: [{ role: "user", content: "hi", timestamp: 0 }] });
     expect(res.errorMessage).toBeUndefined();
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.request.query.model).toBe("claude-sonnet-4-6");
+    expect(calls[0]!.model).toBe("anthropic/claude-sonnet-4.6");
     // The dodo-gateway auth headers (gateway key) never reach the binding call.
     expect(JSON.stringify(calls[0])).not.toContain("gw-key");
   });
@@ -366,7 +494,7 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
   });
 
   it("keeps the caller's AbortSignal off the binding call and still honours it", async () => {
-    const { binding, calls } = fakeAIBinding(() => reply());
+    const { binding, catalogCalls: calls } = fakeAIBinding(() => reply());
     const env = { AI: binding, CLOUDFLARE_ACCOUNT_ID: "acct" } as never;
     const models = createModels();
     setDodoProvider(models, ["anthropic/claude-sonnet-4-6"], config, env);
@@ -403,7 +531,7 @@ describe("pi gateway wire: Anthropic through createAI on AI Gateway", () => {
 
   it("waits out a 429 from the gateway and resends the binding call", async () => {
     let n = 0;
-    const { binding, calls } = fakeAIBinding(() =>
+    const { binding, catalogCalls: calls } = fakeAIBinding(() =>
       n++ === 0
         ? new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }), { status: 429, headers: { "content-type": "application/json", "retry-after": "0" } })
         : reply(),

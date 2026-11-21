@@ -5,7 +5,7 @@ import type { Env } from "../src/types";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
+import { obj, str } from "@earendil-works/pi-schema";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { AssistantEntry, createRegistry, defineExtension, defineTool, Harness } from "@earendil-works/pi-durable";
@@ -38,7 +38,7 @@ describe("pi-durable in workerd", () => {
         tools: [defineTool({
           name: "echo",
           description: "echo",
-          parameters: Type.Object({ text: Type.String() }),
+          parameters: obj({ text: str() }),
           execute: async (args) => { calls++; return { output: [{ type: "text", text: args.text }] }; },
         })],
       }));
@@ -71,7 +71,7 @@ describe("pi-durable in workerd", () => {
       const slow = defineTool({
         name: "slow",
         description: "slow, replay-safe",
-        parameters: Type.Object({}),
+        parameters: obj({}),
         replay: "safe",
         execute: async (_a, _api, c) => {
           runs++;

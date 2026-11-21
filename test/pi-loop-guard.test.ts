@@ -1,6 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import type { Message } from "@earendil-works/pi-ai";
+import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { tool, zodSchema } from "ai";
 import { describe, expect, it } from "vitest";
@@ -67,9 +68,11 @@ describe("loop guard inside a pi run", () => {
       };
       faux.setResponses([respond]);
       const verdicts: LoopVerdict[] = [];
+      const models = createModels();
+      models.setProvider(faux.provider);
       const engine = new PiEngine({
         storage: state.storage,
-        configureModels: (models) => models.setProvider(faux.provider),
+        models: () => models,
         modelRef: () => ({ provider: "faux", modelId: "faux-1" }),
         systemPrompt: () => "You are Dodo.",
         emit: () => {},
