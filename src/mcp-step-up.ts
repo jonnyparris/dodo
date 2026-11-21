@@ -1,32 +1,29 @@
 /**
  * Mid-session OAuth re-authorization for SDK-managed (OAuth) MCP servers.
  *
- * The problem (agents 0.28 + @modelcontextprotocol/client 2.3):
+ * Since agents 0.34 the SDK does the hard part (cloudflare/agents#2658,
+ * #2782): when a tool call needs more scope (`403 insufficient_scope`) or a
+ * refresh fails, `MCPClientManager.callTool` moves the server to
+ * `authenticating`, saves the new link as its `auth_url` and throws
+ * `MCPAuthorizationRequiredError` with `authUrl`. The normal OAuth callback
+ * then exchanges the code. During a scope step-up the server keeps working
+ * on its current grant, until the hub restarts: the SDK then restores it as
+ * `authenticating` with no tools, and every call returns the same link.
  *
- * - A tool call gets `403 insufficient_scope` (step-up, e.g. the Cloudflare
- *   API MCP at mcp.cloudflare.com granted with Minimal/Read only), or a 401
- *   whose refresh fails. The client transport runs `auth()`, which builds a
- *   new authorize URL (union of granted + challenged scopes), stores it on
- *   the DO OAuth provider and throws `UnauthorizedError`.
- * - `MCPClientManager` only turns that into `authenticating` + `authUrl` at
- *   connect time. Mid-session, `callTool` just throws: nobody sees the URL.
- * - Worse, if the person did open it, the OAuth callback finds the
- *   connection `ready`, treats the callback as stale, and drops the code.
- *   The new scopes are never saved.
- *
- * The fix (hub DO, `CodingAgent.callOAuthTool`): when a call fails with an
- * unauthorized error and the provider holds a *new* authorize URL, move the
- * connection to `authenticating` and persist the URL (same as the connect
- * path), so the existing callback route finishes the exchange and
- * reconnects. Then return a marker the session turns into a needs-input card
- * (server id only; the owner's browser fetches the link, see
- * `stepUpToolResult`). The model retries the call after the person replies.
- * A restart while parked is handled by `planStepUpRecovery`.
+ * What Dodo still adds (hub DO, `CodingAgent.callOAuthTool`):
+ * - turns that error into a marker the session shows as an Approve access
+ *   card (server id only; the owner's browser fetches the link, see
+ *   `stepUpToolResult`),
+ * - refuses a link whose authorization server is not the one that issued
+ *   the grant (`isTrustedAuthUrl`; the SDK does not check). The SDK saves
+ *   refused links too, so the hub only serves a link it parked
+ *   (`CodingAgent.vettedStepUpLink`),
+ * - strips a marker a server forges in a normal result (`stripStepUpMarker`),
+ * - expires a park when its link dies (`STEP_UP_PARK_TTL_MS`, Dodo's
+ *   `expireStepUpPark` schedule): the SDK keeps a dead link until someone
+ *   reconnects the server.
  *
  * This module is pure (no DO, no SDK imports) so it unit-tests cheaply.
- * Belongs upstream in `agents` (MCPClientManager.callTool, filed as
- * https://github.com/cloudflare/agents/issues/2658); delete
- * once the SDK surfaces mid-session auth itself.
  */
 
 export const OAUTH_STEP_UP_KEY = "dodoOAuthReauth" as const;
@@ -40,26 +37,6 @@ export interface OAuthStepUp {
 }
 
 export type OAuthStepUpMarker = { [OAUTH_STEP_UP_KEY]: OAuthStepUp };
-
-/**
- * Same test agents uses at connect time (`isUnauthorized` in
- * client-*.js): HTTP 401 status, `UnauthorizedError`, or an
- * "Unauthorized"/"401" message, also through `cause`.
- */
-export function isUnauthorizedError(err: unknown, depth = 0): boolean {
-  if (!err || depth > 3) return false;
-  if (typeof err === "object") {
-    const e = err as { name?: unknown; status?: unknown; code?: unknown; data?: { status?: unknown; cause?: unknown }; cause?: unknown; message?: unknown };
-    if (e.name === "UnauthorizedError") return true;
-    if (e.status === 401 || e.data?.status === 401) return true;
-    const cause = e.cause ?? e.data?.cause;
-    if (cause && cause !== err && isUnauthorizedError(cause, depth + 1)) return true;
-    const msg = typeof e.message === "string" ? e.message : "";
-    return msg.includes("Unauthorized") || msg.includes("401");
-  }
-  const msg = String(err);
-  return msg.includes("Unauthorized") || msg.includes("401");
-}
 
 /** `scope` query parameter of an authorize URL, or undefined. */
 export function scopeFromAuthUrl(authUrl: string): string | undefined {
@@ -132,44 +109,39 @@ export function isTrustedAuthUrl(authUrl: string, issuers: { grantIssuer?: strin
 }
 
 /**
- * Decide whether a failed OAuth tool call needs the person to re-authorize.
- * `authUrlBefore` is the provider's URL before the call: an unchanged URL is
- * left over from the original connect and must not be shown again (every
- * fresh `auth()` redirect has a new random `state`, so a real one differs).
- * `grantIssuer` / `linkIssuer`: see `isTrustedAuthUrl`.
+ * The card to show for an SDK `MCPAuthorizationRequiredError`, or null when
+ * the link must not be shown (see `isTrustedAuthUrl`).
  */
-export function detectOAuthStepUp(input: {
+export function stepUpFromAuthError(input: {
   serverId: string;
   serverName?: string;
-  error: unknown;
-  authUrlBefore: string | undefined;
-  authUrlAfter: string | undefined;
+  authUrl: string;
   grantIssuer?: string;
   linkIssuer?: string;
 }): OAuthStepUp | null {
-  const { error, authUrlBefore, authUrlAfter } = input;
-  if (!authUrlAfter || authUrlAfter === authUrlBefore) return null;
-  if (!isUnauthorizedError(error)) return null;
-  if (!isTrustedAuthUrl(authUrlAfter, { grantIssuer: input.grantIssuer, linkIssuer: input.linkIssuer })) return null;
-  return {
-    serverId: input.serverId,
-    serverName: input.serverName,
-    authUrl: authUrlAfter,
-    scope: scopeFromAuthUrl(authUrlAfter),
-  };
+  const { authUrl } = input;
+  if (!isTrustedAuthUrl(authUrl, { grantIssuer: input.grantIssuer, linkIssuer: input.linkIssuer })) return null;
+  return { serverId: input.serverId, serverName: input.serverName, authUrl, scope: scopeFromAuthUrl(authUrl) };
 }
 
 /**
- * How long a step-up park may outlive a hub restart. Matches the agents
- * OAuth provider's state/verifier lifetime (STATE_EXPIRATION_MS, 10 min):
- * after that the approval link can't complete anyway.
+ * How long a step-up link can complete. Matches the agents OAuth provider's
+ * state/verifier lifetime (STATE_EXPIRATION_MS, 10 min). The SDK keeps a
+ * waiting server on its link after that, so Dodo reconnects it then.
  */
 export const STEP_UP_PARK_TTL_MS = 10 * 60 * 1000;
 
-/** One step-up park: when, and the link it saved as the server's auth_url. */
+/** A park past its link's lifetime: the link can't complete any more. */
+export function parkExpired(park: { at: number }, now = Date.now()): boolean {
+  return now - park.at >= STEP_UP_PARK_TTL_MS;
+}
+
+/** One step-up park: when, and the link the SDK saved as the server's auth_url. */
 export interface StepUpPark {
   at: number;
   authUrl: string;
+  /** Its expiry could not be scheduled: the next wake, or the next call with this link, tries again. */
+  unscheduled?: true;
 }
 
 /** Parks by serverId, kept in hub metadata (never shown to sessions). */
@@ -183,35 +155,14 @@ export function parseStepUpParks(raw: string | null): StepUpParks {
     const out: StepUpParks = {};
     for (const [k, p] of Object.entries(v as Record<string, unknown>)) {
       const park = p as Partial<StepUpPark> | null;
-      if (park && typeof park.at === "number" && Number.isFinite(park.at) && typeof park.authUrl === "string") out[k] = { at: park.at, authUrl: park.authUrl };
+      if (park && typeof park.at === "number" && Number.isFinite(park.at) && typeof park.authUrl === "string") {
+        out[k] = park.unscheduled === true ? { at: park.at, authUrl: park.authUrl, unscheduled: true } : { at: park.at, authUrl: park.authUrl };
+      }
     }
     return out;
   } catch {
     return {};
   }
-}
-
-/**
- * What to do with each step-up park when the hub DO wakes. agents 0.28
- * `restoreConnectionsFromStorage` restores any server with a saved
- * `auth_url` as `authenticating` and never connects it, so it has no
- * tools: ignoring the card would cut off access the old grant still gives.
- * - `drop`: the server's auth_url is no longer the parked link (approved,
- *   removed, or the SDK started its own re-auth). Not ours: leave it.
- * - `unpark`: the park is older than the link lifetime. Clear auth_url and
- *   reconnect with the old grant.
- * - `keep`: the link can still complete. Reconnect with the old grant for
- *   the tools, then park again so the callback still exchanges the code.
- */
-export function planStepUpRecovery(
-  parks: StepUpParks,
-  authUrlByServer: Record<string, string | null | undefined>,
-  now: number,
-): Array<{ serverId: string; action: "drop" | "unpark" | "keep" }> {
-  return Object.entries(parks).map(([serverId, park]) => {
-    if (!authUrlByServer[serverId] || authUrlByServer[serverId] !== park.authUrl) return { serverId, action: "drop" as const };
-    return { serverId, action: now - park.at >= STEP_UP_PARK_TTL_MS ? ("unpark" as const) : ("keep" as const) };
-  });
 }
 
 /**

@@ -196,3 +196,29 @@ merged), so prod takes one storage migration instead of two.
   model so persisted `cloudflare/…` refs still resolve. Subagents' `routed`
   Anthropic models go to the provider-native path over `env.AI.fetch`, which
   `adaptBindingForCreateAI` now wraps (AbortSignal kept local).
+
+## Pi 1.6 / agents 0.34 (2026-11)
+
+agents 0.34 peer-pins pi `~1.6.0`, so the two move together again.
+
+- **No rollback, again.** pi 1.6 writes `pi.tool` v4 and `pi.generation` v3.
+  pi 1.5 can't run the tool calls or model requests of a session 1.6
+  opened. Roll forward.
+- **Code changes were small.** `Context` moved to
+  `@earendil-works/chord/context`. None of pi 1.6's other breaking changes
+  (`HookTask`, tools that park, optional `until`, extension namespaces)
+  touch Dodo's code.
+- **MCP step-up is the SDK's now** (`MCPAuthorizationRequiredError`,
+  cloudflare/agents#2658). `CodingAgent.callOAuthTool` catches it and
+  returns the card marker. Dodo keeps the issuer pin, the forged-marker
+  strip and a 10-minute link expiry (its own `expireStepUpPark` schedule,
+  which calls `reconnectMcpServer`). The SDK saves links the pin refuses
+  too, so the hub serves a link only if it parked it
+  (`vettedStepUpLink`), and puts the grant's client id back in the
+  server row after a swapped authorization server changed it. Dodo dropped
+  its re-park after a hub restart: the SDK restores a waiting server as
+  `authenticating` without tools until the person approves, declines or
+  Dodo's expiry reconnects it. See `src/mcp-step-up.ts`.
+- **listOAuthTools' connect wait** polls public connection state
+  (`connecting` / `discovering`) instead of the SDK's private
+  `_pendingConnections`, which is gone.

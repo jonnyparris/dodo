@@ -10,8 +10,11 @@
  *   3. the OAuth callback exchanges the new code (before: dropped as
  *      "stale" because the connection was `ready`), and
  *   4. the retried call succeeds with the wider token.
- * Plus the review follow-ups: a hub restart while parked (fresh and stale),
- * two parallel 403s, and a link that points off the grant's issuer.
+ * Plus the review follow-ups: a hub restart while parked (the link still
+ * completes; the expiry schedule survives it), two parallel 403s, and a link
+ * that points off the grant's issuer. Since agents 0.34 the SDK parks the
+ * server itself (MCPAuthorizationRequiredError); Dodo adds the card, the
+ * issuer pin and the expiry. Nothing reconnects on a restart any more.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
@@ -238,21 +241,21 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     throw new Error(`tools for ${id} never came back`);
   }
 
-  it("a hub restart while parked keeps the tools and the approval link", async () => {
+  it("a hub restart while parked keeps the approval link; calls ask for it again", async () => {
     const { fake, hub, getHub, id, callbackUrl } = await connected();
     const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
     expect(stepUp).toBeTruthy();
 
-    // Before the fix the restored server stayed `authenticating` with no
-    // tools until someone approved: every session lost it.
+    // agents 0.34 restores a waiting server as `authenticating` without
+    // connecting it (Dodo no longer re-parks it on the old grant): until the
+    // person approves, declines or the link expires, every call asks for the
+    // same link.
     await evictDurableObject(hub as unknown as DurableObjectStub);
     const woke = await getHub();
-    await waitForTools(woke, id);
     const after = (await woke.getMcpServers()).servers[id];
     expect(after.state).toBe("authenticating");
     expect(after.auth_url).toBe(stepUp.authUrl);
-    // Read-only calls still work on the old grant.
-    expect(((await woke.callOAuthTool(id, "forge", {})) as { content?: unknown }).content).toEqual([{ type: "text", text: "hi" }]);
+    expect(stepUpOf(await woke.callOAuthTool(id, "forge", {}))?.authUrl).toBe(stepUp.authUrl);
 
     // The link still completes after the restart.
     fake.codes.set("code-write", `${BASE} ${WRITE}`);
@@ -279,7 +282,7 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     expect(retry.content?.[0]?.text).toBe("wrote it");
   });
 
-  it("a park older than the link lifetime is cleared on restart", async () => {
+  it("a park that outlived its link while the hub was down expires on its durable schedule", async () => {
     const { hub, getHub, id } = await connected();
     const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
     expect(stepUp).toBeTruthy();
@@ -289,6 +292,12 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     });
     await evictDurableObject(hub as unknown as DurableObjectStub);
     const woke = await getHub();
+    // The expiry scheduled at park time survives the restart; fire it.
+    const pending = await runInDurableObject(woke as unknown as DurableObjectStub, async (instance: unknown) =>
+      ((instance as { getSchedules(): Array<{ callback: string; payload: unknown }> }).getSchedules()).filter((x) => x.callback === "expireStepUpPark").map((x) => x.payload));
+    expect(pending).toEqual([{ serverId: id, authUrl: stepUp.authUrl }]);
+    await runInDurableObject(woke as unknown as DurableObjectStub, async (instance: unknown) =>
+      (instance as { expireStepUpPark(p: unknown): Promise<void> }).expireStepUpPark({ serverId: id, authUrl: stepUp.authUrl }));
     await waitForState(woke, id, "ready");
     await waitForTools(woke, id);
     expect((await woke.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
@@ -321,6 +330,8 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
 
     await ageParks(hub, id, stepUp.authUrl);
     await expire(hub, { serverId: id, authUrl: stepUp.authUrl });
+    // The reconnect runs in the background.
+    await waitForState(hub, id, "ready");
     const s = (await hub.getMcpServers()).servers[id];
     expect(s.auth_url ?? null).toBeNull();
     expect(s.state).toBe("ready");
@@ -365,32 +376,29 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(true);
     await evictDurableObject(hub as unknown as DurableObjectStub);
     const woke = await getHub();
-    await waitForTools(woke, id);
     expect((await woke.getMcpServers()).servers[id].state).toBe("authenticating");
     expect(await expiries(woke)).toEqual([{ serverId: id, authUrl: second.authUrl }]);
   });
 
-  it("expiry after a restart puts the server back to the state it was parked from", async () => {
+  it("expiry after a restart puts the server back on its grant", async () => {
     const { hub, getHub, id } = await connected();
     const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
     await evictDurableObject(hub as unknown as DurableObjectStub);
     const woke = await getHub();
-    await waitForTools(woke, id);
     expect((await woke.getMcpServers()).servers[id].state).toBe("authenticating");
     await ageParks(woke, id, stepUp.authUrl);
     await expire(woke, { serverId: id, authUrl: stepUp.authUrl });
+    await waitForState(woke, id, "ready");
     expect((await woke.getMcpServers()).servers[id]).toMatchObject({ state: "ready", auth_url: null });
   });
 
-  it("expiry with no recorded park state reconnects the server", async () => {
+  it("expiry reconnects the server on its grant", async () => {
     const { hub, id } = await connected();
     const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
-    // What a restored connection looks like when nothing re-parked it here.
-    await inDO<void>(hub, async (i) => { i.stepUpParkedFrom.clear(); });
     await ageParks(hub, id, stepUp.authUrl);
     await expire(hub, { serverId: id, authUrl: stepUp.authUrl });
-    expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
     await waitForState(hub, id, "ready");
+    expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
     expect(((await hub.callOAuthTool(id, "forge", {})) as { content?: unknown }).content).toEqual([{ type: "text", text: "hi" }]);
   });
 
@@ -493,7 +501,9 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     const secondLink = await providerAuthUrl(hub, id);
     expect(secondLink).not.toBe(firstLink);
     expect(new URL(secondLink!).origin).toBe(PHISH);
-    expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
+    // The SDK may keep the refused link saved (agents 0.34); Dodo never
+    // serves or waits on it.
+    expect(await inDO<Record<string, string>>(hub, async (i) => i.vettedStepUpLinks())).toEqual({});
     expect(await pinOf(hub, owner, id)).toBeUndefined();
   });
 
@@ -504,6 +514,10 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     const res = await hub.callOAuthTool(id, "execute", { code: "write" }).then((r) => r, (e: unknown) => e);
     expect(stepUpOf(res)).toBeUndefined();
     expect(String(res)).toMatch(/Unauthorized/);
+    // The SDK saved the refused link; Dodo reconnected on the grant, which
+    // forgets it, so a wake won't restore the server as `authenticating`.
+    await waitForState(hub, id, "ready");
+    expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
     // Reconnect from Settings = remove + add: fresh code exchange, new pin.
     await hub.removeMcpServer(id);
     const callbackPath = new URL(callbackUrl).pathname;
@@ -527,62 +541,110 @@ describe("OAuth MCP mid-session step-up (hub DO)", () => {
     // ...but the SDK dropped the grant (stamped for S) before refreshing,
     // so no refresh token went to any token endpoint.
     expect(fake.tokenRequests.slice(before).filter((p) => p.get("refresh_token"))).toEqual([]);
-    expect((await hub.getMcpServers()).servers[id].auth_url ?? null).toBeNull();
+    // No grant is left, so the SDK waits on the phishing link (agents 0.34
+    // saves it before Dodo sees the error). Dodo never turns it into a card,
+    // on this call or the next.
+    expect(new URL((await hub.getMcpServers()).servers[id].auth_url!).origin).toBe(PHISH);
+    const next = await hub.callOAuthTool(id, "forge", {}).then((r) => r, (e: unknown) => e);
+    expect(stepUpOf(next)).toBeUndefined();
     // No exchange happened, so the pin is untouched.
     expect(await pinOf(hub, owner, id)).toBe(S);
   });
 
-  it("a restart reconnect that ends at 'connected' is parked again so the link completes", async () => {
-    const { fake, hub, getHub, id, callbackUrl } = await connected();
+  it("a waiting server answering every call with the same link keeps the park's clock", async () => {
+    const { hub, getHub, id } = await connected();
     const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
-    expect(stepUp).toBeTruthy();
-    // After the restart the server connects but tool discovery fails, so the
-    // reconnect ends at `connected`, which the SDK callback also treats as
-    // already authorized (it would drop the code as stale).
-    fake.knobs.failToolsList = true;
+    const parkOf = async (h: Hub) => JSON.parse(String((await parksOf(h))[0]?.value ?? "{}"))[id] as { at: number; authUrl: string };
+    const first = await parkOf(hub);
     await evictDurableObject(hub as unknown as DurableObjectStub);
     const woke = await getHub();
-    await waitForState(woke, id, "authenticating");
-    expect((await woke.getMcpServers()).servers[id].auth_url).toBe(stepUp.authUrl);
-    fake.knobs.failToolsList = false;
-    fake.codes.set("code-write", `${BASE} ${WRITE}`);
-    expect((await callback(woke, callbackUrl, stepUp.authUrl, "code-write")).status).toBe(302);
-    expect(exchanged(fake, "code-write")).toBe(true);
-    await waitForState(woke, id, "ready");
+    await sleep(20);
+    // A restored waiting server answers with its saved link.
+    expect(stepUpOf(await woke.callOAuthTool(id, "forge", {}))?.authUrl).toBe(stepUp.authUrl);
+    expect(stepUpOf(await woke.callOAuthTool(id, "execute", { code: "write" }))?.authUrl).toBe(stepUp.authUrl);
+    expect(await parkOf(woke)).toEqual(first);
+    expect(await expiries(woke)).toEqual([{ serverId: id, authUrl: stepUp.authUrl }]);
   });
 
-  it("a hung reconnect delays the hub's wake only up to the recovery cap", async () => {
-    const { fake, hub, getHub, id } = await connected();
+  it("a park whose expiry could not be scheduled is scheduled on the next wake", async () => {
+    const { hub, getHub, id } = await connected();
+    await inDO<void>(hub, async (i) => {
+      i.schedule = async () => { throw new Error("schedule down"); };
+    });
     const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
     expect(stepUp).toBeTruthy();
-    type CapClass = { stepUpRecoveryWaitMs: number };
-    const cls = await runInDurableObject(hub as unknown as DurableObjectStub, async (instance: object) => instance.constructor as unknown as CapClass);
-    const before = cls.stepUpRecoveryWaitMs;
-    expect(before).toBe(10_000);
-    let release!: () => void;
-    fake.knobs.hang = new Promise<void>((r) => { release = r; });
-    try {
-      // Shortened so the test is quick; the code path is the same.
-      await runInDurableObject(hub as unknown as DurableObjectStub, async (instance: object) => {
-        (instance.constructor as unknown as CapClass).stepUpRecoveryWaitMs = 300;
-      });
-      await evictDurableObject(hub as unknown as DurableObjectStub);
-      const started = Date.now();
-      const woke = await getHub();
-      const servers = (await woke.getMcpServers()).servers;
-      const waited = Date.now() - started;
-      // The MCP server never answers, so without the cap the wake would block
-      // until the reconnect gives up. With it, the first request runs at ~cap.
-      expect(waited).toBeGreaterThanOrEqual(250);
-      expect(waited).toBeLessThan(5_000);
-      expect(servers[id]).toBeTruthy();
-    } finally {
-      await runInDurableObject(hub as unknown as DurableObjectStub, async (instance: object) => {
-        (instance.constructor as unknown as CapClass).stepUpRecoveryWaitMs = before;
-      }).catch(() => undefined);
-      release();
-      fake.knobs.hang = null;
-    }
+    const parkOf = async (h: Hub) => JSON.parse(String((await parksOf(h))[0]?.value ?? "{}"))[id] as { at: number; authUrl: string; unscheduled?: boolean };
+    const first = await parkOf(hub);
+    expect(first).toMatchObject({ authUrl: stepUp.authUrl, unscheduled: true });
+    expect(await expiries(hub)).toEqual([]);
+    // The link is still served while it waits.
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(true);
+    await evictDurableObject(hub as unknown as DurableObjectStub);
+    const woke = await getHub();
+    for (let i = 0; i < 50 && (await expiries(woke)).length === 0; i++) await sleep(20);
+    expect(await expiries(woke)).toEqual([{ serverId: id, authUrl: stepUp.authUrl }]);
+    expect(await parkOf(woke)).toEqual({ at: first.at, authUrl: stepUp.authUrl });
+    // The next call with the same link adds nothing.
+    expect(stepUpOf(await woke.callOAuthTool(id, "forge", {}))?.authUrl).toBe(stepUp.authUrl);
+    expect(await expiries(woke)).toEqual([{ serverId: id, authUrl: stepUp.authUrl }]);
+  });
+
+  it("a failed early reschedule from the expiry callback flags the park", async () => {
+    const { hub, id } = await connected();
+    const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    const parkOf = async (h: Hub) => JSON.parse(String((await parksOf(h))[0]?.value ?? "{}"))[id] as { at: number; authUrl: string; unscheduled?: boolean };
+    const first = await parkOf(hub);
+    await inDO<void>(hub, async (i) => {
+      i.schedule = async () => { throw new Error("schedule down"); };
+    });
+    // Too early: it reschedules, which fails.
+    await expire(hub, { serverId: id, authUrl: stepUp.authUrl });
+    expect(await parkOf(hub)).toEqual({ ...first, unscheduled: true });
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(true);
+  });
+
+  it("only a vetted link is served or waited on", async () => {
+    const { hub, id } = await connected();
+    const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    const vetted = () => inDO<Record<string, string>>(hub, async (i) => i.vettedStepUpLinks());
+    expect(await vetted()).toEqual({ [id]: stepUp.authUrl });
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(true);
+    // agents 0.34 saves every re-authorization link as auth_url before Dodo
+    // sees it, also one the issuer pin refuses (no grant left to reconnect
+    // on). Simulate that over the vetted one.
+    await runInDurableObject(hub as unknown as DurableObjectStub, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE cf_agents_mcp_servers SET auth_url = ? WHERE id = ?", `${PHISH}/authorize?state=x`, id);
+    });
+    expect(await vetted()).toEqual({});
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(false);
+  });
+
+  it("a park past the link lifetime is never served, even with no expiry scheduled", async () => {
+    const { hub, id } = await connected();
+    await inDO<void>(hub, async (i) => {
+      i.schedule = async () => { throw new Error("schedule down"); };
+    });
+    const stepUp = stepUpOf(await hub.callOAuthTool(id, "execute", { code: "write" }));
+    expect(await expiries(hub)).toEqual([]);
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(true);
+    await ageParks(hub, id, stepUp.authUrl);
+    expect(await inDO<boolean>(hub, async (i) => i.oauthStepUpPending(id))).toBe(false);
+    expect(await inDO<Record<string, string>>(hub, async (i) => i.vettedStepUpLinks())).toEqual({});
+  });
+
+  it("a refused link from a swapped AS leaves the grant's client in the row for the next wake", async () => {
+    const { fake, hub, id } = await connected();
+    const rowClientId = () => inDO<string | null | undefined>(hub, async (i) =>
+      (i.mcp.listServers() as Array<{ id: string; client_id?: string | null }>).find((r) => r.id === id)?.client_id);
+    expect(await rowClientId()).toBe("client-1");
+    fake.as.current = PHISH;
+    await hub.callOAuthTool(id, "execute", { code: "write" }).then(() => null, (e: unknown) => e);
+    // The refused auth() registered "phish-client" and agents 0.34 saved it
+    // with the link; a wake rebuilds the provider from this row.
+    expect(fake.registerOrigins).toContain(PHISH);
+    expect(await rowClientId()).toBe("client-1");
+    await waitForState(hub, id, "ready");
+    expect(((await hub.callOAuthTool(id, "forge", {})) as { content?: unknown }).content).toEqual([{ type: "text", text: "hi" }]);
   });
 
   type ToolsWaitClass = { oauthToolsWaitMs: number };

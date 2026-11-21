@@ -1898,9 +1898,13 @@ app.get("/api/mcp/oauth-servers", async (c) => {
       }>;
       tools: Array<{ serverId: string }>;
     }>;
+    vettedStepUpLinks: () => Promise<Record<string, string>>;
   };
   try {
-    const { servers, tools } = await stub.getMcpServers();
+    // authUrl is only served for a step-up link the hub vetted (issuer pin):
+    // agents 0.34 also saves links the pin refused. Connect-time links come
+    // from POST /api/mcp/start-auth instead.
+    const [{ servers, tools }, vetted] = await Promise.all([stub.getMcpServers(), stub.vettedStepUpLinks()]);
     // Count tools per server so the UI can show "12 tools" next to each
     // connected MCP server.
     const toolCountByServer = new Map<string, number>();
@@ -1912,7 +1916,7 @@ app.get("/api/mcp/oauth-servers", async (c) => {
       name: s.name ?? "",
       url: s.server_url ?? "",
       state: s.state ?? "unknown",
-      authUrl: s.auth_url ?? null,
+      authUrl: vetted[sid] ?? null,
       error: s.error ?? null,
       toolCount: toolCountByServer.get(sid) ?? 0,
     }));

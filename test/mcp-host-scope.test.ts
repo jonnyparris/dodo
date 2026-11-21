@@ -294,11 +294,14 @@ describe("OAuth hub", () => {
             { name: "b", serverId: "s_off", inputSchema: {} },
           ],
           callTool,
-          // callOAuthTool reads the connection for OAuth step-up (src/mcp-step-up.ts).
+          // callOAuthTool reads the server row (host check) and the
+          // connection (OAuth step-up, src/mcp-step-up.ts).
+          listServers: () => [
+            { id: "s_ok", name: "ok", server_url: `https://${okHost}/mcp` },
+            { id: "s_off", name: "off", server_url: `https://${offHost}/mcp` },
+          ],
+          // listOAuthTools waits for connecting servers first; none here.
           mcpConnections: {},
-          // listOAuthTools waits for in-flight connects first; none here.
-          _pendingConnections: new Map(),
-          waitForConnections: async () => undefined,
         },
       });
 
